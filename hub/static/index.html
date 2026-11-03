@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Riko hub</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --ink: #1c2024; --muted: #68707a;
+    --line: #dfe3e8; --accent: #d6336c; --accent-ink: #fff;
+    --ok: #2b8a3e; --bad: #c92a2a; --chip: #eef1f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --panel: #1d2025; --ink: #e8eaed; --muted: #9aa3ad;
+      --line: #2c3138; --accent: #e64980; --accent-ink: #fff;
+      --ok: #51cf66; --bad: #ff6b6b; --chip: #262b32;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0 auto 0 0; }
+  header h1 span { color: var(--accent); }
+  #status { font-size: 12px; color: var(--muted); }
+  main { max-width: 860px; margin: 0 auto; padding: 12px 16px 48px; }
+  nav { display: flex; gap: 6px; margin: 8px 0 14px; flex-wrap: wrap; }
+  nav button, .btn {
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    padding: 6px 12px; border-radius: 8px; cursor: pointer; font: inherit;
+  }
+  nav button.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px; margin-bottom: 12px;
+  }
+  .card h2 { font-size: 14px; margin: 0 0 8px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  input, textarea, select {
+    width: 100%; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); font: inherit;
+  }
+  textarea { min-height: 84px; resize: vertical; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 200px; min-width: 160px; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .btn.small { padding: 3px 9px; font-size: 12px; border-radius: 6px; }
+  .btn.danger { color: var(--bad); }
+  .plist { list-style: none; margin: 0; padding: 0; }
+  .plist li {
+    display: flex; align-items: center; gap: 8px; padding: 8px 2px;
+    border-bottom: 1px solid var(--line);
+  }
+  .plist li:last-child { border-bottom: 0; }
+  .plist .who { flex: 1; }
+  .chip {
+    background: var(--chip); border-radius: 99px; padding: 1px 9px;
+    font-size: 11px; color: var(--muted); margin-left: 6px;
+  }
+  .chip.active { background: var(--accent); color: var(--accent-ink); }
+  .msg { padding: 6px 10px; border-radius: 8px; margin: 4px 0; max-width: 88%; clear: both; }
+  .msg.user { background: var(--chip); }
+  .msg.ai { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+  .msg .meta { font-size: 10px; color: var(--muted); }
+  .transcript {
+    max-height: 46vh; overflow-y: auto; border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px; background: var(--bg);
+  }
+  .err { color: var(--bad); font-size: 12px; min-height: 16px; margin-top: 6px; }
+  .hint { color: var(--muted); font-size: 12px; }
+  #keybar { display: flex; gap: 8px; align-items: center; }
+  #keybar input { width: 220px; }
+  .chatline { display: flex; gap: 8px; margin-top: 8px; }
+  .switched { text-align: center; font-size: 12px; color: var(--accent); margin: 6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Riko <span>hub</span></h1>
+  <span id="status">no key set</span>
+  <div id="keybar">
+    <input id="key" type="password" placeholder="hub API key" autocomplete="off">
+    <button class="btn primary" id="keysave">Use key</button>
+    <button class="btn" id="keyclear">Forget</button>
+  </div>
+</header>
+<main>
+  <nav>
+    <button data-tab="personas" class="on">Personas</button>
+    <button data-tab="history">History</button>
+    <button data-tab="settings">Settings</button>
+    <button data-tab="chat">Chat test</button>
+  </nav>
+
+  <!-- ──────────────────────────── personas ── -->
+  <section id="tab-personas">
+    <div class="card">
+      <h2>Personas</h2>
+      <ul class="plist" id="plist"></ul>
+      <p class="hint">The active persona answers the next plain chat. Clients poll
+        /api/state and follow switches. Keywords (and names) switch personas when
+        typed as a whole chat message, or after a phrase like “switch to …”.</p>
+    </div>
+    <div class="card">
+      <h2 id="pformtitle">New persona</h2>
+      <input type="hidden" id="pid">
+      <div class="row">
+        <div><label>Name</label><input id="pname" placeholder="Asuka"></div>
+        <div><label>Keywords (comma separated)</label><input id="pkeys" placeholder="asuka, td"></div>
+      </div>
+      <label>System prompt</label>
+      <textarea id="pprompt" placeholder="You are Asuka, a tsundere…"></textarea>
+      <div class="row">
+        <div><label>Greeting (shown on switch)</label><input id="pgreet" placeholder="Asuka here!"></div>
+        <div><label>TTS voice (optional)</label><input id="ptts" placeholder="client default if empty"></div>
+      </div>
+      <label>Avatar (.vrm, max 200 MB)</label>
+      <div class="row" style="align-items:center">
+        <div><input type="file" id="pvrm" accept=".vrm,application/octet-stream"></div>
+        <div><button class="btn" id="pupload" disabled>Upload avatar</button>
+             <span class="hint" id="psize"></span></div>
+      </div>
+      <div style="margin-top:10px">
+        <button class="btn primary" id="psave">Create</button>
+        <button class="btn" id="pcancel" hidden>Cancel edit</button>
+      </div>
+      <div class="err" id="perr"></div>
+    </div>
+  </section>
+
+  <!-- ──────────────────────────── history ── -->
+  <section id="tab-history" hidden>
+    <div class="card">
+      <h2>Chat history</h2>
+      <div class="row" style="align-items:end">
+        <div><label>Persona</label><select id="hpick"></select></div>
+        <div><label>&nbsp;</label><button class="btn" id="hreload">Reload</button></div>
+        <div><label>&nbsp;</label><button class="btn danger" id="hclear">Clear…</button></div>
+        <div><label>&nbsp;</label><label style="margin:0"><input type="checkbox" id="hauto" checked
+             style="width:auto"> auto-refresh (state.version <span id="hver">0</span>)</label></div>
+      </div>
+      <div class="transcript" id="htx" style="margin-top:10px"></div>
+      <div class="err" id="herr"></div>
+    </div>
+  </section>
+
+  <!-- ──────────────────────────── settings ── -->
+  <section id="tab-settings" hidden>
+    <div class="card">
+      <h2>LLM</h2>
+      <label>Base URL (any OpenAI-compatible server, ends in /v1)</label>
+      <input id="sbase" placeholder="http://192.0.2.51:8000/v1">
+      <div class="row">
+        <div>
+          <label>API key <span class="hint" id="skeystate"></span></label>
+          <input id="skey" type="password" placeholder="not set" autocomplete="new-password">
+        </div>
+        <div><label>&nbsp;</label><button class="btn small" id="skeyclear">Clear key</button></div>
+        <div><label>Model</label><input id="smodel" placeholder="auto">
+             <span class="hint">auto = first model the server lists</span></div>
+      </div>
+      <div class="row">
+        <div><label>Temperature</label><input id="stemp" type="number" step="0.05" min="0" max="2"></div>
+        <div><label>Max tokens</label><input id="smaxtok" type="number" min="1"></div>
+        <div><label>Max history (messages sent)</label><input id="smaxhist" type="number" min="1"></div>
+        <div><label>Reasoning effort (blank = omit)</label><input id="seffort" placeholder="low | medium | high"></div>
+      </div>
+      <label>Extra body (JSON passed to the server, e.g. {"chat_template_kwargs":{"enable_thinking":false}})</label>
+      <textarea id="sextra" placeholder="{}"></textarea>
+      <h2 style="margin-top:14px">Switch phrases</h2>
+      <textarea id="sphrases" placeholder="switch to, change to, become, persona, talk to, i want to talk to"></textarea>
+      <p class="hint">A whole chat message like “&lt;phrase&gt; &lt;persona keyword&gt;” switches persona.</p>
+      <div style="margin-top:10px"><button class="btn primary" id="ssave">Save settings</button></div>
+      <div class="err" id="serr"></div>
+    </div>
+  </section>
+
+  <!-- ──────────────────────────── chat ── -->
+  <section id="tab-chat" hidden>
+    <div class="card">
+      <h2>Chat test <span class="chip" id="cpersona"></span></h2>
+      <div class="transcript" id="ctx" style="min-height:220px"></div>
+      <div class="chatline">
+        <input id="cinput" placeholder="talk to her — or type a keyword like “asuka” to switch">
+        <button class="btn primary" id="csend">Send</button>
+      </div>
+      <div class="err" id="cerr"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const LSKEY = "riko…_key";
+const $ = (id) => document.getElementById(id);
+let state = null;          // last GET /api/state
+let knownVersion = -1;
+let editing = null;        // persona id being edited (null = create)
+
+/* ── plumbing ─────────────────────────────────────────────────────── */
+function key() { return localStorage.getItem(LSKEY) || ""; }
+function setKey(k) { k ? localStorage.setItem(LSKEY, k) : localStorage.removeItem(LSKEY); refresh(); }
+
+async function api(path, opts = {}) {
+  const headers = opts.headers || {};
+  if (key()) headers["Authorization"] = "Bearer " + key();
+  if (opts.json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.json);
+  }  // FormData in opts.body keeps its own multipart boundary
+  const r = await fetch(path, { ...opts, headers });
+  if (r.status === 204) return null;
+  let body = null;
+  try { body = await r.json(); } catch (e) { /* non-JSON */ }
+  if (r.status === 401) { showKeyBar("Key rejected — enter the hub key:"); throw new Error("401: " + (body && body.detail || "invalid api key")); }
+  if (!r.ok) throw new Error((body && body.detail) || (r.status + " " + r.statusText));
+  return body;
+}
+function fmtBytes(n) {
+  if (n == null) return "";
+  return n > 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.round(n / 1024) + " KB";
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function showKeyBar(msg) {
+  if (msg) $("status").textContent = msg;
+  $("key").focus();
+}
+function show(tab) {
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
+  document.querySelectorAll("main section").forEach((s) => { s.hidden = s.id !== "tab-" + tab; });
+  if (tab === "history") loadHistory();
+}
+
+/* ── state polling (drives every tab) ─────────────────────────────── */
+async function poll() {
+  try {
+    state = await api("/api/state");
+    $("status").textContent = "connected · " + (state.llm_model || "model: auto") +
+      " · active: " + state.active.id;
+    if (state.version !== knownVersion) {
+      knownVersion = state.version;
+      $("hver").textContent = state.version;
+      renderPersonas();
+      renderPicker();
+      $("cpersona").textContent = state.active.name;
+      if (!$("tab-history").hidden && $("hauto").checked) loadHistory();
+    }
+  } catch (e) {
+    $("status").textContent = e.message.startsWith("401") ? "key needed" : "hub unreachable";
+  }
+}
+
+/* ── personas ─────────────────────────────────────────────────────── */
+function renderPersonas() {
+  if (!state) return;
+  const ul = $("plist");
+  ul.innerHTML = "";
+  state.personas.forEach((p) => {
+    const li = document.createElement("li");
+    const active = state.active.id === p.id;
+    li.innerHTML = `<span class="who"><b>${esc(p.name)}</b> <span class="chip">${esc(p.id)}</span>` +
+      (active ? `<span class="chip active">active</span>` : "") + `</span>`;
+    const btn = (text, cls, fn) => {
+      const b = document.createElement("button");
+      b.className = "btn small " + (cls || ""); b.textContent = text; b.onclick = fn;
+      li.appendChild(b);
+    };
+    btn("Edit", "", () => startEdit(p.id));
+    if (!active) btn("Set active", "", () => api("/api/active", { method: "POST", json: { persona: p.id } }).then(poll).catch((e) => alert(e.message)));
+    if (state.personas.length > 1)
+      btn("Delete", "danger", () => confirm(`Delete persona “${p.name}” with its history and avatar?`) &&
+        api(`/api/personas/${p.id}`, { method: "DELETE" }).then(poll).catch((e) => alert(e.message)));
+    ul.appendChild(li);
+  });
+}
+async function startEdit(pid) {
+  const p = await api("/api/personas/" + pid).catch((e) => { alert(e.message); return null; });
+  if (!p) return;
+  editing = pid;
+  $("pformtitle").textContent = "Edit " + p.id;
+  $("psave").textContent = "Save changes";
+  $("pcancel").hidden = false;
+  $("pname").value = p.name; $("pkeys").value = p.keywords.join(", ");
+  $("pprompt").value = p.system_prompt; $("pgreet").value = p.greeting;
+  $("ptts").value = p.tts_voice; $("perr").textContent = "";
+  showAvatarInfo(p);
+  $("pname").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+function startCreate() {
+  editing = null;
+  $("pformtitle").textContent = "New persona";
+  $("psave").textContent = "Create"; $("pcancel").hidden = true;
+  ["pname", "pkeys", "pprompt", "pgreet", "ptts"].forEach((i) => $(i).value = "");
+  $("psize").textContent = ""; $("pvrm").value = ""; $("pupload").disabled = true;
+}
+async function showAvatarInfo(p) {
+  try {
+    const r = await fetch(`/api/personas/${p.id}/avatar`, { headers: { Authorization: "Bearer " + key() } });
+    const blob = await r.blob();
+    $("psize").textContent = `current: ${fmtBytes(blob.size)}, v${p.avatar_version}` + (p.avatar_version ? "" : " (default)");
+  } catch (e) { $("psize").textContent = ""; }
+}
+async function savePersona() {
+  const body = {
+    name: $("pname").value.trim(),
+    keywords: $("pkeys").value.split(",").map((s) => s.trim()).filter(Boolean),
+    system_prompt: $("pprompt").value,
+    greeting: $("pgreet").value,
+    tts_voice: $("ptts").value.trim(),
+  };
+  $("perr").textContent = "";
+  try {
+    if (!editing) {
+      const p = await api("/api/personas", { method: "POST", json: body });
+      editing = p.id;  // subsequent saves update the persona we just made
+    } else {
+      await api("/api/personas/" + editing, { method: "PUT", json: body });
+    }
+    await poll();
+    $("perr").style.color = "var(--ok)";
+    $("perr").textContent = "saved ✔";
+    setTimeout(() => { $("perr").textContent = ""; $("perr").style.color = ""; }, 1500);
+  } catch (e) { $("perr").textContent = e.message; }
+}
+$("pvrm").addEventListener("change", () => {
+  const f = $("pvrm").files[0];
+  $("pupload").disabled = !f || !editing;
+  if (f) $("psize").textContent = `picked: ${f.name} (${fmtBytes(f.size)})` + (!editing ? " — save the persona first" : "");
+});
+$("pupload").onclick = async () => {
+  const f = $("pvrm").files[0];
+  if (!f || !editing) return;
+  if (f.size > 200 * 1024 * 1024) { $("perr").textContent = "avatar is over 200 MB"; return; }
+  const fd = new FormData();
+  fd.append("file", f, f.name);
+  $("perr").textContent = "";
+  try {
+    await api(`/api/personas/${editing}/avatar`, { method: "PUT", body: fd });
+    $("perr").textContent = "avatar uploaded ✔";
+    $("pvrm").value = ""; $("pupload").disabled = true;
+    await poll();
+    showAvatarInfo(await api("/api/personas/" + editing));
+  } catch (e) { $("perr").textContent = "upload failed: " + e.message; }
+};
+
+/* ── history ──────────────────────────────────────────────────────── */
+function renderPicker() {
+  if (!state) return;
+  const sel = $("hpick");
+  const want = sel.value || state.active.id;
+  sel.innerHTML = state.personas.map((p) =>
+    `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  if (state.personas.some((p) => p.id === want)) sel.value = want;
+}
+async function loadHistory() {
+  renderPicker();
+  const pid = $("hpick").value || (state && state.active.id);
+  if (!pid) return;
+  try {
+    const h = await api(`/api/history?persona=${encodeURIComponent(pid)}&limit=200`);
+    $("htx").innerHTML = h.messages.map((m) =>
+      `<div class="msg ${m.role === "user" ? "user" : "ai"}">` +
+      `${m.role === "user" ? "you" : esc(h.persona)}: ${esc(m.content)}` +
+      `<div class="meta">#${m.id} · ${esc(m.created_at)} · via ${esc(m.source || "?")}</div></div>`
+    ).join("") || `<p class="hint">no history yet</p>`;
+    $("htx").scrollTop = $("htx").scrollHeight;
+  } catch (e) { $("herr").textContent = e.message; }
+}
+$("hclear").onclick = async () => {
+  const pid = $("hpick").value;
+  if (!confirm(`Clear ALL history of “${pid}”?`)) return;
+  try { await api("/api/history?persona=" + encodeURIComponent(pid), { method: "DELETE" }); await poll(); loadHistory(); }
+  catch (e) { $("herr").textContent = e.message; }
+};
+
+/* ── settings ─────────────────────────────────────────────────────── */
+async function loadSettings() {
+  try {
+    const s = await api("/api/settings");
+    const llm = s.llm;
+    $("sbase").value = llm.base_url || "";
+    $("smodel").value = llm.model || "auto";
+    $("stemp").value = llm.temperature; $("smaxtok").value = llm.max_tokens;
+    $("smaxhist").value = llm.max_history; $("seffort").value = llm.reasoning_effort || "";
+    $("sextra").value = Object.keys(llm.extra_body || {}).length ? JSON.stringify(llm.extra_body, null, 2) : "";
+    $("sphrases").value = (s.switch_phrases || []).join(", ");
+    $("skey").value = "";
+    $("skeystate").textContent = llm.api_key_set ? "• set on server" : "• not set";
+    $("skeystate").style.color = llm.api_key_set ? "var(--ok)" : "var(--muted)";
+    $("skey").placeholder = llm.api_key_set ? "••••• (leave blank to keep)" : "not set";
+  } catch (e) { $("serr").textContent = e.message; }
+}
+$("ssave").onclick = async () => {
+  $("serr").textContent = "";
+  let extra = {};
+  const rawExtra = $("sextra").value.trim();
+  if (rawExtra) {
+    try { extra = JSON.parse(rawExtra); } catch (e) { $("serr").textContent = "extra_body is not valid JSON: " + e.message; return; }
+    if (typeof extra !== "object" || extra === null || Array.isArray(extra)) { $("serr").textContent = "extra_body must be a JSON object"; return; }
+  }
+  const llm = {
+    base_url: $("sbase").value.trim(),
+    model: $("smodel").value.trim() || "auto",
+    temperature: parseFloat($("stemp").value),
+    max_tokens: parseInt($("smaxtok").value, 10),
+    max_history: parseInt($("smaxhist").value, 10),
+    reasoning_effort: $("seffort").value.trim(),
+    extra_body: extra,
+  };
+  for (const k of ["temperature", "max_tokens", "max_history"])
+    if (!Number.isFinite(llm[k])) { $("serr").textContent = k + " must be a number"; return; }
+  if ($("skey").value) llm.api_key = $("skey").value;  // blank keeps the stored key
+  const phrases = $("sphrases").value.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  try {
+    await api("/api/settings", { method: "PUT", json: { llm, switch_phrases: phrases } });
+    await loadSettings(); await poll();
+    $("serr").style.color = "var(--ok)"; $("serr").textContent = "saved ✔";
+    setTimeout(() => { $("serr").textContent = ""; $("serr").style.color = ""; }, 1500);
+  } catch (e) { $("serr").textContent = e.message; }
+};
+$("skeyclear").onclick = async () => {
+  try { await api("/api/settings", { method: "PUT", json: { llm: { api_key: "" } } }); await loadSettings(); }
+  catch (e) { $("serr").textContent = e.message; }
+};
+
+/* ── chat test ────────────────────────────────────────────────────── */
+async function sendChat() {
+  const text = $("cinput").value.trim();
+  if (!text) return;
+  $("cinput").value = ""; $("cerr").textContent = "";
+  addChat("user", "you", text);
+  $("csend").disabled = true;
+  try {
+    const r = await api("/api/chat", { method: "POST", json: { text, source: "web" } });
+    if (r.switched) {
+      const d = document.createElement("div");
+      d.className = "switched";
+      d.textContent = "⇄ switched to " + r.persona;
+      $("ctx").appendChild(d);
+    } else {
+      addChat("ai", r.persona, r.reply);
+    }
+    $("ctx").scrollTop = $("ctx").scrollHeight;
+    await poll();
+  } catch (e) { $("cerr").textContent = e.message; }
+  $("csend").disabled = false; $("cinput").focus();
+}
+function addChat(cls, who, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + (cls === "user" ? "user" : "ai");
+  d.innerHTML = `${cls === "user" ? "you" : esc(who)}: ${esc(text)}`;
+  $("ctx").appendChild(d);
+}
+
+/* ── boot ─────────────────────────────────────────────────────────── */
+$("keysave").onclick = () => setKey($("key").value.trim());
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") setKey($("key").value.trim()); });
+$("keyclear").onclick = () => { $("key").value = ""; setKey(""); };
+document.querySelectorAll("nav button").forEach((b) =>
+  b.onclick = () => { show(b.dataset.tab); if (b.dataset.tab === "settings") loadSettings(); });
+$("psave").onclick = savePersona;
+$("pcancel").onclick = startCreate;
+$("hpick").onchange = loadHistory;
+$("hreload").onclick = loadHistory;
+$("csend").onclick = sendChat;
+$("cinput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+
+$("key").value = key();
+if (!key()) showKeyBar("Enter the hub key (or this hub has no key):");
+startCreate();
+poll().then(() => { loadSettings(); });
+setInterval(poll, 3000);
+</script>
+</body>
+</html>

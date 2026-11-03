@@ -1,0 +1,14 @@
+[project]
+name = "riko-hub"
+version = "1.0.0"
+description = "Riko hub: one small FastAPI server for personas, chat memory and LLM settings, shared by every Riko client."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "openai",
+]
+
+[tool.uv]
+package = false
