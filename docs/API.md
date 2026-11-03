@@ -59,6 +59,7 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
     "cfg_scale": null              // null = breeze server default
   },
   "voice_version": 1,              // +1 on every voice/reference/lock change
+  "emotes": true,                  // emotion tags on/off (see *Emotion tags*)
   "updated_at": "2026-11-03T18:00:00Z"
 }
 ```
@@ -75,6 +76,10 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   cache the bytes by `(persona, v)`; when it grows, old audio is stale.
 * `avatar_version` — integer, +1 on every avatar upload. **Cache avatars by
   `id` + `avatar_version`** (see *Avatars*).
+* `emotes` — when true the hub instructs the model to open every reply with
+  an emotion tag and hands you the parsed emotion as structured metadata (see
+  *Emotion tags*). Default **true**, including for personas that existed
+  before this field existed.
 
 ### Message
 
@@ -85,6 +90,10 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   "role": "user",
   "content": "hi",
   "source": "android",
+  "emotion": "teasing",            // assistant messages only, else null
+  "tools_used": [                  // [] unless the turn ran tools
+    {"tool": "web_search", "label": "searching the web for “tokyo weather”"}
+  ],
   "created_at": "2026-11-03T18:00:00Z"
 }
 ```
@@ -92,7 +101,9 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
 `id` is global and monotonically increasing across all personas — it is your
 `after` cursor. `role` is `user` or `assistant`. `source` is the client name
 you passed to `/api/chat` (`desktop`, `android`, `web`, `terminal`,
-`import`, …).
+`import`, …). `emotion` is one of the fixed emotion ids (see *Emotion tags*)
+and `content` **never contains the raw tag**; `tools_used` is the compact
+trace of which tools the turn called (full history in `/api/tools/log`).
 
 ### State
 
@@ -153,6 +164,16 @@ transcript with `after=0`).
 | `DELETE /api/history` | clear a persona's transcript |
 | `POST /api/history/import` | bulk-import old logs |
 | `POST /api/chat` | the only writing route in daily use |
+| `GET /api/events` | long-poll live events (turn/tool progress, approvals) |
+| `GET /api/tools` | built-in + online client tools, permissions, settings, status |
+| `GET /api/tools/log` | recent tool-call log entries |
+| `GET /api/tools/status` | function-calling health (`ok` / `rejected` / `unknown`) |
+| `GET /api/clients` | online client-tool registrations |
+| `POST /api/clients/{id}/register` | register this client's runnable tools |
+| `POST /api/clients/{id}/heartbeat` | keep-alive (~every 30 s) |
+| `GET /api/clients/{id}/requests` | long-poll for tool calls to run |
+| `POST /api/clients/{id}/results` | return a tool call's result/approval |
+| `DELETE /api/clients/{id}` | unregister |
 | `GET /api/messages/{id}/audio` | cached WAV of an assistant reply |
 | `GET /api/personas/{id}/greeting/audio` | cached WAV of a greeting |
 | `POST /api/tts` | one-shot WAV (never cached) for a client line |
@@ -163,9 +184,9 @@ transcript with `after=0`).
 | `DELETE /api/personas/{id}/voice/reference` | drop clip → back to design |
 | `POST /api/personas/{id}/voice/preview` | uncached WAV in this voice (`text`/`voice` overrides) |
 | `POST /api/personas/{id}/voice/lock` | freeze designed voice: its take becomes the clone |
-| `GET /api/settings` | LLM + TTS settings + defaults + per-field source (key never returned) |
+| `GET /api/settings` | LLM + TTS + tools settings + defaults + per-field source (key never returned) |
 | `PUT /api/settings` | change settings (blank field = unset → default; `clear_api_key`) |
-| `POST /api/settings/reset` | drop saved LLM/TTS/switch-phrase overrides → defaults |
+| `POST /api/settings/reset` | drop saved LLM/TTS/tools/switch-phrase overrides → defaults |
 | `POST /api/settings/test` | model probe + breeze health → `{ok, model, tts}` |
 | `GET /` | web config page (no auth; asks for the key) |
 
@@ -195,9 +216,10 @@ curl -s -H "$AUTH" $HUB/api/personas      # -> [Persona, …] in creation order
 
 ### POST /api/personas → `201`
 
-Body: `{name, system_prompt, keywords?, greeting?, tts_voice?}`
+Body: `{name, system_prompt, keywords?, greeting?, tts_voice?, emotes?}`
 (`system_prompt` defaults to `""`; keywords default to `[slug(name)]` plus
-whatever you pass; keywords are lower-cased by the hub).
+whatever you pass; keywords are lower-cased by the hub; `emotes` defaults to
+`true`).
 
 ```bash
 curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
@@ -211,8 +233,8 @@ Errors: `409` the slug already exists; `422` name empty (or no slug possible);
 ### GET /api/personas/{id} · PUT /api/personas/{id}
 
 `PUT` takes any subset of `{name, system_prompt, keywords, greeting,
-tts_voice}` — everything else stays. The `id` never changes. Returns the full
-updated Persona; `404` unknown id.
+tts_voice, emotes}` — everything else stays. The `id` never changes. Returns
+the full updated Persona; `404` unknown id.
 
 ### DELETE /api/personas/{id} → `204`
 
@@ -296,9 +318,11 @@ Body: `{"text": "…", "source": "android", "persona": optional id,
 
 ```json
 {
-  "reply": "Melon bread, obviously, senpai.",
+  "reply": "It is 21 C and sunny in Tokyo today, senpai.",
   "persona": "riko",
   "switched": false,
+  "emotion": "happy",
+  "tools_used": [{"tool": "web_search", "label": "searching the web for “tokyo weather”"}],
   "message_ids": [41, 42],
   "audio_url": "/api/messages/42/audio",
   "state_version": 17
@@ -308,13 +332,24 @@ Body: `{"text": "…", "source": "android", "persona": optional id,
 Two outcomes:
 
 1. **Switch command** (see below): `switched: true`, `reply` is the target's
-   greeting, `message_ids: []` — **nothing is stored** and the target becomes
-   active (which bumps `state.version`). `audio_url` points at the greeting
-   WAV: `/api/personas/<id>/greeting/audio?v=<voice_version>`.
-2. **Normal turn**: the hub builds `system_prompt + last <max_history>
-   stored messages + your text`, calls the LLM, then stores your message and
-   the reply (both with your `source`) and returns both ids. `audio_url` is
-   `/api/messages/<assistant_id>/audio`.
+   greeting, `message_ids: []`, `emotion: null`, `tools_used: []` — **nothing
+   is stored** and the target becomes active (which bumps `state.version`).
+   `audio_url` points at the greeting WAV:
+   `/api/personas/<id>/greeting/audio?v=<voice_version>`.
+2. **Normal turn**: the hub builds `system_prompt + emotion/tools prompt
+   lines + last <max_history> stored messages + your text`, runs the model
+   (possibly through the tool loop — see *Tools*), strips any emotion tag,
+   then stores your message and the clean reply (both with your `source`,
+   the assistant one with `emotion` + `tools_used`) and returns both ids.
+   `audio_url` is `/api/messages/<assistant_id>/audio`.
+
+`emotion` is the parsed emotion id (`neutral` when the persona has `emotes`
+off or the model gave no/unknown tag) — drive your VRM expression from it,
+the raw `[tag]` is **never** in `reply` (see *Emotion tags*). `tools_used` is
+`[]` when no tools ran; while a turn runs you can watch live progress on
+`GET /api/events` (see *Events*). A turn that uses tools can take noticeably
+longer than a plain one (each tool step is another model call): keep your
+chat timeout generous (minutes, not seconds).
 
 `audio_url` is `null` when `speak: false`, when TTS is off/unconfigured, or
 when that persona's `voice.mode` is `off`. **The chat never waits for
@@ -345,6 +380,9 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
           "reasoning_effort": "", "extra_body": {}, "api_key_set": true},
   "tts": {"enabled": true, "base_url": "http://breeze-tts:8137",
           "timeout": 120, "parallel_note": ""},
+  "tools": {"enabled": true, "max_steps": 8, "max_seconds": 120,
+            "max_result_chars": 12000, "searxng_url": "http://192.0.2.101:8989",
+            "allow_private_fetch": false, "permissions": {"desktop__do_thing": "never"}},
   "switch_phrases": ["switch to", "change to", "become", "persona",
                      "talk to", "i want to talk to"],
   "defaults": {"llm": {"base_url": "http://192.0.2.51:8000/v1", "model": "auto",
@@ -352,10 +390,14 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                        "reasoning_effort": "", "extra_body": {}, "api_key_set": true},
                "tts": {"enabled": true, "base_url": "http://breeze-tts:8137",
                        "timeout": 120, "parallel_note": ""},
+               "tools": {"enabled": true, "max_steps": 8, "max_seconds": 120,
+                         "max_result_chars": 12000, "searxng_url": "",
+                         "allow_private_fetch": false, "permissions": {}},
                "switch_phrases": ["switch to", "..."]},
   "llm_source": {"base_url": "saved", "model": "default", "api_key": "default",
                  "temperature": "default", "...": "...", "switch_phrases": "default"},
-  "tts_source": {"base_url": "default", "enabled": "default", "...": "..."}
+  "tts_source": {"base_url": "default", "enabled": "default", "...": "..."},
+  "tools_source": {"enabled": "default", "searxng_url": "saved", "...": "..."}
 }
 ```
 
@@ -391,10 +433,17 @@ Semantics (made so a careless form save cannot break the hub):
   means voice is off everywhere); `enabled` is a plain boolean; `timeout` ≥ 1;
   only `base_url` and `parallel_note` blank back to defaults. Voice is on
   only when `enabled` is true **and** a base URL resolves.
+- **The `tools` block** (see *Tools*): blank `searxng_url` deletes the saved
+  override so `RIKO_SEARXNG_URL` applies again. `enabled` /
+  `allow_private_fetch` are booleans; `max_steps` 1–32, `max_seconds` 5–600,
+  `max_result_chars` 500–100000 (out of range → `422`). `permissions` **is
+  replaced wholesale** when sent: `{tool_name: "always" | "ask" | "never"}`,
+  and a `null` value for one name removes that explicit override (back to
+  the risk-based default).
 - Numbers validate as before: `422` on non-numeric or negative
   temperature/max_tokens/max_history, or non-object `extra_body`.
 
-`POST /api/settings/reset` with `{"llm": true, "tts": true,
+`POST /api/settings/reset` with `{"llm": true, "tts": true, "tools": true,
 "switch_phrases": true}` (each side optional, `422` if none) drops the saved
 overrides so the defaults apply again. Returns the same body as `GET`.
 
@@ -429,8 +478,10 @@ nothing was synthesised.
 
 The WAV of one **assistant** message in its persona's voice. `404` for user
 messages / unknown ids. Cache key server-side is `(message_id,
-voice_version)`: editing the persona voice re-synthesises on the next
-fetch; old replies keep their old audio until asked again.
+voice_version, emotion)`: editing the persona voice re-synthesises on the
+next fetch; old replies keep their old audio until asked again. The stored
+emotion adds a matching delivery hint to the synthesis (see *Emotion tags*)
+— the tag itself is never spoken.
 
 ### GET /api/personas/{id}/greeting/audio
 
@@ -440,8 +491,10 @@ Same, for the greeting (`?v=` informational). This is what a switch's
 ### POST /api/tts
 
 One-shot WAV for a line that is not in any transcript (client-side
-narration): body `{"text": "…", "persona": optional id}`, ≤ **1000
-characters** (`422`), never cached, `Content-Type: audio/wav`.
+narration): body `{"text": "…", "persona": optional id, "emotion": optional
+one of the emotion ids}`, ≤ **1000 characters** (`422`), never cached,
+`Content-Type: audio/wav`. The `emotion` only steers delivery (same hint as
+below); unknown emotion → `422`.
 
 ```bash
 curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
@@ -555,6 +608,167 @@ client can replay the greeting) but leaves `state.version` alone.
 | `502` | LLM call failed — **nothing was stored**, safe to retry. Also: breeze synthesis/registration failed | `{"detail": "<ExceptionType>: <reason>"}` |
 | `503` | no `llm.base_url` configured; or TTS off/unreachable on an audio route | `{"detail": "LLM not configured"}` / `{"detail": "TTS …"}` |
 
+## Emotion tags
+
+When a persona has `emotes: true` the hub adds one line to the system prompt:
+the reply must open with exactly one tag from a **fixed set** —
+`neutral, happy, teasing, annoyed, sad, surprised, thinking, embarrassed` —
+e.g. `[teasing] Sure thing, senpai.` The hub then:
+
+* **strips the tag** — `reply` / stored `content` / spoken audio never
+  contain it (parentheses `(teasing)` are tolerated too);
+* reports the parsed id as `emotion` in the ChatResult and on the stored
+  Message (missing or unknown tag → `neutral`; `emotes: false` → always
+  `neutral` and no prompt line);
+* gives Breeze a matching *delivery hint* in `instructions` (e.g. "with a
+  playful, teasing lilt") — the emotion changes the voice, not the words;
+  the audio cache key includes the emotion.
+
+**Client job:** map `emotion` → your VRM expression blendshapes. It is plain
+metadata — you never parse the text, and old clients that ignore it keep
+working. The set matches StoryLine's emotion vocabulary, so a client can
+share its expression table.
+
+## Tools
+
+The hub runs an OpenAI function-calling loop inside `POST /api/chat`: the
+model may call tools, the hub executes them and feeds the results back, and
+only the final text answer is stored/spoken. Stored history keeps only your
+message + the final reply + a compact `tools_used` list; the full trace goes
+to the tool log. Tool/web results are wrapped as **untrusted data** (the
+model is told they are not instructions) and capped at `max_result_chars`.
+
+Built-in hub tools:
+
+| tool | what it does |
+|---|---|
+| `web_search` | SearXNG JSON search → `{results: [{title, url, content}]}`. Needs a `searxng_url` setting/env (`RIKO_SEARXNG_URL`); **not offered** when unset |
+| `fetch_page` | GET a URL, extract readable text (title + paragraphs/heads/lists, ≤ 20 000 chars, ≤ 10 MB, ≤ 20 s). Refuses loopback/private IPs unless `allow_private_fetch` |
+| `get_time` | hub clock as ISO-8601 with UTC offset |
+
+Permissions per tool name, effective policy (`GET /api/tools` shows all of
+it): an explicit `settings.tools.permissions[name]` wins (`always` / `ask` /
+`never`); otherwise hub tools are `always`, client tools default from their
+declared `risk` (`read` → `always`, `act` / `danger` → `ask`). `never` tools
+are never offered; `ask` waits for a human yes/no over the client-tool
+channel (see below) — up to 120 s, then treated as *not approved*.
+
+Function-calling health: `GET /api/tools/status` →
+`{"function_calling": "ok" | "rejected" | "unknown"}`. If the model server
+400s the `tools` parameter itself the hub falls back to plain one-shot
+answers and marks `rejected` until a later turn works again.
+
+```bash
+curl -s -H "$AUTH" $HUB/api/tools
+# {"tools":[{"name":"web_search","source":"hub","risk":"read","permission":"always","available":true,"description":"…"}, …],
+#  "settings":{…merged tools block…},"function_calling":"ok"}
+
+curl -s -H "$AUTH" "$HUB/api/tools/log?limit=50"
+# {"entries":[{"id":9,"created_at":"…","persona":"riko","tool":"web_search",
+#   "source":"hub","arguments":"{\"query\": \"tokyo weather\"}","ok":true,
+#   "error":"","ms":812,"approval":""}, …]}
+# entries also carry source:"client" rows; approval is "", "approved",
+# "denied" or "not approved" for gated calls
+```
+
+## Events long-poll
+
+Live progress without websockets (any HTTP client can follow — this is the
+same long-poll trick as the client-tool channel):
+
+```bash
+curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
+# {"events":[
+#   {"seq":12,"type":"turn_started","data":{"persona":"riko","source":"android"}},
+#   {"seq":13,"type":"tool_started","data":{"call_id":"…","tool":"web_search","label":"searching the web for “tokyo weather”"}},
+#   {"seq":14,"type":"tool_finished","data":{"call_id":"…","tool":"web_search","ok":true,"ms":812}},
+#   {"seq":15,"type":"approval_needed","data":{"request_id":"…","client_id":"my-desktop","tool":"desktop__do_thing","summary":"do_thing {}"}},
+#   {"seq":16,"type":"turn_finished","data":{"persona":"riko","message_id":42,"emotion":"happy"}},
+#   {"seq":17,"type":"state_changed","data":{"version":18}}
+# ],"last":17}
+```
+
+Loop: keep `last`, pass it back as `after`, `wait` ≤ 30 s (default 25). The
+call returns immediately when anything new happens, otherwise after `wait`
+with an empty list — treat an empty return as "nothing happened, poll
+again". `seq` is monotonic from hub start (last 500 events are buffered; if
+your `after` is older than that you get everything still buffered). Show
+`tool_started.label` as activity text ("🔧 searching the web…") while your
+chat POST is still in flight; `turn_finished` tells you the turn is done.
+`state_changed` mirrors the `/api/state` version bumps, so you can replace
+part of your state polling with this one connection.
+
+## Client tool channel (desktop / Android tools the model can call)
+
+A running app can expose its own tools; the hub pushes the work to the app
+over HTTP long-poll and feeds the result back to the model. Model-facing
+name is **`<kind>__<name>`** (double underscore), e.g. `desktop__open_url`.
+
+Protocol (client side, all with `$AUTH`):
+
+1. **Register** at startup — `POST /api/clients/{id}/register` with
+   `{name, kind, platform?, version?, tools: [{name, description,
+   parameters?, risk?}]}`. `id` matches `[A-Za-z0-9_-]{1,64}` (e.g.
+   `my-desktop`), `kind` is a lowercase word (`desktop`, later `android`),
+   tool `name` matches `[A-Za-z0-9_-]{1,64}`, `risk` is `read` (default),
+   `act` or `danger`. Re-register with the same `id` any time your tool
+   list changes — it replaces the whole registration.
+2. **Long-poll for work** — `GET /api/clients/{id}/requests?wait=25`
+   returns immediately when there is queued work, else after `wait` with
+   `[]`. Each request: `{"request_id", "tool", "arguments",
+   "needs_approval", "summary", "deadline"}`. `tool` here is the **bare
+   name** (`open_url`, not `desktop__open_url`). A request with
+   `tool: "__approval__"` is approval-only (a hub tool gated to `ask`): show
+   `summary`, answer, run nothing.
+3. **Execute (or refuse)** and post the result once per request:
+   `POST /api/clients/{id}/results` with `{"request_id", "ok": true,
+   "approved": true|false, "result": <json|text>, "error": ""}`.
+   `approved: false` means the human said no — the model is told it was not
+   approved. If you never answer an approval-gated call, it times out
+   (120 s) as *not approved*.
+4. **Stay online** — re-register or `POST /api/clients/{id}/heartbeat`
+   every ≤ 30 s. No contact for 75 s → the client and its tools disappear
+   from `/api/tools` and the model stops seeing them (in-flight calls fail
+   fast). `DELETE /api/clients/{id}` on clean exit. `GET /api/clients`
+   shows who is online.
+
+Worked example — a desktop app exposing `open_url` (risk `read`, so it runs
+without asking):
+
+```bash
+H=http://192.0.2.51:8002; AUTH='Authorization: Bearer test'
+
+# 1. register
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "name": "Lain desktop", "kind": "desktop", "platform": "arch",
+  "tools": [{"name": "open_url", "risk": "read",
+             "description": "Open a URL in the user's default browser",
+             "parameters": {"type": "object",
+                            "properties": {"url": {"type": "string"}},
+                            "required": ["url"]}}]
+}' $H/api/clients/my-desktop/register
+# {"ok":true,"model_tools":["desktop__open_url"],"heartbeat_seconds":30,...}
+
+# 2. in a background loop: wait for work
+curl -s -H "$AUTH" "$H/api/clients/my-desktop/requests?wait=25"
+# [{"request_id":"3f9c…","tool":"open_url",
+#   "arguments":{"url":"https://docs.godotengine.org"},
+#   "needs_approval":false,"summary":"open_url {\"url\": \"https://…\"}",
+#   "deadline":"2026-11-03T18:31:02Z"}]
+
+# 3. open the browser, then report
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"request_id":"3f9c…","ok":true,"approved":true,"result":"opened","error":""}' \
+  $H/api/clients/my-desktop/results
+```
+
+Meanwhile the user asked Riko "open the godot docs for me"; `/api/chat`
+returns once the model had the tool result. An approval-gated flow looks
+identical except `needs_approval: true` — you decide, then post the result
+with `approved: true/false`. Clients may run **multiple concurrent**
+requests (different `request_id`s) — the hub issues independent calls in
+parallel.
+
 ## A minimal Android flow
 
 1. `GET /api/health` → reachable? then `GET /api/state` with the key → cache
@@ -566,4 +780,8 @@ client can replay the greeting) but leaves `state.version` alone.
    can take seconds — it synthesises once), cache the WAV by URL, and play.
 3. In a coroutine, poll `GET /api/state` every 3 s; on `version` change apply
    the diff rules from *The polling pattern*. Treat `401` as "key wrong — ask
-   again" and `502` as "retry later, history is intact".
+   again" and `502` as "retry later, history is intact". Optionally replace
+   part of this polling with one long-running `GET /api/events` connection
+   (*Events*), render `emotion` from chat results / history onto your VRM
+   face (*Emotion tags*), and watch tool activity live while a chat is in
+   flight (*Events*).

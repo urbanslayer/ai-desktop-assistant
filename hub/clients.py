@@ -129,7 +129,8 @@ class ClientHub:
         return [ToolSpec(name=t["model_name"], display=t["name"],
                          description=t["description"] or f"client tool {t['name']}",
                          parameters=t["parameters"], source="client", risk=t["risk"],
-                         client_id=rec["client_id"], run=None, label=None)
+                         client_id=rec["client_id"], run=None,
+                         label=(lambda nm: lambda args: summarize(nm, args))(t["name"]))
                 for name, (rec, t) in found.items()]
 
     def dispatch(self, spec: ToolSpec, arguments: dict, needs_approval: bool,

@@ -76,8 +76,10 @@ def run_turn(brain, llm_settings: dict, tools_cfg: dict, specs: list,
     def remaining() -> float:
         return ctx["deadline"] - time.monotonic()
 
-    for step in range(max_steps):
-        steps = step + 1
+    step = 0
+    while step < max_steps:
+        step += 1
+        steps = step
         if use_tools and remaining() <= 0:  # ran out of time mid-loop
             msgs.append({"role": "user", "content": FORCE_FINAL_NOTE})
             use_tools = False
@@ -101,8 +103,9 @@ def run_turn(brain, llm_settings: dict, tools_cfg: dict, specs: list,
         if not calls:
             return {"text": text, "tools_used": tools_used,
                     "steps": steps, "tools_rejected": rejected_reported}
-        if step == max_steps - 1 or remaining() <= 0:
+        if step >= max_steps - 1 or remaining() <= 0:
             # budget spent: feed nothing back, demand a plain final answer
+            # (the next iteration IS that final call — range() would exit here)
             msgs.append({"role": "user", "content": FORCE_FINAL_NOTE})
             use_tools = False
             continue
@@ -139,6 +142,7 @@ def execute_call(call: dict, by_name: dict, permissions: dict, cap: int,
     payload = None
     approval = ""
     source = spec.source if spec else "unknown"
+    perm = "always"
     t0 = time.monotonic()
 
     try:
@@ -153,6 +157,10 @@ def execute_call(call: dict, by_name: dict, permissions: dict, cap: int,
     if spec is not None and error is None:
         perm = permission_for(spec.name, spec.source, spec.risk, permissions)
         label = _label_for(spec, args)
+    # announce BEFORE running: long-poll watchers show in-flight tools
+    events.publish("tool_started", call_id=call_id, tool=name, label=label)
+
+    if spec is not None and error is None:
         if perm == "never":
             error = f"tool '{name}' is not allowed (permission: never)"
         elif spec.source == "client":

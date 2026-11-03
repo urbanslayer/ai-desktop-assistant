@@ -162,7 +162,7 @@ class _TextExtractor(HTMLParser):
 
 def _looks_binary(content_type: str) -> bool:
     ct = content_type.lower()
-    return not any(t in ct for t in ("html", "xml", "text", "json", ""))
+    return bool(ct) and not any(t in ct for t in ("html", "xml", "text", "json"))
 
 
 def fetch_page(url: str, allow_private: bool = False) -> dict:

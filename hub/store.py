@@ -313,12 +313,12 @@ class Store:
 
     @staticmethod
     def _message_dict(row) -> dict:
-        tools = None
+        tools = []
         if row["tools"]:
             try:
                 tools = json.loads(row["tools"])
             except ValueError:
-                tools = None
+                tools = []
         return {"id": row["id"], "persona": row["persona"], "role": row["role"],
                 "content": row["content"], "source": row["source"],
                 "emotion": row["emotion"], "tools_used": tools,
