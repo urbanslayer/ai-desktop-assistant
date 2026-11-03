@@ -1,6 +1,6 @@
 # Plan: making her move (animation)
 
-Status: **plan, not started.** The open questions at the end need the owner's answer before work starts.
+Status: **plan approved, not started.** Owner decisions (2026-11-03): walking = overlay strip along the bottom of the screen with click-through; clips = free VRoid/pixiv packs only, bundled; emotion tags = yes.
 
 ## Where we are
 

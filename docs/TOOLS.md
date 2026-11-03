@@ -1,7 +1,7 @@
 # Plan: tools, internet access and calling other models
 
-Status: **plan, not started.** Section C (other models) is **plan only, do not implement** (owner's instruction).
-The open questions at the end need the owner's answer before work starts.
+Status: **plan approved, not started.** Section C (other models) is **plan only, do not implement** (owner's instruction).
+Owner decisions (2026-11-03): drive the owner's **real Firefox** with their logins, asking before anything that sends/buys/posts/deletes; search via the owner's SearXNG.
 
 ## Facts checked
 
@@ -61,6 +61,28 @@ URL plus env), plus a **tool log** showing every call, its arguments, result siz
 - Domain allow/deny lists.
 - Keys and passwords never pass through the model. Logins happen in the browser with your own sessions.
 - Everything is logged on the hub.
+
+### B1. Firefox specifics (decided: real Firefox)
+
+Firefox dropped CDP, Playwright can't attach to a normal Firefox, and no mature Firefox MCP server exists (checked: the
+top hits have about 30 stars and are experimental). So:
+
+- **Recommended: a small "Riko Helper" Firefox extension** (WebExtension, kept in `browser-ext/`).
+  - It runs inside your everyday Firefox and profile, with no special start flags.
+  - It connects to the desktop app on `127.0.0.1` (a local WebSocket with a per-install token; native messaging is
+    the fallback).
+  - Capabilities:
+    - tabs: list, open, switch, close
+    - read page: readable text plus a numbered list of links/buttons/inputs (a compact accessibility snapshot)
+    - click / type / select by snapshot number
+    - scroll, back/forward
+    - `captureVisibleTab` screenshots
+  - Approval prompts appear in the page itself (a small Riko banner) and in the tray.
+  - Per-site permissions use Firefox's own optional host permissions, and there's a kill switch in the toolbar.
+  - Release Firefox only installs signed extensions. It's signed once as **unlisted on AMO** (free, needs your
+    Mozilla account and `web-ext sign`). It never appears in the store and you install the `.xpi` yourself.
+- Fallback: Marionette (`firefox --marionette` plus geckodriver `--connect-existing`). Less code, but Firefox
+  then shows its remote-control striped address bar, and it's an all-or-nothing control port, so it's not the default.
 
 ## C. Letting her call other models (plan only — do not implement)
 
