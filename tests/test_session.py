@@ -117,6 +117,27 @@ def test_switch_persona_call_emits_and_greets(turn_env):
         s.switch_persona("nobody")  # callers see the 404
 
 
+def test_persona_next_cycles_and_wraps(turn_env):
+    cfg, url, fake_hub = turn_env
+    s = session.Session(cfg, source="desktop")  # fake hub order: riko, asuka
+
+    active = s.persona_next()  # riko -> asuka, announced like any other switch
+    assert active["id"] == "asuka"
+    assert hub_client.active_persona()["id"] == "asuka"
+    events = collect_events(url, [], {"persona", "say"})
+    types = [e["type"] for e in events]
+    assert events[types.index("persona")]["id"] == "asuka"
+    assert events[types.index("say")]["text"] == "Asuka here, senpai."
+
+    requests.get(f"{url}/next", timeout=5)  # drain before the next cycle
+    active = s.persona_next()  # wraps around to the first persona
+    assert active["id"] == "riko"
+    assert hub_client.active_persona()["id"] == "riko"
+    assert fake_hub.active == "riko"
+    events = collect_events(url, [], {"persona"}, timeout=5)
+    assert any(e["type"] == "persona" and e["id"] == "riko" for e in events)
+
+
 def test_state_poller_notices_an_external_switch(turn_env, monkeypatch):
     cfg, url, fake_hub = turn_env
     session.Session(cfg, source="desktop")

@@ -46,6 +46,17 @@ class Session:
         self._turns.put(("greet", active))
         return active
 
+    def persona_next(self):
+        """Cycle to the next persona on the hub (wraps around to the first).
+        Announced exactly like any other switch; returns the new active persona."""
+        listed = self.hub.personas()
+        if not listed:
+            raise hub_client.HubError("persona-next: the hub has no personas")
+        ids = [p["id"] for p in listed]
+        active_id = (hub_client.active_persona() or {}).get("id")
+        nxt = listed[(ids.index(active_id) + 1) % len(listed)] if active_id in ids else listed[0]
+        return self.switch_persona(nxt["id"])
+
     def talk_start(self):
         if self.recorder.recording:
             return

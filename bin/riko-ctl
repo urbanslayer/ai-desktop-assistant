@@ -9,6 +9,7 @@
     riko-ctl forget       clear the chat history (on the hub, for this persona)
     riko-ctl personas     list personas and which one is active
     riko-ctl persona NAME switch who she is (id, name or keyword; case doesn't matter)
+    riko-ctl persona-next switch to the next persona on the hub (cycles around)
     riko-ctl quit
     riko-ctl status
 
@@ -25,7 +26,7 @@ import urllib.request
 URL = os.environ.get("RIKO_URL", "http://127.0.0.1:8080")
 APP_ID = "riko"
 COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide", "forget",
-            "personas", "persona", "quit", "status"}
+            "personas", "persona", "persona-next", "quit", "status"}
 
 
 def focus_window():
@@ -69,7 +70,7 @@ def main():
         for p in reply.get("personas", []):
             print(("* " if p["id"] == active else "  ") + f"{p['name']}  ({p['id']})")
         sys.exit(0)
-    if cmd in ("status", "personas", "persona") or not reply.get("ok", True):
+    if cmd in ("status", "personas", "persona", "persona-next") or not reply.get("ok", True):
         print(json.dumps(reply))
     sys.exit(0 if reply.get("ok", True) else 1)
 

@@ -207,7 +207,7 @@ The hub can hold any number of personas — Riko, Asuka, whoever you write. One 
 |---|---|
 | **Web page** | Pick the persona on `http://<box>:8002`. |
 | **Say it** | "switch to asuka", "become riko", or just her keyword ("riko-chan"). The hub matches the switch itself — every client understands it, and she greets you in her new body. |
-| **`riko-ctl`** | `riko-ctl personas` lists them; `riko-ctl persona asuka` switches (by name, id or keyword). |
+| **`riko-ctl`** | `riko-ctl personas` lists them; `riko-ctl persona asuka` switches (by name, id or keyword); `riko-ctl persona-next` cycles to the next one. |
 | **Tray menu** | Desktop app: right-click the tray icon → *Persona*. |
 
 Whatever route a switch takes, the avatar page notices within about three seconds: she downloads the new `.vrm`, reuses the file next time (versioned cache), disposes the old body and swaps in the new one — no page reload, and the greeting lands in the bubble.
@@ -292,7 +292,7 @@ Instead of a browser tab, she can live in a small borderless, transparent, alway
 | Push-to-talk | Hold **Space**, speak, release |
 | Quit | **Ctrl+Q**, the tray menu, or `riko-ctl quit` |
 
-**From anywhere else:** `bin/riko-ctl <command>` talks to the running app over its local port — `type` (open her input and focus the window), `talk` / `talk-start` / `talk-stop`, `show` / `hide` / `toggle`, `status`, `forget`, `personas`, `persona <name>`, `quit`. Handy in a keybinding or a script.
+**From anywhere else:** `bin/riko-ctl <command>` talks to the running app over its local port — `type` (open her input and focus the window), `talk` / `talk-start` / `talk-stop`, `show` / `hide` / `toggle`, `status`, `forget`, `personas`, `persona <name>`, `persona-next`, `quit`. Handy in a keybinding or a script.
 
 **Window rules.** `desktop.py` asks Hyprland to float, size and pin her on its own. For best results add the shipped rules so it happens the instant she maps:
 
@@ -306,7 +306,7 @@ dofile(os.getenv("HOME") .. "/Development/riko_project/desktop/hyprland/riko.lua
 source = ~/Development/riko_project/desktop/hyprland/riko.conf
 ```
 
-The lua file also wires global shortcuts (Super+Alt+T type, hold Super+Alt+R to talk, Super+Alt+H hide). Window size and bubble time are under `desktop:` in `character_config.yaml`.
+The shipped files also wire global shortcuts: **Ctrl+Alt+T** type to her, hold **Ctrl+Alt+Space** to talk, **Ctrl+Alt+H** show/hide, **Ctrl+Alt+P** cycle to the next persona. They stay off the Super key on purpose (your WM lives there) — but they're only suggestions: check `hyprctl binds` for clashes and pick other keys if needed. Window size and bubble time are under `desktop:` in `character_config.yaml`.
 
 To start her with the session, copy `desktop/riko.desktop` to `~/.config/autostart/` (or launch `bin/riko-desktop` from your compositor's autostart). Outside Hyprland she still appears, but floating/sizing is left to your window manager, and true transparency needs a compositor.
 

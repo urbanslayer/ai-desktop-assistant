@@ -13,6 +13,7 @@ From anywhere (bind these to keys in your compositor, see README):
     bin/riko-ctl type | talk | talk-start | talk-stop | toggle | forget | quit
     bin/riko-ctl personas          list personas and which one is active
     bin/riko-ctl persona asuka     switch who she is (tray has the same menu)
+    bin/riko-ctl persona-next      cycle to the next persona on the hub
 """
 import argparse
 import json
@@ -265,6 +266,12 @@ def main():
                 return {"ok": False, "error": "persona: give a name, e.g. riko-ctl persona asuka"}
             try:
                 active = session.switch_persona(name)  # speaks the greeting on the worker
+            except hub_client.HubError as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "persona": active["name"]}
+        elif cmd == "persona-next":
+            try:
+                active = session.persona_next()  # cycle to the next persona (wraps)
             except hub_client.HubError as e:
                 return {"ok": False, "error": str(e)}
             return {"ok": True, "persona": active["name"]}

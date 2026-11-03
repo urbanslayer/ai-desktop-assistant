@@ -19,8 +19,10 @@ hl.window_rule({
     move = "monitor_w-440 monitor_h-700",  -- bottom-right corner
 })
 
--- Global shortcuts
-hl.bind("SUPER + ALT + T", hl.dsp.exec_cmd(ctl .. " type"))                         -- type to her
-hl.bind("SUPER + ALT + R", hl.dsp.exec_cmd(ctl .. " talk-start"))                   -- hold to talk...
-hl.bind("SUPER + ALT + R", hl.dsp.exec_cmd(ctl .. " talk-stop"), { release = true }) -- ...release to send
-hl.bind("SUPER + ALT + H", hl.dsp.exec_cmd(ctl .. " toggle"))                       -- show / hide her
+-- Global shortcuts (stay off the Super key — that's yours for the WM. These are suggestions:
+-- check `hyprctl binds` for clashes and pick other keys if needed.)
+hl.bind("CTRL + ALT + T", hl.dsp.exec_cmd(ctl .. " type"))                         -- type to her
+hl.bind("CTRL + ALT + SPACE", hl.dsp.exec_cmd(ctl .. " talk-start"))               -- hold to talk...
+hl.bind("CTRL + ALT + SPACE", hl.dsp.exec_cmd(ctl .. " talk-stop"), { release = true }) -- ...release to send
+hl.bind("CTRL + ALT + H", hl.dsp.exec_cmd(ctl .. " toggle"))                       -- show / hide her
+hl.bind("CTRL + ALT + P", hl.dsp.exec_cmd(ctl .. " persona-next"))                 -- next persona (cycles)
