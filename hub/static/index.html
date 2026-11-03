@@ -80,6 +80,13 @@
   .src { font-size: 11px; color: var(--muted); }
   .chatline { display: flex; gap: 8px; margin-top: 8px; }
   .switched { text-align: center; font-size: 12px; color: var(--accent); margin: 6px 0; }
+  table.tbl { border-collapse: collapse; }
+  .tbl th, .tbl td { text-align: left; font-size: 12px; padding: 3px 10px 3px 0;
+                     border-bottom: 1px solid var(--line); font-weight: normal; color: var(--ink); }
+  .tbl th { color: var(--muted); }
+  .tbl select { width: auto; padding: 2px 6px; }
+  .emo { font-size: 11px; color: var(--muted); background: var(--chip); border-radius: 6px;
+         padding: 1px 6px; margin-left: 6px; }
 </style>
 </head>
 <body>
@@ -121,6 +128,8 @@
       <div class="row">
         <div><label>Greeting (shown on switch)</label><input id="pgreet" placeholder="Asuka here!"></div>
         <div><label>TTS voice (optional)</label><input id="ptts" placeholder="client default if empty"></div>
+        <div><label>Emotions</label><label style="margin:0"><input type="checkbox" id="pemotes" checked
+             style="width:auto"> Emote — start replies with an emotion tag (stripped before storage/speech)</label></div>
       </div>
       <label>Avatar (.vrm, max 200 MB)</label>
       <div class="row" style="align-items:center">
@@ -232,6 +241,32 @@
         off everywhere and audio_url stays null. The hub synthesises and caches the audio; clients only
         fetch /api/.../audio URLs — nobody talks to Breeze directly.</p>
 
+      <h2 style="margin-top:14px">Tools <span class="chip" id="tstatus">function calling: ?</span></h2>
+      <label><input type="checkbox" id="stoolsenabled" style="width:auto; vertical-align:middle">
+        Let her use tools (web_search · fetch_page · get_time · tools from online clients)</label>
+      <div class="row" style="max-width:640px">
+        <div><label>Max tool steps / reply</label><input id="stoolsteps" type="number" min="1" max="32"></div>
+        <div><label>Max seconds / reply</label><input id="stoolsecs" type="number" min="5" max="600"></div>
+        <div><label>Max result chars</label><input id="stoolchars" type="number" min="500" max="100000"></div>
+      </div>
+      <label>SearXNG URL <span class="src" id="stoolsrc"></span></label>
+      <input id="stsearxng" placeholder="http://192.0.2.101:8989 (blank = server default; empty default = web_search off)">
+      <label style="margin-top:4px"><input type="checkbox" id="stoolpriv" style="width:auto; vertical-align:middle">
+        fetch_page may reach private / loopback addresses (dev only — SSRF otherwise)</label>
+
+      <h3 style="margin-top:12px">Permissions</h3>
+      <table class="tbl" id="tperm" style="width:100%"><tbody></tbody></table>
+      <p class="hint">default = hub tools always; client tools always for risk “read”, ask for
+        “act”/“danger”. never hides the tool from the model entirely.</p>
+
+      <div style="margin-top:8px; display:flex; gap:8px; align-items:center">
+        <button class="btn small" id="treload">Reload tools &amp; clients</button>
+        <span class="hint" id="tclientshint"></span>
+      </div>
+      <div id="tclients" class="hint" style="margin-top:4px"></div>
+      <div style="margin-top:8px"><button class="btn small" id="tlogreload">Show recent tool calls</button></div>
+      <div id="tlog" class="hint" style="margin-top:4px; white-space:pre-wrap"></div>
+
       <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap">
         <button class="btn primary" id="ssave" disabled>Save settings</button>
         <button class="btn" id="sreset">Reset to server defaults</button>
@@ -303,6 +338,7 @@ function show(tab) {
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((s) => { s.hidden = s.id !== "tab-" + tab; });
   if (tab === "history") loadHistory();
+  if (tab === "chat") eventsLoop();  // restart if it died (key set later, hub was down)
 }
 
 /* ── state polling (drives every tab) ─────────────────────────────── */
@@ -357,6 +393,7 @@ async function startEdit(pid) {
   $("pname").value = p.name; $("pkeys").value = p.keywords.join(", ");
   $("pprompt").value = p.system_prompt; $("pgreet").value = p.greeting;
   $("ptts").value = p.tts_voice; $("perr").textContent = "";
+  $("pemotes").checked = p.emotes !== false;
   showAvatarInfo(p);
   fillVoicePanel(p);
   $("pname").scrollIntoView({ behavior: "smooth", block: "center" });
@@ -366,6 +403,7 @@ function startCreate() {
   $("pformtitle").textContent = "New persona";
   $("psave").textContent = "Create"; $("pcancel").hidden = true;
   ["pname", "pkeys", "pprompt", "pgreet", "ptts"].forEach((i) => $(i).value = "");
+  $("pemotes").checked = true;
   $("psize").textContent = ""; $("pvrm").value = ""; $("pupload").disabled = true;
   fillVoicePanel(null);
 }
@@ -383,6 +421,7 @@ async function savePersona() {
     system_prompt: $("pprompt").value,
     greeting: $("pgreet").value,
     tts_voice: $("ptts").value.trim(),
+    emotes: $("pemotes").checked,
   };
   $("perr").textContent = "";
   try {
@@ -573,7 +612,11 @@ async function loadHistory() {
     $("htx").innerHTML = h.messages.map((m) =>
       `<div class="msg ${m.role === "user" ? "user" : "ai"}">` +
       `${m.role === "user" ? "you" : esc(h.persona)}: ${esc(m.content)}` +
-      `<div class="meta">#${m.id} · ${esc(m.created_at)} · via ${esc(m.source || "?")}</div></div>`
+      (m.role !== "user" && m.emotion && m.emotion !== "neutral"
+        ? `<span class="emo">${esc(m.emotion)}</span>` : "") +
+      `<div class="meta">#${m.id} · ${esc(m.created_at)} · via ${esc(m.source || "?")}` +
+      (m.tools_used && m.tools_used.length ? ` · tools: ${esc(m.tools_used.map((t) => t.tool).join(", "))}` : "") +
+      `</div></div>`
     ).join("") || `<p class="hint">no history yet</p>`;
     $("htx").scrollTop = $("htx").scrollHeight;
   } catch (e) { $("herr").textContent = e.message; }
@@ -586,8 +629,10 @@ $("hclear").onclick = async () => {
 };
 
 /* ── settings ─────────────────────────────────────────────────────── */
-const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "sttsbase", "sttstimeout"];
+const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "sttsbase", "sttstimeout",
+                     "stoolsteps", "stoolsecs", "stoolchars", "stsearxng"];
 let settingsSnap = null;    // field values as loaded — the diff base for Save
+let permSnap = {};          // saved per-tool permission overrides ("" = default)
 let apikeyTyped = false;    // the user typed into the key field (autofill does not count... mostly)
 $("apikey").addEventListener("input", () => { apikeyTyped = true; });
 
@@ -595,6 +640,8 @@ function snapSettings() {
   const s = {};
   SETTING_IDS.forEach((id) => { s[id] = $(id).value.trim(); });
   s.sttsenabled = $("sttsenabled").checked ? "1" : "0";
+  s.stoolsenabled = $("stoolsenabled").checked ? "1" : "0";
+  s.stoolpriv = $("stoolpriv").checked ? "1" : "0";
   return s;
 }
 
@@ -620,6 +667,17 @@ async function loadSettings() {
     if (defTts.base_url) $("sttsbase").placeholder = defTts.base_url;
     $("sttssrc").textContent = tsrc.base_url === "default" ? "· using server default" : "";
     $("sttstimeout").value = tts.timeout == null ? "" : tts.timeout;
+    const tools = s.tools || {}, toolsrc = s.tools_source || {};
+    const defTools = ((s.defaults || {}).tools || {});
+    $("stoolsenabled").checked = !!tools.enabled;
+    $("stoolsteps").value = tools.max_steps == null ? "" : tools.max_steps;
+    $("stoolsecs").value = tools.max_seconds == null ? "" : tools.max_seconds;
+    $("stoolchars").value = tools.max_result_chars == null ? "" : tools.max_result_chars;
+    $("stsearxng").value = tools.searxng_url || "";
+    if (defTools.searxng_url) $("stsearxng").placeholder = defTools.searxng_url;
+    $("stoolsrc").textContent = toolsrc.searxng_url === "default" ? "· using server default" : "";
+    $("stoolpriv").checked = !!tools.allow_private_fetch;
+    loadTools();
     $("apikey").value = "";
     apikeyTyped = false;
     $("skeystate").textContent = llm.api_key_set ? "• set on server" : "• not set";
@@ -694,6 +752,24 @@ $("ssave").onclick = async () => {
     tts.timeout = v;
   }
   if (Object.keys(tts).length) body.tts = tts;
+  const tools = {};
+  if (changed("stoolsenabled")) tools.enabled = now.stoolsenabled === "1";
+  for (const [id, k] of [["stoolsteps", "max_steps"], ["stoolsecs", "max_seconds"],
+                         ["stoolchars", "max_result_chars"]]) {
+    if (!changed(id)) continue;
+    const v = parseInt(now[id], 10);
+    if (!Number.isFinite(v)) { setSerr("tools." + k + " must be a number"); return; }
+    tools[k] = v;
+  }
+  if (changed("stsearxng")) tools.searxng_url = now.stsearxng;   // blank → server default again
+  if (changed("stoolpriv")) tools.allow_private_fetch = now.stoolpriv === "1";
+  const perms = {};
+  document.querySelectorAll("#tperm select").forEach((sel) => {
+    const name = sel.dataset.tool;
+    if ((permSnap[name] || "") !== sel.value) perms[name] = sel.value === "" ? null : sel.value;
+  });
+  if (Object.keys(perms).length) tools.permissions = perms;
+  if (Object.keys(tools).length) body.tools = tools;
   if (!Object.keys(body).length) { setSerr("nothing changed", true); return; }
   try {
     await api("/api/settings", { method: "PUT", json: body });
@@ -713,14 +789,59 @@ $("skeyclear").onclick = async () => {
   } catch (e) { setSerr(e.message); }
 };
 $("sreset").onclick = async () => {
-  if (!confirm("Drop the saved LLM settings, TTS settings and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* env) apply?")) return;
+  if (!confirm("Drop the saved LLM settings, TTS settings, tools settings and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* / RIKO_SEARXNG_URL env) apply?")) return;
   setSerr("");
   try {
-    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, switch_phrases: true } });
+    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, tools: true, switch_phrases: true } });
     setSerr("reset to server defaults ✔", true);
     await loadSettings(); await poll();
     await reportLlmState();
   } catch (e) { setSerr(e.message); }
+};
+
+/* ── tools panel (settings tab) ───────────────────────────────────── */
+async function loadTools() {
+  try {
+    const t = await api("/api/tools");
+    const st = t.status || {};
+    $("tstatus").textContent = "function calling: " + st.function_calling +
+      (st.function_calling === "rejected" ? " — model server refuses tools; chat runs without them" : "");
+    $("tstatus").style.color = st.function_calling === "rejected" ? "var(--bad)" : "";
+    const saved = (t.settings || {}).permissions || {};
+    permSnap = {};
+    const rows = (t.tools || []).map((tool) => {
+      permSnap[tool.name] = saved[tool.name] || "";
+      const opts = [["", "default (" + tool.permission + ")"], ["always", "always"],
+                    ["ask", "ask"], ["never", "never"]]
+        .map(([v, label]) => `<option value="${v}"${saved[tool.name] === v ? " selected" : ""}>${label}</option>`)
+        .join("");
+      return `<tr><td>${esc(tool.name)}</td><td>${esc(tool.source)}</td>` +
+        `<td>${esc(tool.risk)}</td>` +
+        `<td>${tool.available ? "" : "unavailable · "}${esc((tool.description || "").slice(0, 70))}…</td>` +
+        `<td><select data-tool="${esc(tool.name)}">${opts}</select></td></tr>`;
+    });
+    $("tperm").innerHTML = rows.length
+      ? `<tr><th>tool</th><th>source</th><th>risk</th><th></th><th>permission</th></tr>` + rows.join("")
+      : `<tr><td class="hint">no tools right now — turn tools on and check SearXNG; client tools appear when a client is online</td></tr>`;
+  } catch (e) { $("tperm").innerHTML = `<tr><td class="hint">tools unavailable: ${esc(e.message)}</td></tr>`; }
+  try {
+    const c = await api("/api/clients");
+    $("tclientshint").textContent = c.clients.length + " client(s) online (heartbeat every " +
+      c.heartbeat_s + " s, offline after " + c.offline_after_s + " s)";
+    $("tclients").textContent = c.clients.map((cl) =>
+      `${cl.name} [${cl.kind}] · ${cl.tools.map((x) => x.model_name + "/" + x.risk).join(", ") || "no tools"} · ${cl.seconds_since_seen}s ago`
+    ).join("\n") || "none";
+  } catch (e) { $("tclientshint").textContent = e.message; }
+}
+$("treload").onclick = loadTools;
+$("tlogreload").onclick = async () => {
+  try {
+    const l = await api("/api/tools/log?limit=50");
+    $("tlog").textContent = l.entries.length
+      ? l.entries.map((e) => `${e.created_at} ${e.tool} [${e.source}] ${e.ok ? "ok" : "FAILED: " + e.error} ` +
+          `${e.ms}ms${e.approval && e.approval !== "not needed" ? " · " + e.approval : ""} · ${e.arguments}`).join("\n")
+      : "no tool calls yet";
+  } catch (e) { $("tlog").textContent = e.message; }
 };
 
 /* ── chat test ────────────────────────────────────────────────────── */
@@ -729,6 +850,7 @@ async function sendChat() {
   if (!text) return;
   $("cinput").value = ""; $("cerr").textContent = "";
   addChat("user", "you", text);
+  eventsLoop();
   $("csend").disabled = true;
   try {
     const r = await api("/api/chat", { method: "POST", json: { text, source: "web" } });
@@ -738,7 +860,13 @@ async function sendChat() {
       d.textContent = "⇄ switched to " + r.persona;
       $("ctx").appendChild(d);
     } else {
-      addChat("ai", r.persona, r.reply);
+      addChat("ai", r.persona, r.reply, r.emotion);
+      if (r.tools_used && r.tools_used.length) {
+        const d = document.createElement("div");
+        d.className = "hint";
+        d.textContent = "🔧 used: " + r.tools_used.map((t) => t.tool).join(", ");
+        $("ctx").appendChild(d);
+      }
     }
     if (r.audio_url) {           // hub-made audio: fetch the cached WAV and play it
       playInto($("ctx"), r.audio_url)
@@ -749,11 +877,39 @@ async function sendChat() {
   } catch (e) { $("cerr").textContent = e.message; }
   $("csend").disabled = false; $("cinput").focus();
 }
-function addChat(cls, who, text) {
+function addChat(cls, who, text, emotion) {
   const d = document.createElement("div");
   d.className = "msg " + (cls === "user" ? "user" : "ai");
-  d.innerHTML = `${cls === "user" ? "you" : esc(who)}: ${esc(text)}`;
+  const emo = emotion && emotion !== "neutral" ? `<span class="emo">${esc(emotion)}</span>` : "";
+  d.innerHTML = `${cls === "user" ? "you" : esc(who)}: ${esc(text)}${emo}`;
   $("ctx").appendChild(d);
+}
+
+/* ── events long-poll: tool progress lives in the chat box ────────── */
+let evAfter = 0, evRunning = false;
+async function eventsLoop() {
+  if (evRunning) return;
+  evRunning = true;
+  try {
+    for (;;) {
+      const r = await api(`/api/events?after=${evAfter}&wait=25`);
+      (r.events || []).forEach(applyEvent);
+      evAfter = r.last;
+    }
+  } catch (e) { /* hub down or key missing — show()/sendChat() restart it */ }
+  evRunning = false;
+}
+function applyEvent(e) {
+  if ($("tab-chat").hidden) return;
+  if (e.type === "tool_started") {
+    const d = document.createElement("div");
+    d.className = "hint"; d.id = "tc-" + e.call_id;
+    d.textContent = "🔧 " + (e.label || e.tool) + "…";
+    $("ctx").appendChild(d); $("ctx").scrollTop = $("ctx").scrollHeight;
+  } else if (e.type === "tool_finished") {
+    const el = $("tc-" + e.call_id);
+    if (el) el.textContent += e.ok ? ` ✔ ${e.ms} ms` : ` ✗ failed (${e.ms} ms)`;
+  }
 }
 
 /* ── boot ─────────────────────────────────────────────────────────── */
@@ -774,6 +930,7 @@ if (!key()) showKeyBar("Enter the hub key (or this hub has no key):");
 startCreate();
 poll().then(() => { loadSettings(); });
 setInterval(poll, 3000);
+eventsLoop();  // tool progress in the chat box; restarts on tab switch too
 </script>
 </body>
 </html>

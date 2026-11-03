@@ -12,7 +12,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Voice migration for personas written before the voice round (docs/VOICE.md):
 # a bland design-mode voice with a random seed, so they keep talking after the
@@ -58,6 +58,24 @@ CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- JSON value
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);      -- version, active
 """
 
+# Emotion + tools round (docs/ROUNDS.md R1-B). The tool_log is a ring in
+# practice: keep_tool_log() trims to TOOL_LOG_KEEP newest rows.
+_TOOL_LOG_KEEP = 1000
+_SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS tool_log(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  persona    TEXT NOT NULL,
+  tool       TEXT NOT NULL,
+  source     TEXT NOT NULL DEFAULT 'hub',    -- hub | client
+  arguments  TEXT NOT NULL DEFAULT '',       -- JSON, truncated
+  ok         INTEGER NOT NULL DEFAULT 1,
+  error      TEXT NOT NULL DEFAULT '',
+  ms         INTEGER NOT NULL DEFAULT 0,
+  approval   TEXT NOT NULL DEFAULT ''        -- '' | approved | denied | not approved | …
+);
+"""
+
 
 def now_iso() -> str:
     """ISO-8601 UTC, second precision, e.g. 2026-11-03T18:00:00Z."""
@@ -98,6 +116,20 @@ class Store:
                 if not row["voice"]:
                     self.db.execute("UPDATE personas SET voice=? WHERE id=?",
                                     (json.dumps(default_voice()), row["id"]))
+            self.db.execute("PRAGMA user_version=2")
+            self.db.commit()
+        if version < 3:  # emotion + tools round (docs/ROUNDS.md R1-B)
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(personas)")}
+            if "emotes" not in cols:
+                # ALTER with a DEFAULT fills existing rows with 1: emotes are
+                # on by default for personas written before this round.
+                self.db.execute("ALTER TABLE personas ADD COLUMN emotes INTEGER NOT NULL DEFAULT 1")
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+            if "emotion" not in cols:
+                self.db.execute("ALTER TABLE messages ADD COLUMN emotion TEXT")
+            if "tools" not in cols:
+                self.db.execute("ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT ''")
+            self.db.executescript(_SCHEMA_V3)
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.db.commit()
 
@@ -153,6 +185,7 @@ class Store:
             "system_prompt": row["system_prompt"],
             "greeting": row["greeting"],
             "tts_voice": row["tts_voice"],
+            "emotes": bool(row["emotes"]),
             "voice": voice,
             "voice_version": row["voice_version"],
             "avatar_version": row["avatar_version"],
@@ -175,17 +208,18 @@ class Store:
             return self.db.execute("SELECT 1 FROM personas WHERE id=?", (persona_id,)).fetchone() is not None
 
     def add_persona(self, pid: str, name: str, keywords: list[str], system_prompt: str,
-                    greeting: str, tts_voice: str, voice: dict | None = None) -> dict:
+                    greeting: str, tts_voice: str, voice: dict | None = None,
+                    emotes: bool = True) -> dict:
         ts = now_iso()
         if voice is None:
             voice = default_voice()
         with self._lock:
             self.db.execute(
                 "INSERT INTO personas(id,name,keywords,system_prompt,greeting,tts_voice,"
-                "avatar_version,has_avatar,created_at,updated_at,voice,voice_version) "
-                "VALUES(?,?,?,?,?,?,0,0,?,?,?,1)",
+                "avatar_version,has_avatar,created_at,updated_at,voice,voice_version,emotes) "
+                "VALUES(?,?,?,?,?,?,0,0,?,?,?,?,?)",
                 (pid, name, json.dumps(keywords), system_prompt, greeting, tts_voice,
-                 ts, ts, json.dumps(voice)))
+                 ts, ts, json.dumps(voice), 1, 1 if emotes else 0))
             self.db.commit()
         persona = self.get_persona(pid)
         assert persona is not None
@@ -197,6 +231,9 @@ class Store:
             if key in fields:
                 sets.append(f"{key}=?")
                 vals.append(fields[key])
+        if "emotes" in fields:
+            sets.append("emotes=?")
+            vals.append(1 if fields["emotes"] else 0)
         if "keywords" in fields:
             sets.append("keywords=?")
             vals.append(json.dumps(fields["keywords"]))
@@ -236,11 +273,17 @@ class Store:
         return self.get_persona(pid)
 
     # ── messages ────────────────────────────────────────────────────────
-    def add_message(self, persona: str, role: str, content: str, source: str) -> int:
+    def add_message(self, persona: str, role: str, content: str, source: str,
+                    emotion: str | None = None, tools: list | None = None) -> int:
+        """`emotion` only makes sense on assistant messages (docs/ROUNDS.md:
+        null for user messages). `tools` is the compact tools_used list
+        [{tool, label}] stored on the assistant reply."""
         with self._lock:
             cur = self.db.execute(
-                "INSERT INTO messages(persona,role,content,source,created_at) VALUES(?,?,?,?,?)",
-                (persona, role, content, source, now_iso()))
+                "INSERT INTO messages(persona,role,content,source,created_at,emotion,tools) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (persona, role, content, source, now_iso(),
+                 emotion, json.dumps(tools) if tools else ""))
             self.db.commit()
             assert cur.lastrowid is not None
             return cur.lastrowid
@@ -270,8 +313,15 @@ class Store:
 
     @staticmethod
     def _message_dict(row) -> dict:
+        tools = []
+        if row["tools"]:
+            try:
+                tools = json.loads(row["tools"])
+            except ValueError:
+                tools = []
         return {"id": row["id"], "persona": row["persona"], "role": row["role"],
                 "content": row["content"], "source": row["source"],
+                "emotion": row["emotion"], "tools_used": tools,
                 "created_at": row["created_at"]}
 
     def clear_messages(self, persona: str) -> int:
@@ -320,3 +370,28 @@ class Store:
             cur = self.db.execute("DELETE FROM settings WHERE key=?", (key,))
             self.db.commit()
             return cur.rowcount > 0
+
+    # ── tool log (GET /api/tools/log) ───────────────────────────────────
+    def log_tool(self, persona: str, tool: str, source: str, arguments: str,
+                 ok: bool, error: str, ms: int, approval: str = "") -> None:
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO tool_log(created_at,persona,tool,source,arguments,ok,error,"
+                "ms,approval) VALUES(?,?,?,?,?,?,?,?,?)",
+                (now_iso(), persona, tool, source, str(arguments or "")[:500],
+                 1 if ok else 0, str(error or "")[:500], int(ms), approval or ""))
+            # keep the table small without a scheduler: trim on write
+            self.db.execute(
+                "DELETE FROM tool_log WHERE id <= (SELECT MAX(id) FROM tool_log) - ?",
+                (_TOOL_LOG_KEEP,))
+            self.db.commit()
+
+    def tool_log(self, limit: int = 50) -> list[dict]:
+        limit = max(1, min(200, int(limit)))
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM tool_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"id": r["id"], "created_at": r["created_at"], "persona": r["persona"],
+                 "tool": r["tool"], "source": r["source"], "arguments": r["arguments"],
+                 "ok": bool(r["ok"]), "error": r["error"], "ms": r["ms"],
+                 "approval": r["approval"]} for r in rows]

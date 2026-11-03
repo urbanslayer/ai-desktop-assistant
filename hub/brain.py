@@ -37,6 +37,19 @@ DEFAULT_SWITCH_PHRASES = ["switch to", "change to", "become", "persona", "talk t
 EMPTY_REPLY = "...sorry senpai, I lost my train of thought."
 
 
+class ToolsRejected(Exception):
+    """The server 400'd the `tools` parameter itself (not the prompt): the
+    model/server build cannot do function calling. The caller retries the
+    turn without tools and marks it in /api/tools/status."""
+
+
+def _looks_like_tools_rejection(e: Exception) -> bool:
+    if getattr(e, "status_code", None) != 400:
+        return False
+    text = str(e).lower()
+    return "tool" in text or "function" in text
+
+
 def clean(text):
     """Strip inline think-blocks and whitespace from a model reply."""
     text = _THINK.sub("", text or "")
@@ -46,67 +59,115 @@ def clean(text):
     return text.strip()
 
 
-def _complete(client, model, messages, temperature, max_tokens,
-              reasoning_effort=None, extra_body=None):
-    """Ask the model, streaming when the server supports it: reasoning models keep the
-    connection quiet while they think, and stream chunks do not expire the read timeout
-    the way one long non-stream body does.
+def _finalize_calls(calls: dict) -> list[dict]:
+    """Collected streaming deltas -> [{id, name, arguments}] in index order."""
+    out = []
+    for i, idx in enumerate(sorted(calls)):
+        slot = calls[idx]
+        out.append({"id": slot["id"] or f"call_{i}", "name": slot["name"],
+                    "arguments": slot["arguments"] or ""})
+    return out
 
-    If the answer comes back empty because the model spent the whole token budget
-    thinking (finish_reason == 'length'), retry once with double max_tokens."""
+
+def _attempt(client, model, messages, temperature, budget, kwargs, want_tools):
+    """One completion attempt: streaming when the server supports it.
+
+    Returns (text, finish_reason, thought, tool_calls). reasoning models keep
+    the connection quiet while they think, and stream chunks do not expire
+    the read timeout the way one long non-stream body does; tool_calls
+    arrive as per-index deltas and are stitched here."""
+    try:
+        stream = client.chat.completions.create(
+            model=model, messages=messages, temperature=temperature,
+            max_tokens=budget, stream=True, **kwargs,
+        )
+        parts = []
+        calls: dict = {}
+        finish = None
+        thought = False
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    parts.append(delta.content)
+                # vLLM/llama.cpp/Ollama put hidden thinking here, not in content
+                if getattr(delta, "reasoning_content", None):
+                    thought = True
+                for tc in (getattr(delta, "tool_calls", None) or []):
+                    slot = calls.setdefault(tc.index or 0,
+                                            {"id": "", "name": "", "arguments": ""})
+                    if tc.id:
+                        slot["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if fn.name:
+                            slot["name"] += fn.name
+                        if fn.arguments:
+                            slot["arguments"] += fn.arguments
+            if chunk.choices:
+                finish = chunk.choices[0].finish_reason or finish
+        if finish is None:  # the stream died mid-reply; do not save half a sentence
+            raise RuntimeError("the LLM closed the stream before finishing its reply")
+        return "".join(parts), finish, thought, _finalize_calls(calls)
+    except RuntimeError:
+        raise
+    except Exception as e:  # server without streaming support (or a transport hiccup): try once, plain
+        print(f"[hub-brain] streaming failed ({type(e).__name__}: {e}); retrying without stream")
+        try:
+            response = client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature,
+                max_tokens=budget, **kwargs,
+            )
+        except Exception as e2:
+            if want_tools and (_looks_like_tools_rejection(e2)
+                               or _looks_like_tools_rejection(e)):
+                raise ToolsRejected(f"{type(e2).__name__}: {e2}") from e2
+            raise
+        message = response.choices[0].message
+        text = message.content or ""
+        thought = bool(getattr(message, "reasoning_content", None))
+        tool_calls = [{"id": tc.id or f"call_{i}", "name": tc.function.name or "",
+                       "arguments": tc.function.arguments or ""}
+                      for i, tc in enumerate(message.tool_calls or [])]
+        return text, response.choices[0].finish_reason, thought, tool_calls
+
+
+def _run(client, model, messages, temperature, max_tokens,
+         reasoning_effort=None, extra_body=None, tools=None):
+    """A completion with the reasoning-model token retry: empty reply +
+    finish_reason 'length' -> one retry at double the budget, capped."""
     kwargs = {}
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
     if extra_body:
         kwargs["extra_body"] = dict(extra_body)
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
 
-    def _attempt(budget):
-        try:
-            stream = client.chat.completions.create(
-                model=model, messages=messages, temperature=temperature,
-                max_tokens=budget, stream=True, **kwargs,
-            )
-            parts = []
-            finish = None
-            thought = False
-            for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta:
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        parts.append(delta.content)
-                    # vLLM/llama.cpp/Ollama put hidden thinking here, not in content
-                    if getattr(delta, "reasoning_content", None):
-                        thought = True
-                if chunk.choices:
-                    finish = chunk.choices[0].finish_reason or finish
-            if finish is None:  # the stream died mid-reply; do not save half a sentence
-                raise RuntimeError("the LLM closed the stream before finishing its reply")
-            return "".join(parts), finish, thought
-        except RuntimeError:
-            raise
-        except Exception as e:  # server without streaming support (or a transport hiccup): try once, plain
-            print(f"[hub-brain] streaming failed ({type(e).__name__}: {e}); retrying without stream")
-            response = client.chat.completions.create(
-                model=model, messages=messages, temperature=temperature,
-                max_tokens=budget, **kwargs,
-            )
-            message = response.choices[0].message
-            text = message.content or ""
-            thought = bool(getattr(message, "reasoning_content", None))
-            return text, response.choices[0].finish_reason, thought
-
-    text, finish, thought = _attempt(max_tokens)
-    if not text.strip() and finish == "length":
+    text, finish, thought, tool_calls = _attempt(
+        client, model, messages, temperature, max_tokens, kwargs, bool(tools))
+    if not text.strip() and not tool_calls and finish == "length":
         retry = min(max_tokens * 2, _MAX_TOKENS_RETRY_CAP)
         if retry > max_tokens:
             print(f"[hub-brain] ran out of tokens while thinking; retrying with {retry}")
-            text, finish, thought = _attempt(retry)
+            text, finish, thought, tool_calls = _attempt(
+                client, model, messages, temperature, retry, kwargs, bool(tools))
         if not text.strip():
             print(f"[hub-brain] the reply stayed empty after every token went to "
                   f"{'hidden thinking' if thought else 'generation'}: raise llm.max_tokens "
                   "in the hub settings, set llm.reasoning_effort, or disable thinking, "
                   "e.g. llm.extra_body: {chat_template_kwargs: {enable_thinking: false}} "
                   "for Qwen on vLLM/llama.cpp")
+    return text, tool_calls
+
+
+def _complete(client, model, messages, temperature, max_tokens,
+              reasoning_effort=None, extra_body=None):
+    """Ask the model one plain question; returns the raw text (thinking
+    blocks may still be inline — clean() strips them later)."""
+    text, _calls = _run(client, model, messages, temperature, max_tokens,
+                        reasoning_effort=reasoning_effort, extra_body=extra_body)
     return text
 
 
@@ -185,6 +246,27 @@ class Brain:
         )
         answer = clean(raw)
         return answer or EMPTY_REPLY
+
+    def chat_tools(self, settings: dict, messages: list[dict],
+                   tools: list[dict]) -> dict:
+        """One model step WITH function calling. Returns
+        {text: <cleaned, may be empty>, tool_calls: [{id,name,arguments}]}.
+        Raises ToolsRejected when the server 400s the `tools` parameter
+        itself; any other transport/model failure raises as usual."""
+        base_url = settings.get("base_url") or ""
+        if not base_url:
+            raise RuntimeError("LLM not configured")
+        client = OpenAI(base_url=base_url, api_key=_api_key_arg(settings), timeout=120)
+        model = self._resolve_model(client, settings)
+        raw, tool_calls = _run(
+            client, model, messages,
+            float(settings.get("temperature", 0.8)),
+            int(settings.get("max_tokens", 4096) or 4096),
+            reasoning_effort=settings.get("reasoning_effort") or None,
+            extra_body=settings.get("extra_body") or None,
+            tools=tools,
+        )
+        return {"text": clean(raw), "tool_calls": tool_calls}
 
 
 def _api_key_arg(settings: dict) -> str:
