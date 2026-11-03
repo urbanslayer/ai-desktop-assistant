@@ -11,6 +11,9 @@ dependencies = [
     "requests",
     "soundfile",
     "numpy",
+    # MCP client (docs/ROUNDS.md R2-M). The hub imports it lazily, so local
+    # mode without it still boots — MCP just reports "unavailable".
+    "mcp",
 ]
 
 [tool.uv]
