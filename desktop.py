@@ -13,15 +13,17 @@ From anywhere (bind these to keys in your compositor, see README):
     bin/riko-ctl type | talk | talk-start | talk-stop | toggle | forget | quit
 """
 import argparse
+import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import time
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
-from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -37,9 +39,23 @@ class Bridge(QObject):
     command = Signal(str)
 
 
+class AvatarPage(QWebEnginePage):
+    """Repeats the page's console in our terminal, so a broken script here is visible there."""
+
+    NAMES = {"InfoMessageLevel": "log", "WarningMessageLevel": "warning", "ErrorMessageLevel": "error"}
+
+    def javaScriptConsoleMessage(self, level, message, line, source):
+        name = self.NAMES.get(getattr(level, "name", ""), "log")
+        print(f"[js:{name}] {message}  ({source}:{line})", flush=True)
+
+
 class AvatarWindow(QWebEngineView):
     def __init__(self, cfg):
         super().__init__()
+        # setPage() rather than the QWebEngineView(page) constructor: through the
+        # constructor PySide6 keeps the view's own default page and our console
+        # forwarding below never runs.
+        self.setPage(AvatarPage(self))
         d = cfg.get("desktop") or {}
         self.input_open = False
         self._drag_target = None
@@ -47,6 +63,9 @@ class AvatarWindow(QWebEngineView):
         self.setWindowTitle("Riko")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Without this the render widget gets its own native window, which breaks
+        # the translucent background and leaves a black strip on resized Wayland windows.
+        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
         self.resize(int(d.get("width", 420)), int(d.get("height", 680)))
 
         self.page().setBackgroundColor(Qt.GlobalColor.transparent)
@@ -95,15 +114,76 @@ def _tray_icon():
     return QIcon(pix)
 
 
-def _hyprland_setup(width, height):
-    """On Hyprland, float + pin the window and drop its border/shadow (best effort; window rules do it better)."""
+HYPR_RULE = "riko-avatar-runtime"
+
+
+def _hyprland_rule(width, height):
+    """Float + size + pin her through a runtime window rule (Hyprland 0.55+, Lua config).
+
+    Doing it by rule (before the window maps) matters: resizing a mapped-and-tiled
+    Qt window into a float leaves QtWebEngine's Wayland surface too short, with an
+    opaque black strip at the bottom (as of Qt 6.12). Call this before creating the
+    window. Best effort: on failure the caller falls back to dispatchers.
+    """
     if not (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl")):
-        return
-    w = f"class:^({APP_ID})$"
-    for dispatcher, arg in (("setfloating", w),
-                            ("resizewindowpixel", f"exact {width} {height},{w}"),
-                            ("pin", w)):
-        subprocess.run(["hyprctl", "dispatch", dispatcher, arg], capture_output=True, timeout=3)
+        return False
+    spec = (f'hl.window_rule({{ name = "{HYPR_RULE}", match = {{ class = "^({APP_ID})$" }}, '
+            f'float = true, pin = true, size = "{width} {height}", '
+            f'move = "monitor_w-{width + 20} monitor_h-{height + 20}", '
+            f'border_size = 0, no_shadow = true, no_blur = true, rounding = 0, no_anim = true }})')
+    return subprocess.run(["hyprctl", "eval", spec], capture_output=True, timeout=3).returncode == 0
+
+
+def _find_own_window():
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=3).stdout
+        return next((c for c in json.loads(out) if c.get("class") == APP_ID), None)
+    except Exception:
+        return None
+
+
+def _hyprland_setup(width, height, ruled):
+    """Make sure the window actually ended up floating, sized and pinned (best effort).
+
+    The runtime rule normally does all of this at map time. This pass only fixes what
+    differs, and for classic-config Hyprland (no `hyprctl eval`) it falls back to
+    dispatchers with the old syntax.
+    """
+    if not (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl")):
+        return False
+
+    def dispatch(expr):
+        return subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, timeout=3).returncode == 0
+
+    win = None
+    for _ in range(10):  # give the compositor a moment to map the window
+        win = _find_own_window()
+        if win:
+            break
+        time.sleep(0.3)
+    if not win:
+        return False
+    w = f'address:{win["address"]}'
+    if ruled:  # the rule should have done everything; only correct anything that did not stick
+        if not win["floating"]:
+            dispatch(f'hl.dsp.window.float({{action="enable", window="{w}"}})')
+        if list(win["size"]) != [width, height]:
+            dispatch(f'hl.dsp.window.resize({{x={width}, y={height}, window="{w}"}})')
+        if not win["pinned"]:
+            dispatch(f'hl.dsp.window.pin({{window="{w}"}})')
+        return True
+    calls = [(f'hl.dsp.window.float({{action="enable", window="{w}"}})',  # 0.55+, Lua config
+              f'hl.dsp.window.resize({{x={width}, y={height}, window="{w}"}})',
+              f'hl.dsp.window.pin({{window="{w}"}})'),
+             (f'"setfloating 1,class:^({APP_ID})$"',  # classic hyprland.conf syntax, 0.54 and older
+              f'"resizewindowpixel exact {width} {height},class:^({APP_ID})$"',
+              f'"pin,class:^({APP_ID})$"')]
+    for attempt in calls:
+        if dispatch(attempt[0]):  # first call ok means this is the right syntax for this Hyprland
+            for expr in attempt[1:]:
+                dispatch(expr)
+            return True
+    return False
 
 
 def main():
@@ -111,6 +191,9 @@ def main():
     parser.add_argument("--asr", choices=["remote", "local", "groq"], help="speech to text (overrides the config)")
     parser.add_argument("--tts", choices=["none", "openai", "sovits", "fish"], help="her voice (overrides the config)")
     args = parser.parse_args()
+
+    # Line-buffer stdout even when piped to a log file, so tail -f shows things as they happen.
+    sys.stdout.reconfigure(line_buffering=True)
 
     cfg = load_config()
     cfg["asr"] = args.asr or cfg["asr"]
@@ -132,6 +215,10 @@ def main():
     keepalive.start(250)
     keepalive.timeout.connect(lambda: None)
 
+    # Ask the compositor to float/size/pin her before the window maps (Hyprland only;
+    # mapping tiled and resizing afterwards leaves QtWebEngine's surface short).
+    d = cfg.get("desktop") or {}
+    ruled = _hyprland_rule(int(d.get("width", 420)), int(d.get("height", 680)))
     win = AvatarWindow(cfg)
     bridge = Bridge()
 
@@ -168,8 +255,10 @@ def main():
             session.forget()
         elif cmd == "input-opened":
             win.input_open = True
+            print("[ctl] input opened", flush=True)
         elif cmd == "input-closed":
             win.input_open = False
+            print("[ctl] input closed", flush=True)
         elif cmd == "status":
             return {"ok": True, "recording": session.recorder.recording, "visible": win.isVisible()}
         elif cmd in ("type", "hide-input", "toggle", "show", "hide", "quit"):
@@ -199,8 +288,7 @@ def main():
         tray.show()
 
     show_window()
-    d = cfg.get("desktop") or {}
-    QTimer.singleShot(400, lambda: _hyprland_setup(int(d.get("width", 420)), int(d.get("height", 680))))
+    QTimer.singleShot(400, lambda: _hyprland_setup(int(d.get("width", 420)), int(d.get("height", 680)), ruled))
 
     code = app.exec()
     if session.recorder.recording:
