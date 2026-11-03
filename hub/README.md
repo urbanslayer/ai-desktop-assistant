@@ -40,6 +40,21 @@ docker compose up -d      # builds the image on first run
 Open `http://<box>:8002` and paste the hub key into the page. The health
 check hits `/api/health` every 30 s; `docker compose ps` shows the status.
 
+## Environment variables (compose / .env)
+
+`compose.yaml` forwards every variable the hub reads (see `hub/server.py`
+`main()`; `tests/test_hub_packaging.py` fails if one drifts):
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `RIKO_HUB_KEY` | empty (open LAN) | bearer key required on `/api/*` |
+| `RIKO_HUB_PORT` | `8002` | **host** port published to the container's 8002 |
+| `RIKO_LLM_BASE_URL` / `RIKO_LLM_API_KEY` / `RIKO_LLM_MODEL` | `""` / `""` / `auto` | OpenAI-compatible LLM defaults |
+| `RIKO_TTS_BASE_URL` / `RIKO_TTS_ENABLED` | `http://breeze-tts:8137` / `1` | Breeze-TTS-2; empty URL = voice off |
+| `RIKO_SEARXNG_URL` | empty (web_search off) | SearXNG backend for `web_search`, e.g. `http://192.0.2.101:8989` |
+| `RIKO_ALLOW_PRIVATE_FETCH` | `0` | `1` lets `fetch_page` reach private/loopback IPs (SSRF guard off) |
+| `RIKO_HUB_DATA` / `RIKO_HUB_HOST` / `RIKO_HUB_PORT` (in-container) | `/data` / `0.0.0.0` / `8002` | baked into the image; compose pins them, see `.env.example` |
+
 ## Voice (Breeze-TTS-2)
 
 The hub is the **only** component that talks to breeze

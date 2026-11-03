@@ -19,9 +19,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev && rm -rf /root/.cache/uv
 
-COPY __init__.py server.py store.py brain.py voice.py ./
-COPY static/ ./static/
-COPY assets/ ./assets/
+# Whole source tree in one layer — .dockerignore keeps .venv/, __pycache__/,
+# data/ and .env out. A hand-written file list here crash-looped the deployed
+# hub when clients.py/emotion.py/events.py/toolloop.py/tools/ were added
+# (ModuleNotFoundError); tests/test_hub_packaging.py keeps that from recurring.
+COPY . ./
 
 # non-root, but /data is world-writable so `user:` overrides in compose still work
 RUN useradd -m -u 1000 hub \
