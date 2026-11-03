@@ -1,7 +1,13 @@
 # No GPU at all: docker compose -f compose.yaml -f compose.cpu.yaml up -d
 # Slower but works; --cpu is appended after anything you set in BREEZE_ARGS.
+# Uses the prebuilt Vulkan image (no CUDA compile, no NVIDIA reservation).
 services:
   breeze-tts:
-    deploy: !reset null  # drop the NVIDIA device reservation from compose.yaml
+    build:
+      dockerfile: Dockerfile   # prebuilt Vulkan tarball, quick build
+      args: !reset null        # CUDA_ARCHS is meaningless for the Vulkan build
+    image: riko-breeze-tts
     environment:
       BREEZE_ARGS: "${BREEZE_ARGS:-} --cpu"
+      NVIDIA_DRIVER_CAPABILITIES: !reset null
+    deploy: !reset null  # drop the NVIDIA device reservation from compose.yaml

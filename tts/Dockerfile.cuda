@@ -1,0 +1,115 @@
+# Riko's voice: Breeze-TTS-2.cpp (breeze-server), CUDA backend, built from
+# source. This is the NVIDIA image (compose.yaml); the AMD/Intel image is the
+# prebuilt Vulkan build (Dockerfile).
+#
+# Why a separate CUDA build for NVIDIA: on the target box (Fedora, RTX 5060 Ti,
+# nvidia-container-toolkit) the NVIDIA Vulkan ICD fails to load inside ANY
+# container — "loader_scanned_icd_add: Could not get 'vkCreateInstance' via
+# 'vk_icdGetInstanceProcAddr' for ICD /usr/lib64/libGLX_nvidia.so.0" — even
+# with NVIDIA_DRIVER_CAPABILITIES=all, so the prebuilt Vulkan binary falls
+# back to CPU there. CUDA works fine in containers on the same box (the ASR
+# container uses it), so NVIDIA gets this CUDA build instead.
+#
+# Compiled with the CUDA 12.9 toolkit: Blackwell (sm_120, RTX 50xx) needs
+# CUDA >= 12.8. The build needs no GPU, so it also builds on AMD/CPU boxes.
+#
+# Build args:
+#   BREEZE_VERSION — release tag to build (pinned, see BREEZE_COMMIT)
+#   CUDA_ARCHS     — GPU architectures to bake in, default "86;89;120"
+#                    (Ampere, Ada, Blackwell). Narrow it for a much faster
+#                    build, e.g. --build-arg CUDA_ARCHS=120 (RTX 50xx) or
+#                    CUDA_ARCHS=75 (Turing).
+
+# v0.1.6 is a lightweight tag resolving to exactly this commit
+# (git ls-remote https://github.com/HoppouAI/Breeze-TTS-2.cpp refs/tags/v0.1.6);
+# its ggml submodule is pinned at 36da57138425487184aa1da2eee2cde155909c6f.
+ARG BREEZE_VERSION=0.1.6
+ARG BREEZE_COMMIT=87b43667ca5597f826441991e416a279ed7373b9
+
+# ---------- builder ----------
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# plain RUN (no --mount): must also build with the legacy builder, no BuildKit
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG BREEZE_VERSION
+ARG BREEZE_COMMIT
+RUN git clone --recursive --depth 1 --branch "v${BREEZE_VERSION}" \
+        https://github.com/HoppouAI/Breeze-TTS-2.cpp /src \
+    && cd /src \
+    && test "$(git rev-parse HEAD)" = "${BREEZE_COMMIT}" \
+    && echo "pinned Breeze-TTS-2.cpp v${BREEZE_VERSION} @ ${BREEZE_COMMIT}"
+
+# CUDA_ARCHS deliberately narrow (no all-arch fat binary): one arch list,
+# semicolons survive because the value is quoted for the shell.
+# -Wl,-rpath-link,.../compat: ggml builds libggml-cuda.so with a DT_NEEDED on
+# libcuda.so.1 (the driver); this image has no driver, only the forward-compat
+# copy in the CUDA toolkit — ld just needs to *see* it to link the exes. The
+# real libcuda.so.1 is injected by the container toolkit at runtime.
+# Everything stays in ONE RUN layer and build/ is deleted at the end: the
+# object tree is ~5 GB but the image only ever needs the installed files.
+# install by hand: exes in /opt/breeze, and every ggml .so (incl. the
+# dlopen'ed libggml-cuda.so backend, flattened next to libggml.so where the
+# ggml loader looks for it) in /opt/breeze/lib.
+# gate: everything the binaries link must resolve in THIS image except the
+# driver libs (libcuda.so.1 / libnvidia-ml.so.1), which the container toolkit
+# injects at runtime. Anything else "not found" fails the build.
+ARG CUDA_ARCHS=86;89;120
+WORKDIR /src
+RUN cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBREEZE_CUDA=ON \
+        -DBREEZE_VULKAN=OFF \
+        -DBREEZE_BUILD_SHARED=OFF \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/compat" \
+    && cmake --build build --parallel "$(nproc)" \
+    && mkdir -p /opt/breeze/lib \
+    && cp -a build/breeze-server build/breeze-cli /opt/breeze/ \
+    && cp -a build/third_party/ggml/src/*.so* /opt/breeze/lib/ \
+    && cp -a build/third_party/ggml/src/ggml-cuda/*.so* /opt/breeze/lib/ \
+    && LD_LIBRARY_PATH=/opt/breeze/lib ldd /opt/breeze/breeze-server /opt/breeze/breeze-cli > /tmp/ldd.txt 2>&1; \
+       cat /tmp/ldd.txt; \
+       if grep 'not found' /tmp/ldd.txt | grep -vE 'lib(cuda|nvidia-ml)\.so'; then \
+           echo "FATAL: unresolved libraries listed above"; exit 1; \
+       fi; \
+       rm -rf /tmp/ldd.txt /src
+
+# ---------- runtime ----------
+FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# runtime base carries cuBLAS/cuBLASLt + the CUDA runtime that ggml-cuda links;
+# curl is for the entrypoint's model download and the healthcheck.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# exes + all ggml shared libs (ggml dlopens libggml-cuda.so from the directory
+# next to libggml.so, so they stay together); LD_LIBRARY_PATH makes ld.so find
+# them (the build-tree RPATH baked by cmake no longer exists).
+COPY --from=builder /opt/breeze /opt/breeze
+ENV LD_LIBRARY_PATH=/opt/breeze/lib
+COPY entrypoint.sh /entrypoint.sh
+
+# Some nvidia/cuda bases ship a user at uid 1000 (`cuda`); give that uid to
+# `breeze` so both tts images behave alike (compose's `user:` override makes
+# the exact uid flexible, /data stays world-writable anyway).
+RUN set -eux; \
+    u="$(getent passwd 1000 | cut -d: -f1 || true)"; \
+    if [ -n "$u" ]; then userdel "$u"; fi; \
+    useradd -m -u 1000 breeze; \
+    mkdir -p /data/models /data/voices; \
+    chmod +x /entrypoint.sh; \
+    chmod -R a+w /data
+USER breeze
+
+EXPOSE 8137
+ENTRYPOINT ["/entrypoint.sh"]

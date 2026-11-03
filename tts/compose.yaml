@@ -1,18 +1,26 @@
 # Riko's voice box on an NVIDIA host.  docker compose up -d
-# AMD/Intel GPU: add -f compose.amd.yaml   CPU only: add -f compose.cpu.yaml
+# Builds the CUDA image from source (Dockerfile.cuda): the prebuilt Vulkan
+# binary's NVIDIA Vulkan ICD does not load inside containers on this box, so
+# NVIDIA runs talk CUDA. The first build compiles for a while; see README.md.
+# AMD/Intel GPU: add -f compose.amd.yaml (switches back to the Vulkan image)
+# CPU only: add -f compose.cpu.yaml
 # One-time setup on the host (shared with hub/): docker network create riko
 # Tweaks live in .env (see .env.example).
 services:
   breeze-tts:
-    build: ./
-    image: riko-breeze-tts
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+      args:
+        # GPU archs to compile for; narrow it for a faster build (see README)
+        CUDA_ARCHS: "${CUDA_ARCHS:-86;89;120}"
+    image: riko-breeze-tts-cuda
     container_name: breeze-tts  # the hub reaches her as http://breeze-tts:8137
     environment:
       BREEZE_MODEL: "${BREEZE_MODEL:-breeze-tts-2-q8_0.gguf}"
       BREEZE_ARGS: "${BREEZE_ARGS:-}"
-      # Vulkan needs graphics; the NVIDIA container toolkit then injects the
-      # NVIDIA Vulkan ICD into the container.
-      NVIDIA_DRIVER_CAPABILITIES: "compute,utility,graphics"
+      # CUDA needs compute+utility (no `graphics`: we don't use the Vulkan ICD).
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     volumes:
       # models and cloned voices land here and survive rebuilds
       - ./data:/data

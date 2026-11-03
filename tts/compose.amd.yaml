@@ -1,9 +1,19 @@
 # AMD / Intel GPU (Vulkan through Mesa/RADV): docker compose -f compose.yaml -f compose.amd.yaml up -d
+# Switches back to the prebuilt Vulkan image (Dockerfile) — the CUDA build is
+# only needed on NVIDIA, where its Vulkan ICD doesn't work in containers.
 # No NVIDIA reservation; the container talks to the GPU through /dev/dri.
 # The container user needs the video + render groups: put the NUMERIC gids in
 # .env — look them up on the host with:  getent group video render
 services:
   breeze-tts:
+    build:
+      dockerfile: Dockerfile   # prebuilt Vulkan tarball, quick build
+      args: !reset null        # CUDA_ARCHS is meaningless for the Vulkan build
+    image: riko-breeze-tts
+    environment:
+      # Vulkan needs graphics; the NVIDIA container toolkit then injects the
+      # NVIDIA Vulkan ICD into the container (harmless on AMD/Intel).
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility,graphics"
     devices:
       - /dev/dri:/dev/dri
     group_add:

@@ -27,17 +27,31 @@ default — only the hub talks to it, and it has no authentication.
 
 ## Deploy
 
+There are **two images** for two GPU vendors:
+
+| image | built from | for | why |
+|---|---|---|---|
+| `riko-breeze-tts-cuda` (default) | `Dockerfile.cuda` — compiles Breeze-TTS-2.cpp from source with the CUDA backend | NVIDIA | the prebuilt Vulkan binary's NVIDIA driver ICD fails to load inside containers (`Could not get 'vkCreateInstance' via 'vk_icdGetInstanceProcAddr' for ICD /usr/lib64/libGLX_nvidia.so.0`), even with `NVIDIA_DRIVER_CAPABILITIES=all`; CUDA works in containers fine |
+| `riko-breeze-tts` | `Dockerfile` — downloads the pinned prebuilt Vulkan tarball | AMD/Intel GPU, or CPU-only | prebuilt, quick build; Mesa's Vulkan works in containers |
+
 Copy this folder to the AI box, e.g. `~/AI/Docker/breeze-tts`, then:
 
 ```sh
 cp .env.example .env       # optional; everything has defaults
-docker compose up -d       # NVIDIA box
+docker compose up -d       # NVIDIA box (CUDA image, built from source)
 # AMD/Intel GPU (Vulkan through Mesa):
 #   set VIDEO_GID/RENDER_GID in .env first — numeric gids from:  getent group video render
 docker compose -f compose.yaml -f compose.amd.yaml up -d
 # No GPU at all:
 docker compose -f compose.yaml -f compose.cpu.yaml up -d
 ```
+
+The CUDA build needs no GPU on the build machine (it also builds on AMD boxes),
+but the **first build takes a while** — it pulls several GB of CUDA devel
+images and compiles the ggml CUDA kernels. Afterwards it's cached. By default
+it bakes in sm 86 + 89 + 120 (Ampere/Ada/Blackwell); set `CUDA_ARCHS` in
+`.env` to just your card's arch for a much faster build, e.g. `CUDA_ARCHS=120`
+(RTX 50xx), `89` (RTX 40xx), `86` (RTX 30xx), `75` (Turing).
 
 First start downloads the model into `./data/models/` (resumable — the
 healthcheck's long `start_period` covers it), then warms the GPU and answers
@@ -96,7 +110,14 @@ works the same on NVIDIA, AMD and Intel GPUs.
 ## Notes
 
 - GPU memory on the 16 GB AI box: ASR ~1.1 GB + Breeze q8_0 ~4 GB — plenty of room.
-- The image is `debian:trixie-slim` on purpose: its Mesa is new enough for
-  RDNA4 cards (RX 90xx); bookworm's is not.
-- `docker compose logs -f breeze-tts` shows the Vulkan device it picked at
-  startup (`backend: Vulkan0, ...` = the GPU; `cpu` = something is wrong).
+- The Vulkan image is `debian:trixie-slim` on purpose: its Mesa is new enough
+  for RDNA4 cards (RX 90xx); bookworm's is not. The CUDA image is
+  `nvidia/cuda:12.9.1-runtime-ubuntu24.04` (built with the 12.9 devel image —
+  Blackwell needs CUDA >= 12.8).
+- `docker compose logs -f breeze-tts` shows the device it picked at startup
+  (`backend: Vulkan0`/`CUDA0`/`CUDA1, sample rate: 24000` = the GPU;
+  `backend: CPU` = the GPU isn't reaching the container).
+- The CUDA binary is pinned to the same source as the release: tag `v0.1.6`,
+  commit `87b43667ca5597f826441991e416a279ed7373b9` (the build fails if the
+  tag ever moves). Both images speak the identical HTTP API docs/VOICE.md
+  describes — the hub doesn't care which one runs.
