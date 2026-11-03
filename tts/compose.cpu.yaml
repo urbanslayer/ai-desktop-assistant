@@ -1,5 +1,5 @@
 # No GPU at all: docker compose -f compose.yaml -f compose.cpu.yaml up -d
-# Slower but works; breeze gets --cpu (keep it first if you set BREEZE_ARGS too).
+# Slower but works; --cpu is appended after anything you set in BREEZE_ARGS.
 services:
   breeze-tts:
     deploy: !reset null  # drop the NVIDIA device reservation from compose.yaml
