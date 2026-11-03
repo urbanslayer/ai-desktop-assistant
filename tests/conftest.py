@@ -9,6 +9,8 @@ import json
 import re
 import socket
 import threading
+import time
+import urllib.parse
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -54,8 +56,9 @@ def avatar_bytes(pid, version):
 
 class FakeHub:
     """Stand-in for hub/server.py: personas, keyword switching, history, import,
-    avatars, auth, hub-side voice (docs/VOICE.md) and a state version counter —
-    the contract the clients use."""
+    avatars, auth, hub-side voice (docs/VOICE.md), a state version counter and
+    the client-tool channel + events long-poll (docs/API.md) — the contract
+    the clients use."""
 
     SWITCH = re.compile(r"^(switch to|change to|become|persona|talk to|i want to talk to)\s+(.+)$")
 
@@ -70,6 +73,16 @@ class FakeHub:
         self.audio_requests = []      # path of every audio GET (or /api/tts body)
         self.emotion = None           # when set, chat replies carry this ChatResult.emotion
         self.last_auth = None         # Authorization header of the last API call
+        # Client-tool channel (docs/API.md), server side, simplified:
+        self.registered = {}          # client_id -> last register body
+        self.heartbeats = []          # client_id of every heartbeat POST
+        self.results = []             # JSON body of every /results POST
+        self.unregistered = []        # client_ids that DELETEd themselves
+        self._queued = {}             # client_id -> list of tool requests
+        self._cond = threading.Condition()
+        # Events ring (GET /api/events):
+        self.events = []              # {seq, time, type, ...}
+        self.event_seq = 0
         # Voice knobs the tests flip:
         self.tts_enabled = True       # False -> every audio_url is null
         self.tts_reachable = True     # GET /api/tts/status reports this
@@ -96,6 +109,10 @@ class FakeHub:
             def _json_body(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 return json.loads(self.rfile.read(length) or b"{}")
+
+            def _query(self):
+                return urllib.parse.parse_qs(self.path.split("?", 1)[1]
+                                             if "?" in self.path else "")
 
             def _audio(self):
                 """Reply for any audio GET / POST /api/tts, honouring audio_mode."""
@@ -153,6 +170,33 @@ class FakeHub:
                     if (p.get("voice") or {}).get("mode") == "off":
                         return self._send({"detail": "persona voice is off"}, 409)
                     return self._audio()
+                if path == "/api/events":
+                    qp = self._query()
+                    after = int(qp.get("after", ["0"])[0] or 0)
+                    wait = min(float(qp.get("wait", ["0"])[0] or 0), 0.5)
+                    deadline = time.monotonic() + wait
+                    with outer._cond:
+                        while not any(e["seq"] > after for e in outer.events) \
+                                and time.monotonic() < deadline:
+                            outer._cond.wait(0.05)
+                        out = [e for e in outer.events if e["seq"] > after]
+                    return self._send({"events": out,
+                                       "last": max([e["seq"] for e in out], default=after)})
+                if path == "/api/clients":
+                    return self._send({"clients": [
+                        {"client_id": cid, "tools": body.get("tools", [])}
+                        for cid, body in outer.registered.items()],
+                        "heartbeat_s": 30})
+                if m := re.fullmatch(r"/api/clients/([\w-]+)/requests", path):
+                    cid = m[1]
+                    wait = min(float(self._query().get("wait", ["25"])[0] or 25), 0.5)
+                    with outer._cond:
+                        if cid not in outer.registered:
+                            return self._send({"detail": "register first"}, 404)
+                        if not outer._queued.get(cid):
+                            outer._cond.wait(wait)
+                        out = outer._queued.pop(cid, [])
+                    return self._send({"requests": out, "approval_timeout_s": 120})
                 self._send({"detail": "not found"}, 404)
 
             def do_POST(self):
@@ -187,6 +231,30 @@ class FakeHub:
                             n += 1
                         outer.version += 1
                     return self._send({"imported": n})
+                if m := re.fullmatch(r"/api/clients/([\w-]+)/register", self.path):
+                    tools = body.get("tools")
+                    if not isinstance(tools, list):
+                        return self._send({"detail": "tools must be a list"}, 422)
+                    for t in tools:
+                        if not isinstance(t, dict) or not re.fullmatch(
+                                r"[A-Za-z0-9_-]{1,64}", str(t.get("name") or "")):
+                            return self._send({"detail": "bad tool name"}, 422)
+                        if t.get("risk", "read") not in ("read", "act", "danger"):
+                            return self._send({"detail": "bad tool risk"}, 422)
+                    with outer._cond:
+                        outer.registered[m[1]] = body
+                        outer._cond.notify_all()
+                    return self._send({"ok": True, "heartbeat_s": 30})
+                if m := re.fullmatch(r"/api/clients/([\w-]+)/heartbeat", self.path):
+                    if m[1] not in outer.registered:
+                        return self._send({"detail": "register first"}, 404)
+                    outer.heartbeats.append(m[1])
+                    return self._send({"ok": True, "heartbeat_s": 30})
+                if m := re.fullmatch(r"/api/clients/([\w-]+)/results", self.path):
+                    if not body.get("request_id"):
+                        return self._send({"detail": "request_id required"}, 422)
+                    outer.results.append(body)
+                    return self._send({"ok": True})
                 self._send({"detail": "not found"}, 404)
 
             def do_PUT(self):
@@ -211,6 +279,12 @@ class FakeHub:
                     with outer.lock:
                         outer.messages = []
                         outer.version += 1
+                    return self._send(b"", 204)
+                if m := re.fullmatch(r"/api/clients/([\w-]+)", self.path.split("?")[0]):
+                    with outer._cond:
+                        outer.registered.pop(m[1], None)
+                        outer.unregistered.append(m[1])
+                        outer._cond.notify_all()
                     return self._send(b"", 204)
                 self._send({"detail": "not found"}, 404)
 
@@ -300,9 +374,51 @@ class FakeHub:
             self.personas[pid]["avatar_version"] += 1
             self.version += 1
 
+    # ── client-tool channel test helpers ─────────────────────
+    def push_request(self, client_id, tool, arguments=None, needs_approval=False,
+                     summary=None, request_id=None):
+        """Queue a tool call for a client, like the real dispatch() does."""
+        req = {"request_id": request_id or f"req-{tool}-{len(self.results)}",
+               "tool": tool, "arguments": arguments or {},
+               "needs_approval": bool(needs_approval),
+               "summary": summary or f"{tool} {json.dumps(arguments or {})}"}
+        with self._cond:
+            self._queued.setdefault(client_id, []).append(req)
+            self._cond.notify_all()
+        return req
+
+    def push_event(self, etype, **fields):
+        """Append one event to the GET /api/events ring."""
+        with self._cond:
+            self.event_seq += 1
+            ev = {"seq": self.event_seq, "time": "2026-11-03T00:00:00Z",
+                  "type": etype, **fields}
+            self.events.append(ev)
+            self._cond.notify_all()
+        return ev
+
+    def wait_for_register(self, client_id, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if client_id in self.registered:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def wait_for_result(self, request_id, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for r in self.results:
+                if r.get("request_id") == request_id:
+                    return r
+            time.sleep(0.05)
+        return None
+
     def stop(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+        with self._cond:  # wake any half-open long-polls so shutdown is quick
+            self._cond.notify_all()
 
 
 def make_cfg(hub_url):
