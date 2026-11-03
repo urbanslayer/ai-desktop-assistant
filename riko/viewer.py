@@ -81,6 +81,18 @@ class _Handler(SimpleHTTPRequestHandler):
             active = hub_client.active_persona() or {}
             settings["persona_name"] = active.get("name")
             return self._send(json.dumps(settings).encode(), "application/json")
+        if self.path == "/animations.json":
+            # Optional VRMA gesture clips the owner dropped into client/animations/:
+            # wave.vrma replaces the built-in wave, etc. Files starting with '_' are ignored.
+            anims = sorted(
+                (
+                    {"name": p.name.split(".", 1)[0], "url": f"animations/{p.name}"}
+                    for p in (ROOT / "client" / "animations").glob("*.vrma")
+                    if not p.name.startswith(".") and not p.name.startswith("_")
+                ),
+                key=lambda a: a["name"],
+            )
+            return self._send(json.dumps({"animations": anims}).encode(), "application/json")
         if self.path != "/next":
             return super().do_GET()  # the page and the voice clip, from client/
         _page_last_seen = time.monotonic()
@@ -204,19 +216,22 @@ def start(cfg):
     return server
 
 
-def play(wav_path, text=None):
+def play(wav_path, text=None, emotion="neutral"):
     """Show her line and play her voice on the avatar page (or the speakers if no page is open).
 
     wav_path may be None (tts: none): then only the speech bubble shows. Returns when she is done.
+    emotion is forwarded to the page (the director turns it into a face + gesture);
+    old hubs may not send one, hence the default.
     """
+    emotion = emotion or "neutral"
     if wav_path is None:
         if text:
-            emit("say", text=text)
+            emit("say", text=text, emotion=emotion)
         return
     duration = sf.info(wav_path).duration
     if page_open():
         if text:
-            emit("say", text=text, seconds=duration)
+            emit("say", text=text, seconds=duration, emotion=emotion)
         _finished.clear()
         _clips.put(f"audio/{wav_path.name}?v={time.time()}")  # ?v= so the browser never replays the old clip
         if not _finished.wait(timeout=duration + 10):

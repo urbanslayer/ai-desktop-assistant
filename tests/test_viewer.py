@@ -209,6 +209,25 @@ def test_chunked_post_body(base_url):
         viewer.on_say(None)
 
 
+def test_animations_json_lists_dropped_vrma_files(base_url, tmp_path, monkeypatch):
+    anims = tmp_path / "client" / "animations"
+    anims.mkdir(parents=True)
+    for name in ("wave.vrma", "think.vrma", "_draft.vrma", "README.md"):
+        (anims / name).write_bytes(b"glTF")
+    monkeypatch.setattr(viewer, "ROOT", tmp_path)
+    body = requests.get(f"{base_url}/animations.json", timeout=5).json()
+    names = sorted(a["name"] for a in body["animations"])
+    assert names == ["think", "wave"], body  # underscore and non-vrma ignored
+    urls = {a["name"]: a["url"] for a in body["animations"]}
+    assert urls["wave"] == "animations/wave.vrma"
+
+
+def test_animations_json_is_empty_when_folder_missing(base_url, tmp_path, monkeypatch):
+    monkeypatch.setattr(viewer, "ROOT", tmp_path)  # tmp_path/client/animations does not exist
+    body = requests.get(f"{base_url}/animations.json", timeout=5).json()
+    assert body == {"animations": []}
+
+
 def test_index_page_is_served(base_url):
     r = requests.get(base_url + "/", timeout=5)
     assert r.status_code == 200

@@ -48,7 +48,7 @@ Her head — personas, memory, which LLM to think with — is a small server cal
 | 🧠 **Thinks** | Her brain is the **hub**: any OpenAI-compatible server (vLLM, llama.cpp, LM Studio, Ollama, OpenAI itself), reached over a small HTTP API the hub owns. |
 | 📝 **Remembers** | Chat history lives on the hub, not on your PC: browse it, edit it or wipe it from her web page. |
 | 🗣️ **Speaks** | Her voice lives on the **hub**: [Breeze-TTS-2](https://github.com/HoppouAI/Breeze-TTS-2.cpp) makes every persona sound different, designed from a text description or cloned from a short clip, all edited on the hub's web page. Clients just download the WAV — no TTS keys on your PC. (English and Chinese only; the weights and audio are non-commercial.) Prefer TTS on this PC? `tts: openai`, `sovits` or `fish` still work; `tts: none` shows a speech bubble instead. |
-| 💃 **Shows up** | A VRM avatar in your browser that lip-syncs to her voice. Drag to spin her around, right-drag to move her, scroll to zoom. |
+| 💃 **Shows up** | A VRM avatar in your browser: she blinks, breathes, looks around, follows your pointer, lip-syncs actual vowel shapes, waves hello, thinks with a hand on her chin and wears her emotion — see [Her animation](#animation). Drag to spin her around, right-drag to move her, scroll to zoom. |
 | 🪟 **Lives on your desktop** | On Linux she can also run as a small borderless, transparent, always-on-top window, no browser involved: `uv run desktop.py` ([Desktop pet](#desktop-pet)). |
 | 🎭 **Becomes anyone** | Multiple **personas** on the hub — personality, avatar, greeting and voice each. Switch from her web page, the tray menu, or `riko-ctl persona asuka`; she changes her whole body live, no reload. |
 | ✅ **Tells you what's missing** | Before she starts, a quick check catches a missing key, server or file and tells you how to fix it. |
@@ -205,6 +205,45 @@ uv run main.py --tts fish        # or sovits, openai, hub, none
 uv run main.py --asr groq        # or local, remote
 uv run main.py --type            # type your messages instead of using a mic
 ```
+
+<a id="animation"></a>
+## 💃 Her animation
+
+She is never a statue. Everything that moves her lives in `client/js/` and runs on the
+*normalized* VRM bones, so every gesture works on any persona — when you switch
+characters she re-targets her whole repertoire onto the new body mid-motion.
+
+- **Always alive** (`client/js/motion.js`): blinks (occasionally a double blink),
+  breathes, makes small eye saccades every second or two, glances off to the side
+  every 20-40 s, and slowly turns her head after where her eyes are going. She looks
+  at the camera while listening or speaking, follows your pointer inside her window,
+  and glances away when `embarrassed`.
+- **Lip sync** (`client/js/gestures.js` + the WebAudio analyser): the voice clip's
+  band energies pick a vowel shape — `aa / ih / ee / oh / ou` — with fast attack and
+  softer release, so she mouths words instead of flapping.
+- **Gestures**: wave (hello, persona switch, after 10+ minutes apart), hand-to-chin
+  `think` while she processes, lean-and-tilt `listen`, small open-hand talk gestures
+  while speaking, and idle stretches / look-arounds / fidgets every 1-3 minutes.
+  Cheap one-shots — nod, head shake, laugh, pout — punctuate her emotions. They are
+  keyframed bone poses (probed against the shipped avatar), eased in and out with
+  slerps from an arms-down rest, never the T-pose.
+- **The director** (`client/js/director.js`): a small state machine that decides
+  *what* she does — a gesture never interrupts one already playing, each gesture has
+  its own cooldown, and the whole thing is pure logic with unit tests
+  (`node --test client/js/`).
+- **Emotion**: the hub's `ChatResult.emotion` tag sets her face for the length of the
+  line — happy, angry, sad, embarrassed (eyes wandering off), surprised, thinking,
+  teasing (head tilt) — plus the matching cheap gesture. No emotion from an older
+  hub? She stays neutral.
+
+**Want better gestures than my poses?** Drop a VRMA clip named `wave.vrma` (or
+`think.vrma`, `listen.vrma`, ...) into `client/animations/` and it replaces the
+built-in version, loaded through `@pixiv/three-vrm-animation` and re-targeted per
+persona. Free clip sources: pixiv's VRM Animation Sample pack
+(<https://booth.pm/ja/items/5512385> — free but needs a BOOTH login to download,
+which is why nothing is bundled in the repo) and the VRoid Hub motion tag
+(<https://hub.vroid.com/en/tags/4530169210384817001>). Check each pack's licence
+before shipping it.
 
 <a id="personas"></a>
 ## 🎭 Switching characters

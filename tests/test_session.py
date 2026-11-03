@@ -79,6 +79,34 @@ def test_submit_text_end_to_end(turn_env):
     assert history[0]["source"] == "terminal"
 
 
+def test_hub_emotion_reaches_the_say_event(turn_env):
+    cfg, url, fake_hub = turn_env
+    fake_hub.emotion = "happy"
+    s = session.Session(cfg, source="terminal")
+    s.submit_text("good news")
+    events = collect_events(url, [], {"say"})
+    say = next(e for e in events if e["type"] == "say")
+    assert say["emotion"] == "happy"
+
+
+def test_say_event_defaults_to_neutral_for_hubs_without_emotion(turn_env):
+    cfg, url, fake_hub = turn_env  # fake_hub.emotion is None: old-hub reply shape
+    s = session.Session(cfg, source="terminal")
+    s.submit_text("hello")
+    events = collect_events(url, [], {"say"})
+    say = next(e for e in events if e["type"] == "say")
+    assert say["emotion"] == "neutral"
+
+
+def test_switch_greeting_says_happy(turn_env):
+    cfg, url, fake_hub = turn_env
+    s = session.Session(cfg, source="desktop")
+    s.switch_persona("asuka")
+    events = collect_events(url, [], {"say"})
+    say = next(e for e in events if e["type"] == "say")
+    assert say["emotion"] == "happy", "greetings should light her face up"
+
+
 def test_keyword_turn_swaps_persona_and_emits_event(turn_env):
     cfg, url, fake_hub = turn_env
     s = session.Session(cfg, source="desktop")

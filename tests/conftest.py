@@ -68,6 +68,7 @@ class FakeHub:
         self.avatar_requests = []     # (id, version) of every avatar GET
         self.chat_requests = []       # JSON body of every /api/chat
         self.audio_requests = []      # path of every audio GET (or /api/tts body)
+        self.emotion = None           # when set, chat replies carry this ChatResult.emotion
         self.last_auth = None         # Authorization header of the last API call
         # Voice knobs the tests flip:
         self.tts_enabled = True       # False -> every audio_url is null
@@ -251,10 +252,13 @@ class FakeHub:
                 self.active = target["id"]
                 self.version += 1
                 greeting_audio = self._greeting_audio_url(target)
-                return {"reply": target["greeting"] or f"{target['name']} here.",
+                resp = {"reply": target["greeting"] or f"{target['name']} here.",
                         "persona": target["id"], "switched": True,
                         "message_ids": [], "state_version": self.version,
                         "audio_url": greeting_audio}
+                if self.emotion:  # tests can set .emotion to mimic an emotion-aware hub
+                    resp["emotion"] = self.emotion
+                return resp
             pid = self.active
             ids = []
             for role, content in (("user", body.get("text")), ("assistant",
@@ -269,11 +273,14 @@ class FakeHub:
             audio_url = None
             if self.tts_enabled:
                 audio_url = f"/api/messages/{ids[-1]}/audio"
-            return {"reply": CHAT_REPLY.format(name=self.personas[pid]["name"],
+            resp = {"reply": CHAT_REPLY.format(name=self.personas[pid]["name"],
                                                text=body.get("text")),
                     "persona": pid, "switched": False,
                     "message_ids": ids, "state_version": self.version,
                     "audio_url": audio_url}
+            if self.emotion:
+                resp["emotion"] = self.emotion
+            return resp
 
     def _greeting_audio_url(self, p):
         """ChatResult.audio_url for a switch (docs/VOICE.md), null with TTS

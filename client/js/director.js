@@ -102,6 +102,14 @@ export class Director {
     return acts;
   }
 
+  /** A queued status loop only makes sense while its state still holds. */
+  #prunePending() {
+    const want = this.state === 'listening' || this.state === 'hearing' ? 'listen'
+      : this.state === 'thinking' ? 'think' : null;
+    if (this.pending && (this.pending.name === 'listen' || this.pending.name === 'think')
+        && this.pending.name !== want) this.pending = null;
+  }
+
   error(now) {
     this.lastActivity = now;
     return [];
@@ -110,6 +118,7 @@ export class Director {
   status(now, state) {
     if (state === this.state) return [];
     this.state = state;
+    this.#prunePending();
     const acts = [];
     if (state !== 'idle') acts.push(...this.#activity(now));
 
@@ -168,7 +177,8 @@ export class Director {
       : null;
     acts.push({ type: 'expression', name: map.expression, value: map.value,
                 hold: Math.max(seconds, 0) + 3, tilt: !!map.tilt, away: !!map.away });
-    const g = EMOTION_GESTURES[emotion];
+    // a long happy line earns the bouncing laugh instead of the plain nod
+    const g = emotion === 'happy' && seconds >= 6 ? 'laugh' : EMOTION_GESTURES[emotion];
     if (g) acts.push(...this.#play(g, now, { priority: PRIO_EMOTION }));
     if (emotion === 'thinking' && this.state !== 'thinking') {
       acts.push(...this.#play('think', now, { priority: PRIO_EMOTION, noCooldown: true }));
@@ -186,6 +196,7 @@ export class Director {
     }
     // a pending one-shot may go as soon as the body is free (or when it can
     // preempt a loop)
+    this.#prunePending();
     if (this.pending) {
       const free = !this.gesture || (this.gesture.loop && this.pending.priority >= PRIO_PERSONA);
       if (now >= this.pending.expiresAt) this.pending = null;

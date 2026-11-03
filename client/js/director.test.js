@@ -120,6 +120,20 @@ test('talk gestures sprinkle while speaking, never twice in a row', () => {
   for (let i = 1; i < picks.length; i++) assert.notEqual(picks[i], picks[i - 1]);
 });
 
+test('a queued status loop dies when its state passes before it got the body', () => {
+  const d = new Director({ random: seq(0.5, 0.5, 0.5) });
+  d.start(0);                              // wave one-shot until ~2.4 s
+  assert.deepEqual(names(d.status(1, 'thinking')), [], 'think queues behind the wave');
+  assert.equal(d.pending.name, 'think');
+  // the whole turn finished while the wave still played (event batch raced ahead)
+  d.status(1.2, 'speaking');
+  d.status(1.4, 'idle');
+  assert.equal(d.pending, null, 'the stale think queue is gone');
+  for (let t = 2.5; t < 8; t += 0.25) {
+    assert.ok(!names(d.tick(t)).includes('think'), 'no orphan think when the body frees up');
+  }
+});
+
 test('idle gestures only while idle, every 1-3 minutes, from the right set', () => {
   const d = new Director({ random: seq(0, 0.5, 0.5, 0.5, 0.5, 0.5) });
   d.start(0);
@@ -201,4 +215,13 @@ test('director state survives a long random sequence without glitches', () => {
     }
     if (d.pending) assert.ok(GESTURES[d.pending.name]);
   }
+});
+
+test('a long happy line earns the laugh, a short one just a nod', () => {
+  const d = new Director({ random: seq(0.5, 0.5, 0.5, 0.5) });
+  d.start(0);
+  d.tick(3);  // wave over
+  assert.deepEqual(names(d.say(3, { emotion: 'happy', seconds: 2 })), ['nod']);
+  d.tick(5);  // nod over
+  assert.deepEqual(names(d.say(30, { emotion: 'happy', seconds: 9 })), ['laugh']);
 });
