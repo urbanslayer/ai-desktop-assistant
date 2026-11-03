@@ -85,3 +85,18 @@ desktop:
   width: 420           # window size in pixels; everything around her is see-through
   height: 680
   bubble_seconds: 8    # how long her speech bubble stays after she finishes
+
+  # Keyboard shortcuts. They are app-specific: they only fire while her window
+  # is focused, so they never fight your window manager — and NEVER use the
+  # Super/Meta/Win key (it is rejected at startup). Format: optional Ctrl/Alt/
+  # Shift modifiers + one key name matching KeyboardEvent.key (letters are
+  # case-insensitive; Space, Enter, Escape, Backspace, Tab, F1..F12, "/").
+  # A list means "any of these"; "" or [] turns the action off. Anything
+  # invalid is reported in the terminal at startup and ignored.
+  shortcuts:
+    type: ["Enter", "/"]            # open the text box
+    talk: "Space"                   # hold to talk, release to send
+    persona_next: "P"               # switch to the next persona
+    hide: "H"                       # hide her (the tray icon brings her back)
+    forget: "Ctrl+Shift+Backspace"  # forget the chat (press again within 3 s to confirm)
+    quit: "Ctrl+Q"                  # quit (also in the tray menu)

@@ -27,7 +27,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import sounddevice as sd
 import soundfile as sf
 
-from riko import hub_client
+from riko import hub_client, shortcuts
 from riko.config import ROOT
 
 HOST = "127.0.0.1"  # 127.0.0.1, not localhost: behaves the same on Windows and Linux
@@ -174,9 +174,22 @@ class _Handler(SimpleHTTPRequestHandler):
         pass  # keep the terminal readable
 
 
+def _desktop_settings(cfg):
+    """The desktop: config section plus the resolved shortcut map the page keys off.
+
+    Bad bindings (Super, typos, clashes) are warned about here, once, at startup.
+    """
+    settings = dict(cfg.get("desktop") or {})
+    resolved, warnings = shortcuts.resolve(settings.get("shortcuts"))
+    for w in warnings:
+        print(f"[shortcuts] {w}", flush=True)
+    settings["shortcuts"] = resolved
+    return settings
+
+
 def start(cfg):
     global _settings, PORT
-    _settings = dict(cfg.get("desktop") or {})
+    _settings = _desktop_settings(cfg)
     PORT = int(os.environ.get("RIKO_PORT") or PORT)  # re-read: tests (and scripts) may set it late
     try:
         server = ThreadingHTTPServer((HOST, PORT), partial(_Handler, directory=str(ROOT / "client")))

@@ -282,17 +282,27 @@ She starts with the sample voice in `character_files/main_sample.wav`. Swap in y
 
 Instead of a browser tab, she can live in a small borderless, transparent, always-on-top window on your desktop: `uv run desktop.py` (or `bin/riko-desktop`). It's the same page and the same loop, rendered by QtWebEngine, with the desktop showing through everywhere except her.
 
-**In the window**
+**In the window (mouse)**
 
 | Do | With |
 |---|---|
 | Move her around the screen | Left-drag anywhere (under Hyprland) |
 | Pan / rotate / zoom the camera | Shift-drag / right-drag / scroll |
-| Type to her | Press `/` or **Enter**, type, **Enter** to send, **Esc** to give up |
-| Push-to-talk | Hold **Space**, speak, release |
-| Quit | **Ctrl+Q**, the tray menu, or `riko-ctl quit` |
 
-**From anywhere else:** `bin/riko-ctl <command>` talks to the running app over its local port — `type` (open her input and focus the window), `talk` / `talk-start` / `talk-stop`, `show` / `hide` / `toggle`, `status`, `forget`, `personas`, `persona <name>`, `persona-next`, `quit`. Handy in a keybinding or a script.
+**Keyboard shortcuts (in the window) — this is the way.** They are app-specific: they fire only while her window is focused, so they never fight your window manager. And they never touch the **Super/Meta/Win** key — that one is yours; a binding that uses it is rejected at startup with a warning. Change everything under `desktop.shortcuts:` in `character_config.yaml`.
+
+| Do | Default key |
+|---|---|
+| Type to her | `/` or **Enter** — type, **Enter** sends, **Esc** gives up |
+| Push-to-talk | Hold **Space**, speak, release to send |
+| Next persona | **P** |
+| Hide her | **H** (the tray icon brings her back) |
+| Forget the chat | **Ctrl+Shift+Backspace**, press again within 3 s to confirm |
+| Quit | **Ctrl+Q** (also in the tray menu) |
+
+Keys are written as optional `Ctrl` / `Alt` / `Shift` modifiers plus one key name matching `KeyboardEvent.key` (letters — case doesn't matter — `Space`, `Enter`, `Escape`, `Backspace`, `Tab`, `F1`–`F12`, `/`). Use a list for several keys per action (`type: ["Enter", "/"]`), and `""` or `[]` to switch an action off. Typos, unknown keys and duplicate bindings are reported in the terminal at startup and ignored; anything you leave out keeps its default.
+
+**Optional: global keys.** Want to reach her without focusing the window first? `bin/riko-ctl <command>` talks to the running app over its local port — `type` (open her input and focus the window), `talk` / `talk-start` / `talk-stop`, `show` / `hide` / `toggle`, `status`, `forget`, `personas`, `persona <name>`, `persona-next`, `quit` — handy in a compositor keybind or a script. The shipped `desktop/hyprland/` files are examples of exactly that: window rules plus suggested global binds (**Ctrl+Alt+T** type, hold **Ctrl+Alt+Space** talk, **Ctrl+Alt+H** show/hide, **Ctrl+Alt+P** next persona). They stay off the Super key on purpose, and they're only suggestions: check `hyprctl binds` for clashes and pick other keys if needed.
 
 **Window rules.** `desktop.py` asks Hyprland to float, size and pin her on its own. For best results add the shipped rules so it happens the instant she maps:
 
@@ -306,7 +316,7 @@ dofile(os.getenv("HOME") .. "/Development/riko_project/desktop/hyprland/riko.lua
 source = ~/Development/riko_project/desktop/hyprland/riko.conf
 ```
 
-The shipped files also wire global shortcuts: **Ctrl+Alt+T** type to her, hold **Ctrl+Alt+Space** to talk, **Ctrl+Alt+H** show/hide, **Ctrl+Alt+P** cycle to the next persona. They stay off the Super key on purpose (your WM lives there) — but they're only suggestions: check `hyprctl binds` for clashes and pick other keys if needed. Window size and bubble time are under `desktop:` in `character_config.yaml`.
+Window size, bubble time and the in-window shortcuts themselves live under `desktop:` in `character_config.yaml`.
 
 To start her with the session, copy `desktop/riko.desktop` to `~/.config/autostart/` (or launch `bin/riko-desktop` from your compositor's autostart). Outside Hyprland she still appears, but floating/sizing is left to your window manager, and true transparency needs a compositor.
 

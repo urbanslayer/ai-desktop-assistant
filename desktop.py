@@ -2,18 +2,22 @@
 
     uv run desktop.py
 
-In the window:
-    Enter or /      type to her (Enter sends, Esc closes)
-    Space           start / stop talking (push-to-talk, your local mic)
+Keys (only while her window is focused — app-specific, and never the Super/Win
+key, which belongs to your window manager). Configure them under
+desktop.shortcuts in character_config.yaml; defaults:
+    Enter or /               type to her (Enter sends, Esc closes)
+    Space (hold)             talk, release to send (push-to-talk, your local mic)
+    P                        next persona
+    H                        hide her (the tray icon brings her back)
+    Ctrl+Shift+Backspace     forget the chat (press again within 3 s to confirm)
+    Ctrl+Q                   quit (also in the tray menu)
+With the mouse:
     drag            move the window          right-drag  turn her around
     shift-drag      move her inside it       scroll      zoom
-    Ctrl+Q          quit (also in the tray menu)
 
-From anywhere (bind these to keys in your compositor, see README):
-    bin/riko-ctl type | talk | talk-start | talk-stop | toggle | forget | quit
-    bin/riko-ctl personas          list personas and which one is active
-    bin/riko-ctl persona asuka     switch who she is (tray has the same menu)
-    bin/riko-ctl persona-next      cycle to the next persona on the hub
+Want the same from any window? Those are optional, not part of the app:
+bin/riko-ctl hits her local port from a keybind or script (see its --help),
+and desktop/hyprland/ ships example Hyprland binds that stay off Super too.
 """
 import argparse
 import json
@@ -25,12 +29,12 @@ import sys
 import time
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from riko import asr, hub_client, tts, viewer
+from riko import asr, hub_client, shortcuts, tts, viewer
 from riko.config import load_config
 from riko.session import Session
 
@@ -78,8 +82,8 @@ class AvatarWindow(QWebEngineView):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.loadFinished.connect(self._hook_mouse)
         self.load(QUrl(f"http://{viewer.HOST}:{viewer.PORT}/?desktop=1"))
-
-        QShortcut(QKeySequence("Ctrl+Q"), self, QApplication.quit)
+        # No QShortcut here: every key, quit included, goes through the page and
+        # its configurable shortcut map (desktop.shortcuts) — one source of truth.
 
     # Chromium draws into a child widget; catch left-drags there and hand them to the
     # compositor as a window move (works on Wayland, where apps can't place their own windows).
@@ -300,7 +304,18 @@ def main():
     viewer.on_say(session.submit_text)
     viewer.on_control(control)
 
-    # Tray menu (shows up if your bar has a tray, e.g. waybar / DMS)
+    # Tray menu (shows up if your bar has a tray, e.g. waybar / DMS).
+    # Labels name the configured keys; viewer.start() above already resolved the
+    # same map and printed any warnings, so this pass stays quiet.
+    sc, _ = shortcuts.resolve(d.get("shortcuts"), warn=False)
+
+    def keys(action):
+        return ", ".join(sc.get(action) or [])
+
+    def hint(action, verb=""):  # ' (hold Space)' / ' (Ctrl+Q)' / '' when disabled
+        k = keys(action)
+        return f"  ({verb}{k})" if k else ""
+
     tray = QSystemTrayIcon(_tray_icon())
     tray.setToolTip("Riko")
     menu = QMenu()
@@ -334,11 +349,11 @@ def main():
     persona_menu.aboutToShow.connect(rebuild_persona_menu)
     rebuild_persona_menu()
     menu.addMenu(persona_menu)
-    for label, fn in (("Type to her", lambda: on_command("type")),
-                      ("Talk / stop talking", session.talk_toggle),
-                      ("Show / hide", toggle_window),
-                      ("Forget the chat", session.forget),
-                      ("Quit", app.quit)):
+    for label, fn in ((f"Type to her{hint('type')}", lambda: on_command("type")),
+                      (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle),
+                      (f"Show / hide{hint('hide')}", toggle_window),
+                      (f"Forget the chat{hint('forget')}", session.forget),
+                      (f"Quit{hint('quit')}", app.quit)):
         action = QAction(label, menu)
         action.triggered.connect(fn)
         menu.addAction(action)

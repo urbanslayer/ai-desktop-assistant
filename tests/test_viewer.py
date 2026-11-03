@@ -53,8 +53,23 @@ def test_next_drains_events(base_url):
 
 
 def test_settings_returns_desktop_section_plus_active_persona(base_url, hub_connected):
+    from riko.shortcuts import resolve
+    defaults, _ = resolve(None, warn=False)
     body = requests.get(f"{base_url}/settings", timeout=5).json()
-    assert body == {"width": 420, "height": 680, "bubble_seconds": 8, "persona_name": "Riko"}
+    assert body == {"width": 420, "height": 680, "bubble_seconds": 8,
+                    "shortcuts": defaults, "persona_name": "Riko"}
+
+
+def test_desktop_settings_resolves_and_warns(capsys):
+    # overrides ride through; a Super binding is dropped with a startup warning
+    settings = viewer._desktop_settings({"desktop": {"width": 1, "shortcuts": {
+        "hide": "Ctrl+H", "quit": "Super+Q"}}})
+    assert settings["width"] == 1
+    assert settings["shortcuts"]["hide"] == ["Ctrl+H"]
+    assert settings["shortcuts"]["quit"] == []  # a rejected binding does not fall back
+    assert settings["shortcuts"]["talk"] == ["Space"]  # untouched actions keep defaults
+    out = capsys.readouterr().out
+    assert "[shortcuts]" in out and "Super" in out
 
 
 def test_settings_persona_name_is_none_without_a_hub(base_url):

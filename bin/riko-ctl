@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Control a running Riko desktop app from anywhere. Bind these to keys in your compositor.
+"""Control a running Riko desktop app from anywhere. OPTIONAL: her window has
+its own configurable shortcuts (desktop.shortcuts in character_config.yaml,
+never Super) for all of this; use riko-ctl when you want the same actions from
+a compositor keybind or a script, without focusing her first.
 
     riko-ctl type         open the text box (and focus her window)
     riko-ctl talk         start / stop recording from your mic
