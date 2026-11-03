@@ -488,6 +488,7 @@ def create_app(data_dir, api_key: str | None = None,
             str(body.get("system_prompt") or ""),
             str(body.get("greeting") or ""),
             str(body.get("tts_voice") or ""),
+            emotes=body["emotes"] if "emotes" in body else True,
         )
         bump_state()
         return JSONResponse(public_persona(persona), status_code=201)
@@ -519,6 +520,8 @@ def create_app(data_dir, api_key: str | None = None,
         for key in ("system_prompt", "greeting", "tts_voice"):
             if key in body:
                 fields[key] = str(body[key] or "")
+        if "emotes" in body:
+            fields["emotes"] = bool(body["emotes"])
         if "keywords" in body:
             if not isinstance(body["keywords"], list):
                 return err(422, "keywords must be a list")
