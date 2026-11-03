@@ -6,3 +6,4 @@ chat_history.json
 client/audio/
 .venv/
 __pycache__/
+.worktrees/
