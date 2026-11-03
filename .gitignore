@@ -9,3 +9,7 @@ __pycache__/
 .worktrees/
 server/data/*
 !server/data/.gitkeep
+hub/data/*
+!hub/data/.gitkeep
+hub_data/
+chat_history.json.imported
