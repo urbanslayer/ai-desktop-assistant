@@ -422,9 +422,18 @@ $("pupload").onclick = async () => {
 
 /* ── voice panel (per-persona, docs/VOICE.md) ─────────────────────── */
 let voicePid = null;
-async function audioBlobUrl(path) {
-  const headers = key() ? { Authorization: "Bearer " + key() } : {};
-  const r = await fetch(path, { headers });
+async function audioBlobUrl(path, opts = {}) {
+  // opts is plain fetch options; `json` is sugar (same rule as api()).
+  // The route decides the method: preview is POST, plain audio GETs are not.
+  const headers = opts.headers || {};
+  if (key()) headers["Authorization"] = "Bearer " + key();
+  const init = { ...opts, headers };
+  if (opts.json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.json);
+  }
+  delete init.json;
+  const r = await fetch(path, init);
   if (!r.ok) {
     let detail = r.status + " " + r.statusText;
     try { detail = (await r.json()).detail || detail; } catch (e) { /* not json */ }
@@ -432,8 +441,8 @@ async function audioBlobUrl(path) {
   }
   return URL.createObjectURL(await r.blob());
 }
-async function playInto(container, path) {
-  const url = await audioBlobUrl(path);
+async function playInto(container, path, opts) {
+  const url = await audioBlobUrl(path, opts);
   const a = document.createElement("audio");
   a.controls = true; a.src = url; a.style.width = "100%";
   container.appendChild(a);
@@ -462,9 +471,9 @@ function setVerr(msg, ok) {
   $("verr").textContent = msg;
 }
 $("vroll").onclick = () => { $("vseed").value = 1 + Math.floor(Math.random() * 2147483646); };
-$("vsave").onclick = async () => {
-  if (!voicePid) return;
-  setVerr("");
+function voiceForm() {
+  // The panel's current (possibly unsaved) values, validated the way the
+  // server validates them — throws with the message to show the user.
   const body = {
     mode: $("vmode").value,
     description: $("vdesc").value.trim(),
@@ -472,10 +481,23 @@ $("vsave").onclick = async () => {
   };
   if ($("vseed").value !== "") {
     const seed = parseInt($("vseed").value, 10);
-    if (!Number.isInteger(seed) || seed < 0) { setVerr("seed must be a non-negative integer"); return; }
+    if (!Number.isInteger(seed) || seed < 0) throw new Error("seed must be a non-negative integer");
     body.seed = seed;
   }
-  body.cfg_scale = $("vcfg").value === "" ? null : parseFloat($("vcfg").value);
+  if ($("vcfg").value === "") body.cfg_scale = null;
+  else {
+    const cfg = parseFloat($("vcfg").value);
+    // NaN would serialise to null and silently mean "server default"
+    if (!Number.isFinite(cfg) || cfg <= 0 || cfg > 10) throw new Error("cfg_scale must be in (0, 10] or blank");
+    body.cfg_scale = cfg;
+  }
+  return body;
+}
+$("vsave").onclick = async () => {
+  if (!voicePid) return;
+  setVerr("");
+  let body;
+  try { body = voiceForm(); } catch (e) { setVerr(e.message); return; }
   try {
     fillVoicePanel(await api(`/api/personas/${voicePid}/voice`, { method: "PUT", json: body }));
     setVerr("voice saved ✔ (existing replies keep their old audio)", true);
@@ -485,8 +507,14 @@ $("vsave").onclick = async () => {
 $("vpreview").onclick = async () => {
   if (!voicePid) return;
   setVerr(""); $("vplayrow").innerHTML = "";
-  try { await playInto($("vplayrow"), `/api/personas/${voicePid}/voice/preview`); }
-  catch (e) { setVerr("preview failed: " + e.message); }
+  let voice;
+  try { voice = voiceForm(); } catch (e) { setVerr(e.message); return; }
+  try {
+    // POST + the panel's CURRENT values: preview what you are editing,
+    // not only what is saved (the hub stores/caches nothing here).
+    await playInto($("vplayrow"), `/api/personas/${voicePid}/voice/preview`,
+                   { method: "POST", json: { voice } });
+  } catch (e) { setVerr("preview failed: " + e.message); }
 };
 $("vlock").onclick = async () => {
   if (!voicePid) return;

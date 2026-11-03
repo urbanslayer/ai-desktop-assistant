@@ -435,6 +435,86 @@ def test_preview_uses_greeting_by_default_and_is_not_cached(client, fake_breeze,
     assert list((tmp_path / "hubdata" / "audio").glob("*.wav")) == []  # never cached
 
 
+def test_preview_design_override_reaches_breeze_and_stores_nothing(client, fake_breeze, tmp_path):
+    """The web page previews the panel's UNSAVED values: the `voice` override
+    must reach the breeze request and change nothing on the persona."""
+    v0 = client.get("/api/state").json()["version"]
+    stored = voice_of(client)
+    r = client.post("/api/personas/riko/voice/preview", json={
+        "text": "audition line",
+        "voice": {"mode": "design", "description": "A gruff old captain.",
+                  "style": "slow and grumpy", "seed": 4242, "cfg_scale": 3.5},
+    })
+    assert r.status_code == 200
+    readable_wav(r.content)
+    req = fake_breeze.speech_requests[-1]
+    assert req["input"] == "audition line"
+    assert "voice" not in req  # still design: no clone id
+    assert req["instructions"] == "A gruff old captain. slow and grumpy"
+    assert req["seed"] == 4242
+    assert req["cfg_scale"] == 3.5
+    # nothing stored: persona voice and both versions untouched
+    after = voice_of(client)
+    assert after == stored
+    assert client.get("/api/personas/riko").json()["voice_version"] == 1
+    assert client.get("/api/state").json()["version"] == v0
+    assert list((tmp_path / "hubdata" / "audio").glob("*.wav")) == []  # not cached
+
+
+def test_preview_override_validation(client, fake_breeze):
+    v0 = client.get("/api/state").json()["version"]
+    bad = [
+        {"voice": "design"},                # not an object
+        {"voice": {"mode": "robot"}},       # bad mode
+        {"voice": {"seed": -1}},            # negative seed
+        {"voice": {"seed": "big"}},         # non-int seed
+        {"voice": {"seed": True}},          # bool is not a seed
+        {"voice": {"cfg_scale": 0}},        # out of range
+        {"voice": {"cfg_scale": "loud"}},   # not a number
+        {"voice": {"wat": 1}},              # unknown field
+    ]
+    for body in bad:
+        r = client.post("/api/personas/riko/voice/preview", json=body)
+        assert r.status_code == 422, body
+        assert "detail" in r.json()
+    assert fake_breeze.speech_requests == []  # rejects synthesise nothing
+    assert client.get("/api/state").json()["version"] == v0  # and store nothing
+
+
+def test_preview_clone_override_without_reference_is_422(client, fake_breeze):
+    add_persona(client)
+    r = client.post("/api/personas/asuka/voice/preview",
+                    json={"voice": {"mode": "clone", "style": "whispery"}})
+    assert r.status_code == 422
+    assert "reference" in r.json()["detail"]
+    assert fake_breeze.speech_requests == []
+
+
+def test_preview_clone_override_with_reference(client, fake_breeze):
+    add_persona(client)
+    upload_reference(client, "asuka")  # mode clone, voice_version 2
+    r = client.post("/api/personas/asuka/voice/preview",
+                    json={"voice": {"mode": "clone", "style": "whispery"}})
+    assert r.status_code == 200
+    req = fake_breeze.speech_requests[-1]
+    assert req["voice"] == "riko-asuka-v2"  # stored voice_version, not a new one
+    assert req["instructions"] == "whispery"  # style override is the delivery direction
+    after = voice_of(client, "asuka")  # the override is not stored
+    assert after["mode"] == "clone" and after["style"] != "whispery"
+    assert client.get("/api/personas/asuka").json()["voice_version"] == 2
+
+
+def test_preview_override_can_audition_off_voice_in_design(client, fake_breeze):
+    """Saved mode off must not block Preview, and the override switches mode
+    just for this one synthesis."""
+    assert client.put("/api/personas/riko/voice", json={"mode": "off"}).status_code == 200
+    r = client.post("/api/personas/riko/voice/preview",
+                    json={"voice": {"mode": "design", "description": "Bright and shy."}})
+    assert r.status_code == 200
+    assert fake_breeze.speech_requests[-1]["instructions"] == "Bright and shy."
+    assert voice_of(client)["mode"] == "off"  # still off — override thrown away
+
+
 # ── POST /api/tts ────────────────────────────────────────────────────────────
 
 def test_tts_route_length_limit_and_validation(client):

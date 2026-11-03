@@ -849,6 +849,45 @@ def create_app(data_dir, api_key: str | None = None,
                 "base_url": str(settings.get("base_url") or ""), "voices": voices}
 
     # ── voice: persona voice editing ───────────────────────────────────
+    def validate_voice_fields(raw: dict) -> tuple[dict, str | None]:
+        """PUT /voice rules: check a raw voice-field dict and return
+        (cleaned fields, error message). Nothing here touches the store —
+        the preview override runs through the exact same validation."""
+        for key in raw:
+            if key not in ("mode", "description", "style", "ref_text", "seed", "cfg_scale"):
+                return {}, f"unknown voice field '{key}'"
+        out: dict = {}
+        if "mode" in raw:
+            mode = str(raw["mode"] or "")
+            if mode not in ("design", "clone", "off"):
+                return {}, "voice.mode must be design, clone or off"
+            out["mode"] = mode
+        for key in ("description", "style", "ref_text"):
+            if key in raw:
+                out[key] = str(raw[key] or "")
+        if "seed" in raw:
+            if isinstance(raw["seed"], bool):
+                return {}, "voice.seed must be an integer"
+            try:
+                seed = int(raw["seed"])
+            except (TypeError, ValueError):
+                return {}, "voice.seed must be an integer"
+            if seed < 0:
+                return {}, "voice.seed must be a non-negative integer"
+            out["seed"] = seed
+        if "cfg_scale" in raw:
+            if raw["cfg_scale"] is None:
+                out["cfg_scale"] = None
+            else:
+                try:
+                    cfg = float(raw["cfg_scale"])
+                except (TypeError, ValueError):
+                    return {}, "voice.cfg_scale must be a number or null"
+                if not (0 < cfg <= 10):
+                    return {}, "voice.cfg_scale must be in (0, 10] or null"
+                out["cfg_scale"] = cfg
+        return out, None
+
     @app.put("/api/personas/{persona_id}/voice")
     async def put_persona_voice(persona_id: str, request: Request):
         persona = persona_or_404(persona_id)
@@ -860,39 +899,13 @@ def create_app(data_dir, api_key: str | None = None,
             return err(400, "invalid JSON body")
         if not isinstance(body, dict):
             return err(400, "body must be a JSON object")
-        for key in body:
-            if key not in ("mode", "description", "style", "ref_text", "seed", "cfg_scale"):
-                return err(422, f"unknown voice field '{key}'")
+        cleaned, bad = validate_voice_fields(body)
+        if bad is not None:
+            return err(422, bad)
+        if cleaned.get("mode") == "clone" and not reference_path(persona_id).exists():
+            return err(422, "no reference clip on this persona — upload one first")
         voice = dict(persona.get("voice") or {})
-        if "mode" in body:
-            mode = str(body["mode"] or "")
-            if mode not in ("design", "clone", "off"):
-                return err(422, "voice.mode must be design, clone or off")
-            if mode == "clone" and not reference_path(persona_id).exists():
-                return err(422, "no reference clip on this persona — upload one first")
-            voice["mode"] = mode
-        for key in ("description", "style", "ref_text"):
-            if key in body:
-                voice[key] = str(body[key] or "")
-        if "seed" in body:
-            try:
-                seed = int(body["seed"])
-            except (TypeError, ValueError):
-                return err(422, "voice.seed must be an integer")
-            if seed < 0 or isinstance(body["seed"], bool):
-                return err(422, "voice.seed must be a non-negative integer")
-            voice["seed"] = seed
-        if "cfg_scale" in body:
-            if body["cfg_scale"] is None:
-                voice["cfg_scale"] = None
-            else:
-                try:
-                    cfg = float(body["cfg_scale"])
-                except (TypeError, ValueError):
-                    return err(422, "voice.cfg_scale must be a number or null")
-                if not (0 < cfg <= 10):
-                    return err(422, "voice.cfg_scale must be in (0, 10] or null")
-                voice["cfg_scale"] = cfg
+        voice.update(cleaned)
         voice.pop("has_reference", None)  # read-only, derived from disk
         changed = voice != {k: v for k, v in (persona.get("voice") or {}).items()
                             if k != "has_reference"}
@@ -972,7 +985,12 @@ def create_app(data_dir, api_key: str | None = None,
     @app.post("/api/personas/{persona_id}/voice/preview")
     async def post_voice_preview(persona_id: str, request: Request):
         """One uncached WAV in this persona's voice — the page's Preview.
-        Works even with mode off, so you can audition before enabling."""
+        Body: {"text"?: str, "voice"?: {mode, description, style, ref_text,
+        seed, cfg_scale}}. The `voice` override lets the page audition the
+        values in its panel BEFORE saving: validated exactly like PUT
+        /voice, applied to the stored voice for this one synthesis only —
+        nothing is stored and nothing is cached. Works even with mode off,
+        so you can audition before enabling."""
         persona = persona_or_404(persona_id)
         if not persona:
             return err(404, f"no persona '{persona_id}'")
@@ -984,11 +1002,24 @@ def create_app(data_dir, api_key: str | None = None,
         if not isinstance(body, dict):
             return err(400, "body must be a JSON object")
         text = str(body.get("text") or "").strip() or default_speech_text(persona)
+        voice = {k: v for k, v in (persona.get("voice") or {}).items()
+                 if k != "has_reference"}
+        override = body.get("voice")
+        if override is not None:
+            if not isinstance(override, dict):
+                return err(422, "voice override must be an object")
+            cleaned, bad = validate_voice_fields(override)
+            if bad is not None:
+                return err(422, bad)
+            voice.update(cleaned)
+        if voice.get("mode", "design") == "clone" and not reference_path(persona_id).exists():
+            return err(422, "no reference clip on this persona — upload one first "
+                             "(or preview in design mode)")
         blocked = tts_gate(None)
         if blocked is not None:
             return blocked
         try:
-            wav = await run_in_threadpool(synth, persona, text)
+            wav = await run_in_threadpool(synth, {**persona, "voice": voice}, text)
         except Exception as e:
             return tts_error_response(e)
         return wav_response(wav)

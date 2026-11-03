@@ -161,7 +161,7 @@ transcript with `after=0`).
 | `PUT /api/personas/{id}/voice/reference` | upload reference clip (multipart) → clone |
 | `GET /api/personas/{id}/voice/reference` | download the stored clip |
 | `DELETE /api/personas/{id}/voice/reference` | drop clip → back to design |
-| `POST /api/personas/{id}/voice/preview` | uncached WAV in this voice |
+| `POST /api/personas/{id}/voice/preview` | uncached WAV in this voice (`text`/`voice` overrides) |
 | `POST /api/personas/{id}/voice/lock` | freeze designed voice: its take becomes the clone |
 | `GET /api/settings` | LLM + TTS settings + defaults + per-field source (key never returned) |
 | `PUT /api/settings` | change settings (blank field = unset → default; `clear_api_key`) |
@@ -482,9 +482,26 @@ drops it and returns the persona to `design` mode (`voice_version` +1).
 
 ### POST /api/personas/{id}/voice/preview
 
-`{"text": optional}` — one uncached WAV in this persona's current voice
-(default text: the greeting). Works even when `mode` is `off`, so you can
-audition before enabling. Errors like `/api/tts`.
+`{"text": optional, "voice": optional}` — one uncached WAV in this persona's
+voice (default text: the greeting). Works even when `mode` is `off`, so you
+can audition before enabling.
+
+The optional `voice` override — `{mode, description, style, ref_text, seed,
+cfg_scale}`, any subset — is applied on top of the stored voice for **this
+one synthesis only**: validated exactly like `PUT /voice` (bad values →
+`422`), then thrown away. Nothing is stored, `voice_version`/`state.version`
+do not move, and the WAV is not cached. That is how the web page's Preview
+plays what you are currently editing, before you press Save. A `clone` mode
+(effective after the override) with no stored reference clip → `422`.
+
+```bash
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"text":"Try me first.","voice":{"mode":"design","description":"A gruff captain.","seed":4242}}' \
+  $HUB/api/personas/riko/voice/preview -o try.wav
+```
+
+Other errors are like `/api/tts` (`503` TTS off/unreachable, `502` breeze
+failed).
 
 ### POST /api/personas/{id}/voice/lock
 
