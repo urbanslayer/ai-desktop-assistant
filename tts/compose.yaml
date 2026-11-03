@@ -1,0 +1,43 @@
+# Riko's voice box on an NVIDIA host.  docker compose up -d
+# AMD/Intel GPU: add -f compose.amd.yaml   CPU only: add -f compose.cpu.yaml
+# One-time setup on the host (shared with hub/): docker network create riko
+# Tweaks live in .env (see .env.example).
+services:
+  breeze-tts:
+    build: ./
+    image: riko-breeze-tts
+    container_name: breeze-tts  # the hub reaches her as http://breeze-tts:8137
+    environment:
+      BREEZE_MODEL: "${BREEZE_MODEL:-breeze-tts-2-q8_0.gguf}"
+      BREEZE_ARGS: "${BREEZE_ARGS:-}"
+      # Vulkan needs graphics; the NVIDIA container toolkit then injects the
+      # NVIDIA Vulkan ICD into the container.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility,graphics"
+    volumes:
+      # models and cloned voices land here and survive rebuilds
+      - ./data:/data
+    user: "${UID:-1000}:${GID:-1000}"  # keep ./data owned by your host user
+    networks:
+      - riko
+    # Not published by default (the hub proxies all audio). Uncomment to use
+    # breeze's own web UI, e.g. through a tunnel: ssh -L 8137:127.0.0.1:8137 <box>
+    # ports:
+    #   - "127.0.0.1:8137:8137"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8137/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45m  # first start downloads a ~2.4-3.3 GB model into ./data
+
+networks:
+  riko:
+    external: true

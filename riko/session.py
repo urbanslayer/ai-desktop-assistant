@@ -3,7 +3,8 @@
 Turns (typed text, a recorded clip, or a persona switch) go into a queue and
 a single worker thread handles them in order:
 
-    clip -> asr.transcribe -> text -> hub.chat -> tts.speak -> viewer.play
+    clip -> asr.transcribe -> text -> hub.chat -> tts (this PC, or the
+    hub's audio_url with tts: hub) -> viewer.play
 
 Every step is reported to the avatar page as a UI event, so the desktop
 window can show "listening...", "thinking...", her speech bubble, and swap
@@ -23,6 +24,7 @@ class Session:
         hub_client.note_active(self.hub.state())  # who is active right now?
         self.recorder = asr.Recorder()
         self._turns = queue.Queue()
+        self._hub_audio_down = False  # hub voice trouble: print once, not per turn
         threading.Thread(target=self._worker, daemon=True, name="riko-session").start()
 
     # ── Ways in ──────────────────────────────────────────────
@@ -109,7 +111,7 @@ class Session:
         if kind == "greet":
             viewer.emit("status", state="thinking")
             greeting = payload.get("greeting") or f"{payload['name']} here."
-            self._speak(greeting)
+            self._speak(greeting, audio_url=self._greeting_audio_url(payload))
             return
         if kind == "audio":
             viewer.emit("status", state="hearing")
@@ -128,14 +130,46 @@ class Session:
         # greeting as the reply; a persona change also reloads the avatar page.
         if result.get("switched") or result.get("persona") != self._active_id():
             hub_client.announce_persona(self.hub.state())
-        self._speak(result["reply"])
+        # tts: hub — the hub already made (or will make) the audio; audio_url
+        # is null when TTS is off or this persona's voice is, so: bubble only.
+        self._speak(result["reply"], audio_url=result.get("audio_url"))
 
-    def _speak(self, answer):
+    def _speak(self, answer, audio_url=None):
         persona = hub_client.active_persona() or {}
         print(f"{persona.get('name', 'Riko')}: {answer}")
-        wav = tts.speak(answer, self.cfg, voice=persona.get("tts_voice") or None)
+        if self.cfg["tts"] == "hub":
+            wav = self._hub_audio(audio_url)
+        else:
+            wav = tts.speak(answer, self.cfg, voice=persona.get("tts_voice") or None)
         viewer.emit("status", state="speaking")
         viewer.play(wav, answer)
+
+    def _hub_audio(self, audio_url):
+        """Fetch reply/greeting audio the hub made. None = speech bubble only;
+        a hub voice failure is printed once (not every turn) and never fatal."""
+        if not audio_url:
+            return None
+        try:
+            wav = tts.from_hub_audio(self.hub.get_audio(audio_url))
+            self._hub_audio_down = False  # back to normal, next failure gets one line again
+            return wav
+        except Exception as e:  # hub 502/503/409, torn-down connection, bad bytes...
+            if not self._hub_audio_down:
+                print(f"[tts] hub audio failed ({type(e).__name__}: {e}); "
+                      "her reply shows in the bubble only")
+                self._hub_audio_down = True
+            return None
+
+    def _greeting_audio_url(self, persona):
+        """Where the hub keeps a persona's greeting audio (only with tts: hub);
+        None on an old hub without voice fields or when her voice is off."""
+        if self.cfg["tts"] != "hub":
+            return None
+        if ((persona or {}).get("voice") or {}).get("mode") == "off":
+            return None
+        url = f"/api/personas/{persona['id']}/greeting/audio"
+        version = (persona or {}).get("voice_version")
+        return f"{url}?v={version}" if version is not None else url
 
     def _active_id(self):
         active = hub_client.active_persona() or {}

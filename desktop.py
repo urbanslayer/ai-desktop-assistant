@@ -196,7 +196,7 @@ def _hyprland_setup(width, height, ruled):
 def main():
     parser = argparse.ArgumentParser(description="Riko as a floating desktop avatar.")
     parser.add_argument("--asr", choices=["remote", "local", "groq"], help="speech to text (overrides the config)")
-    parser.add_argument("--tts", choices=["none", "openai", "sovits", "fish"], help="her voice (overrides the config)")
+    parser.add_argument("--tts", choices=["hub", "none", "openai", "sovits", "fish"], help="her voice (overrides the config)")
     args = parser.parse_args()
 
     # Line-buffer stdout even when piped to a log file, so tail -f shows things as they happen.

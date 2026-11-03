@@ -22,7 +22,7 @@ from riko.session import Session
 def main():
     parser = argparse.ArgumentParser(description="Talk to Riko.")
     parser.add_argument("--asr", choices=["remote", "local", "groq"], help="speech to text (overrides the config)")
-    parser.add_argument("--tts", choices=["none", "openai", "sovits", "fish"], help="her voice (overrides the config)")
+    parser.add_argument("--tts", choices=["hub", "none", "openai", "sovits", "fish"], help="her voice (overrides the config)")
     parser.add_argument("--type", action="store_true", help="type your messages instead of speaking")
     args = parser.parse_args()
 
