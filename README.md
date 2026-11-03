@@ -35,9 +35,9 @@
 
 Riko is a voice companion you set up yourself. Press Enter and talk. She hears you, comes up with a reply (usually a snarky one), and says it out loud while her lips move along on screen.
 
-This repo is the open-source core of Project Riko: the whole loop from your voice to hers, written to be read. It's under 500 lines in total, and every part sits in its own small file, so when you want to change how she thinks, sounds or looks, you know exactly where to go.
+This repo is the open-source core of Project Riko: the whole loop from your voice to hers, written to be read. Every part on your PC sits in its own small file, so when you want to change how she hears, sounds or looks, you know exactly where to go.
 
-Her personality, her avatar and her voice all live in one config file. Making her yours takes a few minutes.
+Her head — personas, memory, which LLM to think with — is a small server called the **hub**, so any app (this one, a phone, a web page) shares the same Riko. The parts on your PC are ears, mouth and a face.
 
 ## ✨ What she can do
 
@@ -45,12 +45,12 @@ Her personality, her avatar and her voice all live in one config file. Making he
 |---|---|
 | 🎙️ **Listens** | Push-to-talk. Press Enter, speak, press Enter. Or just type to her. |
 | 👂 **Understands** | Speech to text with [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) on your own PC, on a second machine with a GPU (see [Remote ears](#remote-ears)), or [Groq](https://console.groq.com)'s fast online Whisper. |
-| 🧠 **Thinks** | Any OpenAI-compatible server: a local one (vLLM, llama.cpp, LM Studio, Ollama) or OpenAI GPT itself, in whatever personality you write for her. |
-| 📝 **Keeps the conversation** | The chat is saved to `chat_history.json`, so she picks up where you left off. |
+| 🧠 **Thinks** | Her brain is the **hub**: any OpenAI-compatible server (vLLM, llama.cpp, LM Studio, Ollama, OpenAI itself), reached over a small HTTP API the hub owns. |
+| 📝 **Remembers** | Chat history lives on the hub, not on your PC: browse it, edit it or wipe it from her web page. |
 | 🗣️ **Speaks** | Clones a voice from a short clip with [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS), uses any voice on [Fish Audio](https://fish.audio/?fpr=rayen10), or any OpenAI-style `/audio/speech` server. `tts: none` skips her voice and shows a speech bubble instead. |
 | 💃 **Shows up** | A VRM avatar in your browser that lip-syncs to her voice. Drag to spin her around, right-drag to move her, scroll to zoom. |
 | 🪟 **Lives on your desktop** | On Linux she can also run as a small borderless, transparent, always-on-top window, no browser involved: `uv run desktop.py` ([Desktop pet](#desktop-pet)). |
-| 🎭 **Becomes anyone** | Personality, avatar and voice are all set in one file. |
+| 🎭 **Becomes anyone** | Multiple **personas** on the hub — personality, avatar, greeting and voice each. Switch from her web page, the tray menu, or `riko-ctl persona asuka`; she changes her whole body live, no reload. |
 | ✅ **Tells you what's missing** | Before she starts, a quick check catches a missing key, server or file and tells you how to fix it. |
 
 ## ⚙️ How it works
@@ -58,25 +58,33 @@ Her personality, her avatar and her voice all live in one config file. Making he
 ```mermaid
 flowchart LR
     you(["🎙️ You talk"]) --> ears["👂 Ears<br/>Faster-Whisper (PC or server) or Groq"]
-    ears --> brain["🧠 Brain<br/>any OpenAI-compatible LLM"]
-    brain --> voice["🗣️ Voice<br/>GPT-SoVITS, Fish Audio or OpenAI-style"]
+    ears --> hub["🧠 Hub<br/>personas · memory · LLM<br/>http://box:8002"]
+    hub --> voice["🗣️ Voice<br/>GPT-SoVITS, Fish Audio or OpenAI-style"]
     voice --> face(["💃 Face<br/>VRM avatar + lip sync"])
 ```
 
-Each step is one file, and `main.py` runs them in a loop:
+The hub keeps her head — the persona list, each persona's avatar, the chat history, the LLM settings — and serves a web page at `http://<box>:8002` where you edit all of it. Your PC runs the body: it records you, ships the text to the hub, plays the answer through TTS and her avatar. The hub can run **on this same PC** (`hub.mode: local`, no Docker involved) or on any machine on your LAN (`hub.mode: remote`).
+
+Each step is one file, and `main.py` / `desktop.py` run them in a loop:
 
 | Step | File | What it does |
 |---|---|---|
 | 👂 Ears | `riko/asr.py` | Records you between the two Enters, turns it into text |
-| 🧠 Brain | `riko/llm.py` | Sends the chat to your LLM server, saves her answer to the history |
+| 🧠 Head | `riko/hub_client.py` | Talks to the hub: chat, personas, history, avatar download; can even start the hub inside this process |
 | 🗣️ Voice | `riko/tts.py` | Turns her answer into a voice clip (or a plain bubble with `tts: none`) |
-| 💃 Face | `riko/viewer.py` + `client/index.html` | Plays the clip on the avatar page and moves her mouth with it |
+| 💃 Face | `riko/viewer.py` + `client/index.html` | Serves the avatar page and her active persona's body, plays the clip, moves her mouth with it |
 
 ## 🚀 Quick start
 
-The easiest way in uses Fish Audio for her voice: no GPU and nothing extra to install. If you'd rather generate her voice on your own PC, do this first and then see [Local voice](#local-voice).
+Pick a shape first:
 
-**You need:** a Windows or Linux PC with a microphone, somewhere for her to think (an [OpenAI API key](https://platform.openai.com/api-keys), or any [OpenAI-compatible server](#brain) running locally), and a [Fish Audio API key](https://fish.audio/?fpr=rayen10) (sign up, then create one under *API keys*).
+| | 🏠 **All on one PC** | 🖥️ **Client + server** |
+|---|---|---|
+| The hub runs | inside this app (`hub.mode: local`) | in Docker on a Linux box (`hub/`) |
+| Her ears | your PC (`asr: local`) | a GPU box (`asr: remote`, see [Remote ears](#remote-ears)) |
+| Good for | trying her out right now | her living on the same GPU box as your LLM and ears, phones/apps joining later |
+
+**You need:** a Windows or Linux PC with a microphone, somewhere for her to think (an [OpenAI API key](https://platform.openai.com/api-keys), or any [OpenAI-compatible server](#the-hub) running), and — for the easiest voice — a [Fish Audio API key](https://fish.audio/?fpr=rayen10) (sign up, then create one under *API keys*).
 
 **1. Install uv.** It sets up Python for you.
 
@@ -115,15 +123,29 @@ copy .env.example .env    # Linux: cp .env.example .env
 notepad .env              # Linux: nano .env
 ```
 
-Paste your keys after the `=` signs and save. `.env` is git-ignored, so your keys stay out of any commit.
+Paste your keys after the `=` signs and save. `.env` is git-ignored, so your keys stay out of any commit. `RIKO_HUB_KEY` is the token the client uses to talk to the hub — make one up; in server mode the hub's own `.env` must carry the same value.
 
-**5. Start her.**
+**5a. All on one PC (local mode).** In `character_config.yaml` set `hub.mode: local` — that's it. The app starts the hub inside itself on `127.0.0.1:8002` and keeps her head in `hub_data/` (git-ignored). The `llm:` block is where her hub starts; after the first run you change the brain on the web page, not in the file.
 
 ```bash
 uv run main.py --tts fish
 ```
 
-The first launch takes a minute while it downloads the speech recognition model.
+**5b. Client + server (remote mode).** Leave `hub.mode: remote` and `hub.url` pointed at your Linux box. On that box (Docker + [NVIDIA container toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for the GPU parts):
+
+```bash
+# her head — from this repo's hub/ directory
+mkdir -p ~/AI/Docker/riko-hub && cp -r hub/* ~/AI/Docker/riko-hub/ && cd ~/AI/Docker/riko-hub
+cp .env.example .env      # set RIKO_HUB_KEY (same value as on your PC) and LLM_API_KEY
+docker compose up -d
+
+# her ears — from this repo's server/ directory (skip if asr: local)
+mkdir -p ~/AI/Docker/riko-asr && cp -r server/* ~/AI/Docker/riko-asr/ && cd ~/AI/Docker/riko-asr
+cp .env.example .env      # set ASR_API_KEY
+docker compose up -d
+```
+
+Then on your PC: `uv run main.py`. Both containers have their own `.env` and data folder; the hub's page lives at `http://<box>:8002`.
 
 **6. Say hi.**
 
@@ -134,28 +156,35 @@ The first launch takes a minute while it downloads the speech recognition model.
 > [!TIP]
 > Set `tts: fish` in `character_config.yaml` and a plain `uv run main.py` does the same thing.
 
+> [!NOTE]
+> Coming from the old version? Your `chat_history.json` doesn't move by itself: `uv run -m riko.migrate` uploads it to the hub's active persona and renames the file so it never imports twice (`--prompt` also copies your old `system_prompt` into that persona).
+
 ## 🎨 Make her yours
 
-Everything about her lives in `character_config.yaml`. Put her files (avatar, voice clip) in `character_files/`.
+Half of her lives in `character_config.yaml` on your PC — her ears, her voice, the window. The other half lives on the hub: open **http://&lt;box&gt;:8002** (local mode: http://127.0.0.1:8002) and edit her head in the browser.
 
-```yaml
-system_prompt: |
-  You are a helpful assistant named Riko.
-  You speak like a snarky anime girl.
-  Always refer to the user as "senpai".
-```
+**On the hub's web page:**
 
 | To change her... | Edit |
 |---|---|
-| **Personality** | `system_prompt`. Describe her the way you'd brief an actor: who she is, how she talks, what she calls you. |
-| **Look** | `vrm_model`. Any `.vrm` file works. You can make your own for free in [VRoid Studio](https://vroid.com/en/studio). |
+| **Personality** | The persona's `system_prompt`. Describe her the way you'd brief an actor: who she is, how she talks, what she calls you. |
+| **Look** | The persona's avatar — upload any `.vrm` file. You can make your own for free in [VRoid Studio](https://vroid.com/en/studio). The avatar page swaps her body live, no reload. |
+| **Greeting & keywords** | Each persona has a greeting she says when she becomes active, and keywords that summon her (see [Switching characters](#personas)). |
+| **Her voice name** | A persona's `tts_voice` picks the voice on OpenAI-style TTS servers; empty falls back to `openai_tts.voice` in your local config. |
+| **Brain** | Which OpenAI-compatible server and model she thinks with — same fields as the `llm:` block, edited live. |
+| **Memory** | The chat history: read it, edit a message, wipe it. |
+
+**On your PC** (`character_config.yaml`, restart to apply):
+
+| To change her... | Edit |
+|---|---|
+| **Where her head lives** | The `hub:` block: `mode: local` to run it inside the app, or `mode: remote` + `url` for the hub server. `api_key_env` names the `.env` variable holding the hub key (`RIKO_HUB_KEY`). |
 | **Fish voice** | `fish.voice_id`. Open any voice on [fish.audio](https://fish.audio/?fpr=rayen10) and copy the ID from the page address: `fish.audio/m/<voice id>`. |
 | **GPT-SoVITS voice** | `ref_audio_path`: a 3–10 second clip with no long silences. `prompt_text`: exactly what the clip says. |
-| **Brain** | The `llm:` block: `base_url` of any OpenAI-compatible server ([your own](#brain) or `https://api.openai.com/v1`), `model` (`auto` picks whatever the server offers), `api_key_env` (the `.env` variable holding the key, if any). |
 | **Ears** | `asr: local` (Faster-Whisper, free, on your PC), `asr: remote` (Faster-Whisper on [another machine](#remote-ears)) or `asr: groq` (needs a free [Groq key](https://console.groq.com/keys)). |
 | **Voice** | `tts: none` (bubble only), `openai` (any `/audio/speech` server, see `openai_tts:`), `sovits` or `fish`. |
 | **Speech model size or GPU** | `local_asr.model` / `local_asr.device` in `character_config.yaml`. |
-| **A fresh start** | Delete `chat_history.json`. |
+| **A fresh start** | `riko-ctl forget`, or the wipe button on the hub page. |
 
 You can also switch voice or ears for one run without touching the config:
 
@@ -165,10 +194,26 @@ uv run main.py --asr groq        # or local, remote
 uv run main.py --type            # type your messages instead of using a mic
 ```
 
-<a id="brain"></a>
-## 🧠 Bring your own brain
+<a id="personas"></a>
+## 🎭 Switching characters
 
-Her brain is any server that speaks the OpenAI chat API: vLLM, llama.cpp, LM Studio, Ollama in OpenAI mode, OpenAI itself. Point `llm.base_url` at it and she thinks there, nothing else changes:
+The hub can hold any number of personas — Riko, Asuka, whoever you write. One is *active*: her personality, her body, her greeting. Four ways to change it, all of them instant:
+
+| How | Do |
+|---|---|
+| **Web page** | Pick the persona on `http://<box>:8002`. |
+| **Say it** | "switch to asuka", "become riko", or just her keyword ("riko-chan"). The hub matches the switch itself — every client understands it, and she greets you in her new body. |
+| **`riko-ctl`** | `riko-ctl personas` lists them; `riko-ctl persona asuka` switches (by name, id or keyword). |
+| **Tray menu** | Desktop app: right-click the tray icon → *Persona*. |
+
+Whatever route a switch takes, the avatar page notices within about three seconds: she downloads the new `.vrm`, reuses the file next time (versioned cache), disposes the old body and swaps in the new one — no page reload, and the greeting lands in the bubble.
+
+<a id="the-hub"></a>
+## 🧠 The hub
+
+The hub is a small FastAPI server (see `hub/`, endpoints in [docs/API.md](docs/API.md)). It keeps the personas, their avatars, the chat history and the LLM settings, and speaks one versioned HTTP API with a bearer key. Every client — terminal, desktop, later a phone app — talks that same API, so they all share one head: switch the persona from your phone and the desktop avatar changes too.
+
+Her *brain* is whatever OpenAI-compatible server the hub is configured with: vLLM, llama.cpp, LM Studio, Ollama in OpenAI mode, OpenAI itself. In `hub.mode: local` the app seeds it from this file on first start:
 
 ```yaml
 llm:
@@ -177,7 +222,7 @@ llm:
   model: auto                # "auto" = the first model the server lists at /v1/models
 ```
 
-`model: auto` means you can swap the model on the server without touching Riko. Reasoning models spend part of their budget thinking, so `max_tokens` should leave headroom (1024 is a safe default).
+After the first start those settings live on the hub — edit them on its web page. `model: auto` means you can swap the model on the server without touching Riko. Reasoning models spend part of their budget thinking, so `max_tokens` should leave headroom (1024 is a safe default), and the clients wait up to 180 s per reply.
 
 <a id="remote-ears"></a>
 ## 👂 Remote ears
@@ -243,7 +288,7 @@ Instead of a browser tab, she can live in a small borderless, transparent, alway
 | Push-to-talk | Hold **Space**, speak, release |
 | Quit | **Ctrl+Q**, the tray menu, or `riko-ctl quit` |
 
-**From anywhere else:** `bin/riko-ctl <command>` talks to the running app over its local port — `type` (open her input and focus the window), `talk` / `talk-start` / `talk-stop`, `show` / `hide` / `toggle`, `status`, `forget`, `quit`. Handy in a keybinding or a script.
+**From anywhere else:** `bin/riko-ctl <command>` talks to the running app over its local port — `type` (open her input and focus the window), `talk` / `talk-start` / `talk-stop`, `show` / `hide` / `toggle`, `status`, `forget`, `personas`, `persona <name>`, `quit`. Handy in a keybinding or a script.
 
 **Window rules.** `desktop.py` asks Hyprland to float, size and pin her on its own. For best results add the shipped rules so it happens the instant she maps:
 
@@ -278,7 +323,7 @@ Same Riko, three ways to have her. Each one is made for a different kind of pers
 | Her voice | GPT-SoVITS voice clone or Fish Audio | GPT-SoVITS voice clone or Fish Audio | Both, switched in Settings, with automatic fallback |
 | Conversation | Push-to-talk, easy to rewire | Hands-free: she can tell when you've finished | Hands-free, or type to her |
 | Face and body | Lip sync, ready for your own animation system | Expressions and animations she picks herself | Expressions and animations she picks herself |
-| Memory | Chat history in a file you control | Long-term memory across sessions | Long-term memory you can browse, edit and reset |
+| Memory | Chat history on your hub, browsable and editable on its page | Long-term memory across sessions | Long-term memory you can browse, edit and reset |
 | Doing things | Plug in your own tools | Tool calling with tools you write | Looks things up online when you ask |
 | Backgrounds and anime scenes | A clean stage for your own | Drop in any 3D room, with lighting presets and a light editor | A clean stage, all eyes on her |
 | Your own character | Edit one config file: avatar, voice, personality | Edit the config files: avatar, voice, personality, room | Guided in the app: drop in a VRM, pick a voice, write her personality |
@@ -306,7 +351,8 @@ Tested on Windows 11 and Ubuntu 22.04 (WSL2) with an RTX 3060 12 GB. Faster-Whis
 
 | Key | When | Get it |
 |---|---|---|
-| `LLM_API_KEY` | `llm.api_key_env` says so; leave empty if your server needs none | your server (or [platform.openai.com](https://platform.openai.com/api-keys) for OpenAI) |
+| `RIKO_HUB_KEY` | always — the client's bearer key for the hub (`hub.api_key_env` says the name) | anything you choose, shared with the hub (`RIKO_HUB_KEY` in the hub server's `.env`) |
+| `LLM_API_KEY` | local mode: seeds the hub's LLM settings on first start; remote mode only for the hub container | your server (or [platform.openai.com](https://platform.openai.com/api-keys) for OpenAI) |
 | `ASR_API_KEY` | `asr: remote` and the ears server was started with a key | anything you choose, shared with `server/asr_server.py` |
 | `TTS_API_KEY` | `tts: openai`, if that server needs a key | that server |
 | `GROQ_API_KEY` | `asr: groq` | [console.groq.com](https://console.groq.com/keys) (free tier) |
@@ -317,9 +363,11 @@ Tested on Windows 11 and Ubuntu 22.04 (WSL2) with an RTX 3060 12 GB. Faster-Whis
 | You see | Try this |
 |---|---|
 | `[setup] OPENAI_API_KEY is missing` (or another key) | Add it to `.env`. Check the file is called exactly `.env`, not `.env.txt`. |
+| `can't reach the hub at http://...` | The hub is down or the URL is wrong. Local mode: is `hub_data/` writable, is port 8002 busy (another app on it → change `hub.local_port`)? Remote mode: on the hub box, `cd ~/AI/Docker/riko-hub && docker compose up -d`, then `curl http://<box>:8002/api/health` from your PC. |
+| `the hub at ... rejected the key (401)` | `RIKO_HUB_KEY` in this PC's `.env` doesn't match the hub server's. The hub's key lives in its own `.env`; restart the container after changing it. |
 | `GPT-SoVITS is not running` | Start its API server first (see [Local voice](#local-voice)), or run with `--tts fish`. |
 | `Port 8080 is busy` | Riko is probably already running in another terminal. Close that one. |
-| `Avatar not found` | Check the `vrm_model` path in `character_config.yaml`. |
+| `the hub has no avatar for persona ...` | The active persona has no `.vrm` yet — upload one on the hub page. |
 | She replies in the terminal, but there's no sound | Click the avatar page once. Browsers block sound until you do. |
 | `no avatar page open, playing on speakers` | That's normal: with no page open she talks through your speakers. Open the page to see her. |
 | `(heard nothing, try again)` | Make sure your mic is the default recording device, and talk a little longer. |
@@ -330,34 +378,39 @@ Tested on Windows 11 and Ubuntu 22.04 (WSL2) with an RTX 3060 12 GB. Faster-Whis
 ## 🔧 Under the hood
 
 ```
-main.py                the loop: record → transcribe → reply → speak → play
+main.py                the loop: record → transcribe → hub → speak → play
 desktop.py             the floating desktop window (PySide6 + QtWebEngine, Linux)
 riko/
   config.py            loads character_config.yaml and .env
+  hub_client.py        the hub API: chat, personas, history, avatars; starts the hub in-process in local mode
   asr.py               push-to-talk recording + speech to text (local / remote / groq)
-  llm.py               LLM server reply + chat_history.json
   tts.py               GPT-SoVITS, Fish Audio or OpenAI-style TTS → client/audio/riko.wav
-  viewer.py            serves the avatar page and hands it each voice clip
+  viewer.py            serves the avatar page, its events and the active persona's avatar (disk-cached)
+  session.py           the turn queue shared by mic, typing and riko-ctl
+  migrate.py           one-shot import of an old chat_history.json into the hub
 client/
-  index.html           three.js + three-vrm: the avatar, lip sync, rotate and zoom
+  index.html           three.js + three-vrm: the avatar, lip sync, persona swap, rotate and zoom
+hub/                   the hub server itself (FastAPI; its deployment notes in docs/API.md)
 server/
   asr_server.py        Faster-Whisper as a small HTTP server (her remote ears)
 bin/
-  riko-ctl             command the running app from anywhere (status / type / talk / quit ...)
+  riko-ctl             command the running app from anywhere (status / type / talk / persona / quit ...)
   riko-desktop         launcher for the desktop window
 desktop/
   riko.desktop         launcher / autostart entry
   hyprland/            riko.lua + riko.conf: window rules and global shortcuts
-character_files/       her avatar (sample_avatar.vrm) and sample voice (main_sample.wav)
-character_config.yaml  her personality, brain, ears, voice and window
+character_files/       her sample voice (main_sample.wav); sample_avatar.vrm is spare, the avatar comes from the hub
+character_config.yaml  hub location, ears, voice and window (personality lives on the hub now)
+docs/
+  DESIGN.md            the hub contract: objects, routes, auth (the hub's own docs: docs/API.md)
 ```
 
 Every part also runs on its own, which helps when something isn't working:
 
 ```bash
-uv run python -m riko.llm      # one reply from her LLM server
-uv run python -m riko.tts      # one voice line (add --fish for Fish Audio)
-uv run python -m riko.asr      # record, then print what she heard
+uv run python -m riko.hub_client   # one test turn against your hub (check() + one chat)
+uv run python -m riko.tts          # one voice line (add --fish for Fish Audio)
+uv run python -m riko.asr          # record, then print what she heard
 ```
 
 **Ideas if you want to build on it**

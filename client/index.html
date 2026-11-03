@@ -106,29 +106,59 @@
     });
 
     // ── Load her ──
+    // The avatar is the ACTIVE persona's, served by riko/viewer.py from the hub.
+    // On a 'persona' event the page fetches /avatar.vrm?v=<id>-<version> again
+    // and swaps the model without reloading (her greeting arrives as a 'say').
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser));
-    const vrm = (await loader.loadAsync('avatar.vrm')).userData.vrm;  // set vrm_model in character_config.yaml
-    VRMUtils.rotateVRM0(vrm);  // older VRM 0.x models face away without this
-    scene.add(vrm.scene);
 
-    // Arms down. VRM 0.x models are mirrored on this axis, so the angle flips.
-    const arm = vrm.meta.metaVersion === '0' ? -1.3 : 1.3;
-    vrm.humanoid.getNormalizedBoneNode('leftUpperArm').rotation.z = -arm;
-    vrm.humanoid.getNormalizedBoneNode('rightUpperArm').rotation.z = arm;
+    let vrm = null;
+    let spine = null;
+    let head = null;
 
-    // ── Camera: framed by her head height, so short and tall models look the same.
-    //    Browser: drag to rotate, right-drag to move her, scroll to zoom.
+    async function loadVRM(url) {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`avatar ${res.status}`);
+      const data = await res.arrayBuffer();
+      const gltf = await new Promise((ok, bad) => loader.parse(data, '', ok, bad));
+      if (!gltf.userData.vrm) throw new Error('not a VRM file');
+      return gltf.userData.vrm;
+    }
+
+    function attach(model) {
+      if (vrm) {  // old persona: out of the scene, GPU memory freed
+        scene.remove(vrm.scene);
+        VRMUtils.deepDispose(vrm.scene);
+        vrm.dispose();
+      }
+      vrm = model;
+      VRMUtils.rotateVRM0(vrm);  // older VRM 0.x models face away without this
+      scene.add(vrm.scene);
+
+      // Arms down. VRM 0.x models are mirrored on this axis, so the angle flips.
+      const arm = vrm.meta.metaVersion === '0' ? -1.3 : 1.3;
+      vrm.humanoid.getNormalizedBoneNode('leftUpperArm').rotation.z = -arm;
+      vrm.humanoid.getNormalizedBoneNode('rightUpperArm').rotation.z = arm;
+
+      // Reframe for this model's height so short and tall personas look the same.
+      const headY = vrm.humanoid.getNormalizedBoneNode('head').getWorldPosition(new THREE.Vector3()).y;
+      if (DESKTOP) {
+        camera.position.set(0, headY * 0.68, headY * 2.6);  // whole body, a little room above for the bubble
+        controls.target.set(0, headY * 0.62, 0);
+      } else {
+        camera.position.set(0, headY * 0.94, headY * 1.37);
+        controls.target.set(0, headY * 0.9, 0);
+      }
+      spine = vrm.humanoid.getNormalizedBoneNode('spine');
+      head = vrm.humanoid.getNormalizedBoneNode('head');
+    }
+
+    // ── Camera: drag to rotate, right-drag to move her, scroll to zoom.
     //    Desktop: drag moves the window, right-drag rotates, shift-drag moves her, scroll zooms. ──
-    const headY = vrm.humanoid.getNormalizedBoneNode('head').getWorldPosition(new THREE.Vector3()).y;
     const controls = new OrbitControls(camera, renderer.domElement);
     if (DESKTOP) {
-      camera.position.set(0, headY * 0.68, headY * 2.6);  // whole body, a little room above for the bubble
-      controls.target.set(0, headY * 0.62, 0);
       controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
     } else {
-      camera.position.set(0, headY * 0.94, headY * 1.37);
-      controls.target.set(0, headY * 0.9, 0);
       controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
     }
     controls.minDistance = 0.5;
@@ -136,6 +166,12 @@
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;  // lower = longer glide
     addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // The viewer 503s while the hub is still starting; keep asking until she's there.
+    for (;;) {
+      try { attach(await loadVRM('avatar.vrm')); break; }
+      catch { start.textContent = 'Waiting for her avatar...'; await new Promise((r) => setTimeout(r, 2000)); }
+    }
 
     // ── Lip sync: her mouth opens with the loudness of her voice ──
     const voice = document.getElementById('voice');
@@ -212,6 +248,12 @@
       else if (ev.type === 'error') flash(bubble, ev.text, 6, 'error');
       else if (ev.type === 'open_input') openInput();
       else if (ev.type === 'close_input') closeInput();
+      else if (ev.type === 'persona')
+        // Someone switched the persona (web page, riko-ctl, or she switched herself):
+        // fetch her new body and swap without reloading; her greeting arrives as 'say'.
+        loadVRM(`avatar.vrm?v=${encodeURIComponent(`${ev.id}-${ev.avatar_version}`)}`)
+          .then(attach)
+          .catch(() => location.reload());  // if her new body won't load, reload the page
     }
 
     async function checkForVoice() {
@@ -241,8 +283,7 @@
 
     // ── Being alive: blink now and then, breathe, sway a little ──
     const clock = new THREE.Clock();
-    const spine = vrm.humanoid.getNormalizedBoneNode('spine');
-    const head = vrm.humanoid.getNormalizedBoneNode('head');
+    // spine/head are set by attach() and follow persona swaps.
     let nextBlink = 2, blinkT = -1, t = 0;
     function idle(dt) {
       t += dt;
