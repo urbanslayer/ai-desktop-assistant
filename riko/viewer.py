@@ -1,8 +1,13 @@
 """Her body: a tiny web server for the avatar page (client/index.html).
 
-The page asks /next four times a second. When a new voice clip is waiting,
-it plays it, moves her mouth to it, and calls /done when the clip ends, so
-push-to-talk only comes back after she has finished talking.
+The page asks /next four times a second. The answer carries a voice clip (if
+one is waiting) plus UI events: what state she is in, what she said, what
+she heard. When a clip ends the page calls /done, so the next turn only
+starts after she has finished talking.
+
+The desktop app and riko-ctl talk to the same server:
+    POST /say            {"text": "..."}   you typed something
+    POST /control/<cmd>  {}                talk / talk-start / talk-stop / type / forget / quit ...
 
 No page open? The clip plays on your speakers instead.
 """
@@ -22,9 +27,31 @@ from riko.config import ROOT
 HOST, PORT = "127.0.0.1", 8080  # 127.0.0.1, not localhost: behaves the same on Windows and Linux
 
 _clips = queue.Queue()          # voice clips waiting for the page
+_events = queue.Queue()         # UI events waiting for the page
 _finished = threading.Event()   # set when the page says a clip ended
 _page_last_seen = float("-inf")  # when the page last asked /next (time.monotonic); never yet
 _avatar = None                  # the .vrm file named in character_config.yaml
+_settings = {}                  # the desktop: section of the config, for the page
+_handlers = {"say": None, "control": None}  # set by on_say() / on_control()
+
+
+def on_say(fn):
+    """Register fn(text) for text typed into the page."""
+    _handlers["say"] = fn
+
+
+def on_control(fn):
+    """Register fn(cmd) for /control/<cmd> requests. Return value is sent back as JSON."""
+    _handlers["control"] = fn
+
+
+def emit(kind, **data):
+    """Send a UI event to the page (status changes, speech bubbles, errors)."""
+    _events.put({"type": kind, **data})
+
+
+def page_open():
+    return time.monotonic() - _page_last_seen < 2
 
 
 class _Handler(SimpleHTTPRequestHandler):
@@ -32,6 +59,8 @@ class _Handler(SimpleHTTPRequestHandler):
         global _page_last_seen
         if self.path == "/avatar.vrm":
             return self._send(_avatar.read_bytes(), "application/octet-stream")
+        if self.path == "/settings":
+            return self._send(json.dumps(_settings).encode(), "application/json")
         if self.path != "/next":
             return super().do_GET()  # the page and the voice clip, from client/
         _page_last_seen = time.monotonic()
@@ -39,17 +68,44 @@ class _Handler(SimpleHTTPRequestHandler):
             clip = _clips.get_nowait()
         except queue.Empty:
             clip = None
-        self._send(json.dumps({"audio": clip}).encode(), "application/json")
+        events = []
+        while True:
+            try:
+                events.append(_events.get_nowait())
+            except queue.Empty:
+                break
+        self._send(json.dumps({"audio": clip, "events": events}).encode(), "application/json")
 
     def do_POST(self):
         if self.path == "/done":
             _finished.set()
-        self._send(b"{}", "application/json")
+            return self._send(b"{}", "application/json")
+        # Everything else changes state, so insist on JSON: a random web page can't send that
+        # cross-origin without a CORS preflight, which this server never approves.
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            return self._send(b'{"error": "send application/json"}', "application/json", 415)
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            return self._send(b'{"error": "bad json"}', "application/json", 400)
 
-    def _send(self, body, content_type):
-        self.send_response(200)
+        if self.path == "/say" and _handlers["say"]:
+            text = str(body.get("text", "")).strip()
+            if text:
+                _handlers["say"](text)
+            return self._send(b'{"ok": true}', "application/json")
+        if self.path.startswith("/control/") and _handlers["control"]:
+            result = _handlers["control"](self.path.removeprefix("/control/"))
+            return self._send(json.dumps(result if result is not None else {"ok": True}).encode(),
+                              "application/json")
+        self._send(b'{"error": "not found"}', "application/json", 404)
+
+    def _send(self, body, content_type, status=200):
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -58,8 +114,9 @@ class _Handler(SimpleHTTPRequestHandler):
 
 
 def start(cfg):
-    global _avatar
+    global _avatar, _settings
     _avatar = ROOT / cfg["vrm_model"]
+    _settings = dict(cfg.get("desktop") or {})
     if not _avatar.exists():
         sys.exit(f"[setup] Avatar not found: {_avatar}. Check vrm_model in character_config.yaml.")
     try:
@@ -69,12 +126,22 @@ def start(cfg):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"[viewer] avatar: {cfg['vrm_model']}")
     print(f"[viewer] avatar page: http://{HOST}:{PORT}  (open it, then click once)")
+    return server
 
 
-def play(wav_path):
-    """Play her voice on the avatar page, or the speakers if no page is open. Returns when she is done."""
+def play(wav_path, text=None):
+    """Show her line and play her voice on the avatar page (or the speakers if no page is open).
+
+    wav_path may be None (tts: none): then only the speech bubble shows. Returns when she is done.
+    """
+    if wav_path is None:
+        if text:
+            emit("say", text=text)
+        return
     duration = sf.info(wav_path).duration
-    if time.monotonic() - _page_last_seen < 2:
+    if page_open():
+        if text:
+            emit("say", text=text, seconds=duration)
         _finished.clear()
         _clips.put(f"audio/{wav_path.name}?v={time.time()}")  # ?v= so the browser never replays the old clip
         if not _finished.wait(timeout=duration + 10):

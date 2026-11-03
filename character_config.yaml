@@ -1,26 +1,55 @@
 # Everything about your character lives in this file and in character_files/.
-# Paths are relative to this folder.
+# Paths are relative to this folder. API keys go in .env (see .env.example).
 
 # ── Her personality ──────────────────────────────────────────
-model: gpt-4.1-mini              # any OpenAI model name
 history_file: chat_history.json  # delete this file to make her forget the chat
 system_prompt: |
   You are a helpful assistant named Riko.
   You speak like a snarky anime girl.
   Always refer to the user as "senpai".
+  Keep replies short and conversational: one to three sentences, no markdown, no emoji.
+
+# ── Her brain: any OpenAI-compatible server (vLLM, llama.cpp, LM Studio, Ollama, ...) ──
+llm:
+  base_url: http://192.0.2.51:8000/v1
+  api_key_env: LLM_API_KEY   # name of the .env variable holding the key; leave it unset if the server needs none
+  model: auto                # "auto" = the first model the server lists at /v1/models
+  temperature: 0.8
+  max_tokens: 1024           # reasoning models spend tokens thinking, so leave headroom
+  max_history: 40            # past messages sent each turn (the history file keeps everything)
 
 # ── Her look ─────────────────────────────────────────────────
 vrm_model: character_files/sample_avatar.vrm   # any .vrm file (VRoid Studio exports work)
 
 # ── Her ears (speech to text) ────────────────────────────────
-# local = Faster-Whisper, free, runs on your PC
-# groq  = Groq's online Whisper, needs GROQ_API_KEY in .env
-asr: local
+# remote = Faster-Whisper on another machine (run server/asr_server.py there).
+#          The mic stays on this PC; only the recorded clip is sent over.
+# local  = Faster-Whisper on this PC
+# groq   = Groq's online Whisper, needs GROQ_API_KEY in .env
+asr: remote
+
+remote_asr:
+  url: http://192.0.2.51:8001/v1   # server/asr_server.py, or any OpenAI-compatible STT server (e.g. speaches)
+  api_key_env: ASR_API_KEY           # only needed if the server was started with ASR_API_KEY set
+  model: large-v3-turbo              # asr_server.py ignores this and uses the model it was started with
+  language: en                       # "" = auto-detect
+
+local_asr:
+  model: base.en     # bigger = more accurate, slower: small.en, medium.en, large-v3-turbo
+  device: cpu        # "cuda" for an NVIDIA GPU (needs CUDA + cuDNN)
 
 # ── Her voice (text to speech) ───────────────────────────────
-# sovits = GPT-SoVITS, runs on your PC (start its API server first)
+# none   = no voice; her reply shows in a speech bubble only
+# openai = any OpenAI-compatible /audio/speech server (Kokoro-FastAPI, speaches, ...)
+# sovits = GPT-SoVITS (start its API server first)
 # fish   = Fish Audio, online, needs FISH_API_KEY in .env
-tts: sovits
+tts: none
+
+openai_tts:
+  url: http://192.0.2.51:8880/v1
+  api_key_env: TTS_API_KEY
+  model: kokoro
+  voice: af_heart
 
 sovits:
   url: http://127.0.0.1:9880/tts
@@ -34,3 +63,9 @@ fish:
   # from its page address (fish.audio/m/<voice id>). This one is an e-girl voice.
   voice_id: 98655a12fa944e26b274c535e5e03842
   model: s2.1-pro
+
+# ── Desktop app (uv run desktop.py) ──────────────────────────
+desktop:
+  width: 420           # window size in pixels; everything around her is see-through
+  height: 680
+  bubble_seconds: 8    # how long her speech bubble stays after she finishes

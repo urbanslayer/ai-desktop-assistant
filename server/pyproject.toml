@@ -1,0 +1,22 @@
+[project]
+name = "riko-asr-server"
+version = "1.0.0"
+description = "Faster-Whisper speech-to-text server with an OpenAI-compatible API, for Riko's remote ears."
+requires-python = ">=3.10"
+dependencies = [
+    "av<19",  # av 19 breaks faster-whisper 1.2.1 audio loading
+    "faster-whisper",
+    "fastapi",
+    "python-multipart",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+# NVIDIA GPU: CUDA 12 cuBLAS + cuDNN 9 as wheels, so no system CUDA install is needed.
+cuda = [
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12>=9,<10",
+]
+
+[tool.uv]
+package = false

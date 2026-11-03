@@ -8,6 +8,7 @@ dependencies = [
     "faster-whisper",
     "numpy",
     "openai",
+    "pyside6>=6.12.0",
     "python-dotenv",
     "pyyaml",
     "requests",

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Start the floating Riko desktop avatar (used by the .desktop launcher and autostart).
+cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
+exec uv run desktop.py "$@"

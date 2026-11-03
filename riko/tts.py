@@ -1,6 +1,8 @@
 """Her voice: turn her reply into a WAV file.
 
-tts: sovits -> GPT-SoVITS API running on your PC
+tts: none   -> no voice (the desktop app still shows her reply in a bubble)
+tts: openai -> any OpenAI-compatible /v1/audio/speech server (Kokoro-FastAPI, speaches, ...)
+tts: sovits -> GPT-SoVITS API
 tts: fish   -> Fish Audio online
 """
 import io
@@ -16,8 +18,19 @@ VOICE_FILE = ROOT / "client" / "audio" / "riko.wav"  # inside client/ so the ava
 
 
 def check(cfg):
+    if cfg["tts"] == "none":
+        print("[setup] tts: none, she will reply in text only")
+        return
     if cfg["tts"] == "fish":
         need_key("FISH_API_KEY", "tts: fish")
+        return
+    if cfg["tts"] == "openai":
+        url = cfg["openai_tts"]["url"]
+        try:
+            requests.get(url.rstrip("/") + "/models", timeout=3)  # any answer means it is running
+        except requests.ConnectionError:
+            sys.exit(f"[setup] No TTS server at {url}. Start it, or set tts: none.")
+        print(f"[setup] TTS server is up at {url}")
         return
     ref_audio = ROOT / cfg["sovits"]["ref_audio_path"]
     if not ref_audio.exists():
@@ -31,8 +44,15 @@ def check(cfg):
 
 
 def speak(text, cfg):
-    """Make her say `text`. Returns the path of the WAV file."""
-    audio = _fish(text, cfg["fish"]) if cfg["tts"] == "fish" else _sovits(text, cfg["sovits"])
+    """Make her say `text`. Returns the path of the WAV file, or None with tts: none."""
+    if cfg["tts"] == "none" or not text.strip():
+        return None
+    if cfg["tts"] == "fish":
+        audio = _fish(text, cfg["fish"])
+    elif cfg["tts"] == "openai":
+        audio = _openai(text, cfg["openai_tts"])
+    else:
+        audio = _sovits(text, cfg["sovits"])
     # Re-save through soundfile: Fish's WAV header claims the clip is hours
     # long, and browsers believe it and never fire "ended". This fixes it.
     data, sample_rate = sf.read(io.BytesIO(audio))
@@ -50,6 +70,18 @@ def _sovits(text, s):
         "prompt_text": s["prompt_text"],
         "prompt_lang": s["prompt_lang"],
     }, timeout=120)
+    response.raise_for_status()
+    return response.content
+
+
+def _openai(text, o):
+    key = os.getenv(o.get("api_key_env") or "", "")
+    response = requests.post(
+        o["url"].rstrip("/") + "/audio/speech",
+        headers={"Authorization": f"Bearer {key}"} if key else {},
+        json={"model": o["model"], "voice": o["voice"], "input": text, "response_format": "wav"},
+        timeout=120,
+    )
     response.raise_for_status()
     return response.content
 

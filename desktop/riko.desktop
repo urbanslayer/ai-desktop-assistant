@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Riko
+Comment=Floating anime AI companion
+# Point Exec at bin/riko-desktop inside your copy of the project.
+Exec=sh -c '"$HOME/Development/riko_project/bin/riko-desktop"'
+Icon=face-smile
+Terminal=false
+Categories=Utility;
+StartupWMClass=riko

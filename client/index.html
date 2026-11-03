@@ -6,11 +6,47 @@
   <title>Riko</title>
   <link rel="icon" href="data:,">
   <style>
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; font: 15px/1.35 system-ui, sans-serif; }
+    body.desktop { background: transparent; }
+    canvas { display: block; }
     #start {
       position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
-      font: 20px sans-serif; color: #444; background: rgba(255, 255, 255, 0.8); cursor: pointer;
+      font-size: 20px; color: #444; background: rgba(255, 255, 255, 0.8); cursor: pointer;
     }
+
+    /* Her speech bubble, at the top so it never covers her face for long */
+    #bubble {
+      position: fixed; top: 10px; left: 12px; right: 12px; max-height: 32vh; overflow-y: auto;
+      padding: 10px 14px; border-radius: 16px; color: #2b2233;
+      background: rgba(255, 255, 255, 0.93); box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+      opacity: 0; transform: translateY(-8px); transition: opacity .25s, transform .25s; pointer-events: none;
+      scrollbar-width: none;
+    }
+    #bubble.show { opacity: 1; transform: none; pointer-events: auto; }
+    #bubble.error { background: rgba(255, 228, 228, 0.95); color: #7a1c1c; font-size: 13px; }
+
+    /* What she heard you say + what she's doing */
+    #hud {
+      position: fixed; left: 12px; right: 12px; bottom: 64px; display: flex; flex-direction: column;
+      align-items: flex-end; gap: 6px; pointer-events: none;
+    }
+    #heard, #status {
+      max-width: 85%; padding: 5px 11px; border-radius: 12px; font-size: 13px;
+      background: rgba(30, 25, 45, 0.78); color: #f3eefc; opacity: 0; transition: opacity .25s;
+    }
+    #heard.show, #status.show { opacity: 1; }
+    #status { align-self: center; }
+    #status.listening { background: rgba(200, 40, 70, 0.88); }
+    #status.listening::before { content: "● "; animation: blink 1s infinite; }
+    @keyframes blink { 50% { opacity: .2; } }
+
+    /* Text input: Enter (or the global shortcut) opens it, Esc closes it */
+    #input {
+      position: fixed; left: 10px; right: 10px; bottom: 12px; display: none;
+      padding: 10px 14px; border: 2px solid rgba(140, 100, 220, 0.9); border-radius: 22px; outline: none;
+      font: inherit; color: #221a30; background: rgba(255, 255, 255, 0.96); box-shadow: 0 4px 18px rgba(0, 0, 0, 0.3);
+    }
+    #input.show { display: block; }
   </style>
   <script type="importmap">
     {
@@ -24,6 +60,9 @@
 </head>
 <body>
   <div id="start">Loading...</div>
+  <div id="bubble"></div>
+  <div id="hud"><div id="heard"></div><div id="status"></div></div>
+  <input id="input" type="text" placeholder="Say something to her… (Enter to send, Esc to close)" autocomplete="off">
   <audio id="voice"></audio>
 
   <script type="module">
@@ -32,18 +71,27 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 
-    // ── Scene: white background ──
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    // desktop.py opens this page with ?desktop=1: see-through background, no click-to-start,
+    // and the whole body in frame. In a normal browser it looks like it always did.
+    const DESKTOP = new URLSearchParams(location.search).has('desktop');
+    if (DESKTOP) document.body.classList.add('desktop');
+    const settings = await fetch('/settings').then((r) => r.json()).catch(() => ({}));
+    const BUBBLE_SECONDS = settings.bubble_seconds ?? 8;
+
+    // ── Scene ──
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: DESKTOP });
     renderer.setPixelRatio(devicePixelRatio);
     renderer.setSize(innerWidth, innerHeight);
-    document.body.appendChild(renderer.domElement);
+    document.body.prepend(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xffffff);
+    if (DESKTOP) renderer.setClearColor(0x000000, 0);  // fully transparent around her
+    else scene.background = new THREE.Color(0xffffff);
     const camera = new THREE.PerspectiveCamera(30, innerWidth / innerHeight, 0.1, 20);
     const light = new THREE.DirectionalLight(0xffffff, Math.PI);
     light.position.set(1, 1, 1);
     scene.add(light);
+    if (DESKTOP) scene.add(new THREE.AmbientLight(0xffffff, 0.6));  // no white room to bounce off, so lift the shadows
 
     addEventListener('resize', () => {
       camera.aspect = innerWidth / innerHeight;
@@ -64,16 +112,24 @@
     vrm.humanoid.getNormalizedBoneNode('rightUpperArm').rotation.z = arm;
 
     // ── Camera: framed by her head height, so short and tall models look the same.
-    //    Drag to rotate, right-drag to move her, scroll to zoom. She glides a little after you let go. ──
+    //    Browser: drag to rotate, right-drag to move her, scroll to zoom.
+    //    Desktop: drag moves the window, right-drag rotates, shift-drag moves her, scroll zooms. ──
     const headY = vrm.humanoid.getNormalizedBoneNode('head').getWorldPosition(new THREE.Vector3()).y;
-    camera.position.set(0, headY * 0.94, headY * 1.37);
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, headY * 0.9, 0);
-    controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    if (DESKTOP) {
+      camera.position.set(0, headY * 0.68, headY * 2.6);  // whole body, a little room above for the bubble
+      controls.target.set(0, headY * 0.62, 0);
+      controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+    } else {
+      camera.position.set(0, headY * 0.94, headY * 1.37);
+      controls.target.set(0, headY * 0.9, 0);
+      controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    }
     controls.minDistance = 0.5;
-    controls.maxDistance = 5;
+    controls.maxDistance = 6;
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;  // lower = longer glide
+    addEventListener('contextmenu', (e) => e.preventDefault());
 
     // ── Lip sync: her mouth opens with the loudness of her voice ──
     const voice = document.getElementById('voice');
@@ -90,12 +146,72 @@
       return Math.sqrt(sum / samples.length);
     }
 
-    // ── Ask Python for her next line, tell it when she is done ──
+    // ── Speech bubble, status pill, what she heard ──
+    const bubble = document.getElementById('bubble');
+    const heard = document.getElementById('heard');
+    const status = document.getElementById('status');
+    const timers = {};
+    function flash(el, text, seconds, cls = '') {
+      el.textContent = text;
+      el.className = `show ${cls}`;
+      clearTimeout(timers[el.id]);
+      if (seconds) timers[el.id] = setTimeout(() => el.classList.remove('show'), seconds * 1000);
+    }
+    const STATUS_TEXT = { listening: 'listening…', hearing: 'hmm?', thinking: 'thinking…' };
+    function setStatus(state) {
+      if (STATUS_TEXT[state]) flash(status, STATUS_TEXT[state], 0, state);
+      else status.classList.remove('show');
+    }
+
+    // ── Text input ──
+    const input = document.getElementById('input');
+    const control = (cmd) => fetch(`/control/${cmd}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    }).catch(() => {});
+    function openInput() {
+      input.classList.add('show');
+      input.focus();
+      control('input-opened');
+    }
+    function closeInput() {
+      input.classList.remove('show');
+      input.blur();
+      control('input-closed');
+    }
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { input.value = ''; closeInput(); }
+      if (e.key === 'Enter' && !e.isComposing) {
+        const text = input.value.trim();
+        input.value = '';
+        if (text) fetch('/say', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+        closeInput();
+      }
+      e.stopPropagation();
+    });
+    addEventListener('keydown', (e) => {
+      if (!DESKTOP) return;  // only the desktop app listens for typed messages and talk requests
+      if (e.key === 'Enter' || e.key === '/') { e.preventDefault(); openInput(); }
+      else if (e.key === ' ') { e.preventDefault(); control('talk'); }
+      else if (e.key === 'Escape') control('hide-input');
+    });
+    window.riko = { openInput, closeInput };  // desktop.py calls these too
+
+    // ── Ask Python for her next line and UI events, tell it when a clip is done ──
     voice.onended = voice.onerror = () => fetch('/done', { method: 'POST' });
+
+    function handle(ev) {
+      if (ev.type === 'status') setStatus(ev.state);
+      else if (ev.type === 'say') flash(bubble, ev.text, (ev.seconds || 0) + BUBBLE_SECONDS);
+      else if (ev.type === 'heard') flash(heard, ev.text, 6);
+      else if (ev.type === 'error') flash(bubble, ev.text, 6, 'error');
+      else if (ev.type === 'open_input') openInput();
+      else if (ev.type === 'close_input') closeInput();
+    }
 
     async function checkForVoice() {
       try {
-        const { audio } = await (await fetch('/next')).json();
+        const { audio, events = [] } = await (await fetch('/next')).json();
+        events.forEach(handle);
         if (audio) {
           voice.src = audio;
           await voice.play();
@@ -103,25 +219,47 @@
       } catch { /* Python is not running; keep asking */ }
     }
 
-    // Browsers only allow sound after a click, so wait for one.
+    // Browsers only allow sound after a click, so wait for one. The desktop app allows it up front.
     const start = document.getElementById('start');
-    start.textContent = 'Click to start';
-    start.onclick = () => {
+    function begin() {
       start.remove();
       audioCtx.resume();
-      setInterval(checkForVoice, 250);
-    };
+      setInterval(checkForVoice, DESKTOP ? 150 : 250);
+    }
+    if (DESKTOP) begin();
+    else {
+      start.textContent = 'Click to start';
+      start.onclick = begin;
+    }
+
+    // ── Being alive: blink now and then, breathe, sway a little ──
+    const clock = new THREE.Clock();
+    const spine = vrm.humanoid.getNormalizedBoneNode('spine');
+    const head = vrm.humanoid.getNormalizedBoneNode('head');
+    let nextBlink = 2, blinkT = -1, t = 0;
+    function idle(dt) {
+      t += dt;
+      if (blinkT < 0 && t > nextBlink) blinkT = 0;
+      if (blinkT >= 0) {
+        blinkT += dt;
+        vrm.expressionManager.setValue('blink', Math.sin(Math.min(blinkT / 0.15, 1) * Math.PI));
+        if (blinkT > 0.15) { blinkT = -1; nextBlink = t + 2 + Math.random() * 4; }
+      }
+      if (spine) spine.rotation.x = Math.sin(t * 1.6) * 0.012;
+      if (head) { head.rotation.z = Math.sin(t * 0.7) * 0.03; head.rotation.y = Math.sin(t * 0.45) * 0.05; }
+    }
 
     // ── Every frame ──
-    const clock = new THREE.Clock();
     let mouth = 0;
     let loudest = 0.05;  // loudest recent level, so quiet and loud voices both move the mouth fully
     renderer.setAnimationLoop(() => {
+      const dt = clock.getDelta();
       const level = loudness();
       loudest = Math.max(0.05, loudest * 0.995, level);
       mouth += (level / loudest - mouth) * 0.5;  // smoothed so it does not flicker
       vrm.expressionManager.setValue('aa', mouth);
-      vrm.update(clock.getDelta());
+      idle(dt);
+      vrm.update(dt);
       controls.update();  // runs the glide
       renderer.render(scene, camera);
     });
