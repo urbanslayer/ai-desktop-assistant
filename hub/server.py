@@ -7,6 +7,7 @@ Two ways to run it, same code path:
 API contract: docs/DESIGN.md at the repo root; full reference in docs/API.md.
 """
 import hmac
+import json
 import os
 import re
 import sys
@@ -18,22 +19,36 @@ if str(_HERE) not in sys.path:  # `python server.py` inside hub/ must find its s
 
 import threading
 
-from fastapi import FastAPI, File, Request, UploadFile  # noqa: E402
+from fastapi import FastAPI, File, Form, Request, UploadFile  # noqa: E402
 from fastapi.concurrency import run_in_threadpool  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
 
 try:  # package import (repo root: `from hub.server import create_app`)
     from . import brain as _brain
-    from .store import Store, now_iso
+    from . import voice as _voice
+    from .store import Store, default_voice, now_iso
 except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     import brain as _brain  # type: ignore[no-redef]
-    from store import Store, now_iso  # type: ignore[no-redef]
+    import voice as _voice  # type: ignore[no-redef]
+    from store import Store, default_voice, now_iso  # type: ignore[no-redef]
 
 HUB_VERSION = "1"
 STATIC_DIR = _HERE / "static"
 DEFAULT_AVATAR = _HERE / "assets" / "default_avatar.vrm"
 MAX_AVATAR_BYTES = 200 * 1024 * 1024  # 200 MB
 GLTF_MAGIC = b"glTF"
+
+# Voice round (docs/VOICE.md)
+MAX_REFERENCE_BYTES = 20 * 1024 * 1024          # reference clip upload cap
+REFERENCE_MIN_SECONDS = 3.0                     # breeze wants a usable clip
+REFERENCE_MAX_SECONDS = 30.0
+MAX_TTS_TEXT = 1000                             # POST /api/tts text cap
+MAX_AUDIO_CACHE_BYTES = 500 * 1024 * 1024       # data/audio total cap, oldest evicted
+PREVIEW_LINE = "Hey senpai, this is how I sound right now. Not bad, right?"
+
+# Breeze-TTS-2 settings defaults; the env overlay happens in main()/create_app.
+# base_url "" means TTS is off (nothing to talk to); enabled is the user switch.
+TTS_DEFAULTS = {"enabled": True, "base_url": "", "timeout": 120, "parallel_note": ""}
 
 # Seed persona: the system prompt copied from character_config.yaml at build
 # time (the Docker image has no access to that file).
@@ -52,6 +67,11 @@ SEED_PERSONA = {
     "tts_voice": "",
 }
 
+# Seed persona's voice description (docs/VOICE.md): matches her character.
+# The voice object itself (incl. the random seed) is built at seed time.
+SEED_VOICE_DESCRIPTION = ("A playful, snarky young woman: quick, teasing and a "
+                          "little smug, with a bright clear voice.")
+
 _SLUG = re.compile(r"[^a-z0-9]+")
 
 
@@ -65,25 +85,34 @@ def normalize_switch_text(text: str) -> str:
 
 
 def create_app(data_dir, api_key: str | None = None,
-               llm_defaults: dict | None = None) -> FastAPI:
+               llm_defaults: dict | None = None,
+               tts_defaults: dict | None = None) -> FastAPI:
     """Build the hub app over `data_dir` (SQLite + avatars live there).
 
     api_key None/empty disables auth. llm_defaults fills any LLM settings
     field the user has not saved via PUT /api/settings (api_key included);
-    saved values always win."""
+    saved values always win. tts_defaults does the same for the `tts`
+    settings object (RIKO_TTS_BASE_URL / RIKO_TTS_ENABLED)."""
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     avatars_dir = data_dir / "avatars"
     avatars_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir = data_dir / "audio"    # cached WAVs (docs/VOICE.md)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    voices_dir = data_dir / "voices"  # stored per-persona reference clips
+    voices_dir.mkdir(parents=True, exist_ok=True)
 
     store = Store(data_dir / "hub.db")
     if not store.list_personas():  # first start on an empty data dir: seed Riko
-        store.add_persona(pid=SEED_PERSONA["id"], **{k: v for k, v in SEED_PERSONA.items() if k != "id"})
+        store.add_persona(pid=SEED_PERSONA["id"],
+                          voice=default_voice(SEED_VOICE_DESCRIPTION),
+                          **{k: v for k, v in SEED_PERSONA.items() if k != "id"})
         store.set_active(SEED_PERSONA["id"])
         store.set_version(1)
 
     brain = _brain.Brain()
     llm_defaults = dict(llm_defaults or {})
+    tts_defaults = dict(tts_defaults or {})
     app = FastAPI(title="riko-hub", version=HUB_VERSION, docs_url=None, redoc_url=None)
     chat_lock = threading.Lock()  # one chat at a time; concurrent requests queue
 
@@ -123,6 +152,33 @@ def create_app(data_dir, api_key: str | None = None,
     def switch_phrases() -> list[str]:
         return stored_switch_phrases() or list(_brain.DEFAULT_SWITCH_PHRASES)
 
+    # ── TTS (breeze) settings — same "blank = server default" semantics ──
+    _TTS_BLANK_MEANS_UNSET = ("base_url", "parallel_note")
+
+    def stored_tts() -> dict:
+        saved = dict(store.get_json("tts", {}))
+        for key in _TTS_BLANK_MEANS_UNSET:
+            if key in saved and not str(saved[key] or "").strip():
+                del saved[key]
+        return saved
+
+    def default_tts() -> dict:
+        merged = dict(TTS_DEFAULTS)
+        merged.update(tts_defaults)
+        merged["enabled"] = bool(merged.get("enabled"))
+        return merged
+
+    def tts_settings() -> dict:
+        merged = default_tts()
+        merged.update(stored_tts())
+        return merged
+
+    def tts_on() -> bool:
+        """TTS is on only with the user switch AND a base URL to talk to
+        (RIKO_TTS_BASE_URL empty = TTS off, docs/VOICE.md)."""
+        settings = tts_settings()
+        return bool(settings.get("enabled")) and bool(str(settings.get("base_url") or "").strip())
+
     def settings_response() -> dict:
         saved = stored_llm()
         defaults = default_llm()
@@ -130,12 +186,17 @@ def create_app(data_dir, api_key: str | None = None,
         defaults_public["api_key_set"] = bool(defaults.get("api_key"))
         source = {k: ("saved" if k in saved else "default") for k in _brain.LLM_DEFAULTS}
         source["switch_phrases"] = "saved" if stored_switch_phrases() else "default"
+        saved_tts = stored_tts()
+        tts_source = {k: ("saved" if k in saved_tts else "default") for k in TTS_DEFAULTS}
         return {
             "llm": public_llm(llm_settings()),
+            "tts": tts_settings(),
             "switch_phrases": switch_phrases(),
             "defaults": {"llm": defaults_public,
+                         "tts": default_tts(),
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES)},
             "llm_source": source,
+            "tts_source": tts_source,
         }
 
     def persona_lookup() -> dict[str, str]:
@@ -169,7 +230,7 @@ def create_app(data_dir, api_key: str | None = None,
         active = store.get_persona(store.active()) or {}
         return {
             "version": store.version(),
-            "active": active,
+            "active": public_persona(active),
             "personas": [{"id": p["id"], "name": p["name"]} for p in store.list_personas()],
             "last_message_id": store.last_message_id(),
             "llm_model": brain.cached_model(settings),
@@ -180,8 +241,118 @@ def create_app(data_dir, api_key: str | None = None,
         out["api_key_set"] = bool(settings.get("api_key"))
         return out
 
+    def public_persona(persona: dict | None) -> dict | None:
+        """Persona as the API shows it: voice.has_reference is read-only and
+        derived from the stored clip on disk."""
+        if not persona:
+            return persona
+        out = dict(persona)
+        out["voice"] = dict(persona.get("voice") or {})
+        out["voice"]["has_reference"] = reference_path(out["id"]).exists()
+        return out
+
+    def reference_path(persona_id: str) -> Path:
+        return voices_dir / f"{persona_id}.wav"
+
     def err(status: int, detail: str) -> JSONResponse:
         return JSONResponse({"detail": detail}, status_code=status)
+
+    # ── voice / audio plumbing (docs/VOICE.md) ─────────────────────────
+    def voice_id_for(persona: dict) -> str:
+        """breeze voice id for a clone persona; changes with voice_version so
+        any edit forces a fresh registration/synthesis."""
+        return f"riko-{persona['id']}-v{persona.get('voice_version', 1)}"
+
+    def synth(persona: dict, text: str) -> bytes:
+        """Blocking: one breeze utterance in this persona's voice. Returns
+        proper WAV bytes. Raises _voice.TtsError subclasses (caller maps to
+        HTTP); TtsNotFound on clone is recovered once by re-registering the
+        stored clip (breeze may have been reset)."""
+        breezy = _voice.Breeze(tts_settings())
+        voice = dict(persona.get("voice") or {})
+        mode = voice.get("mode", "design")
+        style = str(voice.get("style") or "")
+        seed = voice.get("seed")
+        cfg = voice.get("cfg_scale")
+        if mode == "clone":
+            vid = voice_id_for(persona)
+            try:
+                return breezy.speech(text, voice=vid, instructions=style,
+                                     seed=seed, cfg_scale=cfg)
+            except _voice.TtsNotFound:
+                clip = reference_path(persona["id"])
+                if not clip.exists():
+                    raise
+                breezy.register_voice(vid, clip.read_bytes(),
+                                      str(voice.get("ref_text") or ""))
+                return breezy.speech(text, voice=vid, instructions=style,
+                                     seed=seed, cfg_scale=cfg)
+        # design (and 'off', for previews): describe the voice, fix the seed
+        instructions = str(voice.get("description") or "")
+        if style:
+            instructions = (instructions + " " + style).strip()
+        return breezy.speech(text, instructions=instructions, seed=seed, cfg_scale=cfg)
+
+    def tts_gate(persona: dict | None) -> JSONResponse | None:
+        """503/409 gate shared by every audio-producing route, or None to go on."""
+        if not str(str_or_empty(tts_settings().get("base_url"))).strip():
+            return err(503, "TTS not configured")
+        if not tts_settings().get("enabled"):
+            return err(503, "TTS disabled in settings")
+        if persona is not None and (persona.get("voice") or {}).get("mode") == "off":
+            return err(409, "this persona's voice is off")
+        return None
+
+    def str_or_empty(value) -> str:
+        return "" if value is None else str(value)
+
+    def tts_error_response(e: Exception) -> JSONResponse:
+        if isinstance(e, _voice.TtsUnreachable):
+            return err(503, str(e))
+        if isinstance(e, _voice.TtsBusy):
+            return err(503, str(e))
+        return err(502, f"{type(e).__name__}: {e}")
+
+    def wav_response(wav: bytes) -> Response:
+        return Response(wav, media_type="audio/wav")
+
+    def audio_cache_path(name: str) -> Path:
+        return audio_dir / name
+
+    def write_audio_cache(path: Path, wav: bytes) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(wav)
+        tmp.replace(path)
+        evict_audio_cache()
+
+    def evict_audio_cache() -> None:
+        """Keep data/audio under MAX_AUDIO_CACHE_BYTES, oldest files first."""
+        try:
+            files = sorted(audio_dir.glob("*.wav"), key=lambda f: f.stat().st_mtime)
+        except OSError:
+            return
+        total = sum(f.stat().st_size for f in files)
+        for f in files:
+            if total <= MAX_AUDIO_CACHE_BYTES:
+                break
+            try:
+                size = f.stat().st_size
+                f.unlink()
+                total -= size
+            except OSError:
+                pass
+
+    def delete_message_audio(message_ids: list[int]) -> None:
+        for mid in message_ids:
+            for f in audio_dir.glob(f"{mid}-v*.wav"):
+                f.unlink(missing_ok=True)
+
+    def delete_persona_audio(persona_id: str) -> None:
+        for f in audio_dir.glob(f"greeting-{persona_id}-v*.wav"):
+            f.unlink(missing_ok=True)
+
+    def default_speech_text(persona: dict) -> str:
+        return str(persona.get("greeting") or "").strip() or PREVIEW_LINE
 
     # ── auth ────────────────────────────────────────────────────────────
     @app.middleware("http")
@@ -205,7 +376,7 @@ def create_app(data_dir, api_key: str | None = None,
 
     @app.get("/api/personas")
     def get_personas():
-        return store.list_personas()
+        return [public_persona(p) for p in store.list_personas()]
 
     @app.post("/api/personas", status_code=201)
     async def post_persona(request: Request):
@@ -233,7 +404,7 @@ def create_app(data_dir, api_key: str | None = None,
             str(body.get("tts_voice") or ""),
         )
         store.bump_version()
-        return JSONResponse(persona, status_code=201)
+        return JSONResponse(public_persona(persona), status_code=201)
 
     def persona_or_404(persona_id: str):
         return store.get_persona(persona_id)
@@ -241,7 +412,7 @@ def create_app(data_dir, api_key: str | None = None,
     @app.get("/api/personas/{persona_id}")
     def get_persona(persona_id: str):
         persona = persona_or_404(persona_id)
-        return persona or err(404, f"no persona '{persona_id}'")
+        return public_persona(persona) or err(404, f"no persona '{persona_id}'")
 
     @app.put("/api/personas/{persona_id}")
     async def put_persona(persona_id: str, request: Request):
@@ -268,7 +439,7 @@ def create_app(data_dir, api_key: str | None = None,
             fields["keywords"] = [str(k).strip().lower() for k in body["keywords"] if str(k).strip()]
         persona = store.update_persona(persona_id, fields) if fields else store.get_persona(persona_id)
         store.bump_version()
-        return persona
+        return public_persona(persona)
 
     @app.delete("/api/personas/{persona_id}", status_code=204)
     def delete_persona(persona_id: str):
@@ -278,8 +449,12 @@ def create_app(data_dir, api_key: str | None = None,
         if not remaining:
             return err(409, "cannot delete the last persona")
         was_active = store.active() == persona_id
+        message_ids = store.message_ids(persona_id)
         store.delete_persona(persona_id)
         (avatars_dir / f"{persona_id}.vrm").unlink(missing_ok=True)
+        reference_path(persona_id).unlink(missing_ok=True)
+        delete_message_audio(message_ids)
+        delete_persona_audio(persona_id)
         if was_active:
             store.set_active(remaining[0])
         store.bump_version()
@@ -319,7 +494,7 @@ def create_app(data_dir, api_key: str | None = None,
         tmp.replace(path)
         persona = store.bump_avatar(persona_id)
         store.bump_version()
-        return persona
+        return public_persona(persona)
 
     @app.post("/api/active")
     async def post_active(request: Request):
@@ -361,6 +536,7 @@ def create_app(data_dir, api_key: str | None = None,
         pid = history_persona(request)
         if not pid:
             return err(404, "no such persona")
+        delete_message_audio(store.message_ids(pid))  # cached audio goes too
         store.clear_messages(pid)
         store.bump_version()
         return Response(status_code=204)
@@ -402,6 +578,7 @@ def create_app(data_dir, api_key: str | None = None,
             return err(422, "text is required")
         source = str(body.get("source") or "")
         override = str(body.get("persona") or "")
+        speak = body.get("speak", True) is not False  # default true (docs/VOICE.md)
         norm = normalize_switch_text(text)
 
         def turn():  # blocking section: store + LLM, one chat at a time
@@ -412,8 +589,13 @@ def create_app(data_dir, api_key: str | None = None,
                         store.bump_version()
                     persona = store.get_persona(target) or {}
                     reply = persona.get("greeting") or f"{persona.get('name', target)} here."
+                    audio_url = None
+                    if speak and tts_on() and (persona.get("voice") or {}).get("mode") != "off":
+                        audio_url = (f"/api/personas/{target}/greeting/audio"
+                                     f"?v={persona.get('voice_version', 1)}")
                     return ("ok", {"reply": reply, "persona": target, "switched": True,
-                                   "message_ids": [], "state_version": store.version()})
+                                   "message_ids": [], "state_version": store.version(),
+                                   "audio_url": audio_url})
 
                 pid = override or store.active()
                 persona = store.get_persona(pid)
@@ -436,9 +618,15 @@ def create_app(data_dir, api_key: str | None = None,
                 user_id = store.add_message(pid, "user", text, source)
                 assistant_id = store.add_message(pid, "assistant", answer, source)
                 store.bump_version()
+                # The chat never waits for audio: audio_url points at the audio
+                # route, which synthesises lazily (and caches on disk).
+                audio_url = None
+                if speak and tts_on() and (persona.get("voice") or {}).get("mode") != "off":
+                    audio_url = f"/api/messages/{assistant_id}/audio"
                 return ("ok", {"reply": answer, "persona": pid, "switched": False,
                                "message_ids": [user_id, assistant_id],
-                               "state_version": store.version()})
+                               "state_version": store.version(),
+                               "audio_url": audio_url})
 
         kind, *rest = await run_in_threadpool(turn)
         return rest[0] if kind == "ok" else err(rest[0], rest[1])
@@ -503,6 +691,33 @@ def create_app(data_dir, api_key: str | None = None,
                 store.set_json("switch_phrases", cleaned)
             else:
                 store.del_json("switch_phrases")
+        if "tts" in body:
+            tts = body["tts"]
+            if not isinstance(tts, dict):
+                return err(422, "tts must be an object")
+            saved_tts = stored_tts()
+            # blank base_url / parallel_note = "unset the override, back to
+            # the RIKO_TTS_* default" — same rule as the llm block.
+            for key in ("base_url", "parallel_note"):
+                if key in tts:
+                    value = str(tts[key] or "").strip()
+                    if value:
+                        saved_tts[key] = value
+                    else:
+                        saved_tts.pop(key, None)
+            if "enabled" in tts:
+                if not isinstance(tts["enabled"], bool):
+                    return err(422, "tts.enabled must be a boolean")
+                saved_tts["enabled"] = tts["enabled"]
+            if "timeout" in tts:
+                try:
+                    num = float(tts["timeout"])
+                except (TypeError, ValueError):
+                    return err(422, "tts.timeout must be a number")
+                if num < 1:
+                    return err(422, "tts.timeout must be >= 1")
+                saved_tts["timeout"] = int(num)
+            store.set_json("tts", saved_tts)
         store.bump_version()
         return settings_response()
 
@@ -520,23 +735,303 @@ def create_app(data_dir, api_key: str | None = None,
         if body.get("llm"):
             changed |= store.del_json("llm")
             brain.invalidate()
+        if body.get("tts"):
+            changed |= store.del_json("tts")
         if body.get("switch_phrases"):
             changed |= store.del_json("switch_phrases")
-        if not body.get("llm") and not body.get("switch_phrases"):
-            return err(422, 'set "llm" and/or "switch_phrases" to true')
+        if not body.get("llm") and not body.get("tts") and not body.get("switch_phrases"):
+            return err(422, 'set "llm", "tts" and/or "switch_phrases" to true')
         if changed:
             store.bump_version()
         return settings_response()
 
     @app.post("/api/settings/test")
     def post_settings_test():
-        """Validate the merged settings cheaply against the LLM server:
-        GET /v1/models with the resolved key. {ok, model} or {ok:false, error}."""
+        """Validate the merged settings cheaply: one GET /v1/models against the
+        LLM server + one GET /health against breeze-tts. Never reveals keys."""
+        out: dict = {}
         settings = llm_settings()
         try:
-            return {"ok": True, "model": brain.test(settings)}
+            out.update({"ok": True, "model": brain.test(settings)})
         except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            out.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        tts = tts_settings()
+        if not str(tts.get("base_url") or "").strip():
+            out["tts"] = {"ok": False, "error": "TTS not configured"}
+        elif not tts.get("enabled"):
+            out["tts"] = {"ok": False, "error": "TTS disabled in settings"}
+        else:
+            try:
+                _voice.Breeze(tts).health()
+                out["tts"] = {"ok": True}
+            except Exception as e:
+                out["tts"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return out
+
+    # ── voice: audio routes (docs/VOICE.md) ────────────────────────────
+    def serve_cached_audio(name: str, persona: dict, text: str):
+        """Shared body of the two cached audio routes: cached WAV if we have
+        it, else one blocking breeze synthesis (made once, then cached)."""
+        blocked = tts_gate(persona)
+        if blocked is not None:
+            return blocked
+        path = audio_cache_path(name)
+        if not path.exists():
+            try:
+                wav = synth(persona, text)
+            except Exception as e:
+                return tts_error_response(e)
+            write_audio_cache(path, wav)
+        return FileResponse(path, media_type="audio/wav")
+
+    @app.get("/api/messages/{message_id}/audio")
+    def get_message_audio(message_id: int):
+        message = store.get_message(message_id)
+        if not message or message["role"] != "assistant":
+            return err(404, "no assistant message with that id")
+        persona = store.get_persona(message["persona"])
+        if not persona:
+            return err(404, "persona of that message no longer exists")
+        return serve_cached_audio(f"{message_id}-v{persona['voice_version']}.wav",
+                                  persona, message["content"])
+
+    @app.get("/api/personas/{persona_id}/greeting/audio")
+    def get_greeting_audio(persona_id: str, request: Request):
+        persona = persona_or_404(persona_id)
+        if not persona:
+            return err(404, f"no persona '{persona_id}'")
+        # ?v= is informational (clients cache by it); the on-disk key is server-side
+        return serve_cached_audio(
+            f"greeting-{persona_id}-v{persona['voice_version']}.wav",
+            persona, default_speech_text(persona))
+
+    @app.post("/api/tts")
+    async def post_tts(request: Request):
+        """One-shot WAV for previews and client lines; never cached."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return err(422, "text is required")
+        if len(text) > MAX_TTS_TEXT:
+            return err(422, f"text is over {MAX_TTS_TEXT} characters")
+        pid = str(body.get("persona") or "") or store.active()
+        persona = store.get_persona(pid)
+        if not persona:
+            return err(404, f"no persona '{pid}'")
+        blocked = tts_gate(persona)
+        if blocked is not None:
+            return blocked
+        try:
+            wav = await run_in_threadpool(synth, persona, text)
+        except Exception as e:
+            return tts_error_response(e)
+        return wav_response(wav)
+
+    @app.get("/api/tts/status")
+    def get_tts_status():
+        settings = tts_settings()
+        enabled = tts_on()
+        reachable, voices = False, 0
+        if enabled:
+            breezy = _voice.Breeze(settings)
+            try:
+                breezy.health()
+                reachable = True
+                voices = len(breezy.voices())
+            except Exception:
+                pass
+        return {"enabled": enabled, "reachable": reachable,
+                "base_url": str(settings.get("base_url") or ""), "voices": voices}
+
+    # ── voice: persona voice editing ───────────────────────────────────
+    @app.put("/api/personas/{persona_id}/voice")
+    async def put_persona_voice(persona_id: str, request: Request):
+        persona = persona_or_404(persona_id)
+        if not persona:
+            return err(404, f"no persona '{persona_id}'")
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        for key in body:
+            if key not in ("mode", "description", "style", "ref_text", "seed", "cfg_scale"):
+                return err(422, f"unknown voice field '{key}'")
+        voice = dict(persona.get("voice") or {})
+        if "mode" in body:
+            mode = str(body["mode"] or "")
+            if mode not in ("design", "clone", "off"):
+                return err(422, "voice.mode must be design, clone or off")
+            if mode == "clone" and not reference_path(persona_id).exists():
+                return err(422, "no reference clip on this persona — upload one first")
+            voice["mode"] = mode
+        for key in ("description", "style", "ref_text"):
+            if key in body:
+                voice[key] = str(body[key] or "")
+        if "seed" in body:
+            try:
+                seed = int(body["seed"])
+            except (TypeError, ValueError):
+                return err(422, "voice.seed must be an integer")
+            if seed < 0 or isinstance(body["seed"], bool):
+                return err(422, "voice.seed must be a non-negative integer")
+            voice["seed"] = seed
+        if "cfg_scale" in body:
+            if body["cfg_scale"] is None:
+                voice["cfg_scale"] = None
+            else:
+                try:
+                    cfg = float(body["cfg_scale"])
+                except (TypeError, ValueError):
+                    return err(422, "voice.cfg_scale must be a number or null")
+                if not (0 < cfg <= 10):
+                    return err(422, "voice.cfg_scale must be in (0, 10] or null")
+                voice["cfg_scale"] = cfg
+        voice.pop("has_reference", None)  # read-only, derived from disk
+        changed = voice != {k: v for k, v in (persona.get("voice") or {}).items()
+                            if k != "has_reference"}
+        if changed:
+            persona = store.set_voice(persona_id, voice)
+            store.bump_version()
+        return public_persona(persona)
+
+    @app.put("/api/personas/{persona_id}/voice/reference")
+    async def put_voice_reference(persona_id: str, file: UploadFile = File(...),
+                                  ref_text: str = Form("")):
+        persona = persona_or_404(persona_id)
+        if not persona:
+            return err(404, f"no persona '{persona_id}'")
+        ref_text = str(ref_text or "").strip()
+        if not ref_text:
+            return err(400, "ref_text (the exact transcript of the clip) is required")
+        raw = await file.read(MAX_REFERENCE_BYTES + 1)
+        if len(raw) > MAX_REFERENCE_BYTES:
+            return err(400, f"reference clip is over {MAX_REFERENCE_BYTES} bytes")
+        try:
+            data, sample_rate = _voice.decode_upload(raw)
+        except ValueError as e:
+            return err(400, str(e))
+        seconds = len(data) / sample_rate
+        if not (REFERENCE_MIN_SECONDS <= seconds <= REFERENCE_MAX_SECONDS):
+            return err(400, f"reference clip must be {REFERENCE_MIN_SECONDS:.0f}"
+                            f"-{REFERENCE_MAX_SECONDS:.0f} seconds, got {seconds:.1f}s")
+        wav = _voice.encode_wav(data, sample_rate)  # re-encoded mono WAV
+        # breeze must accept the clip BEFORE anything changes (a failed
+        # upload leaves the persona exactly as it was).
+        breezy = _voice.Breeze(tts_settings())
+        if not str(tts_settings().get("base_url") or "").strip():
+            return err(503, "TTS not configured — cannot register a reference clip")
+        if not tts_settings().get("enabled"):
+            return err(503, "TTS disabled in settings — cannot register a reference clip")
+        new_version = int(persona.get("voice_version", 1)) + 1
+        try:
+            breezy.register_voice(f"riko-{persona_id}-v{new_version}", wav, ref_text)
+        except Exception as e:
+            return tts_error_response(e)
+        path = reference_path(persona_id)
+        tmp = path.with_suffix(".wav.tmp")
+        tmp.write_bytes(wav)
+        tmp.replace(path)
+        voice = dict(persona.get("voice") or {})
+        voice["mode"] = "clone"
+        voice["ref_text"] = ref_text
+        persona = store.set_voice(persona_id, voice)
+        store.bump_version()
+        return public_persona(persona)
+
+    @app.get("/api/personas/{persona_id}/voice/reference")
+    def get_voice_reference(persona_id: str):
+        persona = persona_or_404(persona_id)
+        if not persona:
+            return err(404, f"no persona '{persona_id}'")
+        path = reference_path(persona_id)
+        if not path.exists():
+            return err(404, "no reference clip on this persona")
+        return FileResponse(path, media_type="audio/wav")
+
+    @app.delete("/api/personas/{persona_id}/voice/reference")
+    def delete_voice_reference(persona_id: str):
+        persona = persona_or_404(persona_id)
+        if not persona:
+            return err(404, f"no persona '{persona_id}'")
+        if not reference_path(persona_id).exists():
+            return err(404, "no reference clip on this persona")
+        reference_path(persona_id).unlink(missing_ok=True)
+        voice = dict(persona.get("voice") or {})
+        voice["mode"] = "design"  # back to a designed voice (docs/VOICE.md)
+        persona = store.set_voice(persona_id, voice)
+        store.bump_version()
+        return public_persona(persona)
+
+    @app.post("/api/personas/{persona_id}/voice/preview")
+    async def post_voice_preview(persona_id: str, request: Request):
+        """One uncached WAV in this persona's voice — the page's Preview.
+        Works even with mode off, so you can audition before enabling."""
+        persona = persona_or_404(persona_id)
+        if not persona:
+            return err(404, f"no persona '{persona_id}'")
+        try:
+            body = await request.body()
+            body = json.loads(body) if body.strip() else {}
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        text = str(body.get("text") or "").strip() or default_speech_text(persona)
+        blocked = tts_gate(None)
+        if blocked is not None:
+            return blocked
+        try:
+            wav = await run_in_threadpool(synth, persona, text)
+        except Exception as e:
+            return tts_error_response(e)
+        return wav_response(wav)
+
+    @app.post("/api/personas/{persona_id}/voice/lock")
+    async def post_voice_lock(persona_id: str, request: Request):
+        """Freeze a designed voice: say `text` in it, store that clip as the
+        reference, register it, switch the persona to clone mode."""
+        persona = persona_or_404(persona_id)
+        if not persona:
+            return err(404, f"no persona '{persona_id}'")
+        try:
+            body = await request.body()
+            body = json.loads(body) if body.strip() else {}
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        mode = (persona.get("voice") or {}).get("mode")
+        if mode != "design":
+            return err(409, f"only a designed voice can be locked (mode is '{mode}')")
+        text = str(body.get("text") or "").strip() or default_speech_text(persona)
+        blocked = tts_gate(None)
+        if blocked is not None:
+            return blocked
+        try:
+            breezy = _voice.Breeze(tts_settings())
+            wav = await run_in_threadpool(synth, persona, text)
+            new_version = int(persona.get("voice_version", 1)) + 1
+            await run_in_threadpool(
+                breezy.register_voice, f"riko-{persona_id}-v{new_version}", wav, text)
+        except Exception as e:
+            return tts_error_response(e)  # nothing changed
+        path = reference_path(persona_id)
+        tmp = path.with_suffix(".wav.tmp")
+        tmp.write_bytes(wav)
+        tmp.replace(path)
+        voice = dict(persona.get("voice") or {})
+        voice["mode"] = "clone"
+        voice["ref_text"] = text
+        persona = store.set_voice(persona_id, voice)
+        store.bump_version()
+        return public_persona(persona)
 
     @app.get("/")
     def index():
@@ -558,11 +1053,17 @@ def main():
         "api_key": os.getenv("RIKO_LLM_API_KEY", ""),
         "model": os.getenv("RIKO_LLM_MODEL", "auto"),
     }
+    tts_defaults = {
+        "base_url": os.getenv("RIKO_TTS_BASE_URL", ""),  # empty = TTS off
+        "enabled": os.getenv("RIKO_TTS_ENABLED", "1").strip().lower()
+                   in ("1", "true", "yes", "on"),
+    }
     app = create_app(data_dir, api_key=os.getenv("RIKO_HUB_KEY") or None,
-                     llm_defaults=llm_defaults)
+                     llm_defaults=llm_defaults, tts_defaults=tts_defaults)
     host = os.getenv("RIKO_HUB_HOST", "0.0.0.0")
     port = int(os.getenv("RIKO_HUB_PORT", "8002"))
-    print(f"[hub] data={data_dir} llm={llm_defaults['base_url'] or '(not configured)'}")
+    print(f"[hub] data={data_dir} llm={llm_defaults['base_url'] or '(not configured)'} "
+          f"tts={tts_defaults['base_url'] or '(off)'}")
     uvicorn.run(app, host=host, port=port)
 
 

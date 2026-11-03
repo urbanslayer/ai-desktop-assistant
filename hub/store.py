@@ -6,12 +6,31 @@ WAL mode keeps readers from blocking the writer. Schema migrations use the
 ``user_version`` pragma (SCHEMA_VERSION below is the target).
 """
 import json
+import random
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Voice migration for personas written before the voice round (docs/VOICE.md):
+# a bland design-mode voice with a random seed, so they keep talking after the
+# upgrade until the user personalises them.
+GENERIC_VOICE_DESCRIPTION = "A young woman with a clear, friendly voice."
+
+
+def default_voice(description: str = GENERIC_VOICE_DESCRIPTION) -> dict:
+    """Fresh per-persona voice: design mode, fixed random seed for stability."""
+    return {
+        "mode": "design",
+        "description": description,
+        "style": "",
+        "ref_text": "",
+        "has_reference": False,
+        "seed": random.randint(1, 2_147_483_646),
+        "cfg_scale": None,
+    }
 
 _SCHEMA_V1 = """
 CREATE TABLE personas(
@@ -67,7 +86,18 @@ class Store:
             self.db.executescript(_SCHEMA_V1)
             self.db.execute("PRAGMA user_version=1")
             self.db.commit()
-        if version < SCHEMA_VERSION:  # future migrations land here
+        if version < 2:  # voice round: per-persona voice + voice_version
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(personas)")}
+            if "voice" not in cols:
+                self.db.execute("ALTER TABLE personas ADD COLUMN voice TEXT NOT NULL DEFAULT ''")
+            if "voice_version" not in cols:
+                self.db.execute("ALTER TABLE personas ADD COLUMN voice_version INTEGER NOT NULL DEFAULT 1")
+            # personas written before the voice round get a generic design voice
+            rows = self.db.execute("SELECT id, voice FROM personas").fetchall()
+            for row in rows:
+                if not row["voice"]:
+                    self.db.execute("UPDATE personas SET voice=? WHERE id=?",
+                                    (json.dumps(default_voice()), row["id"]))
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.db.commit()
 
@@ -112,6 +142,10 @@ class Store:
     # ── personas ────────────────────────────────────────────────────────
     @staticmethod
     def _persona_dict(row) -> dict:
+        try:
+            voice = json.loads(row["voice"]) if row["voice"] else default_voice()
+        except (ValueError, TypeError):
+            voice = default_voice()
         return {
             "id": row["id"],
             "name": row["name"],
@@ -119,6 +153,8 @@ class Store:
             "system_prompt": row["system_prompt"],
             "greeting": row["greeting"],
             "tts_voice": row["tts_voice"],
+            "voice": voice,
+            "voice_version": row["voice_version"],
             "avatar_version": row["avatar_version"],
             "has_avatar": bool(row["has_avatar"]),
             "updated_at": row["updated_at"],
@@ -139,13 +175,17 @@ class Store:
             return self.db.execute("SELECT 1 FROM personas WHERE id=?", (persona_id,)).fetchone() is not None
 
     def add_persona(self, pid: str, name: str, keywords: list[str], system_prompt: str,
-                    greeting: str, tts_voice: str) -> dict:
+                    greeting: str, tts_voice: str, voice: dict | None = None) -> dict:
         ts = now_iso()
+        if voice is None:
+            voice = default_voice()
         with self._lock:
             self.db.execute(
                 "INSERT INTO personas(id,name,keywords,system_prompt,greeting,tts_voice,"
-                "avatar_version,has_avatar,created_at,updated_at) VALUES(?,?,?,?,?,?,0,0,?,?)",
-                (pid, name, json.dumps(keywords), system_prompt, greeting, tts_voice, ts, ts))
+                "avatar_version,has_avatar,created_at,updated_at,voice,voice_version) "
+                "VALUES(?,?,?,?,?,?,0,0,?,?,?,1)",
+                (pid, name, json.dumps(keywords), system_prompt, greeting, tts_voice,
+                 ts, ts, json.dumps(voice)))
             self.db.commit()
         persona = self.get_persona(pid)
         assert persona is not None
@@ -181,6 +221,20 @@ class Store:
             self.db.commit()
         return self.get_persona(pid)
 
+    def set_voice(self, pid: str, voice: dict, bump_version: bool = True) -> dict | None:
+        """Store the persona's voice object; voice_version +1 on a real change
+        (audio caches key on it, so every edit must bump)."""
+        with self._lock:
+            if bump_version:
+                self.db.execute("UPDATE personas SET voice=?, voice_version=voice_version+1, "
+                                "updated_at=? WHERE id=?",
+                                (json.dumps(voice), now_iso(), pid))
+            else:
+                self.db.execute("UPDATE personas SET voice=?, updated_at=? WHERE id=?",
+                                (json.dumps(voice), now_iso(), pid))
+            self.db.commit()
+        return self.get_persona(pid)
+
     # ── messages ────────────────────────────────────────────────────────
     def add_message(self, persona: str, role: str, content: str, source: str) -> int:
         with self._lock:
@@ -190,6 +244,11 @@ class Store:
             self.db.commit()
             assert cur.lastrowid is not None
             return cur.lastrowid
+
+    def get_message(self, message_id: int) -> dict | None:
+        with self._lock:
+            row = self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+        return self._message_dict(row) if row else None
 
     def recent_messages(self, persona: str, limit: int) -> list[dict]:
         """The LAST `limit` messages of a persona, oldest -> newest."""
@@ -220,6 +279,13 @@ class Store:
             cur = self.db.execute("DELETE FROM messages WHERE persona=?", (persona,))
             self.db.commit()
             return cur.rowcount
+
+    def message_ids(self, persona: str) -> list[int]:
+        """Every stored message id of a persona (so its cached audio can be
+        removed before the rows go away)."""
+        with self._lock:
+            rows = self.db.execute("SELECT id FROM messages WHERE persona=?", (persona,)).fetchall()
+        return [r["id"] for r in rows]
 
     def last_message_id(self) -> int:
         with self._lock:

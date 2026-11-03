@@ -203,7 +203,8 @@ def test_chat_stores_both_messages(client, fake_llm):
     assert r.status_code == 200
     res = r.json()
     assert res == {"reply": REPLY, "persona": "riko", "switched": False,
-                   "message_ids": [1, 2], "state_version": st0["version"] + 1}
+                   "message_ids": [1, 2], "state_version": st0["version"] + 1,
+                   "audio_url": None}  # no TTS configured on this hub
 
     req = fake_llm.chat_requests[-1]
     assert req["messages"][0]["role"] == "system"

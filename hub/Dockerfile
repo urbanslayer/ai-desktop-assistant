@@ -19,7 +19,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev && rm -rf /root/.cache/uv
 
-COPY __init__.py server.py store.py brain.py ./
+COPY __init__.py server.py store.py brain.py voice.py ./
 COPY static/ ./static/
 COPY assets/ ./assets/
 

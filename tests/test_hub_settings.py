@@ -164,13 +164,18 @@ def test_reset_route_validation_and_noop(env_defaults):
 def test_settings_test_route(env_defaults, fake_llm):
     r = env_defaults.post("/api/settings/test")
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "model": "test-model"}
+    out = r.json()
+    assert out["ok"] is True and out["model"] == "test-model"
+    # the voice round adds a tts report (no breeze on this hub -> not ok)
+    assert out["tts"] == {"ok": False, "error": "TTS not configured"}
 
 
 def test_settings_test_route_reports_errors(tmp_path):
-    client = make_client(tmp_path)  # no LLM at all
-    assert client.post("/api/settings/test").json() == {"ok": False,
-                                                        "error": "RuntimeError: LLM not configured"}
+    client = make_client(tmp_path)  # no LLM, no TTS at all
+    out = client.post("/api/settings/test").json()
+    assert out["ok"] is False
+    assert out["error"] == "RuntimeError: LLM not configured"
+    assert out["tts"] == {"ok": False, "error": "TTS not configured"}
     client.put("/api/settings", json={"llm": {"base_url": "http://127.0.0.1:1/v1"}})
     out = client.post("/api/settings/test").json()
     assert out["ok"] is False and "error" in out and out["error"] != "LLM not configured"
