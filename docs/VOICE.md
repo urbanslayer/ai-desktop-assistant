@@ -89,7 +89,7 @@ plus `defaults.tts` and `llm_source`-style `tts_source`. Env defaults: `RIKO_TTS
 | `PUT /api/personas/{id}/voice/reference` | multipart `file` (wav/flac/ogg/mp3, ≤ 20 MB, 3–30 s after decoding) + form `ref_text` (required, non-empty) | Persona; stores `data/voices/<id>.wav` (re-encoded mono WAV), registers it on breeze, sets `mode: clone`, voice_version +1. `400` bad audio/length, `502/503` breeze problems (then nothing is changed). |
 | `GET /api/personas/{id}/voice/reference` | – | the stored clip (`audio/wav`) or `404` |
 | `DELETE /api/personas/{id}/voice/reference` | – | Persona; deletes clip, mode back to `design`, voice_version +1 |
-| `POST /api/personas/{id}/voice/preview` | `{"text"?: str}` (default: the greeting or a stock line) | `audio/wav` (not cached) — the web page's "Preview" |
+| `POST /api/personas/{id}/voice/preview` | `{"text"?: str, "voice"?: {unsaved voice fields}}` (default: the greeting or a stock line; overrides are used once, nothing stored) | `audio/wav` (not cached) — the web page's "Preview" |
 | `POST /api/personas/{id}/voice/lock` | `{"text"?: str}` | Persona. Design → clone: generate the text in the current design voice (with its seed), store it as the reference with that text as `ref_text`, register it, `mode: clone`. Freezes a designed voice you like. |
 | `GET /api/tts/status` | – | `{"enabled", "reachable", "base_url", "voices": n}` |
 
