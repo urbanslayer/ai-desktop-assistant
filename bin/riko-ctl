@@ -26,9 +26,18 @@ COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide",
 
 
 def focus_window():
-    """Wayland apps can't grab focus themselves, so ask the compositor (Hyprland) to do it."""
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):
-        subprocess.run(["hyprctl", "dispatch", "focuswindow", f"class:^({APP_ID})$"], capture_output=True, timeout=3)
+    """Wayland apps can't grab focus themselves, so ask the compositor (Hyprland) to do it.
+
+    Hyprland 0.55+ (Lua config) reads `hyprctl dispatch X Y` as Lua, where the classic
+    two-argument form is a syntax error; there the whole command goes in as one
+    exec_raw string. Try classic first, fall back to the Lua form.
+    """
+    if not (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl")):
+        return
+    target = f"focuswindow class:^({APP_ID})$"
+    for args in (["dispatch", "focuswindow", target], ["dispatch", f'hl.dsp.exec_raw("{target}")']):
+        if subprocess.run(["hyprctl", *args], capture_output=True, timeout=3).returncode == 0:
+            return
 
 
 def main():
