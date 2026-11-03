@@ -77,6 +77,47 @@ persona; the hub synthesises replies lazily and caches them per
 re-synthesise on every read. Breeze speaks English and Chinese only, and
 its weights are non-commercial.
 
+## MCP servers (the hub as an MCP client)
+
+Settings > **MCP** on the web page (or `PUT /api/settings` with an `mcp`
+block) attaches external MCP servers; their tools reach the model as
+`mcp_<server>__<tool>`, with the same permissions, tool log and events as the
+built-ins — see [`docs/API.md`](../docs/API.md) *MCP servers* for the full
+contract, `GET /api/mcp/status` and `POST /api/mcp/{name}/restart` for health
+and manual reconnect.
+
+Reference-server examples that work out of the box in the Docker image
+(`uvx` and `npx` are installed there; their caches are writable under
+`/data/cache/`):
+
+```jsonc
+// time — official reference server via uv
+{"name": "time", "transport": "stdio", "enabled": true,
+ "command": "uvx", "args": ["mcp-server-time"]}
+
+// fetch — official reference server via uv
+{"name": "fetch", "transport": "stdio", "enabled": true,
+ "command": "uvx", "args": ["mcp-server-fetch"]}
+
+// filesystem — official reference server via npx; the folder must be
+// mounted into the hub container (compose: `- /srv/data:/srv/data:ro`)
+{"name": "files", "transport": "stdio", "enabled": true,
+ "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem",
+                            "/srv/data"]}
+```
+
+stdio servers are **children of the hub container** — they see its filesystem
+and network, not yours. Anything on your machine needs a bind mount in
+`compose.yaml` (volumes), and anything on another box is better served over
+`transport: "http"`. First `uvx`/`npx` launch downloads the package (the
+status row stays `starting` meanwhile, then goes `ready`).
+
+Local (non-docker) mode: the hub imports the MCP SDK **lazily**, so it still
+boots where `mcp` isn't installed — every server just reports
+`unavailable: mcp package not installed`. For MCP to actually work from the
+root project (`desktop.py` local mode), install it into the same environment
+the root `pyproject.toml` resolves (add `mcp` there too; hub/ pins it).
+
 ## The data folder (`./data`)
 
 ```
@@ -85,6 +126,7 @@ data/
   avatars/<id>.vrm  uploaded avatars (the built-in default is inside the image)
   voices/<id>.wav   per-persona reference clips (the only voice source that persists)
   audio/            cached reply/greeting WAVs (<msg>-v<voicever>.wav, capped at 500 MB)
+  cache/            uv/npm/xdg caches for MCP stdio servers (uvx / npx downloads)
 ```
 
 Back up (or move) the whole folder — that is all she is. `docker compose down`
@@ -108,7 +150,10 @@ drops saved overrides wholesale, and `POST /api/settings/test` answers
 comes from and keeps Save disabled until its first load succeeded. The `tts`
 block follows the same rules: blank `base_url` restores the `RIKO_TTS_BASE_URL`
 default, `enabled` is a plain boolean, and `POST /api/settings/reset` accepts
-`{"tts": true}` too.
+`{"tts": true}` too. The `mcp` block's `servers` list is replaced wholesale;
+per-server `env`/`headers` **values** are write-only (GET shows key names and
+set-flags only; a blank PUT keeps a stored value), and
+`POST /api/settings/reset` accepts `{"mcp": true}`.
 
 ## Security
 

@@ -383,6 +383,9 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
   "tools": {"enabled": true, "max_steps": 8, "max_seconds": 120,
             "max_result_chars": 12000, "searxng_url": "http://192.0.2.101:8989",
             "allow_private_fetch": false, "permissions": {"desktop__do_thing": "never"}},
+  "mcp": {"servers": [{"name": "time", "transport": "stdio", "enabled": true,
+                       "command": "uvx", "args": ["mcp-server-time"], "env": {},
+                       "tool_permissions": {}, "timeout": 60}]},
   "switch_phrases": ["switch to", "change to", "become", "persona",
                      "talk to", "i want to talk to"],
   "defaults": {"llm": {"base_url": "http://192.0.2.51:8000/v1", "model": "auto",
@@ -393,11 +396,13 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                "tools": {"enabled": true, "max_steps": 8, "max_seconds": 120,
                          "max_result_chars": 12000, "searxng_url": "",
                          "allow_private_fetch": false, "permissions": {}},
+               "mcp": {"servers": []},
                "switch_phrases": ["switch to", "..."]},
   "llm_source": {"base_url": "saved", "model": "default", "api_key": "default",
                  "temperature": "default", "...": "...", "switch_phrases": "default"},
   "tts_source": {"base_url": "default", "enabled": "default", "...": "..."},
-  "tools_source": {"enabled": "default", "searxng_url": "saved", "...": "..."}
+  "tools_source": {"enabled": "default", "searxng_url": "saved", "...": "..."},
+  "mcp_source": {"servers": "saved"}
 }
 ```
 
@@ -440,12 +445,20 @@ Semantics (made so a careless form save cannot break the hub):
   replaced wholesale** when sent: `{tool_name: "always" | "ask" | "never"}`,
   and a `null` value for one name removes that explicit override (back to
   the risk-based default).
+- **The `mcp` block** (see *MCP servers*): `servers` **is replaced wholesale**
+  when sent (the web page edits one row at a time by PUTting the whole list).
+  Per-server `env` / `headers` **values are write-only** like `llm.api_key`:
+  `GET` shows only key names and set-flags (`{"TOKEN": true}`); a PUT with a
+  blank value for a key that already exists keeps the stored value, a typed
+  value replaces it, and omitting the key removes it. Bad server definitions
+  (bad name/transport/command/url, duplicate names, `timeout` < 1) → `422`.
 - Numbers validate as before: `422` on non-numeric or negative
   temperature/max_tokens/max_history, or non-object `extra_body`.
 
 `POST /api/settings/reset` with `{"llm": true, "tts": true, "tools": true,
-"switch_phrases": true}` (each side optional, `422` if none) drops the saved
-overrides so the defaults apply again. Returns the same body as `GET`.
+"mcp": true, "switch_phrases": true}` (each side optional, `422` if none)
+drops the saved overrides so the defaults apply again. Returns the same body
+as `GET`.
 
 `POST /api/settings/test` costs one `GET /v1/models` against the currently
 merged settings plus one breeze `GET /health`, and returns
@@ -670,6 +683,73 @@ curl -s -H "$AUTH" "$HUB/api/tools/log?limit=50"
 # entries also carry source:"client" rows; approval is "", "approved",
 # "denied" or "not approved" for gated calls
 ```
+
+## MCP servers (the hub as an MCP client)
+
+The hub can connect to external **MCP servers** and offer their tools to the
+model next to the built-in ones. Configure them in **Settings > MCP** on the
+web page (rows save immediately) or over the API. The MCP SDK is imported
+lazily: without the `mcp` package installed the hub still boots and runs, and
+every configured server reports `state: "unavailable"` with error
+`"mcp package not installed"`.
+
+Server shape (in `settings.mcp.servers`; the whole list is replaced on every
+`PUT`, values of `env`/`headers` are **write-only**):
+
+```json
+{"name": "time",                     // [a-z0-9_-]{1,32}, unique
+ "transport": "stdio",               // or "http" (streamable-HTTP)
+ "command": "uvx", "args": ["mcp-server-time"],   // stdio only
+ "env": {"TZ": "Asia/Tokyo"},        // stdio only; extra env for the child
+ "url": "http://127.0.0.1:8931/mcp", // http only (http/https)
+ "headers": {"X-Key": "***"},   // http only; extra request headers
+ "enabled": true,
+ "tool_permissions": {"delete_file": "never"},     // per *server-side* tool name,
+                                                   // always|ask|never; beats the
+                                                   // global tools.permissions map
+ "timeout": 60}                      // per-call seconds, ≥ 1
+```
+
+How the tools join the loop:
+
+- Model-facing name is **`mcp_<server>__<tool>`** (sanitized to
+  `[A-Za-z0-9_-]{1,64}`), e.g. `mcp_time__get_current_time`.
+- Risk comes from the server's tool annotations: `readOnlyHint` → `read`
+  (offered `always`), `destructiveHint` → `danger`, otherwise `act` (offered
+  `ask`). `tool_permissions` above overrides per tool; `never` hides the tool
+  entirely. `ask` approvals ride the same `__approval__` client channel as
+  client tools.
+- Calls appear in `/api/tools`, `/api/tools/log` (`source: "mcp"`) and the
+  events stream (`tool_started` with label `using <server>: <tool>`); results
+  are capped at `max_result_chars` and wrapped as untrusted like everything
+  else. `tools.enabled: false` turns MCP tools off too.
+- Lifecycle: connecting happens on a dedicated MCP event loop; a dead or
+  silent server is retried with exponential backoff, the tool list refreshes
+  on (re)connect and on `notifications/tools/list_changed` when supported,
+  and a bad per-call outcome never kills the turn — the model just gets an
+  error payload.
+
+```bash
+curl -s -X PUT -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "mcp": {"servers": [
+    {"name": "time", "transport": "stdio", "enabled": true,
+     "command": "uvx", "args": ["mcp-server-time"]}]}}' $HUB/api/settings
+
+curl -s -H "$AUTH" $HUB/api/mcp/status
+# [{"name":"time","transport":"stdio","state":"ready","error":"",
+#   "tools":1,"last_ok":"2026-11-03T18:30:00Z"}]
+# state: starting | ready | error | disabled | unavailable; error carries the
+# last failure; last_ok is the time the server last listed its tools
+
+curl -s -X POST -H "$AUTH" $HUB/api/mcp/time/restart   # force reconnect
+# {"ok":true}   ·   404 unknown name   ·   409 disabled
+```
+
+A failed `PUT`/startup sync publishes an `mcp_error` event and (for a PUT)
+answers `422` — a broken server never bricks chat. In Docker, stdio servers
+run **inside the hub container**: `uvx` and `npx` are installed there and
+their caches are writable under `/data` (see `hub/README.md`); an http server
+pointing at the host needs a host-reachable URL.
 
 ## Events long-poll
 
