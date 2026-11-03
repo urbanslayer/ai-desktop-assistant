@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -25,11 +26,24 @@ from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
 
 try:  # package import (repo root: `from hub.server import create_app`)
     from . import brain as _brain
+    from . import clients as _clients
+    from . import emotion as _emotion
     from . import voice as _voice
+    from .clients import ClientHub
+    from .events import EventBus
+    from .toolloop import run_turn
+    from .tools.registry import build_hub_specs, hub_tool_info, permission_for, tools_prompt
     from .store import Store, default_voice, now_iso
 except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     import brain as _brain  # type: ignore[no-redef]
+    import clients as _clients  # type: ignore[no-redef]
+    import emotion as _emotion  # type: ignore[no-redef]
     import voice as _voice  # type: ignore[no-redef]
+    from clients import ClientHub  # type: ignore[no-redef]
+    from events import EventBus  # type: ignore[no-redef]
+    from toolloop import run_turn  # type: ignore[no-redef]
+    from tools.registry import (build_hub_specs, hub_tool_info,  # type: ignore[no-redef]
+                                permission_for, tools_prompt)
     from store import Store, default_voice, now_iso  # type: ignore[no-redef]
 
 HUB_VERSION = "1"
@@ -49,6 +63,19 @@ PREVIEW_LINE = "Hey senpai, this is how I sound right now. Not bad, right?"
 # Breeze-TTS-2 settings defaults; the env overlay happens in main()/create_app.
 # base_url "" means TTS is off (nothing to talk to); enabled is the user switch.
 TTS_DEFAULTS = {"enabled": True, "base_url": "", "timeout": 120, "parallel_note": ""}
+
+# Tools settings defaults (docs/ROUNDS.md R1-B, docs/TOOLS.md A). Blank
+# searxng_url means unset: the default (RIKO_SEARXNG_URL) applies, same
+# "blank = default" rule as the llm/tts blocks.
+TOOLS_DEFAULTS = {
+    "enabled": True,
+    "max_steps": 8,           # model calls per turn (planning + final answer included)
+    "max_seconds": 120,       # whole-turn wall budget for the tool loop
+    "max_result_chars": 12000,  # per tool result before truncation
+    "searxng_url": "",        # SearXNG base URL; empty = web_search unavailable
+    "allow_private_fetch": False,  # let fetch_page hit loopback/private IPs (dev)
+    "permissions": {},        # tool name -> always | ask | never
+}
 
 # Seed persona: the system prompt copied from character_config.yaml at build
 # time (the Docker image has no access to that file).
@@ -86,13 +113,14 @@ def normalize_switch_text(text: str) -> str:
 
 def create_app(data_dir, api_key: str | None = None,
                llm_defaults: dict | None = None,
-               tts_defaults: dict | None = None) -> FastAPI:
+               tts_defaults: dict | None = None,
+               tools_defaults: dict | None = None) -> FastAPI:
     """Build the hub app over `data_dir` (SQLite + avatars live there).
 
     api_key None/empty disables auth. llm_defaults fills any LLM settings
     field the user has not saved via PUT /api/settings (api_key included);
-    saved values always win. tts_defaults does the same for the `tts`
-    settings object (RIKO_TTS_BASE_URL / RIKO_TTS_ENABLED)."""
+    saved values always win. tts_defaults / tools_defaults do the same for
+    the `tts` / `tools` settings objects (RIKO_TTS_* / RIKO_SEARXNG_URL)."""
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     avatars_dir = data_dir / "avatars"
@@ -113,8 +141,16 @@ def create_app(data_dir, api_key: str | None = None,
     brain = _brain.Brain()
     llm_defaults = dict(llm_defaults or {})
     tts_defaults = dict(tts_defaults or {})
+    tools_defaults = dict(tools_defaults or {})
     app = FastAPI(title="riko-hub", version=HUB_VERSION, docs_url=None, redoc_url=None)
     chat_lock = threading.Lock()  # one chat at a time; concurrent requests queue
+    events = EventBus()           # GET /api events ring buffer (R1-B)
+    clients_hub = ClientHub(events)  # client-tool channel server side (R1-B)
+
+    def bump_state() -> None:
+        """Single choke point for state changes: version bump + event."""
+        store.bump_version()
+        events.publish("state_changed", version=store.version())
 
     # ── helpers ─────────────────────────────────────────────────────────
     # A base_url/model/reasoning_effort/api_key saved as "" used to SHADOW the
@@ -179,6 +215,46 @@ def create_app(data_dir, api_key: str | None = None,
         settings = tts_settings()
         return bool(settings.get("enabled")) and bool(str(settings.get("base_url") or "").strip())
 
+    # ── tools settings — same "blank = server default" semantics ────────
+    _TOOLS_BLANK_MEANS_UNSET = ("searxng_url",)
+
+    def stored_tools() -> dict:
+        saved = dict(store.get_json("tools", {}))
+        for key in _TOOLS_BLANK_MEANS_UNSET:
+            if key in saved and not str(saved[key] or "").strip():
+                del saved[key]
+        return saved
+
+    def default_tools() -> dict:
+        merged = dict(TOOLS_DEFAULTS)
+        merged.update(tools_defaults)
+        merged["enabled"] = bool(merged.get("enabled"))
+        return merged
+
+    def tools_settings() -> dict:
+        merged = default_tools()
+        merged.update(stored_tools())
+        return merged
+
+    def tools_status_response() -> dict:
+        """GET /api/tools/status: whether the LLM server accepts the `tools`
+        parameter at all (learned by trying; docs/ROUNDS.md fallback)."""
+        st = store.get_json("tools_status", None) or {}
+        return {"function_calling": st.get("function_calling", "unknown"),
+                "reason": st.get("reason", "")}
+
+    class ToolsStatus:  # called from the tool loop thread
+        def note_tools_rejected(self, reason: str) -> None:
+            if store.get_json("tools_status", {}).get("function_calling") != "rejected":
+                store.set_json("tools_status", {"function_calling": "rejected",
+                                                "reason": reason[:300]})
+
+        def note_tools_worked(self) -> None:
+            if store.get_json("tools_status", {}).get("function_calling") == "rejected":
+                store.set_json("tools_status", {"function_calling": "ok", "reason": ""})
+
+    tools_status = ToolsStatus()
+
     def settings_response() -> dict:
         saved = stored_llm()
         defaults = default_llm()
@@ -188,15 +264,21 @@ def create_app(data_dir, api_key: str | None = None,
         source["switch_phrases"] = "saved" if stored_switch_phrases() else "default"
         saved_tts = stored_tts()
         tts_source = {k: ("saved" if k in saved_tts else "default") for k in TTS_DEFAULTS}
+        saved_tools = stored_tools()
+        tools_source = {k: ("saved" if k in saved_tools else "default")
+                        for k in TOOLS_DEFAULTS}
         return {
             "llm": public_llm(llm_settings()),
             "tts": tts_settings(),
+            "tools": tools_settings(),
             "switch_phrases": switch_phrases(),
             "defaults": {"llm": defaults_public,
                          "tts": default_tts(),
+                         "tools": default_tools(),
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES)},
             "llm_source": source,
             "tts_source": tts_source,
+            "tools_source": tools_source,
         }
 
     def persona_lookup() -> dict[str, str]:
@@ -263,15 +345,19 @@ def create_app(data_dir, api_key: str | None = None,
         any edit forces a fresh registration/synthesis."""
         return f"riko-{persona['id']}-v{persona.get('voice_version', 1)}"
 
-    def synth(persona: dict, text: str) -> bytes:
+    def synth(persona: dict, text: str, emotion: str | None = None) -> bytes:
         """Blocking: one breeze utterance in this persona's voice. Returns
         proper WAV bytes. Raises _voice.TtsError subclasses (caller maps to
         HTTP); TtsNotFound on clone is recovered once by re-registering the
-        stored clip (breeze may have been reset)."""
+        stored clip (breeze may have been reset). `emotion` adds a delivery
+        hint (docs/ROUNDS.md R1-B) — the emotion tag itself is never spoken."""
         breezy = _voice.Breeze(tts_settings())
         voice = dict(persona.get("voice") or {})
         mode = voice.get("mode", "design")
         style = str(voice.get("style") or "")
+        hint = _emotion.tts_hint(emotion)
+        if hint:
+            style = (style + ", " + hint).strip(", ")
         seed = voice.get("seed")
         cfg = voice.get("cfg_scale")
         if mode == "clone":
@@ -403,7 +489,7 @@ def create_app(data_dir, api_key: str | None = None,
             str(body.get("greeting") or ""),
             str(body.get("tts_voice") or ""),
         )
-        store.bump_version()
+        bump_state()
         return JSONResponse(public_persona(persona), status_code=201)
 
     def persona_or_404(persona_id: str):
@@ -438,7 +524,7 @@ def create_app(data_dir, api_key: str | None = None,
                 return err(422, "keywords must be a list")
             fields["keywords"] = [str(k).strip().lower() for k in body["keywords"] if str(k).strip()]
         persona = store.update_persona(persona_id, fields) if fields else store.get_persona(persona_id)
-        store.bump_version()
+        bump_state()
         return public_persona(persona)
 
     @app.delete("/api/personas/{persona_id}", status_code=204)
@@ -457,7 +543,7 @@ def create_app(data_dir, api_key: str | None = None,
         delete_persona_audio(persona_id)
         if was_active:
             store.set_active(remaining[0])
-        store.bump_version()
+        bump_state()
         return Response(status_code=204)
 
     def avatar_etag(persona: dict) -> str:
@@ -493,7 +579,7 @@ def create_app(data_dir, api_key: str | None = None,
         tmp.write_bytes(data)
         tmp.replace(path)
         persona = store.bump_avatar(persona_id)
-        store.bump_version()
+        bump_state()
         return public_persona(persona)
 
     @app.post("/api/active")
@@ -512,7 +598,7 @@ def create_app(data_dir, api_key: str | None = None,
         if not target:
             return err(404, f"no persona matches '{raw_wanted}'")
         if store.set_active(target):
-            store.bump_version()
+            bump_state()
         return state_object()
 
     def history_persona(request: Request) -> str | None:
@@ -538,7 +624,7 @@ def create_app(data_dir, api_key: str | None = None,
             return err(404, "no such persona")
         delete_message_audio(store.message_ids(pid))  # cached audio goes too
         store.clear_messages(pid)
-        store.bump_version()
+        bump_state()
         return Response(status_code=204)
 
     @app.post("/api/history/import")
@@ -562,7 +648,7 @@ def create_app(data_dir, api_key: str | None = None,
         for m in messages:
             store.add_message(pid, m["role"], m["content"], "import")
         if messages:
-            store.bump_version()
+            bump_state()
         return {"imported": len(messages)}
 
     @app.post("/api/chat")
@@ -586,14 +672,18 @@ def create_app(data_dir, api_key: str | None = None,
                 target = match_switch(norm)
                 if target:  # switch: activate, greet, store nothing
                     if store.set_active(target):
-                        store.bump_version()
+                        bump_state()
                     persona = store.get_persona(target) or {}
                     reply = persona.get("greeting") or f"{persona.get('name', target)} here."
                     audio_url = None
                     if speak and tts_on() and (persona.get("voice") or {}).get("mode") != "off":
                         audio_url = (f"/api/personas/{target}/greeting/audio"
                                      f"?v={persona.get('voice_version', 1)}")
+                    events.publish("turn_started", persona=target, source=source)
+                    events.publish("turn_finished", persona=target,
+                                   message_id=None, emotion=None)
                     return ("ok", {"reply": reply, "persona": target, "switched": True,
+                                   "emotion": None, "tools_used": [],
                                    "message_ids": [], "state_version": store.version(),
                                    "audio_url": audio_url})
 
@@ -605,25 +695,59 @@ def create_app(data_dir, api_key: str | None = None,
                 if not settings.get("base_url"):
                     return ("err", 503, "LLM not configured")
 
+                # offered tools: hub built-ins + online client tools, minus
+                # anything the permission table says `never` (docs/ROUNDS.md)
+                tools_cfg = tools_settings()
+                specs: list = []
+                if tools_cfg.get("enabled"):
+                    permissions = tools_cfg.get("permissions") or {}
+                    for s in build_hub_specs(tools_cfg):
+                        if permission_for(s.name, "hub", s.risk, permissions) != "never":
+                            specs.append(s)
+                    for s in clients_hub.online_tool_specs():
+                        if permission_for(s.name, "client", s.risk, permissions) != "never":
+                            specs.append(s)
+                offered_names = [s.name for s in specs if s.available]
+
+                system = persona["system_prompt"]
+                if persona.get("emotes"):
+                    system += "\n\n" + _emotion.PROMPT_RULE
+                if offered_names:
+                    system += "\n\n" + tools_prompt(offered_names)
+
                 max_history = int(settings.get("max_history") or 40)
                 history = store.recent_messages(pid, max_history)
-                messages = ([{"role": "system", "content": persona["system_prompt"]}]
+                messages = ([{"role": "system", "content": system}]
                             + [{"role": m["role"], "content": m["content"]} for m in history]
                             + [{"role": "user", "content": text}])
+
+                events.publish("turn_started", persona=pid, source=source)
+                ctx = {"persona": pid, "events": events, "log": store.log_tool,
+                       "status": tools_status, "clients": clients_hub,
+                       "deadline": time.monotonic()
+                                   + float(tools_cfg.get("max_seconds") or 120)}
                 try:
-                    answer = brain.chat(settings, messages)
+                    out = run_turn(brain, settings, tools_cfg, specs, messages, ctx)
                 except Exception as e:
                     return ("err", 502, f"{type(e).__name__}: {e}")
 
+                # the emotion tag never reaches the stored reply or the TTS
+                emotion, answer = _emotion.parse_emotion(out["text"])
+                tools_used = out["tools_used"]
+
                 user_id = store.add_message(pid, "user", text, source)
-                assistant_id = store.add_message(pid, "assistant", answer, source)
-                store.bump_version()
+                assistant_id = store.add_message(pid, "assistant", answer, source,
+                                                 emotion=emotion, tools=tools_used)
+                bump_state()
+                events.publish("turn_finished", persona=pid,
+                               message_id=assistant_id, emotion=emotion)
                 # The chat never waits for audio: audio_url points at the audio
                 # route, which synthesises lazily (and caches on disk).
                 audio_url = None
                 if speak and tts_on() and (persona.get("voice") or {}).get("mode") != "off":
                     audio_url = f"/api/messages/{assistant_id}/audio"
                 return ("ok", {"reply": answer, "persona": pid, "switched": False,
+                               "emotion": emotion, "tools_used": tools_used,
                                "message_ids": [user_id, assistant_id],
                                "state_version": store.version(),
                                "audio_url": audio_url})
@@ -718,7 +842,50 @@ def create_app(data_dir, api_key: str | None = None,
                     return err(422, "tts.timeout must be >= 1")
                 saved_tts["timeout"] = int(num)
             store.set_json("tts", saved_tts)
-        store.bump_version()
+        if "tools" in body:
+            tools = body["tools"]
+            if not isinstance(tools, dict):
+                return err(422, "tools must be an object")
+            saved_tools = stored_tools()
+            # blank searxng_url = "unset the override, back to the
+            # RIKO_SEARXNG_URL default" — same rule as the llm/tts blocks.
+            for key in _TOOLS_BLANK_MEANS_UNSET:
+                if key in tools:
+                    value = str(tools[key] or "").strip()
+                    if value:
+                        saved_tools[key] = value
+                    else:
+                        saved_tools.pop(key, None)
+            for key in ("enabled", "allow_private_fetch"):
+                if key in tools:
+                    if not isinstance(tools[key], bool):
+                        return err(422, f"tools.{key} must be a boolean")
+                    saved_tools[key] = tools[key]
+            for key, lo, hi in (("max_steps", 1, 32), ("max_seconds", 5, 600),
+                                ("max_result_chars", 500, 100000)):
+                if key in tools:
+                    try:
+                        num = int(tools[key])
+                    except (TypeError, ValueError):
+                        return err(422, f"tools.{key} must be an integer")
+                    if not lo <= num <= hi:
+                        return err(422, f"tools.{key} must be between {lo} and {hi}")
+                    saved_tools[key] = num
+            if "permissions" in tools:
+                perms = tools["permissions"]
+                if not isinstance(perms, dict):
+                    return err(422, "tools.permissions must be an object")
+                cleaned_perms: dict[str, str] = {}
+                for name, perm in perms.items():
+                    if perm is None:  # null removes the explicit override
+                        continue      # -> back to the risk-based default
+                    if str(perm) not in ("always", "ask", "never"):
+                        return err(422, f"permission for '{name}' must be "
+                                        "always, ask, never or null")
+                    cleaned_perms[str(name)[:80]] = str(perm)
+                saved_tools["permissions"] = cleaned_perms
+            store.set_json("tools", saved_tools)
+        bump_state()
         return settings_response()
 
     @app.post("/api/settings/reset")
@@ -737,12 +904,15 @@ def create_app(data_dir, api_key: str | None = None,
             brain.invalidate()
         if body.get("tts"):
             changed |= store.del_json("tts")
+        if body.get("tools"):
+            changed |= store.del_json("tools")
         if body.get("switch_phrases"):
             changed |= store.del_json("switch_phrases")
-        if not body.get("llm") and not body.get("tts") and not body.get("switch_phrases"):
-            return err(422, 'set "llm", "tts" and/or "switch_phrases" to true')
+        if not (body.get("llm") or body.get("tts") or body.get("tools")
+                or body.get("switch_phrases")):
+            return err(422, 'set "llm", "tts", "tools" and/or "switch_phrases" to true')
         if changed:
-            store.bump_version()
+            bump_state()
         return settings_response()
 
     @app.post("/api/settings/test")
@@ -769,16 +939,18 @@ def create_app(data_dir, api_key: str | None = None,
         return out
 
     # ── voice: audio routes (docs/VOICE.md) ────────────────────────────
-    def serve_cached_audio(name: str, persona: dict, text: str):
+    def serve_cached_audio(name: str, persona: dict, text: str,
+                           emotion: str | None = None):
         """Shared body of the two cached audio routes: cached WAV if we have
-        it, else one blocking breeze synthesis (made once, then cached)."""
+        it, else one blocking breeze synthesis (made once, then cached).
+        The emotion is part of the cache key (different delivery per mood)."""
         blocked = tts_gate(persona)
         if blocked is not None:
             return blocked
         path = audio_cache_path(name)
         if not path.exists():
             try:
-                wav = synth(persona, text)
+                wav = synth(persona, text, emotion)
             except Exception as e:
                 return tts_error_response(e)
             write_audio_cache(path, wav)
@@ -792,8 +964,12 @@ def create_app(data_dir, api_key: str | None = None,
         persona = store.get_persona(message["persona"])
         if not persona:
             return err(404, "persona of that message no longer exists")
-        return serve_cached_audio(f"{message_id}-v{persona['voice_version']}.wav",
-                                  persona, message["content"])
+        emotion = message.get("emotion")
+        # 'neutral' sounds like no hint at all: same cache file, no duplicate WAV
+        suffix = "" if not emotion or emotion == "neutral" else f"-{emotion}"
+        return serve_cached_audio(f"{message_id}-v{persona['voice_version']}{suffix}.wav",
+                                  persona, message["content"],
+                                  None if not emotion or emotion == "neutral" else emotion)
 
     @app.get("/api/personas/{persona_id}/greeting/audio")
     def get_greeting_audio(persona_id: str, request: Request):
@@ -823,11 +999,14 @@ def create_app(data_dir, api_key: str | None = None,
         persona = store.get_persona(pid)
         if not persona:
             return err(404, f"no persona '{pid}'")
+        emotion = str(body.get("emotion") or "") or None
+        if emotion is not None and emotion not in _emotion.EMOTIONS:
+            return err(422, "emotion must be one of " + ", ".join(_emotion.EMOTIONS))
         blocked = tts_gate(persona)
         if blocked is not None:
             return blocked
         try:
-            wav = await run_in_threadpool(synth, persona, text)
+            wav = await run_in_threadpool(synth, persona, text, emotion)
         except Exception as e:
             return tts_error_response(e)
         return wav_response(wav)
@@ -911,7 +1090,7 @@ def create_app(data_dir, api_key: str | None = None,
                             if k != "has_reference"}
         if changed:
             persona = store.set_voice(persona_id, voice)
-            store.bump_version()
+            bump_state()
         return public_persona(persona)
 
     @app.put("/api/personas/{persona_id}/voice/reference")
@@ -955,7 +1134,7 @@ def create_app(data_dir, api_key: str | None = None,
         voice["mode"] = "clone"
         voice["ref_text"] = ref_text
         persona = store.set_voice(persona_id, voice)
-        store.bump_version()
+        bump_state()
         return public_persona(persona)
 
     @app.get("/api/personas/{persona_id}/voice/reference")
@@ -979,7 +1158,7 @@ def create_app(data_dir, api_key: str | None = None,
         voice = dict(persona.get("voice") or {})
         voice["mode"] = "design"  # back to a designed voice (docs/VOICE.md)
         persona = store.set_voice(persona_id, voice)
-        store.bump_version()
+        bump_state()
         return public_persona(persona)
 
     @app.post("/api/personas/{persona_id}/voice/preview")
@@ -1061,8 +1240,120 @@ def create_app(data_dir, api_key: str | None = None,
         voice["mode"] = "clone"
         voice["ref_text"] = text
         persona = store.set_voice(persona_id, voice)
-        store.bump_version()
+        bump_state()
         return public_persona(persona)
+
+    # ── events (docs/ROUNDS.md R1-B) ───────────────────────────────────
+    @app.get("/api/events")
+    async def get_events(request: Request):
+        """Long-poll the event ring buffer: ?after=<last seq>&wait=<seconds>.
+        Returns {events: [...], last}: pass `last` back as the next `after`.
+        Event types: turn_started, tool_started, tool_finished,
+        approval_needed, turn_finished, state_changed."""
+        qp = request.query_params
+        try:
+            after = int(qp.get("after") or 0)
+            wait = float(qp.get("wait") or 25)
+        except ValueError:
+            return err(422, "after must be an integer and wait a number")
+        out = await run_in_threadpool(events.wait, after, wait)
+        return out
+
+    # ── tools (docs/ROUNDS.md R1-B, docs/TOOLS.md) ─────────────────────
+    @app.get("/api/tools")
+    def get_tools():
+        """Everything the Tools section of the page (and the desktop) shows:
+        the built-ins plus every ONLINE client tool, each with its effective
+        permission, plus the merged settings and the function-calling status."""
+        cfg = tools_settings()
+        permissions = cfg.get("permissions") or {}
+        tools = hub_tool_info(cfg, permissions)
+        for s in clients_hub.online_tool_specs():
+            tools.append({"name": s.name, "display": s.display, "source": "client",
+                          "risk": s.risk, "available": True,
+                          "description": s.description,
+                          "permission": permission_for(s.name, "client", s.risk,
+                                                       permissions),
+                          "client_id": s.client_id})
+        return {"tools": tools, "settings": cfg, "defaults": default_tools(),
+                "status": tools_status_response()}
+
+    @app.get("/api/tools/log")
+    def get_tools_log(request: Request):
+        try:
+            limit = int(request.query_params.get("limit") or 50)
+        except ValueError:
+            return err(422, "limit must be an integer")
+        return {"entries": store.tool_log(limit)}
+
+    @app.get("/api/tools/status")
+    def get_tools_status():
+        return tools_status_response()
+
+    # ── client-tool channel (docs/ROUNDS.md R1-B) ──────────────────────
+    @app.get("/api/clients")
+    def get_clients():
+        """Online clients and the tools they can run right now."""
+        return {"clients": clients_hub.online_clients(),
+                "heartbeat_s": _clients.HEARTBEAT_S,
+                "offline_after_s": _clients.OFFLINE_AFTER_S}
+
+    @app.post("/api/clients/{client_id}/register")
+    async def post_client_register(client_id: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        try:
+            out = clients_hub.register(client_id, str(body.get("name") or ""),
+                                       str(body.get("kind") or ""),
+                                       body.get("tools") or [])
+        except ValueError as e:
+            return err(422, str(e))
+        return out
+
+    @app.post("/api/clients/{client_id}/heartbeat")
+    def post_client_heartbeat(client_id: str):
+        if not clients_hub.heartbeat(client_id):
+            return err(404, "register first")
+        return {"ok": True, "heartbeat_s": _clients.HEARTBEAT_S}
+
+    @app.get("/api/clients/{client_id}/requests")
+    async def get_client_requests(client_id: str, request: Request):
+        """Long-poll for tool calls to run (clients poll every ~30 s cycle;
+        `wait` is capped at 60 s). An empty list means 'nothing yet'."""
+        try:
+            wait = float(request.query_params.get("wait") or 25)
+        except ValueError:
+            return err(422, "wait must be a number")
+        try:
+            reqs = await run_in_threadpool(clients_hub.take_requests, client_id, wait)
+        except KeyError:
+            return err(404, "register first")
+        return {"requests": reqs,
+                "approval_timeout_s": _clients.APPROVAL_TIMEOUT_S}
+
+    @app.post("/api/clients/{client_id}/results")
+    async def post_client_result(client_id: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        out = clients_hub.submit_result(
+            client_id, str(body.get("request_id") or ""),
+            bool(body.get("ok")), body.get("result"), body.get("error"),
+            body.get("approved"))
+        if out is None:
+            return err(404, "unknown request (already timed out?)")
+        return {"ok": True, **out}
+
+    @app.delete("/api/clients/{client_id}", status_code=204)
+    def delete_client(client_id: str):
+        clients_hub.forget(client_id)
 
     @app.get("/")
     def index():
@@ -1089,12 +1380,19 @@ def main():
         "enabled": os.getenv("RIKO_TTS_ENABLED", "1").strip().lower()
                    in ("1", "true", "yes", "on"),
     }
+    tools_defaults = {
+        "searxng_url": os.getenv("RIKO_SEARXNG_URL", ""),  # empty = web_search off
+        "allow_private_fetch": os.getenv("RIKO_ALLOW_PRIVATE_FETCH", "")
+                               .strip().lower() in ("1", "true", "yes", "on"),
+    }
     app = create_app(data_dir, api_key=os.getenv("RIKO_HUB_KEY") or None,
-                     llm_defaults=llm_defaults, tts_defaults=tts_defaults)
+                     llm_defaults=llm_defaults, tts_defaults=tts_defaults,
+                     tools_defaults=tools_defaults)
     host = os.getenv("RIKO_HUB_HOST", "0.0.0.0")
     port = int(os.getenv("RIKO_HUB_PORT", "8002"))
     print(f"[hub] data={data_dir} llm={llm_defaults['base_url'] or '(not configured)'} "
-          f"tts={tts_defaults['base_url'] or '(off)'}")
+          f"tts={tts_defaults['base_url'] or '(off)'} "
+          f"searxng={tools_defaults['searxng_url'] or '(off)'}")
     uvicorn.run(app, host=host, port=port)
 
 
