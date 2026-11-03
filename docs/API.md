@@ -139,8 +139,10 @@ transcript with `after=0`).
 | `DELETE /api/history` | clear a persona's transcript |
 | `POST /api/history/import` | bulk-import old logs |
 | `POST /api/chat` | the only writing route in daily use |
-| `GET /api/settings` | LLM settings (key never returned) |
-| `PUT /api/settings` | change settings |
+| `GET /api/settings` | LLM settings + defaults + per-field source (key never returned) |
+| `PUT /api/settings` | change settings (blank field = unset → default; `clear_api_key`) |
+| `POST /api/settings/reset` | drop saved LLM/switch-phrase overrides → defaults |
+| `POST /api/settings/test` | one `/v1/models` call with merged settings → `{ok, model}` |
 | `GET /` | web config page (no auth; asks for the key) |
 
 ### GET /api/health
@@ -299,7 +301,9 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"text":"hi","source":"android"}' $HUB/api/chat
 ```
 
-### GET /api/settings · PUT /api/settings
+### GET /api/settings · PUT /api/settings · POST /api/settings/reset · POST /api/settings/test
+
+`GET` returns the **merged** settings plus where each value came from:
 
 ```json
 {
@@ -307,23 +311,57 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
           "temperature": 0.8, "max_tokens": 4096, "max_history": 40,
           "reasoning_effort": "", "extra_body": {}, "api_key_set": true},
   "switch_phrases": ["switch to", "change to", "become", "persona",
-                     "talk to", "i want to talk to"]
+                     "talk to", "i want to talk to"],
+  "defaults": {"llm": {"base_url": "http://192.0.2.51:8000/v1", "model": "auto",
+                       "temperature": 0.8, "max_tokens": 4096, "max_history": 40,
+                       "reasoning_effort": "", "extra_body": {}, "api_key_set": true},
+               "switch_phrases": ["switch to", "..."]},
+  "llm_source": {"base_url": "saved", "model": "default", "api_key": "default",
+                 "temperature": "default", "...": "...", "switch_phrases": "default"}
 }
 ```
 
-The LLM API key is **write-only**: GET returns only `api_key_set`. `PUT`
-takes a partial body — send only what you change:
+`defaults.llm` is the built-in default overlaid with the `RIKO_LLM_*` env the
+server started with; `llm_source` says per field whether the effective value is
+`"saved"` (via PUT) or `"default"`. The API key is **write-only** — only
+`api_key_set` is ever returned.
+
+`PUT` takes a partial body — send only what you changed:
 
 ```bash
 curl -s -X PUT -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"llm":{"temperature":0.7,"api_key":"sk-secret"}}' $HUB/api/settings
 ```
 
-`llm.api_key: ""` clears the stored key; omitting it keeps it. Defaults
-(`auto`, 0.8, 4096, 40) fill fields never saved; anything saved via PUT wins —
-including over the `RIKO_LLM_*` env the container started with. Changing any
-LLM setting re-resolves `model: "auto"` on the next chat. `422` on a
-non-numeric temperature/max_tokens/max_history or non-object `extra_body`.
+Semantics (made so a careless form save cannot break the hub):
+
+- **Blank = unset, never an override.** Sending `""` (or whitespace) for
+  `base_url`, `model` or `reasoning_effort` **deletes the saved override**, so
+  the default applies again (`model` then resolves to `RIKO_LLM_MODEL` or
+  `"auto"`). A blank `base_url` can therefore never shadow the env default.
+- **`llm.api_key` only changes on a non-empty value.** An empty or absent
+  `api_key` leaves the stored key untouched (no accidental wipe, no
+  autofill-induced override). `"clear_api_key": true` inside `llm` removes the
+  stored key so the `RIKO_LLM_API_KEY` env default applies again — there is no
+  way to force a keyless LLM over an env default (not needed).
+- **`switch_phrases: []` resets to the defaults**, it does not disable phrase
+  switching (a persona's keywords and name still switch on their own either
+  way). Any non-empty list replaces the defaults.
+- Numbers validate as before: `422` on non-numeric or negative
+  temperature/max_tokens/max_history, or non-object `extra_body`.
+
+`POST /api/settings/reset` with `{"llm": true, "switch_phrases": true}` (either
+side optional, `422` if neither) drops the saved overrides so the defaults
+apply again. Returns the same body as `GET`.
+
+`POST /api/settings/test` costs one `GET /v1/models` against the currently
+merged settings and returns `{"ok": true, "model": "<resolved id>"}` or
+`{"ok": false, "error": "<reason>"}` (e.g. `"RuntimeError: LLM not
+configured"`, auth failures surface here). Never reveals the key.
+
+Changing any LLM setting re-resolves `model: "auto"` on the next chat; the
+state `version` bumps on every `PUT` and on a `reset` that actually removed
+something.
 
 ## Switching semantics (what `POST /api/chat` intercepts)
 
@@ -336,7 +374,8 @@ trailing `.!?,`. The message is a **switch command** when either:
    way) equals a persona's keyword/name/id — `"switch to asuka"`,
    `"I want to talk to Asuka?"`.
 
-Switch phrases are configurable (`PUT /api/settings`, `switch_phrases`). On a
+Switch phrases are configurable (`PUT /api/settings`, `switch_phrases`; an
+empty list resets them to the defaults — they cannot be switched off). On a
 switch nothing is written to history, so persona changes are invisible in the
 transcript; each persona has its own isolated memory. Anything else is a
 normal chat turn — `"asuka is loud, but tell me a joke"` does **not** switch.

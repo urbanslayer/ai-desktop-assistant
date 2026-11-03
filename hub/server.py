@@ -88,14 +88,55 @@ def create_app(data_dir, api_key: str | None = None,
     chat_lock = threading.Lock()  # one chat at a time; concurrent requests queue
 
     # ── helpers ─────────────────────────────────────────────────────────
-    def llm_settings() -> dict:
+    # A base_url/model/reasoning_effort/api_key saved as "" used to SHADOW the
+    # env default (the web page saving before its GET landed blanked the whole
+    # LLM config). Blank means "unset" now: PUT deletes the key, and reads drop
+    # legacy blanks left in databases written by the old page.
+    _BLANK_MEANS_UNSET = ("base_url", "model", "reasoning_effort", "api_key")
+
+    def stored_llm() -> dict:
+        saved = dict(store.get_json("llm", {}))
+        for key in _BLANK_MEANS_UNSET:
+            if key in saved and not str(saved[key] or "").strip():
+                del saved[key]
+        return saved
+
+    def default_llm() -> dict:
         merged = dict(_brain.LLM_DEFAULTS)
         merged.update(llm_defaults)
-        merged.update(store.get_json("llm", {}))
         return merged
 
+    def llm_settings() -> dict:
+        merged = default_llm()
+        merged.update(stored_llm())
+        return merged
+
+    def stored_switch_phrases() -> list[str] | None:
+        """Cleaned saved phrases, or None when unset/empty (empty = legacy
+        leftover of the old page: there is no way to save 'no phrases')."""
+        saved = store.get_json("switch_phrases", None)
+        if saved is None:
+            return None
+        cleaned = [str(p).strip().lower() for p in saved if str(p).strip()]
+        return cleaned or None
+
     def switch_phrases() -> list[str]:
-        return store.get_json("switch_phrases", list(_brain.DEFAULT_SWITCH_PHRASES))
+        return stored_switch_phrases() or list(_brain.DEFAULT_SWITCH_PHRASES)
+
+    def settings_response() -> dict:
+        saved = stored_llm()
+        defaults = default_llm()
+        defaults_public = {k: v for k, v in defaults.items() if k != "api_key"}
+        defaults_public["api_key_set"] = bool(defaults.get("api_key"))
+        source = {k: ("saved" if k in saved else "default") for k in _brain.LLM_DEFAULTS}
+        source["switch_phrases"] = "saved" if stored_switch_phrases() else "default"
+        return {
+            "llm": public_llm(llm_settings()),
+            "switch_phrases": switch_phrases(),
+            "defaults": {"llm": defaults_public,
+                         "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES)},
+            "llm_source": source,
+        }
 
     def persona_lookup() -> dict[str, str]:
         """lower(name/id/keyword) -> persona id (first match wins, in creation order)."""
@@ -404,7 +445,7 @@ def create_app(data_dir, api_key: str | None = None,
 
     @app.get("/api/settings")
     def get_settings():
-        return {"llm": public_llm(llm_settings()), "switch_phrases": switch_phrases()}
+        return settings_response()
 
     @app.put("/api/settings")
     async def put_settings(request: Request):
@@ -414,16 +455,29 @@ def create_app(data_dir, api_key: str | None = None,
             return err(400, "invalid JSON body")
         if not isinstance(body, dict):
             return err(400, "body must be a JSON object")
-        saved_llm = dict(store.get_json("llm", {}))
+        saved_llm = stored_llm()
         llm = body.get("llm")
         if llm is not None:
             if not isinstance(llm, dict):
                 return err(422, "llm must be an object")
+            # blank base_url / model / reasoning_effort = "unset this override,
+            # fall back to the default" (model's default is RIKO_LLM_MODEL or 'auto')
             for key in ("base_url", "model", "reasoning_effort"):
                 if key in llm:
-                    saved_llm[key] = str(llm[key] or "").strip()
-            if "api_key" in llm:  # write-only; "" clears
-                saved_llm["api_key"] = str(llm["api_key"] or "")
+                    value = str(llm[key] or "").strip()
+                    if value:
+                        saved_llm[key] = value
+                    else:
+                        saved_llm.pop(key, None)
+            # api_key is write-only and NEVER blanked by accident: an empty/absent
+            # api_key leaves the stored key alone; only clear_api_key: true removes
+            # it (then the env default applies — no way to force a keyless LLM).
+            if "api_key" in llm:
+                value = str(llm["api_key"] or "")
+                if value.strip():
+                    saved_llm["api_key"] = value
+            if llm.get("clear_api_key"):
+                saved_llm.pop("api_key", None)
             for key, lo in (("temperature", 0.0), ("max_tokens", 1), ("max_history", 1)):
                 if key in llm:
                     try:
@@ -443,9 +497,46 @@ def create_app(data_dir, api_key: str | None = None,
             phrases = body["switch_phrases"]
             if not isinstance(phrases, list) or not all(isinstance(p, str) for p in phrases):
                 return err(422, "switch_phrases must be a list of strings")
-            store.set_json("switch_phrases", [p.strip().lower() for p in phrases if p.strip()])
+            cleaned = [p.strip().lower() for p in phrases if p.strip()]
+            # [] means "reset", not "no phrases": keywords/names always switch
+            if cleaned:
+                store.set_json("switch_phrases", cleaned)
+            else:
+                store.del_json("switch_phrases")
         store.bump_version()
-        return {"llm": public_llm(llm_settings()), "switch_phrases": switch_phrases()}
+        return settings_response()
+
+    @app.post("/api/settings/reset")
+    async def post_settings_reset(request: Request):
+        """Drop saved overrides so the defaults (built-in + RIKO_LLM_* env) apply:
+        {"llm": true, "switch_phrases": true} — either side optional."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        changed = False
+        if body.get("llm"):
+            changed |= store.del_json("llm")
+            brain.invalidate()
+        if body.get("switch_phrases"):
+            changed |= store.del_json("switch_phrases")
+        if not body.get("llm") and not body.get("switch_phrases"):
+            return err(422, 'set "llm" and/or "switch_phrases" to true')
+        if changed:
+            store.bump_version()
+        return settings_response()
+
+    @app.post("/api/settings/test")
+    def post_settings_test():
+        """Validate the merged settings cheaply against the LLM server:
+        GET /v1/models with the resolved key. {ok, model} or {ok:false, error}."""
+        settings = llm_settings()
+        try:
+            return {"ok": True, "model": brain.test(settings)}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     @app.get("/")
     def index():

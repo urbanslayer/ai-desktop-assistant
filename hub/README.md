@@ -47,6 +47,23 @@ data/
 Back up (or move) the whole folder — that is all she is. `docker compose down`
 keeps it; `docker compose down -v` too (no named volumes are used here).
 
+## Settings semantics (the config page can't shoot itself in the foot)
+
+`PUT /api/settings` only changes what you send, and **blank means "unset"**:
+a blank `base_url` / `model` / `reasoning_effort` deletes that saved override
+so the default applies again (defaults = built-ins overlaid with the
+`RIKO_LLM_*` env the server started with; `model` then means `auto`). The LLM
+`api_key` only changes when the request carries a non-empty value — an empty
+or autofilled-blank field can never wipe or shadow `RIKO_LLM_API_KEY`; send
+`"clear_api_key": true` to deliberately drop the saved key and fall back to
+the env default. `switch_phrases: []` resets the phrases to the defaults
+(keywords and names always switch on their own). `POST /api/settings/reset`
+drops saved overrides wholesale, and `POST /api/settings/test` answers
+`{ok, model}` by listing `/v1/models` with the merged settings. `GET
+/api/settings` returns the merged values plus `defaults` and a per-field
+`llm_source` (`saved` vs `default`) — the web page shows where each value
+comes from and keeps Save disabled until its first load succeeded.
+
 ## Security
 
 The hub speaks plain HTTP with one shared bearer key — run it on a **LAN or

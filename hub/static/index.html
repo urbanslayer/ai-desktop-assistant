@@ -77,6 +77,7 @@
   .hint { color: var(--muted); font-size: 12px; }
   #keybar { display: flex; gap: 8px; align-items: center; }
   #keybar input { width: 220px; }
+  .src { font-size: 11px; color: var(--muted); }
   .chatline { display: flex; gap: 8px; margin-top: 8px; }
   .switched { text-align: center; font-size: 12px; color: var(--accent); margin: 6px 0; }
 </style>
@@ -86,7 +87,7 @@
   <h1>Riko <span>hub</span></h1>
   <span id="status">no key set</span>
   <div id="keybar">
-    <input id="key" type="password" placeholder="hub API key" autocomplete="off">
+    <input id="hubtoken" type="password" name="riko-hub-token" placeholder="hub API key" autocomplete="off">
     <button class="btn primary" id="keysave">Use key</button>
     <button class="btn" id="keyclear">Forget</button>
   </div>
@@ -155,15 +156,17 @@
   <section id="tab-settings" hidden>
     <div class="card">
       <h2>LLM</h2>
-      <label>Base URL (any OpenAI-compatible server, ends in /v1)</label>
+      <label>Base URL (any OpenAI-compatible server, ends in /v1)
+        <span class="src" id="sbasesrc"></span></label>
       <input id="sbase" placeholder="http://192.0.2.51:8000/v1">
       <div class="row">
         <div>
           <label>API key <span class="hint" id="skeystate"></span></label>
-          <input id="skey" type="password" placeholder="not set" autocomplete="new-password">
+          <input id="apikey" type="password" name="riko-llm-apikey"
+                 placeholder="not set" autocomplete="new-password">
         </div>
-        <div><label>&nbsp;</label><button class="btn small" id="skeyclear">Clear key</button></div>
-        <div><label>Model</label><input id="smodel" placeholder="auto">
+        <div><label>&nbsp;</label><button class="btn small" id="skeyclear">Clear saved key (use server default)</button></div>
+        <div><label>Model <span class="src" id="smodelsrc"></span></label><input id="smodel" placeholder="auto">
              <span class="hint">auto = first model the server lists</span></div>
       </div>
       <div class="row">
@@ -176,9 +179,16 @@
       <textarea id="sextra" placeholder="{}"></textarea>
       <h2 style="margin-top:14px">Switch phrases</h2>
       <textarea id="sphrases" placeholder="switch to, change to, become, persona, talk to, i want to talk to"></textarea>
-      <p class="hint">A whole chat message like “&lt;phrase&gt; &lt;persona keyword&gt;” switches persona.</p>
-      <div style="margin-top:10px"><button class="btn primary" id="ssave">Save settings</button></div>
+      <p class="hint">A whole chat message like “&lt;phrase&gt; &lt;persona keyword&gt;” switches persona.
+        Blanking this list restores the server defaults — keywords and names always switch on their own.</p>
+      <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap">
+        <button class="btn primary" id="ssave" disabled>Save settings</button>
+        <button class="btn" id="sreset">Reset to server defaults</button>
+      </div>
+      <p class="hint">Saving is disabled until the current settings have loaded, and only fields you
+        changed are sent. A blank Base URL or Model means “use the server default”, never “unset”.</p>
       <div class="err" id="serr"></div>
+      <div class="hint" id="sllmstate"></div>
     </div>
   </section>
 
@@ -206,7 +216,11 @@ let editing = null;        // persona id being edited (null = create)
 
 /* ── plumbing ─────────────────────────────────────────────────────── */
 function key() { return localStorage.getItem(LSKEY) || ""; }
-function setKey(k) { k ? localStorage.setItem(LSKEY, k) : localStorage.removeItem(LSKEY); refresh(); }
+function setKey(k) {
+  k ? localStorage.setItem(LSKEY, k) : localStorage.removeItem(LSKEY);
+  poll();
+  loadSettings();  // re-pull settings now that requests can authenticate
+}
 
 async function api(path, opts = {}) {
   const headers = opts.headers || {};
@@ -232,7 +246,7 @@ function esc(s) {
 }
 function showKeyBar(msg) {
   if (msg) $("status").textContent = msg;
-  $("key").focus();
+  $("hubtoken").focus();
 }
 function show(tab) {
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
@@ -383,53 +397,122 @@ $("hclear").onclick = async () => {
 };
 
 /* ── settings ─────────────────────────────────────────────────────── */
+const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases"];
+let settingsSnap = null;    // field values as loaded — the diff base for Save
+let apikeyTyped = false;    // the user typed into the key field (autofill does not count... mostly)
+$("apikey").addEventListener("input", () => { apikeyTyped = true; });
+
+function snapSettings() {
+  const s = {};
+  SETTING_IDS.forEach((id) => { s[id] = $(id).value.trim(); });
+  return s;
+}
+
 async function loadSettings() {
   try {
     const s = await api("/api/settings");
     const llm = s.llm;
+    const src = s.llm_source || {};
+    const defBase = ((s.defaults || {}).llm || {}).base_url || "";
     $("sbase").value = llm.base_url || "";
+    if (defBase) $("sbase").placeholder = defBase;  // shows where blanks fall back to
+    $("sbasesrc").textContent = src.base_url === "default" ? "· using server default" : "";
     $("smodel").value = llm.model || "auto";
+    $("smodelsrc").textContent = src.model === "default" ? "· server default" : "";
     $("stemp").value = llm.temperature; $("smaxtok").value = llm.max_tokens;
     $("smaxhist").value = llm.max_history; $("seffort").value = llm.reasoning_effort || "";
     $("sextra").value = Object.keys(llm.extra_body || {}).length ? JSON.stringify(llm.extra_body, null, 2) : "";
     $("sphrases").value = (s.switch_phrases || []).join(", ");
-    $("skey").value = "";
+    $("apikey").value = "";
+    apikeyTyped = false;
     $("skeystate").textContent = llm.api_key_set ? "• set on server" : "• not set";
     $("skeystate").style.color = llm.api_key_set ? "var(--ok)" : "var(--muted)";
-    $("skey").placeholder = llm.api_key_set ? "••••• (leave blank to keep)" : "not set";
-  } catch (e) { $("serr").textContent = e.message; }
+    $("apikey").placeholder = llm.api_key_set ? "••••• (leave blank to keep)" : "not set";
+    settingsSnap = snapSettings();
+    $("ssave").disabled = false;
+  } catch (e) {
+    // Never save blind: with no loaded snapshot the fields are blanks, and a
+    // blank-field PUT is exactly what once wiped the LLM URL and phrases.
+    settingsSnap = null;
+    $("ssave").disabled = true;
+    $("serr").textContent = e.message;
+  }
+}
+function setSerr(msg, ok) {
+  $("serr").style.color = ok ? "var(--ok)" : "";
+  $("serr").textContent = msg;
+}
+async function reportLlmState() {
+  $("sllmstate").style.color = ""; $("sllmstate").textContent = "checking LLM…";
+  try {
+    const t = await api("/api/settings/test", { method: "POST" });
+    $("sllmstate").style.color = t.ok ? "var(--ok)" : "var(--bad)";
+    $("sllmstate").textContent = t.ok ? "LLM ok · model: " + t.model : "LLM problem: " + t.error;
+  } catch (e) {
+    $("sllmstate").style.color = "var(--bad)";
+    $("sllmstate").textContent = "LLM check failed: " + e.message;
+  }
 }
 $("ssave").onclick = async () => {
-  $("serr").textContent = "";
-  let extra = {};
-  const rawExtra = $("sextra").value.trim();
-  if (rawExtra) {
-    try { extra = JSON.parse(rawExtra); } catch (e) { $("serr").textContent = "extra_body is not valid JSON: " + e.message; return; }
-    if (typeof extra !== "object" || extra === null || Array.isArray(extra)) { $("serr").textContent = "extra_body must be a JSON object"; return; }
+  if (!settingsSnap) return;
+  setSerr(""); $("sllmstate").textContent = "";
+  const now = snapSettings();
+  const changed = (id) => now[id] !== settingsSnap[id];
+  const llm = {};
+  if (changed("sbase")) llm.base_url = now.sbase;          // blank → server default again
+  if (changed("smodel")) llm.model = now.smodel;           // blank → "auto"
+  if (changed("seffort")) llm.reasoning_effort = now.seffort;
+  for (const [id, k] of [["stemp", "temperature"], ["smaxtok", "max_tokens"], ["smaxhist", "max_history"]]) {
+    if (!changed(id)) continue;
+    const v = k === "temperature" ? parseFloat(now[id]) : parseInt(now[id], 10);
+    if (!Number.isFinite(v)) { setSerr(k + " must be a number"); return; }
+    llm[k] = v;
   }
-  const llm = {
-    base_url: $("sbase").value.trim(),
-    model: $("smodel").value.trim() || "auto",
-    temperature: parseFloat($("stemp").value),
-    max_tokens: parseInt($("smaxtok").value, 10),
-    max_history: parseInt($("smaxhist").value, 10),
-    reasoning_effort: $("seffort").value.trim(),
-    extra_body: extra,
-  };
-  for (const k of ["temperature", "max_tokens", "max_history"])
-    if (!Number.isFinite(llm[k])) { $("serr").textContent = k + " must be a number"; return; }
-  if ($("skey").value) llm.api_key = $("skey").value;  // blank keeps the stored key
-  const phrases = $("sphrases").value.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (changed("sextra")) {
+    if (!now.sextra) llm.extra_body = {};
+    else {
+      let extra;
+      try { extra = JSON.parse(now.sextra); } catch (e) { setSerr("extra_body is not valid JSON: " + e.message); return; }
+      if (typeof extra !== "object" || extra === null || Array.isArray(extra)) { setSerr("extra_body must be a JSON object"); return; }
+      llm.extra_body = extra;
+    }
+  }
+  // Only a key the USER typed is sent. A password manager that autofilled the
+  // field without a keystroke must not silently override the server's key.
+  const typedKey = apikeyTyped ? $("apikey").value : "";
+  if (typedKey) llm.api_key = typedKey;
+  const body = {};
+  if (Object.keys(llm).length) body.llm = llm;
+  if (changed("sphrases"))
+    body.switch_phrases = now.sphrases.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
+  // (an emptied list sends [] → the server resets the default phrases)
+  if (!Object.keys(body).length) { setSerr("nothing changed", true); return; }
   try {
-    await api("/api/settings", { method: "PUT", json: { llm, switch_phrases: phrases } });
+    await api("/api/settings", { method: "PUT", json: body });
+    setSerr("saved ✔", true);
+    setTimeout(() => { if ($("serr").textContent === "saved ✔") setSerr(""); }, 1500);
     await loadSettings(); await poll();
-    $("serr").style.color = "var(--ok)"; $("serr").textContent = "saved ✔";
-    setTimeout(() => { $("serr").textContent = ""; $("serr").style.color = ""; }, 1500);
-  } catch (e) { $("serr").textContent = e.message; }
+    await reportLlmState();  // show the resolved model (or the LLM error) right away
+  } catch (e) { setSerr(e.message); }
 };
 $("skeyclear").onclick = async () => {
-  try { await api("/api/settings", { method: "PUT", json: { llm: { api_key: "" } } }); await loadSettings(); }
-  catch (e) { $("serr").textContent = e.message; }
+  setSerr(""); 
+  try {
+    await api("/api/settings", { method: "PUT", json: { llm: { clear_api_key: true } } });
+    await loadSettings();
+    setSerr("saved key cleared — the server default applies again", true);
+    await reportLlmState();
+  } catch (e) { setSerr(e.message); }
+};
+$("sreset").onclick = async () => {
+  if (!confirm("Drop the saved LLM settings and switch phrases, so the server defaults (RIKO_LLM_* env) apply?")) return;
+  setSerr("");
+  try {
+    await api("/api/settings/reset", { method: "POST", json: { llm: true, switch_phrases: true } });
+    setSerr("reset to server defaults ✔", true);
+    await loadSettings(); await poll();
+    await reportLlmState();
+  } catch (e) { setSerr(e.message); }
 };
 
 /* ── chat test ────────────────────────────────────────────────────── */
@@ -462,9 +545,9 @@ function addChat(cls, who, text) {
 }
 
 /* ── boot ─────────────────────────────────────────────────────────── */
-$("keysave").onclick = () => setKey($("key").value.trim());
-$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") setKey($("key").value.trim()); });
-$("keyclear").onclick = () => { $("key").value = ""; setKey(""); };
+$("keysave").onclick = () => setKey($("hubtoken").value.trim());
+$("hubtoken").addEventListener("keydown", (e) => { if (e.key === "Enter") setKey($("hubtoken").value.trim()); });
+$("keyclear").onclick = () => { $("hubtoken").value = ""; setKey(""); };
 document.querySelectorAll("nav button").forEach((b) =>
   b.onclick = () => { show(b.dataset.tab); if (b.dataset.tab === "settings") loadSettings(); });
 $("psave").onclick = savePersona;
@@ -474,7 +557,7 @@ $("hreload").onclick = loadHistory;
 $("csend").onclick = sendChat;
 $("cinput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 
-$("key").value = key();
+$("hubtoken").value = key();
 if (!key()) showKeyBar("Enter the hub key (or this hub has no key):");
 startCreate();
 poll().then(() => { loadSettings(); });

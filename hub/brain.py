@@ -148,6 +148,25 @@ class Brain:
             self._cache[key] = models[0]
         return models[0]
 
+    def test(self, settings: dict) -> str:
+        """Cheap reachability/auth check for POST /api/settings/test: always
+        hits /v1/models over the network (bad base_url/key surface there),
+        resolves 'auto' and refreshes the cache. Returns the model that would
+        be used; raises on any transport/auth failure."""
+        base_url = settings.get("base_url") or ""
+        if not base_url:
+            raise RuntimeError("LLM not configured")
+        client = OpenAI(base_url=base_url, api_key=_api_key_arg(settings), timeout=30)
+        models = [m.id for m in client.models.list()]
+        model = settings.get("model") or "auto"
+        if model == "auto":
+            if not models:
+                raise RuntimeError(f"{base_url} lists no models; set the model in the hub settings")
+            model = models[0]
+            with self._lock:
+                self._cache[(base_url, settings.get("api_key", ""))] = model
+        return model
+
     def chat(self, settings: dict, messages: list[dict]) -> str:
         """One model turn. `settings` is the merged llm settings object; `messages`
         is the full list including the leading system prompt. Raises on any
