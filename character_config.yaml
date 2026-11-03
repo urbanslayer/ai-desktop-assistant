@@ -15,8 +15,17 @@ llm:
   api_key_env: LLM_API_KEY   # name of the .env variable holding the key; leave it unset if the server needs none
   model: auto                # "auto" = the first model the server lists at /v1/models
   temperature: 0.8
-  max_tokens: 1024           # reasoning models spend tokens thinking, so leave headroom
+  max_tokens: 4096           # reasoning models spend tokens on hidden thinking BEFORE they
+                             # answer: 1024 is often all thinking and no reply, and she goes
+                             # silent. Leave headroom (the code retries once at 2x on a
+                             # thinking-truncated empty reply, capped at 16384).
   max_history: 40            # past messages sent each turn (the history file keeps everything)
+  # Optional knobs for reasoning models (uncomment for your server):
+  # reasoning_effort: low    # OpenAI param some servers honour (o-series, vLLM): less time
+                             # spent thinking, more budget left for the actual answer
+  # extra_body:              # vendor-specific fields passed through in the request body,
+                             # e.g. switch thinking off entirely on Qwen (vLLM/llama.cpp):
+  #   chat_template_kwargs: {enable_thinking: false}
 
 # ── Her look ─────────────────────────────────────────────────
 vrm_model: character_files/sample_avatar.vrm   # any .vrm file (VRoid Studio exports work)

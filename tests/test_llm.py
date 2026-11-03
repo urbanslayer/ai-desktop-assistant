@@ -105,6 +105,70 @@ def test_empty_model_answer_gets_placeholder(fake_llm, cfg):
     assert llm.reply("hi", cfg).startswith("...sorry senpai")
 
 
+# ── reasoning models that spend the whole budget thinking ──────────────────
+
+
+def test_length_truncation_retries_with_double_max_tokens(fake_llm, cfg):
+    # first call (1024 tokens) gets only hidden thinking + finish_reason='length';
+    # the retry at 2048 is under the fake server's truncation limit, so it answers.
+    fake_llm.truncate_below = 2048
+    assert llm.reply("hi Riko, one short sentence please", cfg) == REPLY
+    budgets = [r["max_tokens"] for r in fake_llm.chat_requests]
+    assert budgets == [1024, 2048]  # exactly one retry, doubled
+    history = json.loads(Path(cfg["history_file"]).read_text())
+    assert history[-1] == {"role": "assistant", "content": REPLY}
+
+
+def test_retry_also_empty_falls_back_and_stops(fake_llm, cfg):
+    # every budget gets truncated -> one retry at double tokens, then the fallback line
+    fake_llm.truncate_below = 10 ** 9
+    answer = llm.reply("hi", cfg)
+    assert answer.startswith("...sorry senpai")
+    assert [r["max_tokens"] for r in fake_llm.chat_requests] == [1024, 2048]
+    history = json.loads(Path(cfg["history_file"]).read_text())
+    assert history[-1] == {"role": "assistant", "content": answer}
+
+
+def test_retry_capped_at_16384(fake_llm, cfg, monkeypatch):
+    monkeypatch.setitem(cfg["llm"], "max_tokens", 16384)  # doubling would exceed the cap
+    fake_llm.truncate_below = 10 ** 9
+    assert llm.reply("hi", cfg).startswith("...sorry senpai")
+    assert [r["max_tokens"] for r in fake_llm.chat_requests] == [16384]  # no point retrying
+
+
+def test_default_max_tokens_is_4096(fake_llm, cfg, monkeypatch):
+    monkeypatch.delitem(cfg["llm"], "max_tokens")  # key left out of the yaml
+    assert llm.reply("hi", cfg) == REPLY
+    assert fake_llm.chat_requests[-1]["max_tokens"] == 4096
+
+
+def test_reasoning_effort_and_extra_body_reach_the_server(fake_llm, cfg, monkeypatch):
+    monkeypatch.setitem(cfg["llm"], "reasoning_effort", "low")
+    monkeypatch.setitem(cfg["llm"], "extra_body",
+                        {"chat_template_kwargs": {"enable_thinking": False}})
+    assert llm.reply("hi", cfg) == REPLY
+    req = fake_llm.chat_requests[-1]
+    assert req["reasoning_effort"] == "low"
+    assert req["chat_template_kwargs"] == {"enable_thinking": False}  # extra_body is merged in
+
+
+def test_passthrough_survives_non_streaming_fallback(fake_llm, cfg, monkeypatch):
+    fake_llm.stream_ok = False  # the plain path must forward the kwargs too
+    monkeypatch.setitem(cfg["llm"], "reasoning_effort", "minimal")
+    monkeypatch.setitem(cfg["llm"], "extra_body", {"top_k": 5})
+    assert llm.reply("hi", cfg) == REPLY
+    req = fake_llm.chat_requests[-1]
+    assert req.get("stream") is not True
+    assert req["reasoning_effort"] == "minimal"
+    assert req["top_k"] == 5
+
+
+def test_no_passthrough_keys_omitted_from_body(fake_llm, cfg):
+    assert llm.reply("hi", cfg) == REPLY
+    assert "reasoning_effort" not in fake_llm.chat_requests[-1]
+    assert "chat_template_kwargs" not in fake_llm.chat_requests[-1]
+
+
 def test_forget_wipes_history(fake_llm, cfg):
     llm.reply("hi", cfg)
     assert Path(cfg["history_file"]).read_text().strip()

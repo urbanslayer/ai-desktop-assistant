@@ -81,33 +81,71 @@ def clean(text):
     return text.strip()
 
 
-def _complete(client, model, messages, temperature, max_tokens):
+_MAX_TOKENS_RETRY_CAP = 16384  # the one doubling retry stops here
+
+
+def _complete(client, model, messages, temperature, max_tokens,
+              reasoning_effort=None, extra_body=None):
     """Ask the model, streaming when the server supports it: reasoning models keep the
     connection quiet while they think, and stream chunks do not expire the read timeout
-    the way one long non-stream body does."""
-    try:
-        stream = client.chat.completions.create(
-            model=model, messages=messages, temperature=temperature,
-            max_tokens=max_tokens, stream=True,
-        )
-        parts = []
-        finish = None
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                parts.append(chunk.choices[0].delta.content)
-            if chunk.choices:
-                finish = chunk.choices[0].finish_reason or finish
-        if finish is None:  # the stream died mid-reply; do not save half a sentence
-            raise RuntimeError("the LLM closed the stream before finishing its reply")
-        return "".join(parts)
-    except RuntimeError:
-        raise
-    except Exception as e:  # server without streaming support (or a transport hiccup): try once, plain
-        print(f"[llm] streaming failed ({type(e).__name__}: {e}); retrying without stream")
-        response = client.chat.completions.create(
-            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens,
-        )
-        return response.choices[0].message.content
+    the way one long non-stream body does.
+
+    If the answer comes back empty because the model spent the whole token budget
+    thinking (finish_reason == 'length'), retry once with double max_tokens."""
+    kwargs = {}
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    if extra_body:
+        kwargs["extra_body"] = dict(extra_body)
+
+    def _attempt(budget):
+        try:
+            stream = client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature,
+                max_tokens=budget, stream=True, **kwargs,
+            )
+            parts = []
+            finish = None
+            thought = False
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        parts.append(delta.content)
+                    # vLLM/llama.cpp/Ollama put hidden thinking here, not in content
+                    if getattr(delta, "reasoning_content", None):
+                        thought = True
+                if chunk.choices:
+                    finish = chunk.choices[0].finish_reason or finish
+            if finish is None:  # the stream died mid-reply; do not save half a sentence
+                raise RuntimeError("the LLM closed the stream before finishing its reply")
+            return "".join(parts), finish, thought
+        except RuntimeError:
+            raise
+        except Exception as e:  # server without streaming support (or a transport hiccup): try once, plain
+            print(f"[llm] streaming failed ({type(e).__name__}: {e}); retrying without stream")
+            response = client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature,
+                max_tokens=budget, **kwargs,
+            )
+            message = response.choices[0].message
+            text = message.content or ""
+            thought = bool(getattr(message, "reasoning_content", None))
+            return text, response.choices[0].finish_reason, thought
+
+    text, finish, thought = _attempt(max_tokens)
+    if not text.strip() and finish == "length":
+        retry = min(max_tokens * 2, _MAX_TOKENS_RETRY_CAP)
+        if retry > max_tokens:
+            print(f"[llm] ran out of tokens while thinking; retrying with {retry}")
+            text, finish, thought = _attempt(retry)
+        if not text.strip():
+            print(f"[llm] the reply stayed empty after every token went to "
+                  f"{'hidden thinking' if thought else 'generation'}: raise llm.max_tokens in "
+                  "character_config.yaml, set llm.reasoning_effort, or disable thinking, "
+                  "e.g. llm.extra_body: {chat_template_kwargs: {enable_thinking: false}} "
+                  "for Qwen on vLLM/llama.cpp")
+    return text
 
 
 def reply(user_text, cfg):
@@ -124,7 +162,9 @@ def reply(user_text, cfg):
             _client, _model,
             [{"role": "system", "content": cfg["system_prompt"]}, *recent],
             llm.get("temperature", 0.8),
-            llm.get("max_tokens", 1024),
+            llm.get("max_tokens", 4096),  # reasoning models burn this on hidden thinking
+            reasoning_effort=llm.get("reasoning_effort"),
+            extra_body=llm.get("extra_body"),
         )
         answer = clean(raw)
         if not answer:

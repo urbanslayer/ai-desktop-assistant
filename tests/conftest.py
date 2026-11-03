@@ -28,6 +28,10 @@ class FakeLLMServer:
         self.stream_ok = True  # False -> 400 on stream:true, like a completion-only server
         self.model_id = "test-model"
         self.chat_requests = []  # parsed JSON body of every chat request received
+        # reason longer than the budget: requests whose max_tokens < truncate_below get
+        # only hidden reasoning (delta.reasoning_content), empty content, and
+        # finish_reason='length', exactly like a reasoning model starved of tokens.
+        self.truncate_below = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -47,6 +51,10 @@ class FakeLLMServer:
                         {"id": outer.model_id, "object": "model", "owned_by": "fake"}]})
                 self._send({"error": "not found"}, 404)
 
+            def _truncated(self, body):
+                limit = outer.truncate_below
+                return limit is not None and int(body.get("max_tokens") or 0) < limit
+
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
@@ -56,7 +64,16 @@ class FakeLLMServer:
                 if body.get("stream"):
                     if not outer.stream_ok:
                         return self._send({"error": {"message": "streaming not supported"}}, 400)
-                    return self._sse()
+                    return self._sse(body)
+                if self._truncated(body):  # all budget on thinking, nothing left to say
+                    return self._send({
+                        "id": "chatcmpl-fake", "object": "chat.completion", "created": 0,
+                        "model": outer.model_id,
+                        "choices": [{"index": 0, "finish_reason": "length",
+                                     "message": {"role": "assistant", "content": "",
+                                                 "reasoning_content": "hmm let me think"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    })
                 return self._send({
                     "id": "chatcmpl-fake", "object": "chat.completion", "created": 0,
                     "model": outer.model_id,
@@ -65,24 +82,32 @@ class FakeLLMServer:
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 })
 
-            def _sse(self):
-                half = max(1, len(outer.reply) // 2)
-                chunks = [
-                    {"role": "assistant"},
-                    {"content": outer.reply[:half]},
-                    {"content": outer.reply[half:]},
-                    {},  # final chunk: only finish_reason
-                ]
+            def _sse(self, body):
+                if self._truncated(body):  # reasoning model starved of tokens: thinking
+                    # deltas, zero content deltas, then finish_reason='length'
+                    deltas = [{"role": "assistant"},
+                              {"reasoning_content": "hmm " * 20},
+                              {}]
+                    finish = "length"
+                else:
+                    half = max(1, len(outer.reply) // 2)
+                    deltas = [
+                        {"role": "assistant"},
+                        {"content": outer.reply[:half]},
+                        {"content": outer.reply[half:]},
+                        {},  # final chunk: only finish_reason
+                    ]
+                    finish = "stop"
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 self.wfile.write(b": ping\n\n")  # SSE comment; a good server may send these
-                for i, delta in enumerate(chunks):
+                for i, delta in enumerate(deltas):
                     payload = {
                         "id": "chatcmpl-fake", "object": "chat.completion.chunk", "created": 0,
                         "model": outer.model_id,
                         "choices": [{"index": 0, "delta": delta,
-                                     "finish_reason": "stop" if i == len(chunks) - 1 else None}],
+                                     "finish_reason": finish if i == len(deltas) - 1 else None}],
                     }
                     self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
