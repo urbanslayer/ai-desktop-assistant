@@ -10,10 +10,21 @@ services:
       RIKO_LLM_BASE_URL: "${RIKO_LLM_BASE_URL:-}"
       RIKO_LLM_API_KEY: "${RIKO_LLM_API_KEY:-}"
       RIKO_LLM_MODEL: "${RIKO_LLM_MODEL:-auto}"
+      # Breeze-TTS-2 voice (docs/VOICE.md). The hub is the ONLY component that
+      # talks to breeze; clients just fetch the audio_url paths it returns.
+      # Empty RIKO_TTS_BASE_URL = voice off (audio_url stays null everywhere).
+      RIKO_TTS_BASE_URL: "${RIKO_TTS_BASE_URL:-http://breeze-tts:8137}"
+      RIKO_TTS_ENABLED: "${RIKO_TTS_ENABLED:-1}"
     volumes:
       # hub.db + avatars live here on the host; back this folder up to move her brain
       - ./data:/data
     user: "${UID:-1000}:${GID:-1000}"  # keep ./data owned by your host user
+    networks:
+      - default
+      # shared with the breeze-tts compose stack (`docker network create riko`
+      # once on the host, see README.md). hub keeps its old default-network
+      # address; clients keep talking only to the hub.
+      - riko
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/app/.venv/bin/python", "-c",
@@ -22,3 +33,8 @@ services:
       timeout: 10s
       retries: 5
       start_period: 10s
+
+networks:
+  default: {}
+  riko:
+    external: true

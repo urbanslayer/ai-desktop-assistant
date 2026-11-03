@@ -133,6 +133,45 @@
         <button class="btn" id="pcancel" hidden>Cancel edit</button>
       </div>
       <div class="err" id="perr"></div>
+
+      <!-- voice panel: needs a saved persona (voice routes are per-persona) -->
+      <div id="vpanel" hidden>
+        <h2 style="margin-top:14px">Voice <span class="hint">made by the hub (Breeze-TTS-2) ·
+          English &amp; Chinese only · non-commercial weights</span></h2>
+        <div class="row">
+          <div><label>Mode</label><select id="vmode">
+            <option value="design">Design — describe the voice</option>
+            <option value="clone">Clone — use the reference clip</option>
+            <option value="off">Off — text only</option>
+          </select></div>
+          <div><label>Seed (fixed keeps the voice stable)
+            <button class="btn small" id="vroll" title="re-roll">🎲</button></label>
+            <input id="vseed" type="number" min="0"></div>
+          <div><label>cfg_scale (blank = server default)</label>
+            <input id="vcfg" type="number" step="0.1" min="0" max="10" placeholder="1–5 typical"></div>
+        </div>
+        <label>Voice description (used in design mode)</label>
+        <textarea id="vdesc" placeholder="A proud, sharp teenage girl. Fast, confident, a little impatient."></textarea>
+        <label>Style — delivery direction (appended for design, used with clone)</label>
+        <textarea id="vstyle" placeholder="(optional) e.g. slower and smugger when teasing"></textarea>
+        <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap">
+          <button class="btn primary" id="vsave">Save voice</button>
+          <button class="btn" id="vpreview">Preview</button>
+          <button class="btn" id="vlock" title="say the greeting in this designed voice and freeze it as a clone">Lock this voice</button>
+        </div>
+        <div id="vplayrow" style="margin-top:6px"></div>
+        <label>Reference clip — wav/flac/ogg (mp3 if the server supports it), 3–30 s, max 20 MB</label>
+        <div class="row" style="align-items:center">
+          <div><input type="file" id="vref" accept=".wav,.flac,.ogg,.mp3,audio/*"></div>
+          <div><input id="vreftext" placeholder="exact transcript of the clip (required)"></div>
+          <div><button class="btn" id="vrefup" disabled>Upload reference</button></div>
+        </div>
+        <div id="vcliprow" hidden style="margin-top:8px; display:flex; gap:8px; align-items:center">
+          <span class="hint">stored clip:</span><audio id="vclip" controls style="flex:1"></audio>
+          <button class="btn small danger" id="vrefdel">Remove reference</button>
+        </div>
+        <div class="err" id="verr"></div>
+      </div>
     </div>
   </section>
 
@@ -181,6 +220,18 @@
       <textarea id="sphrases" placeholder="switch to, change to, become, persona, talk to, i want to talk to"></textarea>
       <p class="hint">A whole chat message like “&lt;phrase&gt; &lt;persona keyword&gt;” switches persona.
         Blanking this list restores the server defaults — keywords and names always switch on their own.</p>
+
+      <h2 style="margin-top:14px">TTS — hub voice</h2>
+      <label><input type="checkbox" id="sttsenabled" style="width:auto; vertical-align:middle">
+        Speak replies with Breeze-TTS-2 (English &amp; Chinese only, non-commercial weights)</label>
+      <label>Breeze base URL <span class="src" id="sttssrc"></span></label>
+      <input id="sttsbase" placeholder="http://breeze-tts:8137 (empty default = voice off)">
+      <div class="row" style="max-width:200px"><div><label>Timeout (s)</label>
+        <input id="sttstimeout" type="number" min="1"></div></div>
+      <p class="hint">Blank base URL = server default (RIKO_TTS_BASE_URL); an empty default turns voice
+        off everywhere and audio_url stays null. The hub synthesises and caches the audio; clients only
+        fetch /api/.../audio URLs — nobody talks to Breeze directly.</p>
+
       <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap">
         <button class="btn primary" id="ssave" disabled>Save settings</button>
         <button class="btn" id="sreset">Reset to server defaults</button>
@@ -307,6 +358,7 @@ async function startEdit(pid) {
   $("pprompt").value = p.system_prompt; $("pgreet").value = p.greeting;
   $("ptts").value = p.tts_voice; $("perr").textContent = "";
   showAvatarInfo(p);
+  fillVoicePanel(p);
   $("pname").scrollIntoView({ behavior: "smooth", block: "center" });
 }
 function startCreate() {
@@ -315,6 +367,7 @@ function startCreate() {
   $("psave").textContent = "Create"; $("pcancel").hidden = true;
   ["pname", "pkeys", "pprompt", "pgreet", "ptts"].forEach((i) => $(i).value = "");
   $("psize").textContent = ""; $("pvrm").value = ""; $("pupload").disabled = true;
+  fillVoicePanel(null);
 }
 async function showAvatarInfo(p) {
   try {
@@ -336,6 +389,7 @@ async function savePersona() {
     if (!editing) {
       const p = await api("/api/personas", { method: "POST", json: body });
       editing = p.id;  // subsequent saves update the persona we just made
+      fillVoicePanel(p);
     } else {
       await api("/api/personas/" + editing, { method: "PUT", json: body });
     }
@@ -364,6 +418,113 @@ $("pupload").onclick = async () => {
     await poll();
     showAvatarInfo(await api("/api/personas/" + editing));
   } catch (e) { $("perr").textContent = "upload failed: " + e.message; }
+};
+
+/* ── voice panel (per-persona, docs/VOICE.md) ─────────────────────── */
+let voicePid = null;
+async function audioBlobUrl(path) {
+  const headers = key() ? { Authorization: "Bearer " + key() } : {};
+  const r = await fetch(path, { headers });
+  if (!r.ok) {
+    let detail = r.status + " " + r.statusText;
+    try { detail = (await r.json()).detail || detail; } catch (e) { /* not json */ }
+    throw new Error(detail);
+  }
+  return URL.createObjectURL(await r.blob());
+}
+async function playInto(container, path) {
+  const url = await audioBlobUrl(path);
+  const a = document.createElement("audio");
+  a.controls = true; a.src = url; a.style.width = "100%";
+  container.appendChild(a);
+  a.play().catch(() => { /* autoplay may be blocked — the player is right there */ });
+}
+function fillVoicePanel(p) {
+  voicePid = p ? p.id : null;
+  $("vpanel").hidden = !p;
+  $("vplayrow").innerHTML = "";
+  $("verr").textContent = "";
+  if (!p) return;
+  const v = p.voice || {};
+  $("vmode").value = v.mode || "design";
+  $("vdesc").value = v.description || "";
+  $("vstyle").value = v.style || "";
+  $("vseed").value = v.seed == null ? "" : v.seed;
+  $("vcfg").value = v.cfg_scale == null ? "" : v.cfg_scale;
+  $("vref").value = ""; $("vrefup").disabled = true; $("vreftext").value = "";
+  $("vcliprow").hidden = !v.has_reference;
+  if (v.has_reference)
+    audioBlobUrl(`/api/personas/${p.id}/voice/reference`)
+      .then((u) => { $("vclip").src = u; }).catch(() => {});
+}
+function setVerr(msg, ok) {
+  $("verr").style.color = ok ? "var(--ok)" : "";
+  $("verr").textContent = msg;
+}
+$("vroll").onclick = () => { $("vseed").value = 1 + Math.floor(Math.random() * 2147483646); };
+$("vsave").onclick = async () => {
+  if (!voicePid) return;
+  setVerr("");
+  const body = {
+    mode: $("vmode").value,
+    description: $("vdesc").value.trim(),
+    style: $("vstyle").value,
+  };
+  if ($("vseed").value !== "") {
+    const seed = parseInt($("vseed").value, 10);
+    if (!Number.isInteger(seed) || seed < 0) { setVerr("seed must be a non-negative integer"); return; }
+    body.seed = seed;
+  }
+  body.cfg_scale = $("vcfg").value === "" ? null : parseFloat($("vcfg").value);
+  try {
+    fillVoicePanel(await api(`/api/personas/${voicePid}/voice`, { method: "PUT", json: body }));
+    setVerr("voice saved ✔ (existing replies keep their old audio)", true);
+    await poll();
+  } catch (e) { setVerr(e.message); }
+};
+$("vpreview").onclick = async () => {
+  if (!voicePid) return;
+  setVerr(""); $("vplayrow").innerHTML = "";
+  try { await playInto($("vplayrow"), `/api/personas/${voicePid}/voice/preview`); }
+  catch (e) { setVerr("preview failed: " + e.message); }
+};
+$("vlock").onclick = async () => {
+  if (!voicePid) return;
+  if (!confirm("Lock this voice: she says her greeting once in the designed voice and that clip becomes her permanent clone. Do it once you're happy with the voice.")) return;
+  setVerr("");
+  try {
+    fillVoicePanel(await api(`/api/personas/${voicePid}/voice/lock`, { method: "POST", json: {} }));
+    setVerr("voice locked ✔ — now a clone from her own take", true);
+    await poll();
+  } catch (e) { setVerr(e.message); }
+};
+$("vref").addEventListener("change", () => {
+  $("vrefup").disabled = !$("vref").files[0] || !voicePid;
+});
+$("vrefup").onclick = async () => {
+  const f = $("vref").files[0];
+  if (!f || !voicePid) return;
+  const refText = $("vreftext").value.trim();
+  if (!refText) { setVerr("the transcript of the clip (ref_text) is required"); return; }
+  const fd = new FormData();
+  fd.append("file", f, f.name);
+  fd.append("ref_text", refText);
+  setVerr("");
+  try {
+    fillVoicePanel(await api(`/api/personas/${voicePid}/voice/reference`, { method: "PUT", body: fd }));
+    setVerr("reference uploaded ✔ — mode is now clone", true);
+    await poll();
+  } catch (e) { setVerr("reference failed: " + e.message); }
+};
+$("vrefdel").onclick = async () => {
+  if (!voicePid) return;
+  if (!confirm("Remove the reference clip? The voice falls back to design mode.")) return;
+  setVerr("");
+  try {
+    fillVoicePanel(await api(`/api/personas/${voicePid}/voice/reference`, { method: "DELETE" }));
+    setVerr("reference removed ✔ — back to design mode", true);
+    await poll();
+  } catch (e) { setVerr(e.message); }
 };
 
 /* ── history ──────────────────────────────────────────────────────── */
@@ -397,7 +558,7 @@ $("hclear").onclick = async () => {
 };
 
 /* ── settings ─────────────────────────────────────────────────────── */
-const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases"];
+const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "sttsbase", "sttstimeout"];
 let settingsSnap = null;    // field values as loaded — the diff base for Save
 let apikeyTyped = false;    // the user typed into the key field (autofill does not count... mostly)
 $("apikey").addEventListener("input", () => { apikeyTyped = true; });
@@ -405,6 +566,7 @@ $("apikey").addEventListener("input", () => { apikeyTyped = true; });
 function snapSettings() {
   const s = {};
   SETTING_IDS.forEach((id) => { s[id] = $(id).value.trim(); });
+  s.sttsenabled = $("sttsenabled").checked ? "1" : "0";
   return s;
 }
 
@@ -423,6 +585,13 @@ async function loadSettings() {
     $("smaxhist").value = llm.max_history; $("seffort").value = llm.reasoning_effort || "";
     $("sextra").value = Object.keys(llm.extra_body || {}).length ? JSON.stringify(llm.extra_body, null, 2) : "";
     $("sphrases").value = (s.switch_phrases || []).join(", ");
+    const tts = s.tts || {}, tsrc = s.tts_source || {};
+    const defTts = ((s.defaults || {}).tts || {});
+    $("sttsenabled").checked = !!tts.enabled;
+    $("sttsbase").value = tts.base_url || "";
+    if (defTts.base_url) $("sttsbase").placeholder = defTts.base_url;
+    $("sttssrc").textContent = tsrc.base_url === "default" ? "· using server default" : "";
+    $("sttstimeout").value = tts.timeout == null ? "" : tts.timeout;
     $("apikey").value = "";
     apikeyTyped = false;
     $("skeystate").textContent = llm.api_key_set ? "• set on server" : "• not set";
@@ -443,11 +612,13 @@ function setSerr(msg, ok) {
   $("serr").textContent = msg;
 }
 async function reportLlmState() {
-  $("sllmstate").style.color = ""; $("sllmstate").textContent = "checking LLM…";
+  $("sllmstate").style.color = ""; $("sllmstate").textContent = "checking LLM + TTS…";
   try {
     const t = await api("/api/settings/test", { method: "POST" });
+    const tts = t.tts || {};
     $("sllmstate").style.color = t.ok ? "var(--ok)" : "var(--bad)";
-    $("sllmstate").textContent = t.ok ? "LLM ok · model: " + t.model : "LLM problem: " + t.error;
+    $("sllmstate").textContent = (t.ok ? "LLM ok · model: " + t.model : "LLM problem: " + t.error) +
+      " · TTS: " + (tts.ok ? "reachable" : tts.error);
   } catch (e) {
     $("sllmstate").style.color = "var(--bad)";
     $("sllmstate").textContent = "LLM check failed: " + e.message;
@@ -486,6 +657,15 @@ $("ssave").onclick = async () => {
   if (changed("sphrases"))
     body.switch_phrases = now.sphrases.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
   // (an emptied list sends [] → the server resets the default phrases)
+  const tts = {};
+  if (changed("sttsbase")) tts.base_url = now.sttsbase;    // blank → server default again
+  if (changed("sttsenabled")) tts.enabled = now.sttsenabled === "1";
+  if (changed("sttstimeout")) {
+    const v = parseInt(now.sttstimeout, 10);
+    if (!Number.isFinite(v)) { setSerr("tts timeout must be a number"); return; }
+    tts.timeout = v;
+  }
+  if (Object.keys(tts).length) body.tts = tts;
   if (!Object.keys(body).length) { setSerr("nothing changed", true); return; }
   try {
     await api("/api/settings", { method: "PUT", json: body });
@@ -505,10 +685,10 @@ $("skeyclear").onclick = async () => {
   } catch (e) { setSerr(e.message); }
 };
 $("sreset").onclick = async () => {
-  if (!confirm("Drop the saved LLM settings and switch phrases, so the server defaults (RIKO_LLM_* env) apply?")) return;
+  if (!confirm("Drop the saved LLM settings, TTS settings and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* env) apply?")) return;
   setSerr("");
   try {
-    await api("/api/settings/reset", { method: "POST", json: { llm: true, switch_phrases: true } });
+    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, switch_phrases: true } });
     setSerr("reset to server defaults ✔", true);
     await loadSettings(); await poll();
     await reportLlmState();
@@ -531,6 +711,10 @@ async function sendChat() {
       $("ctx").appendChild(d);
     } else {
       addChat("ai", r.persona, r.reply);
+    }
+    if (r.audio_url) {           // hub-made audio: fetch the cached WAV and play it
+      playInto($("ctx"), r.audio_url)
+        .catch((e) => { $("cerr").textContent = "audio unavailable: " + e.message; });
     }
     $("ctx").scrollTop = $("ctx").scrollHeight;
     await poll();

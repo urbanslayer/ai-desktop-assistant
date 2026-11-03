@@ -14,11 +14,14 @@ The design contract: [`docs/DESIGN.md`](../docs/DESIGN.md).
 ```bash
 cd hub
 RIKO_LLM_BASE_URL=http://192.0.2.51:8000/v1 RIKO_LLM_API_KEY=*** \
-RIKO_HUB_KEY=*** uv run server.py
+RIKO_HUB_KEY=*** \
+RIKO_TTS_BASE_URL=http://127.0.0.1:8137 uv run server.py
 ```
 
 Data goes to `./data` (override with `RIKO_HUB_DATA`), the port is `8002`
-(`RIKO_HUB_PORT`), and an empty `RIKO_HUB_KEY` disables auth. Then open
+(`RIKO_HUB_PORT`), and an empty `RIKO_HUB_KEY` disables auth. An empty
+`RIKO_TTS_BASE_URL` (or `RIKO_TTS_ENABLED=0`) turns voice off everywhere —
+every `audio_url` stays `null` and the audio routes answer 503. Then open
 <http://127.0.0.1:8002/> for the web config page.
 
 Desktop mode needs no separate process at all: `desktop.py` with
@@ -30,18 +33,43 @@ Desktop mode needs no separate process at all: `desktop.py` with
 mkdir -p ~/AI/Docker/riko-hub && cd ~/AI/Docker/riko-hub
 # copy this whole hub/ folder here (rsync -a repo/hub/ ./)
 cp .env.example .env      # set RIKO_HUB_KEY, RIKO_LLM_BASE_URL, RIKO_LLM_API_KEY
+docker network create riko   # once per host: the shared network for hub + breeze
 docker compose up -d      # builds the image on first run
 ```
 
 Open `http://<box>:8002` and paste the hub key into the page. The health
 check hits `/api/health` every 30 s; `docker compose ps` shows the status.
 
+## Voice (Breeze-TTS-2)
+
+The hub is the **only** component that talks to breeze
+([`docs/VOICE.md`](../docs/VOICE.md)); clients just fetch the `audio_url`
+paths the hub returns and always get properly-headed WAVs. The breeze stack
+(`breeze-tts` service, port 8137) lives in its own compose project; both
+stacks join one external network, created **once** on the host:
+
+```bash
+docker network create riko
+```
+
+`.env` then points the hub at it: `RIKO_TTS_BASE_URL=http://breeze-tts:8137`
+(from outside docker: `http://<gpu-box>:8137`) and `RIKO_TTS_ENABLED=1`.
+Empty base URL = voice off; the switch is also in the web Settings page
+(only `base_url`/`parallel_note` blank back to these env defaults). Each
+persona's voice (design description / clone reference / off) is edited per
+persona; the hub synthesises replies lazily and caches them per
+`voice_version`, so persona voices, previews, and locked voices never
+re-synthesise on every read. Breeze speaks English and Chinese only, and
+its weights are non-commercial.
+
 ## The data folder (`./data`)
 
 ```
 data/
-  hub.db            personas, messages, settings, state version (SQLite, WAL)
+  hub.db            personas, messages, settings, voices, state version (SQLite, WAL)
   avatars/<id>.vrm  uploaded avatars (the built-in default is inside the image)
+  voices/<id>.wav   per-persona reference clips (the only voice source that persists)
+  audio/            cached reply/greeting WAVs (<msg>-v<voicever>.wav, capped at 500 MB)
 ```
 
 Back up (or move) the whole folder — that is all she is. `docker compose down`
@@ -60,9 +88,12 @@ the env default. `switch_phrases: []` resets the phrases to the defaults
 (keywords and names always switch on their own). `POST /api/settings/reset`
 drops saved overrides wholesale, and `POST /api/settings/test` answers
 `{ok, model}` by listing `/v1/models` with the merged settings. `GET
-/api/settings` returns the merged values plus `defaults` and a per-field
+`/api/settings` returns the merged values plus `defaults` and a per-field
 `llm_source` (`saved` vs `default`) — the web page shows where each value
-comes from and keeps Save disabled until its first load succeeded.
+comes from and keeps Save disabled until its first load succeeded. The `tts`
+block follows the same rules: blank `base_url` restores the `RIKO_TTS_BASE_URL`
+default, `enabled` is a plain boolean, and `POST /api/settings/reset` accepts
+`{"tts": true}` too.
 
 ## Security
 
