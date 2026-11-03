@@ -242,3 +242,15 @@ class Store:
                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             (key, json.dumps(value)))
             self.db.commit()
+
+    def has_json(self, key: str) -> bool:
+        with self._lock:
+            return self._meta_json(key) is not None
+
+    def del_json(self, key: str) -> bool:
+        """Delete a stored settings key; True when one existed (an override
+        really went away, so callers know to bump the state version)."""
+        with self._lock:
+            cur = self.db.execute("DELETE FROM settings WHERE key=?", (key,))
+            self.db.commit()
+            return cur.rowcount > 0

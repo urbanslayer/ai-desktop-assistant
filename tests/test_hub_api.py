@@ -373,7 +373,11 @@ def test_settings_never_leaks_api_key(tmp_path, fake_llm):
     s = r.json()["llm"]
     assert s["api_key_set"] is True and s["temperature"] == 0.5 and "api_key" not in s
 
-    assert client.put("/api/settings", json={"llm": {"api_key": ""}}).json()["llm"]["api_key_set"] is False
+    # a blank api_key never changes anything; only clear_api_key removes the saved one
+    assert client.put("/api/settings", json={"llm": {"api_key": ""}}).json()["llm"]["api_key_set"] is True
+    cleared = client.put("/api/settings", json={"llm": {"clear_api_key": True}}).json()
+    assert cleared["llm"]["api_key_set"] is True  # the env default key applies again
+    assert cleared["llm_source"]["api_key"] == "default"
 
     # saved settings win over llm_defaults
     client.put("/api/settings", json={"llm": {"base_url": "http://elsewhere/v1"}})

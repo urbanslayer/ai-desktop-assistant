@@ -27,6 +27,7 @@ class FakeHubLLM:
         self.model_id = "test-model"
         self.chat_requests = []    # parsed JSON body of every chat request received
         self.models_calls = 0      # GET /v1/models count (auto-resolution traffic)
+        self.auth_headers = []     # Authorization header of every request received
         self.fail = False          # True -> 500 on every chat request
         # requests whose max_tokens < truncate_below get only hidden reasoning,
         # empty content and finish_reason='length', like a reasoning model starved of tokens.
@@ -45,6 +46,7 @@ class FakeHubLLM:
                 self.wfile.write(body)
 
             def do_GET(self):
+                outer.auth_headers.append(self.headers.get("Authorization") or "")
                 if self.path == "/v1/models":
                     outer.models_calls += 1
                     return self._send({"object": "list", "data": [
@@ -56,6 +58,7 @@ class FakeHubLLM:
                 return limit is not None and int(body.get("max_tokens") or 0) < limit
 
             def do_POST(self):
+                outer.auth_headers.append(self.headers.get("Authorization") or "")
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if self.path != "/v1/chat/completions":
