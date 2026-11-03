@@ -39,6 +39,12 @@
     #status { align-self: center; }
     #status.listening { background: rgba(200, 40, 70, 0.88); }
     #status.listening::before { content: "● "; animation: blink 1s infinite; }
+    /* Approval ask: "Can I …? Enter = yes, Esc = no" (desktop.py, R2-F) */
+    #approval {
+      max-width: 92%; padding: 7px 13px; border-radius: 12px; font-size: 14px; align-self: center;
+      background: rgba(255, 176, 32, 0.94); color: #241a02; opacity: 0; transition: opacity .25s;
+    }
+    #approval.show { opacity: 1; }
     @keyframes blink { 50% { opacity: .2; } }
 
     /* Text input: Enter (or the global shortcut) opens it, Esc closes it */
@@ -63,7 +69,7 @@
 <body>
   <div id="start">Loading...</div>
   <div id="bubble"></div>
-  <div id="hud"><div id="heard"></div><div id="status"></div></div>
+  <div id="hud"><div id="heard"></div><div id="approval"></div><div id="status"></div></div>
   <input id="input" type="text" placeholder="Say something to her… (Enter to send, Esc to close)" autocomplete="off">
   <audio id="voice"></audio>
 
@@ -269,12 +275,26 @@
     const bubble = document.getElementById('bubble');
     const heard = document.getElementById('heard');
     const status = document.getElementById('status');
+    const approval = document.getElementById('approval');
     const timers = {};
     function flash(el, text, seconds, cls = '') {
       el.textContent = text;
       el.className = `show ${cls}`;
       clearTimeout(timers[el.id]);
       if (seconds) timers[el.id] = setTimeout(() => el.classList.remove('show'), seconds * 1000);
+    }
+    // Approval bubble: desktop.py emits 'approval' while a tool waits for an
+    // answer; Enter says yes, Esc says no (a hub-side timeout denies anyway).
+    let approvalOpen = false;
+    function showApproval(summary, seconds) {
+      approvalOpen = true;
+      flash(approval, `Can I ${summary}?  Enter = yes, Esc = no`, 0);
+    }
+    function hideApproval(answered) {
+      if (!approvalOpen) return;
+      approvalOpen = false;
+      approval.classList.remove('show');
+      if (answered) flash(status, answered === 'yes' ? 'thank you :)' : 'ok, not then', 3);
     }
     const STATUS_TEXT = { listening: 'listening…', hearing: 'hmm?', thinking: 'thinking…' };
     function setStatus(state) {
@@ -345,6 +365,11 @@
     let forgetArmedAt = 0;
     addEventListener('keydown', (e) => {
       if (!DESKTOP || e.target === input) return;  // the text box owns its own keys
+      if (approvalOpen && (e.key === 'Enter' || e.key === 'Escape')) {
+        e.preventDefault();  // the ask wins over the 'type' shortcut on Enter
+        approvalAnswer(e.key === 'Enter');
+        return;
+      }
       if (e.key === 'Escape') { control('hide-input'); return; }
       if (e.repeat) return;
       const action = actionFor(e);
@@ -373,6 +398,11 @@
     });
     addEventListener('blur', talkRelease);  // window lost focus mid-hold: send what we have
 
+    function approvalAnswer(ok) {
+      hideApproval(ok ? 'yes' : 'no');
+      control(ok ? 'approve' : 'deny');
+    }
+
     window.riko = { openInput, closeInput, motion, director };  // desktop.py calls these; motion/director are for debugging and the smoke test
 
     // ── Ask Python for her next line and UI events, tell it when a clip is done ──
@@ -391,6 +421,12 @@
       } else if (ev.type === 'error') {
         flash(bubble, ev.text, 6, 'error');
         feed(director.error(T()));
+      } else if (ev.type === 'approval') {
+        showApproval(ev.summary, ev.timeout_s);
+      } else if (ev.type === 'approval_done') {
+        hideApproval('');  // answered elsewhere (riko-ctl, or it timed out)
+      } else if (ev.type === 'tool' && ev.phase === 'start') {
+        flash(status, ev.label ? `using ${ev.label}` : 'using a tool…', 20, 'thinking');
       } else if (ev.type === 'open_input') openInput();
       else if (ev.type === 'close_input') closeInput();
       else if (ev.type === 'persona')

@@ -321,3 +321,48 @@ def test_browser_tool_without_extension_reports_not_connected(runtime, fake_hub,
     req = fake_hub.push_request(CID, "browser_tabs", {})
     res = fake_hub.wait_for_result(req["request_id"])
     assert res and not res["ok"] and "not connected" in res["error"]
+
+
+def test_start_desktop_glue(fake_hub, hub_connected, tmp_path, monkeypatch):
+    """desktop.py's one call: start_desktop registers the full catalogue, the
+    approval bubble event fires, and the approve/deny hooks answer it."""
+    events = []
+
+    class StubViewer:
+        @staticmethod
+        def emit(kind, **data):
+            events.append((kind, data))
+
+    monkeypatch.setenv("RIKO_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = {"desktop": {"client": {"browser_port": free_port(),
+                                  "approval_timeout": 5}}}
+    rt, br = client_tools.start_desktop(cfg, hub_connected, viewer_module=StubViewer)
+    try:
+        assert rt is not None and br is not None
+        assert fake_hub.wait_for_register(rt.client_id)
+        tools = [t["name"] for t in fake_hub.registered[rt.client_id]["tools"]]
+        assert {"open_url", "clipboard_read", "clipboard_write", "notify",
+                "browser_read", "browser_click"} <= set(tools)
+        # the per-install token file is there and readable only by us
+        token_file = tmp_path / "cfg" / "browser_token"
+        assert token_file.exists() and oct(token_file.stat().st_mode & 0o777) == "0o600"
+        req = fake_hub.push_request(rt.client_id, "__approval__",
+                                   {"summary": "paste your clipboard"})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and rt.pending_approval() is None:
+            time.sleep(0.05)
+        assert any(k == "approval" for k, _ in events), "no approval bubble event"
+        assert rt.approve_hook()["answered"] is True
+        res = fake_hub.wait_for_result(req["request_id"])
+        assert res and res["ok"] and res["approved"] is True
+        assert any(k == "approval_done" for k, _ in events)
+    finally:
+        rt.stop()
+        br.stop()
+
+
+def test_start_desktop_disabled(fake_hub, hub_connected, tmp_path, monkeypatch):
+    monkeypatch.setenv("RIKO_CONFIG_DIR", str(tmp_path / "cfg"))
+    rt, br = client_tools.start_desktop({"desktop": {"client": {"enabled": False}}},
+                                        hub_connected, viewer_module=None)
+    assert rt is None and br is None

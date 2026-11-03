@@ -93,6 +93,19 @@ desktop:
   height: 680
   bubble_seconds: 8    # how long her speech bubble stays after she finishes
 
+  # The client-tool channel (docs/API.md "client tools"): she registers this PC
+  # with the hub and runs what the model asks — open_url, clipboard_read,
+  # clipboard_write, notify, and the browser_* tools relayed to the Riko Helper
+  # Firefox extension (browser-ext/, see README "🌐 Her hands: client tools").
+  client:
+    enabled: true
+    # id: my-desktop       # hub-side identity; default is <user>-desktop, remembered
+                           # in ~/.config/riko/client_id (keep it ^[A-Za-z0-9_-]{1,64}$)
+    name: Riko desktop     # what shows in GET /api/clients
+    browser_port: 8765     # ws://127.0.0.1:<port> the Firefox extension pairs with
+                           # (token: riko-ctl browser-token, or the tray menu)
+    approval_timeout: 120  # seconds to wait for Enter/Esc/riko-ctl approve; timeout = deny
+
   # Keyboard shortcuts. They are app-specific: they only fire while her window
   # is focused, so they never fight your window manager — and NEVER use the
   # Super/Meta/Win key (it is rejected at startup). Format: optional Ctrl/Alt/

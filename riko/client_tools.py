@@ -466,6 +466,9 @@ class ClientRuntime:
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="riko-tool")
         self._stop = threading.Event()
+        # desktop.py installs these (riko-ctl approve / deny entry points)
+        self.approve_hook = lambda: {"ok": False, "error": "no approval UI"}
+        self.deny_hook = lambda: {"ok": False, "error": "no approval UI"}
 
     # ── lifecycle ────────────────────────────────────────────
     def start(self):
