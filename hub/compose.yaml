@@ -1,0 +1,24 @@
+# Riko hub on the AI box:  docker compose up -d   (see README.md / .env.example)
+services:
+  hub:
+    build: ./
+    image: riko-hub
+    ports:
+      - "${RIKO_HUB_PORT:-8002}:8002"
+    environment:
+      RIKO_HUB_KEY: "${RIKO_HUB_KEY:-}"
+      RIKO_LLM_BASE_URL: "${RIKO_LLM_BASE_URL:-}"
+      RIKO_LLM_API_KEY: "${RIKO_LLM_API_KEY:-}"
+      RIKO_LLM_MODEL: "${RIKO_LLM_MODEL:-auto}"
+    volumes:
+      # hub.db + avatars live here on the host; back this folder up to move her brain
+      - ./data:/data
+    user: "${UID:-1000}:${GID:-1000}"  # keep ./data owned by your host user
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
