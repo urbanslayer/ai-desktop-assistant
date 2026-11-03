@@ -43,14 +43,18 @@ def check(cfg):
     print(f"[setup] GPT-SoVITS is running at {cfg['sovits']['url']}")
 
 
-def speak(text, cfg):
-    """Make her say `text`. Returns the path of the WAV file, or None with tts: none."""
+def speak(text, cfg, voice=None):
+    """Make her say `text`. Returns the path of the WAV file, or None with tts: none.
+
+    `voice` overrides the configured voice (the active persona's tts_voice);
+    only the openai backend has named voices, others keep their own sample/id.
+    """
     if cfg["tts"] == "none" or not text.strip():
         return None
     if cfg["tts"] == "fish":
         audio = _fish(text, cfg["fish"])
     elif cfg["tts"] == "openai":
-        audio = _openai(text, cfg["openai_tts"])
+        audio = _openai(text, cfg["openai_tts"], voice=voice)
     else:
         audio = _sovits(text, cfg["sovits"])
     # Re-save through soundfile: Fish's WAV header claims the clip is hours
@@ -74,12 +78,13 @@ def _sovits(text, s):
     return response.content
 
 
-def _openai(text, o):
+def _openai(text, o, voice=None):
     key = os.getenv(o.get("api_key_env") or "", "")
     response = requests.post(
         o["url"].rstrip("/") + "/audio/speech",
         headers={"Authorization": f"Bearer {key}"} if key else {},
-        json={"model": o["model"], "voice": o["voice"], "input": text, "response_format": "wav"},
+        json={"model": o["model"], "voice": voice or o["voice"], "input": text,
+              "response_format": "wav"},
         timeout=120,
     )
     response.raise_for_status()

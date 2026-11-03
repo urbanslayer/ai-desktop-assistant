@@ -2,12 +2,16 @@
 
 The page asks /next four times a second. The answer carries a voice clip (if
 one is waiting) plus UI events: what state she is in, what she said, what
-she heard. When a clip ends the page calls /done, so the next turn only
-starts after she has finished talking.
+she heard, when her persona changed. When a clip ends the page calls /done,
+so the next turn only starts after she has finished talking.
 
 The desktop app and riko-ctl talk to the same server:
-    POST /say            {"text": "..."}   you typed something
-    POST /control/<cmd>  {}                talk / talk-start / talk-stop / type / forget / quit ...
+    POST /say            {"text": "..."}                you typed something
+    POST /control/<cmd>  {"...": ...}                   talk / talk-start / talk-stop /
+                                                        type / forget / persona ...
+
+GET /avatar.vrm streams the ACTIVE persona's avatar from the hub (cached on
+disk by id + version), so the page never talks to the hub or needs its key.
 
 No page open? The clip plays on your speakers instead.
 """
@@ -23,6 +27,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import sounddevice as sd
 import soundfile as sf
 
+from riko import hub_client
 from riko.config import ROOT
 
 HOST = "127.0.0.1"  # 127.0.0.1, not localhost: behaves the same on Windows and Linux
@@ -32,7 +37,6 @@ _clips = queue.Queue()          # voice clips waiting for the page
 _events = queue.Queue()         # UI events waiting for the page
 _finished = threading.Event()   # set when the page says a clip ended
 _page_last_seen = float("-inf")  # when the page last asked /next (time.monotonic); never yet
-_avatar = None                  # the .vrm file named in character_config.yaml
 _settings = {}                  # the desktop: section of the config, for the page
 _handlers = {"say": None, "control": None}  # set by on_say() / on_control()
 
@@ -43,7 +47,8 @@ def on_say(fn):
 
 
 def on_control(fn):
-    """Register fn(cmd) for /control/<cmd> requests. Return value is sent back as JSON."""
+    """Register fn(cmd, args) for /control/<cmd> requests (args = the JSON body).
+    Return value is sent back as JSON."""
     _handlers["control"] = fn
 
 
@@ -59,12 +64,23 @@ def page_open():
 class _Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         global _page_last_seen
-        if self.path == "/avatar.vrm":
-            if _avatar is None or not _avatar.exists():
-                return self._send(b'{"error": "avatar not loaded"}', "application/json", 503)
-            return self._send(_avatar.read_bytes(), "application/octet-stream")
+        if self.path.startswith("/avatar.vrm"):
+            # The page may ask ?v=<id>-<version>; we always serve the ACTIVE persona
+            # (the query just busts the browser cache), fetched from the hub once
+            # per id+version and cached on disk after that.
+            try:
+                state = hub_client.get().state()
+                hub_client.note_active(state)
+                active = state["active"]
+                path = hub_client.get().avatar_file(active["id"], active["avatar_version"])
+                return self._send(path.read_bytes(), "model/gltf-binary")
+            except hub_client.HubError as e:
+                return self._send(json.dumps({"error": str(e)}).encode(), "application/json", 503)
         if self.path == "/settings":
-            return self._send(json.dumps(_settings).encode(), "application/json")
+            settings = dict(_settings)
+            active = hub_client.active_persona() or {}
+            settings["persona_name"] = active.get("name")
+            return self._send(json.dumps(settings).encode(), "application/json")
         if self.path != "/next":
             return super().do_GET()  # the page and the voice clip, from client/
         _page_last_seen = time.monotonic()
@@ -106,7 +122,7 @@ class _Handler(SimpleHTTPRequestHandler):
             if self.path.startswith("/control/"):
                 if not _handlers["control"]:
                     return self._send(b'{"error": "nothing is listening"}', "application/json", 503)
-                result = _handlers["control"](self.path.removeprefix("/control/"))
+                result = _handlers["control"](self.path.removeprefix("/control/"), body)
                 return self._send(json.dumps(result if result is not None else {"ok": True}).encode(),
                                   "application/json")
         except Exception as e:  # a handler bug should not hang up on the caller
@@ -159,19 +175,18 @@ class _Handler(SimpleHTTPRequestHandler):
 
 
 def start(cfg):
-    global _avatar, _settings, PORT
-    _avatar = ROOT / cfg["vrm_model"]
+    global _settings, PORT
     _settings = dict(cfg.get("desktop") or {})
     PORT = int(os.environ.get("RIKO_PORT") or PORT)  # re-read: tests (and scripts) may set it late
-    if not _avatar.exists():
-        sys.exit(f"[setup] Avatar not found: {_avatar}. Check vrm_model in character_config.yaml.")
     try:
         server = ThreadingHTTPServer((HOST, PORT), partial(_Handler, directory=str(ROOT / "client")))
     except OSError:
         sys.exit(f"[setup] Port {PORT} is busy (is Riko already running?). Close it, set RIKO_PORT to "
                  f"another port, or change PORT in riko/viewer.py.")
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"[viewer] avatar: {cfg['vrm_model']}")
+    active = hub_client.active_persona() or {}
+    if active:
+        print(f"[viewer] persona: {active.get('name')} (avatar comes from the hub)")
     print(f"[viewer] avatar page: http://{HOST}:{PORT}  (open it, then click once)")
     return server
 
