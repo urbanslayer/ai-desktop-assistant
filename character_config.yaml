@@ -1,15 +1,23 @@
-# Everything about your character lives in this file and in character_files/.
-# Paths are relative to this folder. API keys go in .env (see .env.example).
+# What the local app (desktop.py / main.py) needs to know: where the hub is,
+# and how THIS PC's ears and voice work. Her personality, personas, avatars
+# and chat history live on the hub now — edit them on the hub's web page
+# (http://<hub box>:8002). API keys go in .env (see .env.example).
 
-# ── Her personality ──────────────────────────────────────────
-history_file: chat_history.json  # delete this file to make her forget the chat
-system_prompt: |
-  You are a helpful assistant named Riko.
-  You speak like a snarky anime girl.
-  Always refer to the user as "senpai".
-  Keep replies short and conversational: one to three sentences, no markdown, no emoji.
+# ── The hub: her brain, memory and personas ──────────────────
+hub:
+  mode: remote                     # local = run the hub inside this app (needs the
+                                   # hub/ folder in this repo); remote = talk to hub.url
+  url: http://192.0.2.51:8002    # remote only: the box running the hub
+                                   # (Docker on the AI box: ~/AI/Docker/riko-hub)
+  api_key_env: RIKO_HUB_KEY        # .env variable holding the hub key (both modes;
+                                   # same value as the hub server's own RIKO_HUB_KEY)
+  local_port: 8002                 # local only; binds 127.0.0.1
+  local_data: hub_data             # local only; her data folder, relative to this file
 
-# ── Her brain: any OpenAI-compatible server (vLLM, llama.cpp, LM Studio, Ollama, ...) ──
+# ── Her brain: LOCAL MODE ONLY ───────────────────────────────
+# These seed the hub the first time it starts on an empty hub_data folder.
+# After that the hub remembers its own settings: change the brain on the
+# hub's web page, not here. In remote mode this whole block is ignored.
 llm:
   base_url: http://192.0.2.51:8000/v1
   api_key_env: LLM_API_KEY   # name of the .env variable holding the key; leave it unset if the server needs none
@@ -17,18 +25,15 @@ llm:
   temperature: 0.8
   max_tokens: 4096           # reasoning models spend tokens on hidden thinking BEFORE they
                              # answer: 1024 is often all thinking and no reply, and she goes
-                             # silent. Leave headroom (the code retries once at 2x on a
+                             # silent. Leave headroom (the hub retries once at 2x on a
                              # thinking-truncated empty reply, capped at 16384).
-  max_history: 40            # past messages sent each turn (the history file keeps everything)
+  max_history: 40            # past messages sent each turn (the hub keeps everything)
   # Optional knobs for reasoning models (uncomment for your server):
   # reasoning_effort: low    # OpenAI param some servers honour (o-series, vLLM): less time
                              # spent thinking, more budget left for the actual answer
   # extra_body:              # vendor-specific fields passed through in the request body,
                              # e.g. switch thinking off entirely on Qwen (vLLM/llama.cpp):
   #   chat_template_kwargs: {enable_thinking: false}
-
-# ── Her look ─────────────────────────────────────────────────
-vrm_model: character_files/sample_avatar.vrm   # any .vrm file (VRoid Studio exports work)
 
 # ── Her ears (speech to text) ────────────────────────────────
 # remote = Faster-Whisper on another machine (run server/asr_server.py there).
@@ -48,6 +53,8 @@ local_asr:
   device: cpu        # "cuda" for an NVIDIA GPU (needs CUDA + cuDNN)
 
 # ── Her voice (text to speech) ───────────────────────────────
+# The hub can also hand out a per-persona voice name (tts_voice): with
+# tts: openai she uses that voice when the persona has one, this one otherwise.
 # none   = no voice; her reply shows in a speech bubble only
 # openai = any OpenAI-compatible /audio/speech server (Kokoro-FastAPI, speaches, ...)
 # sovits = GPT-SoVITS (start its API server first)

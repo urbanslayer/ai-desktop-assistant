@@ -1,29 +1,25 @@
 """Tests for riko.viewer: the local HTTP surface the avatar page and riko-ctl use.
 
 The server runs once per test session on a random port (RIKO_PORT is set before
-viewer.start(); never 8080, which the desktop app may be using).
+viewer.start(); never 8080, which the desktop app may be using). The hub-backed
+bits (/avatar.vrm, /settings persona name) get a fake hub connected per test.
 """
 import http.client
-import os
-import urllib.request
 
 import pytest
 import requests
 
-from conftest import free_port
-from riko import viewer
+from conftest import avatar_bytes, free_port
+from riko import hub_client, viewer
 
 
 @pytest.fixture(scope="session")
 def base_url():
+    import os
     port = free_port()
     os.environ["RIKO_PORT"] = str(port)
     try:
-        cfg = {
-            "vrm_model": "character_files/sample_avatar.vrm",
-            "history_file": "chat_history.json",
-            "desktop": {"width": 420, "height": 680, "bubble_seconds": 8},
-        }
+        cfg = {"desktop": {"width": 420, "height": 680, "bubble_seconds": 8}}
         server = viewer.start(cfg)
         assert viewer.PORT == port and viewer.PORT != 8080  # RIKO_PORT was honoured
         yield f"http://127.0.0.1:{port}"
@@ -45,24 +41,63 @@ def _clean_state(base_url):
 
 def test_next_drains_events(base_url):
     viewer.emit("status", state="thinking")
-    viewer.emit("heard", text="hello")
+    viewer.emit("persona", id="asuka", name="Asuka", avatar_version=2)
     body = requests.get(f"{base_url}/next", timeout=5).json()
     assert body["audio"] is None
     assert body["events"] == [
         {"type": "status", "state": "thinking"},
-        {"type": "heard", "text": "hello"},
+        {"type": "persona", "id": "asuka", "name": "Asuka", "avatar_version": 2},
     ]
     # drained: the next poll sees nothing until something new is emitted
     assert requests.get(f"{base_url}/next", timeout=5).json()["events"] == []
 
 
-def test_settings_returns_desktop_section(base_url):
-    assert requests.get(f"{base_url}/settings", timeout=5).json() == {
-        "width": 420, "height": 680, "bubble_seconds": 8}
+def test_settings_returns_desktop_section_plus_active_persona(base_url, hub_connected):
+    body = requests.get(f"{base_url}/settings", timeout=5).json()
+    assert body == {"width": 420, "height": 680, "bubble_seconds": 8, "persona_name": "Riko"}
+
+
+def test_settings_persona_name_is_none_without_a_hub(base_url):
+    assert requests.get(f"{base_url}/settings", timeout=5).json()["persona_name"] is None
 
 
 def test_done_is_accepted_without_json(base_url):
     assert requests.post(f"{base_url}/done", timeout=5).status_code == 200
+
+
+# ── /avatar.vrm: the hub's active persona, cached by id + version ──
+def test_avatar_serves_active_persona_and_refetches_on_version_change(base_url, fake_hub,
+                                                                      monkeypatch, tmp_path):
+    monkeypatch.setenv("FAKE_HUB_KEY", "test-hub-key")
+    monkeypatch.setenv("RIKO_AVATAR_CACHE", str(tmp_path / "avatars"))
+    hub_client.connect({"hub": {"mode": "remote", "url": fake_hub.url,
+                                "api_key_env": "FAKE_HUB_KEY"}})
+
+    r = requests.get(f"{base_url}/avatar.vrm", timeout=5)
+    assert r.status_code == 200
+    assert r.content == avatar_bytes("riko", 1)
+    assert "gltf" in r.headers["Content-Type"]
+    assert fake_hub.avatar_requests == [("riko", 1)]
+
+    # same persona, same version: still the disk cache, no new hub traffic
+    assert requests.get(f"{base_url}/avatar.vrm?v=riko-1", timeout=5).content == \
+        avatar_bytes("riko", 1)
+    assert fake_hub.avatar_requests == [("riko", 1)]
+
+    fake_hub.bump_avatar("riko")
+    assert requests.get(f"{base_url}/avatar.vrm?v=riko-2", timeout=5).content == \
+        avatar_bytes("riko", 2)
+    assert fake_hub.avatar_requests == [("riko", 1), ("riko", 2)]
+
+    # and the active persona's avatar, whoever that is
+    fake_hub.force_active("asuka")
+    assert requests.get(f"{base_url}/avatar.vrm", timeout=5).content == avatar_bytes("asuka", 1)
+
+
+def test_avatar_without_a_hub_is_a_503_error(base_url):
+    r = requests.get(f"{base_url}/avatar.vrm", timeout=5)
+    assert r.status_code == 503
+    assert "hub" in r.json()["error"]
 
 
 def test_say_requires_json_content_type(base_url):
@@ -89,8 +124,8 @@ def test_say_requires_json_content_type(base_url):
 def test_control_dispatch_and_unknown(base_url):
     calls = []
 
-    def control(cmd):
-        calls.append(cmd)
+    def control(cmd, args):
+        calls.append((cmd, args))
         if cmd == "forget":
             return {"ok": True, "did": "forget"}
         return None  # handlers may return nothing; the viewer turns that into {"ok": true}
@@ -101,13 +136,24 @@ def test_control_dispatch_and_unknown(base_url):
         assert r.status_code == 200 and r.json() == {"ok": True, "did": "forget"}
         r = requests.post(f"{base_url}/control/whatever", json={}, timeout=5)
         assert r.json() == {"ok": True}  # unknown commands are the handler's business
-        assert calls == ["forget", "whatever"]
+        assert calls == [("forget", {}), ("whatever", {})]
+    finally:
+        viewer.on_control(None)
+
+
+def test_control_persona_passes_the_body(base_url):
+    calls = []
+    viewer.on_control(lambda cmd, args: calls.append((cmd, args)) or None)
+    try:
+        r = requests.post(f"{base_url}/control/persona", json={"name": "asuka"}, timeout=5)
+        assert r.status_code == 200 and r.json() == {"ok": True}
+        assert calls == [("persona", {"name": "asuka"})]
     finally:
         viewer.on_control(None)
 
 
 def test_control_handler_exception_returns_500(base_url):
-    def boom(cmd):
+    def boom(cmd, args):
         raise ValueError("handler exploded")
 
     viewer.on_control(boom)

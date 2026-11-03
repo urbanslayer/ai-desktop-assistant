@@ -6,7 +6,9 @@
     riko-ctl talk-start   start recording   (bind to key press)
     riko-ctl talk-stop    stop and send     (bind to key release)
     riko-ctl toggle       show / hide her   (also: show, hide)
-    riko-ctl forget       clear the chat history
+    riko-ctl forget       clear the chat history (on the hub, for this persona)
+    riko-ctl personas     list personas and which one is active
+    riko-ctl persona NAME switch who she is (id, name or keyword; case doesn't matter)
     riko-ctl quit
     riko-ctl status
 
@@ -22,7 +24,8 @@ import urllib.request
 
 URL = os.environ.get("RIKO_URL", "http://127.0.0.1:8080")
 APP_ID = "riko"
-COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide", "forget", "quit", "status"}
+COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide", "forget",
+            "personas", "persona", "quit", "status"}
 
 
 def focus_window():
@@ -41,21 +44,32 @@ def focus_window():
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         sys.exit(__doc__)
     cmd = sys.argv[1]
+    body = {}
+    if cmd == "persona":
+        name = " ".join(sys.argv[2:]).strip()
+        if not name:
+            sys.exit("riko-ctl persona <name>   (id, name or keyword, e.g. riko-ctl persona asuka)")
+        body = {"name": name}
     if cmd in ("type", "show"):
         focus_window()
-    request = urllib.request.Request(f"{URL}/control/{cmd}", data=b"{}", method="POST",
-                                     headers={"Content-Type": "application/json"})
+    request = urllib.request.Request(f"{URL}/control/{cmd}", data=json.dumps(body).encode(),
+                                     method="POST", headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=3) as response:
+        with urllib.request.urlopen(request, timeout=10) as response:
             reply = json.loads(response.read() or b"{}")
     except (urllib.error.URLError, OSError) as e:
         sys.exit(f"riko-ctl: Riko isn't running at {URL} ({e}). Start it with: uv run desktop.py")
     if cmd == "type":
         focus_window()  # again, in case the window was hidden and only just mapped
-    if cmd == "status" or not reply.get("ok", True):
+    if cmd == "personas" and reply.get("ok", True):
+        active = reply.get("active")
+        for p in reply.get("personas", []):
+            print(("* " if p["id"] == active else "  ") + f"{p['name']}  ({p['id']})")
+        sys.exit(0)
+    if cmd in ("status", "personas", "persona") or not reply.get("ok", True):
         print(json.dumps(reply))
     sys.exit(0 if reply.get("ok", True) else 1)
 

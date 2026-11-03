@@ -68,7 +68,7 @@ def asr_url():
 
 def cfg_remote(base, api_key_env="TEST_ASR_KEY"):
     from conftest import make_cfg
-    cfg = make_cfg("http://127.0.0.1:1/v1", "unused_history.json")  # LLM not used here
+    cfg = make_cfg("http://127.0.0.1:1")  # hub/LLM not used here
     cfg["asr"] = "remote"
     cfg["remote_asr"] = {"url": f"{base}/v1", "api_key_env": api_key_env,
                          "model": "whisper-1", "language": "en"}

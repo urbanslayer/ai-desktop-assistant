@@ -1,22 +1,26 @@
 """One conversation, driven from anywhere: the terminal, the desktop app, or riko-ctl.
 
-Turns (typed text or a recorded clip) go into a queue and a single worker
-thread handles them in order:
+Turns (typed text, a recorded clip, or a persona switch) go into a queue and
+a single worker thread handles them in order:
 
-    clip -> asr.transcribe -> text -> llm.reply -> tts.speak -> viewer.play
+    clip -> asr.transcribe -> text -> hub.chat -> tts.speak -> viewer.play
 
 Every step is reported to the avatar page as a UI event, so the desktop
-window can show "listening...", "thinking...", and her speech bubble.
+window can show "listening...", "thinking...", her speech bubble, and swap
+the VRM when the persona changes — by keyword, riko-ctl or another client.
 """
 import queue
 import threading
 
-from riko import asr, llm, tts, viewer
+from riko import asr, hub_client, tts, viewer
 
 
 class Session:
-    def __init__(self, cfg):
+    def __init__(self, cfg, source="desktop"):
         self.cfg = cfg
+        self.source = source  # stamped on every message the hub stores
+        self.hub = hub_client.get()
+        hub_client.note_active(self.hub.state())  # who is active right now?
         self.recorder = asr.Recorder()
         self._turns = queue.Queue()
         threading.Thread(target=self._worker, daemon=True, name="riko-session").start()
@@ -31,6 +35,16 @@ class Session:
 
     def submit_audio(self, wav_bytes):
         self._turns.put(("audio", wav_bytes))
+
+    def switch_persona(self, name):
+        """Switch by id, name or keyword — raises HubError (404) if nothing matches.
+        The page reloads the avatar right away; the greeting is spoken on the worker."""
+        state = self.hub.set_active(name)
+        hub_client.announce_persona(state)
+        active = state["active"]
+        print(f"[persona] {active['name']} is in now")
+        self._turns.put(("greet", active))
+        return active
 
     def talk_start(self):
         if self.recorder.recording:
@@ -63,9 +77,9 @@ class Session:
         (self.talk_stop if self.recorder.recording else self.talk_start)()
 
     def forget(self):
-        llm.forget(self.cfg)
+        self.hub.clear_history()  # the active persona's chat, on the hub
         viewer.emit("say", text="...Who are you again, senpai?")
-        print("[llm] chat history cleared")
+        print("[hub] chat history cleared")
 
     # ── The worker ───────────────────────────────────────────
     def _worker(self):
@@ -81,6 +95,11 @@ class Session:
                     viewer.emit("status", state="idle")
 
     def _turn(self, kind, payload):
+        if kind == "greet":
+            viewer.emit("status", state="thinking")
+            greeting = payload.get("greeting") or f"{payload['name']} here."
+            self._speak(greeting)
+            return
         if kind == "audio":
             viewer.emit("status", state="hearing")
             text = asr.transcribe(payload, self.cfg)
@@ -93,8 +112,20 @@ class Session:
             text = payload
         print(f"You:  {text}")
         viewer.emit("status", state="thinking")
-        answer = llm.reply(text, self.cfg)
-        print(f"Riko: {answer}")
-        wav = tts.speak(answer, self.cfg)
+        result = self.hub.chat(text, source=self.source)
+        # 'switch to asuka' and bare keywords come back as switched, with the
+        # greeting as the reply; a persona change also reloads the avatar page.
+        if result.get("switched") or result.get("persona") != self._active_id():
+            hub_client.announce_persona(self.hub.state())
+        self._speak(result["reply"])
+
+    def _speak(self, answer):
+        persona = hub_client.active_persona() or {}
+        print(f"{persona.get('name', 'Riko')}: {answer}")
+        wav = tts.speak(answer, self.cfg, voice=persona.get("tts_voice") or None)
         viewer.emit("status", state="speaking")
         viewer.play(wav, answer)
+
+    def _active_id(self):
+        active = hub_client.active_persona() or {}
+        return active.get("id")

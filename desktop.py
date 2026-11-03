@@ -11,6 +11,8 @@ In the window:
 
 From anywhere (bind these to keys in your compositor, see README):
     bin/riko-ctl type | talk | talk-start | talk-stop | toggle | forget | quit
+    bin/riko-ctl personas          list personas and which one is active
+    bin/riko-ctl persona asuka     switch who she is (tray has the same menu)
 """
 import argparse
 import json
@@ -27,7 +29,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from riko import asr, llm, tts, viewer
+from riko import asr, hub_client, tts, viewer
 from riko.config import load_config
 from riko.session import Session
 
@@ -199,12 +201,15 @@ def main():
     cfg["asr"] = args.asr or cfg["asr"]
     cfg["tts"] = args.tts or cfg["tts"]
 
-    llm.check(cfg)
+    hub = hub_client.check(cfg)  # starts the hub in-process in local mode
     asr.check(cfg, fatal=False)  # typing still works if the ASR box is down
     tts.check(cfg)
     viewer.start(cfg)
-    session = Session(cfg)
-    print(f"\n=== Riko desktop  |  model: {llm.model_name()}  |  ears: {cfg['asr']}  |  voice: {cfg['tts']} ===")
+    session = Session(cfg, source="desktop")
+    hub_client.start_state_poller()  # notice switches made from the web page or another PC
+    active = hub_client.active_persona() or {}
+    print(f"\n=== Riko desktop  |  hub: {hub.url}  |  persona: {active.get('name', '?')}"
+          f"  |  ears: {cfg['asr']}  |  voice: {cfg['tts']} ===")
 
     QGuiApplication.setDesktopFileName(APP_ID)  # becomes the Wayland app_id
     app = QApplication([sys.argv[0]])
@@ -244,7 +249,8 @@ def main():
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
 
-    def control(cmd):  # runs on the HTTP thread
+    def control(cmd, args=None):  # runs on the HTTP thread; args is the JSON body
+        args = args or {}
         if cmd == "talk":
             session.talk_toggle()
         elif cmd == "talk-start":
@@ -253,6 +259,23 @@ def main():
             session.talk_stop()
         elif cmd == "forget":
             session.forget()
+        elif cmd == "persona":
+            name = str(args.get("name", "")).strip()
+            if not name:
+                return {"ok": False, "error": "persona: give a name, e.g. riko-ctl persona asuka"}
+            try:
+                active = session.switch_persona(name)  # speaks the greeting on the worker
+            except hub_client.HubError as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "persona": active["name"]}
+        elif cmd == "personas":
+            try:
+                listed = hub_client.get().personas()
+            except hub_client.HubError as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True,
+                    "active": (hub_client.active_persona() or {}).get("id"),
+                    "personas": [{"id": p["id"], "name": p["name"]} for p in listed]}
         elif cmd == "input-opened":
             win.input_open = True
             print("[ctl] input opened", flush=True)
@@ -274,6 +297,36 @@ def main():
     tray = QSystemTrayIcon(_tray_icon())
     tray.setToolTip("Riko")
     menu = QMenu()
+
+    # Persona submenu: rebuilt every time it opens, so it tracks the hub
+    # (keyword switches, the web page, another PC) without any polling here.
+    persona_menu = QMenu("Persona", menu)
+
+    def rebuild_persona_menu():
+        persona_menu.clear()
+        try:
+            listed = hub_client.get().personas()
+            active_id = (hub_client.active_persona() or {}).get("id")
+        except hub_client.HubError as e:
+            dead = QAction(f"hub unreachable: {e}", persona_menu)
+            dead.setEnabled(False)
+            persona_menu.addAction(dead)
+            return
+        for p in listed:
+            def pick(pid=p["id"], _=False):
+                try:
+                    session.switch_persona(pid)
+                except hub_client.HubError as e:
+                    print(f"[persona] {e}")
+            action = QAction(p["name"], persona_menu)
+            action.setCheckable(True)
+            action.setChecked(p["id"] == active_id)
+            action.triggered.connect(pick)
+            persona_menu.addAction(action)
+
+    persona_menu.aboutToShow.connect(rebuild_persona_menu)
+    rebuild_persona_menu()
+    menu.addMenu(persona_menu)
     for label, fn in (("Type to her", lambda: on_command("type")),
                       ("Talk / stop talking", session.talk_toggle),
                       ("Show / hide", toggle_window),

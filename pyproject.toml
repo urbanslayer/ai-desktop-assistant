@@ -6,23 +6,23 @@ requires-python = ">=3.11"
 dependencies = [
     "av<19",  # av 19 (Sep 2026) breaks faster-whisper 1.2.1 audio loading
     "faster-whisper",
+    # hub in local mode runs inside this app (hub/server.py is FastAPI)
+    "fastapi",
     "numpy",
     "openai",
     "pyside6>=6.12.0",
     "python-dotenv",
+    "python-multipart",
     "pyyaml",
     "requests",
     "sounddevice",
     "soundfile",
+    "uvicorn",
 ]
 
 [dependency-groups]
 dev = [
     "pytest",
-    # so tests can import server/asr_server.py (build_app) without loading a model
-    "fastapi",
-    "uvicorn",
-    "python-multipart",
 ]
 
 [tool.pytest.ini_options]
