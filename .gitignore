@@ -13,3 +13,5 @@ hub/data/*
 !hub/data/.gitkeep
 hub_data/
 chat_history.json.imported
+tts/data/*
+!tts/data/.gitkeep
