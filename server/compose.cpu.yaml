@@ -1,0 +1,7 @@
+# Override for machines without an NVIDIA GPU:
+#   docker compose -f compose.yaml -f compose.cpu.yaml up -d
+services:
+  asr:
+    environment:
+      ASR_DEVICE: cpu
+    deploy: !reset null  # drop the GPU reservation entirely

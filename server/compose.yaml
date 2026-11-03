@@ -1,0 +1,33 @@
+# Riko's remote ears on an NVIDIA box.  docker compose up -d
+# Tweaks live in .env (see .env.example). CPU-only machine: add -f compose.cpu.yaml
+services:
+  asr:
+    build: ./
+    image: riko-asr-server
+    ports:
+      - "${ASR_PORT:-8001}:8001"
+    environment:
+      ASR_MODEL: "${ASR_MODEL:-large-v3-turbo}"
+      ASR_API_KEY: "${ASR_API_KEY:-}"
+      ASR_COMPUTE_TYPE: "${ASR_COMPUTE_TYPE:-auto}"
+      # set HF_HUB_OFFLINE=1 in .env once the model is downloaded to prove it loads from ./data
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+    volumes:
+      # the model downloads here on first start and is reused afterwards
+      - ./data:/data
+    user: "${UID:-1000}:${GID:-1000}"  # keep ./data owned by your host user
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30m  # first start downloads a ~1.6 GB model into ./data

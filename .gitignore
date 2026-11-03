@@ -7,3 +7,5 @@ client/audio/
 .venv/
 __pycache__/
 .worktrees/
+server/data/*
+!server/data/.gitkeep

@@ -10,6 +10,7 @@ desktop and sends each clip here as a WAV file; this answers with the text.
 Options (or the env vars in brackets):
     --host 0.0.0.0  --port 8001                  [ASR_HOST, ASR_PORT]
     --model large-v3-turbo                       [ASR_MODEL]  any Faster-Whisper model name or path
+    --model-dir /data/models                     [ASR_MODEL_DIR]  where to download models (default: Faster-Whisper's usual HF cache)
     --device auto|cuda|cpu  --compute-type auto  [ASR_DEVICE, ASR_COMPUTE_TYPE]
     ASR_API_KEY=secret  -> clients must send "Authorization: Bearer secret"
 
@@ -55,10 +56,12 @@ def parse_args():
     p.add_argument("--device", default=env("ASR_DEVICE", "auto"), choices=["auto", "cuda", "cpu"])
     p.add_argument("--compute-type", default=env("ASR_COMPUTE_TYPE", "auto"),
                    help="auto = float16 on GPU, int8 on CPU")
+    p.add_argument("--model-dir", default=env("ASR_MODEL_DIR") or None,
+                   help="directory to download models into (default: Faster-Whisper's usual HF cache)")
     return p.parse_args()
 
 
-def build_app(model_name, device, compute_type):
+def build_app(model_name, device, compute_type, model_dir=None):
     if device in ("auto", "cuda"):
         _preload_cuda_libs()
     from faster_whisper import WhisperModel  # after the preload, so it finds the CUDA libs
@@ -67,7 +70,11 @@ def build_app(model_name, device, compute_type):
         compute_type = "int8" if device == "cpu" else "auto"  # CTranslate2's "auto" = fastest the device supports
     print(f"[asr-server] loading {model_name} (device={device}, compute_type={compute_type}); "
           "the first run downloads it...", flush=True)
-    whisper = WhisperModel(model_name, device=device, compute_type=compute_type)
+    print(f"[asr-server] model files: "
+          + (f"{os.path.abspath(model_dir)} (--model-dir)" if model_dir
+             else os.environ.get("HF_HOME") or "the default Hugging Face cache (~/.cache/huggingface)"), flush=True)
+    whisper = WhisperModel(model_name, device=device, compute_type=compute_type,
+                           download_root=model_dir)
     print(f"[asr-server] ready on {whisper.model.device}", flush=True)
     lock = threading.Lock()  # one clip at a time; keeps GPU memory flat
     api_key = os.environ.get("ASR_API_KEY", "")
@@ -124,7 +131,7 @@ def build_app(model_name, device, compute_type):
 
 def main():
     args = parse_args()
-    app = build_app(args.model, args.device, args.compute_type)
+    app = build_app(args.model, args.device, args.compute_type, model_dir=args.model_dir)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

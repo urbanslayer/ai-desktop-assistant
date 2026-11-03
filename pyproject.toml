@@ -19,6 +19,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest",
+    # so tests can import server/asr_server.py (build_app) without loading a model
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
 ]
 
 [tool.pytest.ini_options]
