@@ -128,7 +128,10 @@ def _local_cfg(port):
 
 
 def test_check_local_without_hub_package_exits_clearly(monkeypatch):
-    monkeypatch.setitem(sys.modules, "hub", None)  # `import hub` fails no matter what
+    # `import hub` / `from hub.server import ...` fail no matter what, even if
+    # test_hub_api.py already cached the real hub.server in sys.modules.
+    monkeypatch.setitem(sys.modules, "hub", None)
+    monkeypatch.setitem(sys.modules, "hub.server", None)
     with pytest.raises(SystemExit) as e:
         hub_client.check(_local_cfg(free_port()))
     msg = str(e.value)

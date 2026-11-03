@@ -135,12 +135,16 @@ uv run main.py --tts fish
 
 ```bash
 # her head — from this repo's hub/ directory
-mkdir -p ~/AI/Docker/riko-hub && cp -r hub/* ~/AI/Docker/riko-hub/ && cd ~/AI/Docker/riko-hub
-cp .env.example .env      # set RIKO_HUB_KEY (same value as on your PC) and LLM_API_KEY
+# (cp -a hub/. copies dotfiles too — .env.example, .dockerignore. hub/data/
+#  is her live state; don't drag a stale copy over — rm -rf it after copying,
+#  or use: rsync -a --exclude data/ hub/ ~/AI/Docker/riko-hub/)
+mkdir -p ~/AI/Docker/riko-hub && cp -a hub/. ~/AI/Docker/riko-hub/ && cd ~/AI/Docker/riko-hub
+cp .env.example .env      # set RIKO_HUB_KEY (same value as on your PC), RIKO_LLM_BASE_URL and RIKO_LLM_API_KEY
 docker compose up -d
 
 # her ears — from this repo's server/ directory (skip if asr: local)
-mkdir -p ~/AI/Docker/riko-asr && cp -r server/* ~/AI/Docker/riko-asr/ && cd ~/AI/Docker/riko-asr
+# (same deal: don't copy a leftover server/data/ or server/.venv/)
+mkdir -p ~/AI/Docker/riko-asr && cp -a server/. ~/AI/Docker/riko-asr/ && cd ~/AI/Docker/riko-asr
 cp .env.example .env      # set ASR_API_KEY
 docker compose up -d
 ```
@@ -352,7 +356,7 @@ Tested on Windows 11 and Ubuntu 22.04 (WSL2) with an RTX 3060 12 GB. Faster-Whis
 | Key | When | Get it |
 |---|---|---|
 | `RIKO_HUB_KEY` | always — the client's bearer key for the hub (`hub.api_key_env` says the name) | anything you choose, shared with the hub (`RIKO_HUB_KEY` in the hub server's `.env`) |
-| `LLM_API_KEY` | local mode: seeds the hub's LLM settings on first start; remote mode only for the hub container | your server (or [platform.openai.com](https://platform.openai.com/api-keys) for OpenAI) |
+| `LLM_API_KEY` | local mode only: this PC's `.env` variable that seeds the hub's LLM settings on first start (`llm.api_key_env` says the name). In remote mode the hub reads its own `RIKO_LLM_API_KEY` from the hub server's `.env`, not this one | your server (or [platform.openai.com](https://platform.openai.com/api-keys) for OpenAI) |
 | `ASR_API_KEY` | `asr: remote` and the ears server was started with a key | anything you choose, shared with `server/asr_server.py` |
 | `TTS_API_KEY` | `tts: openai`, if that server needs a key | that server |
 | `GROQ_API_KEY` | `asr: groq` | [console.groq.com](https://console.groq.com/keys) (free tier) |
