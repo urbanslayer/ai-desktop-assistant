@@ -679,12 +679,12 @@ same long-poll trick as the client-tool channel):
 ```bash
 curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 # {"events":[
-#   {"seq":12,"type":"turn_started","data":{"persona":"riko","source":"android"}},
-#   {"seq":13,"type":"tool_started","data":{"call_id":"…","tool":"web_search","label":"searching the web for “tokyo weather”"}},
-#   {"seq":14,"type":"tool_finished","data":{"call_id":"…","tool":"web_search","ok":true,"ms":812}},
-#   {"seq":15,"type":"approval_needed","data":{"request_id":"…","client_id":"my-desktop","tool":"desktop__do_thing","summary":"do_thing {}"}},
-#   {"seq":16,"type":"turn_finished","data":{"persona":"riko","message_id":42,"emotion":"happy"}},
-#   {"seq":17,"type":"state_changed","data":{"version":18}}
+#   {"seq":12,"time":"2026-11-03T18:30:01Z","type":"turn_started","persona":"riko","source":"android"},
+#   {"seq":13,"time":"…","type":"tool_started","call_id":"…","tool":"web_search","label":"searching the web for “tokyo weather”"},
+#   {"seq":14,"time":"…","type":"tool_finished","call_id":"…","tool":"web_search","ok":true,"ms":812},
+#   {"seq":15,"time":"…","type":"approval_needed","request_id":"…","client_id":"my-desktop","tool":"desktop__do_thing","summary":"do_thing {}"},
+#   {"seq":16,"time":"…","type":"turn_finished","persona":"riko","message_id":42,"emotion":"happy"},
+#   {"seq":17,"time":"…","type":"state_changed","version":18}
 # ],"last":17}
 ```
 
@@ -714,10 +714,11 @@ Protocol (client side, all with `$AUTH`):
    `act` or `danger`. Re-register with the same `id` any time your tool
    list changes — it replaces the whole registration.
 2. **Long-poll for work** — `GET /api/clients/{id}/requests?wait=25`
-   returns immediately when there is queued work, else after `wait` with
-   `[]`. Each request: `{"request_id", "tool", "arguments",
-   "needs_approval", "summary", "deadline"}`. `tool` here is the **bare
-   name** (`open_url`, not `desktop__open_url`). A request with
+   (wait ≤ 60 s) returns immediately when there is queued work, else after
+   `wait`; body is `{"requests": [...], "approval_timeout_s": 120}` with an
+   empty list meaning "nothing yet". Each request: `{"request_id", "tool",
+   "arguments", "needs_approval", "summary", "deadline"}`. `tool` here is
+   the **bare name** (`open_url`, not `desktop__open_url`). A request with
    `tool: "__approval__"` is approval-only (a hub tool gated to `ask`): show
    `summary`, answer, run nothing.
 3. **Execute (or refuse)** and post the result once per request:
@@ -751,10 +752,10 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' -d '{
 
 # 2. in a background loop: wait for work
 curl -s -H "$AUTH" "$H/api/clients/my-desktop/requests?wait=25"
-# [{"request_id":"3f9c…","tool":"open_url",
+# {"requests":[{"request_id":"3f9c…","tool":"open_url",
 #   "arguments":{"url":"https://docs.godotengine.org"},
 #   "needs_approval":false,"summary":"open_url {\"url\": \"https://…\"}",
-#   "deadline":"2026-11-03T18:31:02Z"}]
+#   "deadline":"2026-11-03T18:31:02Z"}],"approval_timeout_s":120}
 
 # 3. open the browser, then report
 curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \

@@ -181,7 +181,6 @@ def execute_call(call: dict, by_name: dict, permissions: dict, cap: int,
 
     ms = int((time.monotonic() - t0) * 1000)
     ok = error is None
-    events.publish("tool_started", call_id=call_id, tool=name, label=label)
     events.publish("tool_finished", call_id=call_id, tool=name, ok=ok, ms=ms)
     log(persona=ctx["persona"], tool=name, source=source, arguments=raw_args,
         ok=ok, error=error or "", ms=ms, approval=approval)
