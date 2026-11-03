@@ -1,0 +1,12 @@
+# AMD / Intel GPU (Vulkan through Mesa/RADV): docker compose -f compose.yaml -f compose.amd.yaml up -d
+# No NVIDIA reservation; the container talks to the GPU through /dev/dri.
+# The container user needs the video + render groups: put the NUMERIC gids in
+# .env — look them up on the host with:  getent group video render
+services:
+  breeze-tts:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${VIDEO_GID:?set VIDEO_GID in .env (getent group video)}"
+      - "${RENDER_GID:?set RENDER_GID in .env (getent group render)}"
+    deploy: !reset null  # drop the NVIDIA device reservation from compose.yaml

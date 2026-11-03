@@ -1,9 +1,15 @@
 """Her voice: turn her reply into a WAV file.
 
+tts: hub    -> the HUB makes the audio (Breeze-TTS-2, per-persona voices).
+               We just fetch the chat result's audio_url; see from_hub_audio().
+               Needs a hub with TTS configured (docs/VOICE.md).
 tts: none   -> no voice (the desktop app still shows her reply in a bubble)
 tts: openai -> any OpenAI-compatible /v1/audio/speech server (Kokoro-FastAPI, speaches, ...)
 tts: sovits -> GPT-SoVITS API
 tts: fish   -> Fish Audio online
+
+The hub mode is the default: every client hears the same voice with no
+TTS setup or keys of its own. The others do TTS on this PC.
 """
 import io
 import os
@@ -12,6 +18,7 @@ import sys
 import requests
 import soundfile as sf
 
+from riko import hub_client
 from riko.config import ROOT, need_key
 
 VOICE_FILE = ROOT / "client" / "audio" / "riko.wav"  # inside client/ so the avatar page can load it
@@ -20,6 +27,27 @@ VOICE_FILE = ROOT / "client" / "audio" / "riko.wav"  # inside client/ so the ava
 def check(cfg):
     if cfg["tts"] == "none":
         print("[setup] tts: none, she will reply in text only")
+        return
+    if cfg["tts"] == "hub":
+        # Never fatal: a hub whose breeze is down just means bubbles today.
+        try:
+            status = hub_client.get().tts_status()
+        except hub_client.HubError as e:
+            print(f"[setup] tts: hub, but the hub won't talk about its voice ({e}); "
+                  "her replies may show in bubbles only")
+            return
+        if status is None:
+            print("[setup] tts: hub, but this hub is too old for voice "
+                  "(/api/tts/status missing). Update the hub; until then she "
+                  "replies in bubbles.")
+            return
+        if status.get("enabled") and status.get("reachable"):
+            print(f"[setup] tts: hub — her voice is ready at {status.get('base_url')} "
+                  f"({status.get('voices', 0)} saved voices)")
+        else:
+            why = "is turned off" if not status.get("enabled") else "cannot reach breeze"
+            print(f"[setup] tts: hub, but the hub's TTS {why}; "
+                  "her replies will show in bubbles until it's up")
         return
     if cfg["tts"] == "fish":
         need_key("FISH_API_KEY", "tts: fish")
@@ -44,12 +72,14 @@ def check(cfg):
 
 
 def speak(text, cfg, voice=None):
-    """Make her say `text`. Returns the path of the WAV file, or None with tts: none.
+    """Make her say `text` on THIS PC's own TTS. Returns the path of the WAV
+    file, or None with tts: none / tts: hub (hub audio comes from the chat
+    result instead — see from_hub_audio).
 
     `voice` overrides the configured voice (the active persona's tts_voice);
     only the openai backend has named voices, others keep their own sample/id.
     """
-    if cfg["tts"] == "none" or not text.strip():
+    if cfg["tts"] in ("none", "hub") or not text.strip():
         return None
     if cfg["tts"] == "fish":
         audio = _fish(text, cfg["fish"])
@@ -57,12 +87,22 @@ def speak(text, cfg, voice=None):
         audio = _openai(text, cfg["openai_tts"], voice=voice)
     else:
         audio = _sovits(text, cfg["sovits"])
-    # Re-save through soundfile: Fish's WAV header claims the clip is hours
-    # long, and browsers believe it and never fire "ended". This fixes it.
+    return _write(audio, cfg["tts"])
+
+
+def from_hub_audio(audio_bytes, label="hub"):
+    """Take WAV bytes the hub made and put them where the avatar page reads
+    her voice. Raises on unreadable audio (session falls back to a bubble)."""
+    return _write(audio_bytes, label)
+
+
+def _write(audio, label):
+    # Re-save through soundfile: breeze/Fish WAV headers claim the clip is
+    # hours long, and browsers believe it and never fire "ended". This fixes it.
     data, sample_rate = sf.read(io.BytesIO(audio))
     VOICE_FILE.parent.mkdir(parents=True, exist_ok=True)
     sf.write(VOICE_FILE, data, sample_rate)
-    print(f"[tts] {cfg['tts']}: {len(data) / sample_rate:.1f}s of audio")
+    print(f"[tts] {label}: {len(data) / sample_rate:.1f}s of audio")
     return VOICE_FILE
 
 
@@ -111,5 +151,10 @@ if __name__ == "__main__":
     cfg = load_config()
     if "--fish" in sys.argv:
         cfg["tts"] = "fish"
-    check(cfg)
-    print("Wrote", speak("If you can hear this, my voice is set up correctly.", cfg))
+    if cfg["tts"] == "hub":
+        hub_client.check(cfg)  # the hub needs to be up before we ask it for audio
+        line = "If you can hear this, my voice is set up correctly."
+        print("Wrote", from_hub_audio(hub_client.get().tts_audio(line)))
+    else:
+        check(cfg)
+        print("Wrote", speak("If you can hear this, my voice is set up correctly.", cfg))

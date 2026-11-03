@@ -53,13 +53,20 @@ local_asr:
   device: cpu        # "cuda" for an NVIDIA GPU (needs CUDA + cuDNN)
 
 # ── Her voice (text to speech) ───────────────────────────────
-# The hub can also hand out a per-persona voice name (tts_voice): with
-# tts: openai she uses that voice when the persona has one, this one otherwise.
+# hub    = DEFAULT: the HUB makes the audio (Breeze-TTS-2, a per-persona
+#          voice designed or cloned on the hub's web page). This PC just
+#          downloads the WAV the hub hands back and plays it — no TTS setup
+#          or keys here. Needs a hub with TTS configured (see README and
+#          tts/); Breeze speaks English and Chinese only. If the hub's TTS
+#          is off or unreachable, her reply shows in the bubble only.
+# The rest are TTS on THIS PC (the hub's per-persona voice is ignored;
+# with tts: openai the persona's tts_voice name picks the voice when set):
 # none   = no voice; her reply shows in a speech bubble only
-# openai = any OpenAI-compatible /audio/speech server (Kokoro-FastAPI, speaches, ...)
+# openai = any OpenAI-compatible /audio/speech server on this PC/LAN
+#          (Kokoro-FastAPI, speaches, ...)
 # sovits = GPT-SoVITS (start its API server first)
 # fish   = Fish Audio, online, needs FISH_API_KEY in .env
-tts: none
+tts: hub
 
 openai_tts:
   url: http://192.0.2.51:8880/v1

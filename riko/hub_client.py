@@ -25,6 +25,7 @@ from riko.config import ROOT
 CHAT_TIMEOUT = 180     # reasoning models are slow
 DEFAULT_TIMEOUT = 15
 AVATAR_TIMEOUT = 120   # a .vrm can be tens of MB
+AUDIO_TIMEOUT = 120    # the hub may still be synthesising when we ask
 
 
 def avatar_cache_dir():
@@ -38,7 +39,15 @@ def avatar_cache_dir():
 
 
 class HubError(RuntimeError):
-    """The hub answered, and the answer was an error."""
+    """The hub answered, and the answer was an error.
+
+    `status` carries the HTTP code when there was one (None for transport
+    errors), so callers can tell e.g. 404 = old hub without this route.
+    """
+
+    def __init__(self, *args, status=None):
+        super().__init__(*args)
+        self.status = status
 
 
 class HubAuthError(HubError):
@@ -74,7 +83,8 @@ class HubClient:
                 detail = response.json().get("detail", response.text[:200])
             except ValueError:
                 detail = response.text[:200] or response.reason
-            raise HubError(f"{method} {path} -> {response.status_code}: {detail}")
+            raise HubError(f"{method} {path} -> {response.status_code}: {detail}",
+                           status=response.status_code)
         return response
 
     def _json(self, method, path, **kw):
@@ -124,6 +134,32 @@ class HubClient:
         result = self._json("POST", "/api/history/import",
                             json={"persona": persona, "messages": messages, "replace": replace})
         return int(result.get("imported", 0))
+
+    # ── Voice (the hub makes the audio; docs/VOICE.md) ───────
+    def tts_status(self):
+        """GET /api/tts/status -> {enabled, reachable, base_url, voices}.
+
+        None when the hub is too old to have the route (404) — old hub,
+        no hub-side voice, clients fall back to their own TTS or bubbles.
+        """
+        try:
+            return self._json("GET", "/api/tts/status")
+        except HubError as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def get_audio(self, audio_url):
+        """WAV bytes for a ChatResult's audio_url (a hub path like
+        /api/messages/42/audio or /api/personas/<id>/greeting/audio?v=3)."""
+        return self._call("GET", audio_url, timeout=AUDIO_TIMEOUT).content
+
+    def tts_audio(self, text, persona=None):
+        """POST /api/tts: WAV bytes of `text` in a persona's voice (no cache)."""
+        body = {"text": text}
+        if persona:
+            body["persona"] = persona
+        return self._call("POST", "/api/tts", json=body, timeout=AUDIO_TIMEOUT).content
 
     # ── Avatars ──────────────────────────────────────────────
     def avatar_file(self, persona_id, avatar_version):

@@ -47,7 +47,7 @@ Her head — personas, memory, which LLM to think with — is a small server cal
 | 👂 **Understands** | Speech to text with [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) on your own PC, on a second machine with a GPU (see [Remote ears](#remote-ears)), or [Groq](https://console.groq.com)'s fast online Whisper. |
 | 🧠 **Thinks** | Her brain is the **hub**: any OpenAI-compatible server (vLLM, llama.cpp, LM Studio, Ollama, OpenAI itself), reached over a small HTTP API the hub owns. |
 | 📝 **Remembers** | Chat history lives on the hub, not on your PC: browse it, edit it or wipe it from her web page. |
-| 🗣️ **Speaks** | Clones a voice from a short clip with [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS), uses any voice on [Fish Audio](https://fish.audio/?fpr=rayen10), or any OpenAI-style `/audio/speech` server. `tts: none` skips her voice and shows a speech bubble instead. |
+| 🗣️ **Speaks** | Her voice lives on the **hub**: [Breeze-TTS-2](https://github.com/HoppouAI/Breeze-TTS-2.cpp) makes every persona sound different, designed from a text description or cloned from a short clip, all edited on the hub's web page. Clients just download the WAV — no TTS keys on your PC. (English and Chinese only; the weights and audio are non-commercial.) Prefer TTS on this PC? `tts: openai`, `sovits` or `fish` still work; `tts: none` shows a speech bubble instead. |
 | 💃 **Shows up** | A VRM avatar in your browser that lip-syncs to her voice. Drag to spin her around, right-drag to move her, scroll to zoom. |
 | 🪟 **Lives on your desktop** | On Linux she can also run as a small borderless, transparent, always-on-top window, no browser involved: `uv run desktop.py` ([Desktop pet](#desktop-pet)). |
 | 🎭 **Becomes anyone** | Multiple **personas** on the hub — personality, avatar, greeting and voice each. Switch from her web page, the tray menu, or `riko-ctl persona asuka`; she changes her whole body live, no reload. |
@@ -59,11 +59,11 @@ Her head — personas, memory, which LLM to think with — is a small server cal
 flowchart LR
     you(["🎙️ You talk"]) --> ears["👂 Ears<br/>Faster-Whisper (PC or server) or Groq"]
     ears --> hub["🧠 Hub<br/>personas · memory · LLM<br/>http://box:8002"]
-    hub --> voice["🗣️ Voice<br/>GPT-SoVITS, Fish Audio or OpenAI-style"]
+    hub --> voice["🗣️ Voice<br/>Breeze-TTS-2 on the hub<br/>(or GPT-SoVITS / Fish / OpenAI-style on your PC)"]
     voice --> face(["💃 Face<br/>VRM avatar + lip sync"])
 ```
 
-The hub keeps her head — the persona list, each persona's avatar, the chat history, the LLM settings — and serves a web page at `http://<box>:8002` where you edit all of it. Your PC runs the body: it records you, ships the text to the hub, plays the answer through TTS and her avatar. The hub can run **on this same PC** (`hub.mode: local`, no Docker involved) or on any machine on your LAN (`hub.mode: remote`).
+The hub keeps her head — the persona list, each persona's avatar and voice, the chat history, the LLM settings — and serves a web page at `http://<box>:8002` where you edit all of it. By default the hub also *makes* her voice: it asks **Breeze-TTS-2** (`tts/`) to speak each reply in that persona's voice and hands the WAV to whoever asked, so the desktop app, a web page and a future phone app all hear the same voice. Your PC runs the body: it records you, ships the text to the hub, plays the answer and moves her avatar's mouth with it. The hub can run **on this same PC** (`hub.mode: local`, no Docker involved) or on any machine on your LAN (`hub.mode: remote`). Older ways — `tts: openai`, `sovits`, `fish` — still make the voice on your PC.
 
 Each step is one file, and `main.py` / `desktop.py` run them in a loop:
 
@@ -71,7 +71,7 @@ Each step is one file, and `main.py` / `desktop.py` run them in a loop:
 |---|---|---|
 | 👂 Ears | `riko/asr.py` | Records you between the two Enters, turns it into text |
 | 🧠 Head | `riko/hub_client.py` | Talks to the hub: chat, personas, history, avatar download; can even start the hub inside this process |
-| 🗣️ Voice | `riko/tts.py` | Turns her answer into a voice clip (or a plain bubble with `tts: none`) |
+| 🗣️ Voice | `riko/tts.py` | Plays the voice clip the hub made (`tts: hub`), or runs TTS on this PC (`openai` / `sovits` / `fish`); no audio → a plain bubble |
 | 💃 Face | `riko/viewer.py` + `client/index.html` | Serves the avatar page and her active persona's body, plays the clip, moves her mouth with it |
 
 ## 🚀 Quick start
@@ -84,7 +84,7 @@ Pick a shape first:
 | Her ears | your PC (`asr: local`) | a GPU box (`asr: remote`, see [Remote ears](#remote-ears)) |
 | Good for | trying her out right now | her living on the same GPU box as your LLM and ears, phones/apps joining later |
 
-**You need:** a Windows or Linux PC with a microphone, somewhere for her to think (an [OpenAI API key](https://platform.openai.com/api-keys), or any [OpenAI-compatible server](#the-hub) running), and — for the easiest voice — a [Fish Audio API key](https://fish.audio/?fpr=rayen10) (sign up, then create one under *API keys*).
+**You need:** a Windows or Linux PC with a microphone and somewhere for her to think (an [OpenAI API key](https://platform.openai.com/api-keys), or any [OpenAI-compatible server](#the-hub) running). For a voice, either [the hub's Breeze voice](#her-voice) (no keys on your PC) or — the easiest way to get sound from a plain PC — a [Fish Audio API key](https://fish.audio/?fpr=rayen10) (sign up, then create one under *API keys*).
 
 **1. Install uv.** It sets up Python for you.
 
@@ -147,9 +147,16 @@ docker compose up -d
 mkdir -p ~/AI/Docker/riko-asr && cp -a server/. ~/AI/Docker/riko-asr/ && cd ~/AI/Docker/riko-asr
 cp .env.example .env      # set ASR_API_KEY
 docker compose up -d
+
+# her voice — Breeze-TTS-2 on the same box (tts/; skip if you prefer TTS on your PC)
+docker network create riko    # one-time: the private network hub <-> breeze
+mkdir -p ~/AI/Docker/breeze-tts && cp -a tts/. ~/AI/Docker/breeze-tts/ && cd ~/AI/Docker/breeze-tts
+# AMD/Intel GPU: cp .env.example .env, set VIDEO_GID/RENDER_GID, then
+#   docker compose -f compose.yaml -f compose.amd.yaml up -d
+docker compose up -d          # NVIDIA (CPU-only box: -f compose.yaml -f compose.cpu.yaml)
 ```
 
-Then on your PC: `uv run main.py`. Both containers have their own `.env` and data folder; the hub's page lives at `http://<box>:8002`.
+Then on your PC: `uv run main.py`. Each container has its own `.env` and data folder; the hub's page lives at `http://<box>:8002`. The hub finds Breeze at `http://breeze-tts:8137` on the `riko` network (its Settings page has the TTS section) — with both up, the default `tts: hub` needs no keys on your PC at all. Full notes: [Her voice](#her-voice) and `tts/README.md`.
 
 **6. Say hi.**
 
@@ -174,9 +181,10 @@ Half of her lives in `character_config.yaml` on your PC — her ears, her voice,
 | **Personality** | The persona's `system_prompt`. Describe her the way you'd brief an actor: who she is, how she talks, what she calls you. |
 | **Look** | The persona's avatar — upload any `.vrm` file. You can make your own for free in [VRoid Studio](https://vroid.com/en/studio). The avatar page swaps her body live, no reload. |
 | **Greeting & keywords** | Each persona has a greeting she says when she becomes active, and keywords that summon her (see [Switching characters](#personas)). |
-| **Her voice name** | A persona's `tts_voice` picks the voice on OpenAI-style TTS servers; empty falls back to `openai_tts.voice` in your local config. |
+| **Her voice** | The persona's **Voice** panel (see [Her voice](#her-voice)): design one from a description, clone one from a clip, preview and lock it. A persona's `tts_voice` name is the older field for clients doing their own OpenAI-style TTS; empty falls back to `openai_tts.voice` in your local config. |
 | **Brain** | Which OpenAI-compatible server and model she thinks with — same fields as the `llm:` block, edited live. |
 | **Memory** | The chat history: read it, edit a message, wipe it. |
+| **Hub TTS** | Settings → TTS: turn hub voice on/off and point it at Breeze (`http://breeze-tts:8137` by default). |
 
 **On your PC** (`character_config.yaml`, restart to apply):
 
@@ -186,14 +194,14 @@ Half of her lives in `character_config.yaml` on your PC — her ears, her voice,
 | **Fish voice** | `fish.voice_id`. Open any voice on [fish.audio](https://fish.audio/?fpr=rayen10) and copy the ID from the page address: `fish.audio/m/<voice id>`. |
 | **GPT-SoVITS voice** | `ref_audio_path`: a 3–10 second clip with no long silences. `prompt_text`: exactly what the clip says. |
 | **Ears** | `asr: local` (Faster-Whisper, free, on your PC), `asr: remote` (Faster-Whisper on [another machine](#remote-ears)) or `asr: groq` (needs a free [Groq key](https://console.groq.com/keys)). |
-| **Voice** | `tts: none` (bubble only), `openai` (any `/audio/speech` server, see `openai_tts:`), `sovits` or `fish`. |
+| **Voice** | `tts: hub` (the default — the hub's Breeze speaks and this PC just plays it, see [Her voice](#her-voice)); `none` (bubble only). The rest are **TTS on this PC**: `openai` (any `/audio/speech` server, see `openai_tts:`), `sovits` or `fish`. |
 | **Speech model size or GPU** | `local_asr.model` / `local_asr.device` in `character_config.yaml`. |
 | **A fresh start** | `riko-ctl forget`, or the wipe button on the hub page. |
 
 You can also switch voice or ears for one run without touching the config:
 
 ```bash
-uv run main.py --tts fish        # or sovits, openai, none
+uv run main.py --tts fish        # or sovits, openai, hub, none
 uv run main.py --asr groq        # or local, remote
 uv run main.py --type            # type your messages instead of using a mic
 ```
@@ -263,19 +271,57 @@ On the desktop PC set `asr: remote` in `character_config.yaml` and point `remote
 
 </details>
 
-<a id="local-voice"></a>
-## 🎤 Local voice with GPT-SoVITS
+<a id="her-voice"></a>
+## 🗣️ Her voice: hub voices with Breeze
 
-Want her voice generated on your own machine, cloned from any clip you like? That's what GPT-SoVITS does. It runs best on an NVIDIA GPU and is installed separately.
+Every persona gets her own voice **on the hub**, made by [Breeze-TTS-2.cpp](https://github.com/HoppouAI/Breeze-TTS-2.cpp) — a small C++/GGUF server that runs on NVIDIA, AMD and Intel GPUs through Vulkan. The desktop app just downloads the WAV the hub hands back, so *every* client (this app, the web page, a future Android app) hears the same voice with no TTS setup or keys of its own.
 
-1. Install [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) by following its guide.
-2. In the GPT-SoVITS folder, start its API server and leave it running:
-   ```bash
-   python api_v2.py -a 127.0.0.1 -p 9880
-   ```
-3. Start Riko with `uv run main.py --tts sovits`.
+> [!IMPORTANT]
+> Two licence/scope facts about Breeze: its **weights and the audio it produces are non-commercial** (personal use is fine), and it speaks **English and Chinese only**. If you need other languages or commercial rights, use one of the [TTS on this PC](#pc-tts) modes instead.
 
-She starts with the sample voice in `character_files/main_sample.wav`. Swap in your own clip (see the table above) to change it.
+**Design or clone a voice** on the hub's web page, in the persona's **Voice** panel:
+
+1. **Design** — describe her the way you'd brief a voice actor ("a proud, sharp teenage girl, fast and a little impatient"), pick a seed, hit **Preview**. The same seed keeps the same voice between requests.
+2. **Clone** — upload a 3–30 s clip of the real voice plus its **exact transcript**.
+3. **Lock this voice** — happy with a designed voice? One button renders it once, stores the result as the persona's reference and switches it to clone mode, so it can never drift again.
+
+Each persona's audio is cached on the hub; her greeting is spoken too when she switches in.
+
+**Run Breeze on the box** (`tts/`, one-time `docker network create riko`, then — on an NVIDIA box):
+
+```bash
+mkdir -p ~/AI/Docker/breeze-tts && cp -a tts/. ~/AI/Docker/breeze-tts/ && cd ~/AI/Docker/breeze-tts
+docker compose up -d       # first start downloads the model (~3.3 GB) into tts/data/
+```
+
+AMD/Intel GPUs use `-f compose.yaml -f compose.amd.yaml` (set `VIDEO_GID`/`RENDER_GID` from `getent group video render`), CPU-only boxes `-f compose.yaml -f compose.cpu.yaml`. Model sizes, `BREEZE_MODEL`/`BREEZE_ARGS` and its optional web page: `tts/README.md`. GPU memory on the 16 GB AI box: ASR ~1.1 GB + Breeze q8_0 ~4 GB — plenty of room next to a quantised LLM.
+
+**No Docker?** Run the release binary on one PC (works on AMD/Intel/NVIDIA via Vulkan) and point the hub's Settings → TTS base URL at `http://127.0.0.1:8137`:
+
+```bash
+./breeze-server breeze-tts-2-q8_0.gguf --port 8137 --voices-dir voices
+```
+
+If the hub's TTS is off or breeze is down, Riko says so once at startup and keeps working: her replies show as speech bubbles, typing and chatting are unaffected.
+
+<a id="pc-tts"></a>
+<details>
+<summary><a id="local-voice"></a>TTS on this PC: GPT-SoVITS, Fish Audio or any OpenAI-style server</summary>
+
+The other `tts:` modes make the audio **on your PC**, ignoring the hub's per-persona Breeze voice (except `openai`, which takes the persona's `tts_voice` name when set):
+
+- **`tts: fish`** — [Fish Audio](https://fish.audio/?fpr=rayen10) online, needs `FISH_API_KEY`. The easiest way to get sound on a plain laptop. `fish.voice_id` picks any voice on the site.
+- **`tts: sovits`** — clone a voice from a short clip with [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS), free and local; runs best on an NVIDIA GPU.
+  1. Install GPT-SoVITS by following its guide.
+  2. In the GPT-SoVITS folder, start its API server and leave it running:
+     ```bash
+     python api_v2.py -a 127.0.0.1 -p 9880
+     ```
+  3. Start Riko with `uv run main.py --tts sovits`. She starts with the sample voice in `character_files/main_sample.wav`; swap in your own clip (`sovits.ref_audio_path` + the exact `prompt_text`) to change it.
+- **`tts: openai`** — any OpenAI-compatible `/v1/audio/speech` server on your PC or LAN (Kokoro-FastAPI, speaches, …); see the `openai_tts:` block.
+- **`tts: none`** — no voice at all, just her speech bubble.
+
+</details>
 
 <a id="desktop-pet"></a>
 ## 🪟 Desktop pet (Linux)
@@ -334,7 +380,7 @@ Same Riko, three ways to have her. Each one is made for a different kind of pers
 | **What you get** | This repo: open source, under 500 lines | The full source of the newest build | A Windows app with an installer and a desktop icon |
 | Talks with a lip-synced VRM avatar | ✅ | ✅ | ✅ |
 | Hears you | Faster-Whisper on your PC or on a LAN server, or Groq | Groq Whisper | Groq Whisper |
-| Her voice | GPT-SoVITS voice clone or Fish Audio | GPT-SoVITS voice clone or Fish Audio | Both, switched in Settings, with automatic fallback |
+| Her voice | Hub voices by Breeze-TTS-2 (design/clone per persona) or Fish/GPT-SoVITS on your PC | GPT-SoVITS voice clone or Fish Audio | Both, switched in Settings, with automatic fallback |
 | Conversation | Push-to-talk, easy to rewire | Hands-free: she can tell when you've finished | Hands-free, or type to her |
 | Face and body | Lip sync, ready for your own animation system | Expressions and animations she picks herself | Expressions and animations she picks herself |
 | Memory | Chat history on your hub, browsable and editable on its page | Long-term memory across sessions | Long-term memory you can browse, edit and reset |
@@ -379,7 +425,8 @@ Tested on Windows 11 and Ubuntu 22.04 (WSL2) with an RTX 3060 12 GB. Faster-Whis
 | `[setup] OPENAI_API_KEY is missing` (or another key) | Add it to `.env`. Check the file is called exactly `.env`, not `.env.txt`. |
 | `can't reach the hub at http://...` | The hub is down or the URL is wrong. Local mode: is `hub_data/` writable, is port 8002 busy (another app on it → change `hub.local_port`)? Remote mode: on the hub box, `cd ~/AI/Docker/riko-hub && docker compose up -d`, then `curl http://<box>:8002/api/health` from your PC. |
 | `the hub at ... rejected the key (401)` | `RIKO_HUB_KEY` in this PC's `.env` doesn't match the hub server's. The hub's key lives in its own `.env`; restart the container after changing it. |
-| `GPT-SoVITS is not running` | Start its API server first (see [Local voice](#local-voice)), or run with `--tts fish`. |
+| `GPT-SoVITS is not running` | Start its API server first (see [TTS on this PC](#pc-tts)), or run with `--tts fish`. |
+| `tts: hub`, but she only shows bubbles | The hub's voice isn't up: check its Settings → TTS on the web page (`GET /api/tts/status` tells you: enabled? reachable?). On the box: `cd ~/AI/Docker/breeze-tts && docker compose ps` and `docker compose logs --tail 50 breeze-tts` — `docker compose logs` showing `backend: cpu` means Vulkan didn't find the GPU (see `tts/README.md`). Startup and chat keep working either way. |
 | `Port 8080 is busy` | Riko is probably already running in another terminal. Close that one. |
 | `the hub has no avatar for persona ...` | The active persona has no `.vrm` yet — upload one on the hub page. |
 | She replies in the terminal, but there's no sound | Click the avatar page once. Browsers block sound until you do. |
@@ -398,13 +445,14 @@ riko/
   config.py            loads character_config.yaml and .env
   hub_client.py        the hub API: chat, personas, history, avatars; starts the hub in-process in local mode
   asr.py               push-to-talk recording + speech to text (local / remote / groq)
-  tts.py               GPT-SoVITS, Fish Audio or OpenAI-style TTS → client/audio/riko.wav
+  tts.py               hub audio download (tts: hub) or GPT-SoVITS / Fish Audio / OpenAI-style TTS on this PC → client/audio/riko.wav
   viewer.py            serves the avatar page, its events and the active persona's avatar (disk-cached)
   session.py           the turn queue shared by mic, typing and riko-ctl
   migrate.py           one-shot import of an old chat_history.json into the hub
 client/
   index.html           three.js + three-vrm: the avatar, lip sync, persona swap, rotate and zoom
 hub/                   the hub server itself (FastAPI; its deployment notes in docs/API.md)
+tts/                   Breeze-TTS-2 in Docker — her voice box on the hub's box (tts/README.md)
 server/
   asr_server.py        Faster-Whisper as a small HTTP server (her remote ears)
 bin/
@@ -417,6 +465,7 @@ character_files/       her sample voice (main_sample.wav); sample_avatar.vrm is 
 character_config.yaml  hub location, ears, voice and window (personality lives on the hub now)
 docs/
   DESIGN.md            the hub contract: objects, routes, auth (the hub's own docs: docs/API.md)
+  VOICE.md             the hub-voice round: Breeze facts, persona voice fields, tts/ deployment
 ```
 
 Every part also runs on its own, which helps when something isn't working:
@@ -434,7 +483,7 @@ uv run python -m riko.asr          # record, then print what she heard
 
 ## 🙏 Credits
 
-- Voice by [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) and [Fish Audio](https://fish.audio/?fpr=rayen10)
+- Voice by [Breeze-TTS-2.cpp](https://github.com/HoppouAI/Breeze-TTS-2.cpp) (hub voices; weights and outputs non-commercial), [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) and [Fish Audio](https://fish.audio/?fpr=rayen10)
 - Speech recognition by [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) and [Groq](https://groq.com)
 - Language model by [OpenAI](https://platform.openai.com)
 - Avatar rendering by [three.js](https://threejs.org) and [three-vrm](https://github.com/pixiv/three-vrm)
