@@ -23,6 +23,9 @@ class Session:
 
     # ── Ways in ──────────────────────────────────────────────
     def submit_text(self, text):
+        text = str(text).strip()
+        if not text:
+            return
         viewer.emit("heard", text=text)
         self._turns.put(("text", text))
 
@@ -44,7 +47,13 @@ class Session:
     def talk_stop(self):
         if not self.recorder.recording:
             return
-        clip = self.recorder.stop()
+        try:
+            clip = self.recorder.stop()
+        except Exception as e:  # a mic hiccup must not kill the caller (usually the HTTP handler)
+            print(f"[asr] can't stop the mic: {e}")
+            viewer.emit("error", text=f"Mic error: {e}")
+            viewer.emit("status", state="idle")
+            return
         if clip is None:
             viewer.emit("status", state="idle")
             return

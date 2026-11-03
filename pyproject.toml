@@ -15,3 +15,15 @@ dependencies = [
     "sounddevice",
     "soundfile",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "slow: starts server/asr_server.py as a subprocess (skippable with -m 'not slow')",
+]

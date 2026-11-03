@@ -28,7 +28,7 @@ def check(cfg):
         url = cfg["openai_tts"]["url"]
         try:
             requests.get(url.rstrip("/") + "/models", timeout=3)  # any answer means it is running
-        except requests.ConnectionError:
+        except (requests.ConnectionError, requests.Timeout):
             sys.exit(f"[setup] No TTS server at {url}. Start it, or set tts: none.")
         print(f"[setup] TTS server is up at {url}")
         return

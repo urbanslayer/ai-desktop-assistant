@@ -12,6 +12,7 @@ The desktop app and riko-ctl talk to the same server:
 No page open? The clip plays on your speakers instead.
 """
 import json
+import os
 import queue
 import sys
 import threading
@@ -24,7 +25,8 @@ import soundfile as sf
 
 from riko.config import ROOT
 
-HOST, PORT = "127.0.0.1", 8080  # 127.0.0.1, not localhost: behaves the same on Windows and Linux
+HOST = "127.0.0.1"  # 127.0.0.1, not localhost: behaves the same on Windows and Linux
+PORT = int(os.environ.get("RIKO_PORT") or 8080)  # override with RIKO_PORT=... (see start())
 
 _clips = queue.Queue()          # voice clips waiting for the page
 _events = queue.Queue()         # UI events waiting for the page
@@ -58,6 +60,8 @@ class _Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         global _page_last_seen
         if self.path == "/avatar.vrm":
+            if _avatar is None or not _avatar.exists():
+                return self._send(b'{"error": "avatar not loaded"}', "application/json", 503)
             return self._send(_avatar.read_bytes(), "application/octet-stream")
         if self.path == "/settings":
             return self._send(json.dumps(_settings).encode(), "application/json")
@@ -84,22 +88,63 @@ class _Handler(SimpleHTTPRequestHandler):
         # cross-origin without a CORS preflight, which this server never approves.
         if not self.headers.get("Content-Type", "").startswith("application/json"):
             return self._send(b'{"error": "send application/json"}', "application/json", 415)
-        length = int(self.headers.get("Content-Length") or 0)
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(self._read_body() or b"{}")
         except json.JSONDecodeError:
             return self._send(b'{"error": "bad json"}', "application/json", 400)
+        if not isinstance(body, dict):
+            return self._send(b'{"error": "expected a JSON object"}', "application/json", 400)
 
-        if self.path == "/say" and _handlers["say"]:
-            text = str(body.get("text", "")).strip()
-            if text:
-                _handlers["say"](text)
-            return self._send(b'{"ok": true}', "application/json")
-        if self.path.startswith("/control/") and _handlers["control"]:
-            result = _handlers["control"](self.path.removeprefix("/control/"))
-            return self._send(json.dumps(result if result is not None else {"ok": True}).encode(),
-                              "application/json")
+        try:
+            if self.path == "/say":
+                if not _handlers["say"]:
+                    return self._send(b'{"error": "nothing is listening"}', "application/json", 503)
+                text = str(body.get("text", "")).strip()
+                if text:
+                    _handlers["say"](text)
+                return self._send(b'{"ok": true}', "application/json")
+            if self.path.startswith("/control/"):
+                if not _handlers["control"]:
+                    return self._send(b'{"error": "nothing is listening"}', "application/json", 503)
+                result = _handlers["control"](self.path.removeprefix("/control/"))
+                return self._send(json.dumps(result if result is not None else {"ok": True}).encode(),
+                                  "application/json")
+        except Exception as e:  # a handler bug should not hang up on the caller
+            print(f"[viewer] {self.path} raised {type(e).__name__}: {e}")
+            return self._send(json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(),
+                              "application/json", 500)
         self._send(b'{"error": "not found"}', "application/json", 404)
+
+    def _read_body(self):
+        """Read exactly Content-Length bytes, or until a chunked body ends."""
+        length = self.headers.get("Content-Length")
+        if length is not None:
+            try:
+                remaining = max(0, int(length))
+            except ValueError:
+                return b""
+            data = b""
+            while remaining:  # read() can return short
+                chunk = self.rfile.read(remaining)
+                if not chunk:
+                    break
+                data += chunk
+                remaining -= len(chunk)
+            return data
+        if self.headers.get("Transfer-Encoding", "").lower() != "chunked":
+            return b""
+        data = b""
+        while True:
+            try:
+                size = int(self.rfile.readline().split(b";")[0], 16)
+            except ValueError:
+                break
+            if size <= 0:
+                self.rfile.readline()  # trailing CRLF
+                break
+            data += self.rfile.read(size)
+            self.rfile.readline()  # CRLF after each chunk
+        return data
 
     def _send(self, body, content_type, status=200):
         self.send_response(status)
@@ -114,15 +159,17 @@ class _Handler(SimpleHTTPRequestHandler):
 
 
 def start(cfg):
-    global _avatar, _settings
+    global _avatar, _settings, PORT
     _avatar = ROOT / cfg["vrm_model"]
     _settings = dict(cfg.get("desktop") or {})
+    PORT = int(os.environ.get("RIKO_PORT") or PORT)  # re-read: tests (and scripts) may set it late
     if not _avatar.exists():
         sys.exit(f"[setup] Avatar not found: {_avatar}. Check vrm_model in character_config.yaml.")
     try:
         server = ThreadingHTTPServer((HOST, PORT), partial(_Handler, directory=str(ROOT / "client")))
     except OSError:
-        sys.exit(f"[setup] Port {PORT} is busy (is Riko already running?). Close it or change PORT in riko/viewer.py.")
+        sys.exit(f"[setup] Port {PORT} is busy (is Riko already running?). Close it, set RIKO_PORT to "
+                 f"another port, or change PORT in riko/viewer.py.")
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"[viewer] avatar: {cfg['vrm_model']}")
     print(f"[viewer] avatar page: http://{HOST}:{PORT}  (open it, then click once)")

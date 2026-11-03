@@ -21,6 +21,7 @@ Endpoints:
 import argparse
 import ctypes
 import glob
+import hmac
 import io
 import os
 import site
@@ -72,7 +73,7 @@ def build_app(model_name, device, compute_type):
     api_key = os.environ.get("ASR_API_KEY", "")
 
     def auth(authorization: str = Header(default="")):
-        if api_key and authorization != f"Bearer {api_key}":
+        if api_key and not hmac.compare_digest(authorization, f"Bearer {api_key}"):
             raise HTTPException(status_code=401, detail="invalid api key")
 
     app = FastAPI(title="Riko ASR")
@@ -92,8 +93,12 @@ def build_app(model_name, device, compute_type):
         language: str = Form(default=""),
         prompt: str = Form(default=""),
         response_format: str = Form(default="json"),
-        temperature: float = Form(default=0.0),
+        temperature: str = Form(default=""),  # str so a client sending "" does not 422
     ):
+        try:
+            temp = float(temperature) if temperature else 0.0
+        except ValueError:
+            temp = 0.0
         audio = io.BytesIO(file.file.read())
         started = time.monotonic()
         with lock:
@@ -101,7 +106,7 @@ def build_app(model_name, device, compute_type):
                 audio,
                 language=language or None,
                 initial_prompt=prompt or None,
-                temperature=temperature,
+                temperature=temp,
                 beam_size=5,
                 vad_filter=True,  # skips silence, so a long press with little speech stays fast
             )

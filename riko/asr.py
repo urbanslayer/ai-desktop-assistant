@@ -69,20 +69,29 @@ class Recorder:
         with self._lock:
             if self._stream is not None:
                 return
-            self._chunks = []
-            self._stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                                          callback=lambda data, *_: self._chunks.append(data.copy()))
-            self._stream.start()
+            chunks = []  # the PortAudio callback thread appends to this exact list
+            stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                                    callback=lambda data, *_: chunks.append(data.copy()))
+            try:
+                stream.start()
+            except Exception:
+                stream.close()
+                raise
+            self._chunks = chunks
+            self._stream = stream
 
     def stop(self):
         """Stop and return the clip as WAV bytes, or None if it was too short to be speech."""
         with self._lock:
             if self._stream is None:
                 return None
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+            stream, self._stream = self._stream, None
             chunks, self._chunks = self._chunks, []
+            try:
+                stream.stop()  # after close() returns the callback thread is done, so `chunks` is final
+                stream.close()
+            except Exception as e:  # a device hiccup must not leave recording stuck on
+                print(f"[asr] error closing the mic stream: {e}")
         if not chunks:
             return None
         audio = np.concatenate(chunks)
@@ -110,11 +119,16 @@ def transcribe(wav_bytes, cfg):
         groq = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
         text = groq.audio.transcriptions.create(model=GROQ_MODEL, file=("you.wav", wav_bytes)).text
     elif mode == "remote":
+        if _remote is None:
+            raise RuntimeError("remote ASR was never set up: call asr.check(cfg) first "
+                               "(it failed? start server/asr_server.py on that machine, or set asr: local)")
         r = cfg["remote_asr"]
         extra = {"language": r["language"]} if r.get("language") else {}
         text = _remote.audio.transcriptions.create(model=r.get("model", "whisper-1"),
                                                    file=("you.wav", wav_bytes), **extra).text
     else:
+        if _whisper is None:
+            raise RuntimeError("local ASR was never loaded: call asr.check(cfg) first")
         segments, _ = _whisper.transcribe(io.BytesIO(wav_bytes))
         text = "".join(s.text for s in segments)  # each segment already starts with a space
     return text.strip()
