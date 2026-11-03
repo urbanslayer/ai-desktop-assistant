@@ -155,7 +155,8 @@ def execute_call(call: dict, by_name: dict, permissions: dict, cap: int,
         error = f"malformed JSON arguments: {e}"
 
     if spec is not None and error is None:
-        perm = permission_for(spec.name, spec.source, spec.risk, permissions)
+        perm = permission_for(spec.name, spec.source, spec.risk, permissions,
+                              getattr(spec, "permission_override", ""))
         label = _label_for(spec, args)
     # announce BEFORE running: long-poll watchers show in-flight tools
     events.publish("tool_started", call_id=call_id, tool=name, label=label)

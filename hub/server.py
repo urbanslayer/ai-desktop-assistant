@@ -31,6 +31,9 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from . import voice as _voice
     from .clients import ClientHub
     from .events import EventBus
+    from .mcpmanager import (MCPManager, public_servers as public_mcp_servers,
+                             sdk_available as mcp_available,
+                             validate_servers as validate_mcp_servers)
     from .toolloop import run_turn
     from .tools.registry import build_hub_specs, hub_tool_info, permission_for, tools_prompt
     from .store import Store, default_voice, now_iso
@@ -41,6 +44,10 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     import voice as _voice  # type: ignore[no-redef]
     from clients import ClientHub  # type: ignore[no-redef]
     from events import EventBus  # type: ignore[no-redef]
+    from mcpmanager import (MCPManager,  # type: ignore[no-redef]
+                            public_servers as public_mcp_servers,
+                            sdk_available as mcp_available,
+                            validate_servers as validate_mcp_servers)
     from toolloop import run_turn  # type: ignore[no-redef]
     from tools.registry import (build_hub_specs, hub_tool_info,  # type: ignore[no-redef]
                                 permission_for, tools_prompt)
@@ -76,6 +83,9 @@ TOOLS_DEFAULTS = {
     "allow_private_fetch": False,  # let fetch_page hit loopback/private IPs (dev)
     "permissions": {},        # tool name -> always | ask | never
 }
+
+# MCP settings defaults (docs/ROUNDS.md R2-M): no servers out of the box.
+MCP_DEFAULTS = {"servers": []}
 
 # Seed persona: the system prompt copied from character_config.yaml at build
 # time (the Docker image has no access to that file).
@@ -255,6 +265,22 @@ def create_app(data_dir, api_key: str | None = None,
 
     tools_status = ToolsStatus()
 
+    # ── MCP settings + manager (docs/ROUNDS.md R2-M) ───────────────────
+    # settings `mcp.servers` has no env default: the list is exactly what
+    # the user saved. The manager owns one asyncio loop thread for all
+    # sessions; the hub boots fine without the mcp package (servers just
+    # report state "unavailable").
+    mcp_manager = MCPManager(events)
+
+    def stored_mcp() -> dict:
+        saved = store.get_json("mcp", {})
+        return dict(saved) if isinstance(saved, dict) else {}
+
+    def mcp_servers() -> list[dict]:
+        servers = stored_mcp().get("servers")
+        return [s for s in servers if isinstance(s, dict)] \
+            if isinstance(servers, list) else []
+
     def settings_response() -> dict:
         saved = stored_llm()
         defaults = default_llm()
@@ -267,18 +293,23 @@ def create_app(data_dir, api_key: str | None = None,
         saved_tools = stored_tools()
         tools_source = {k: ("saved" if k in saved_tools else "default")
                         for k in TOOLS_DEFAULTS}
+        has_mcp = isinstance(stored_mcp().get("servers"), list)
         return {
             "llm": public_llm(llm_settings()),
             "tts": tts_settings(),
             "tools": tools_settings(),
+            "mcp": {"servers": public_mcp_servers(mcp_servers())},
             "switch_phrases": switch_phrases(),
             "defaults": {"llm": defaults_public,
                          "tts": default_tts(),
                          "tools": default_tools(),
+                         "mcp": dict(MCP_DEFAULTS, servers=[]),
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES)},
             "llm_source": source,
             "tts_source": tts_source,
             "tools_source": tools_source,
+            "mcp_source": {k: ("saved" if has_mcp else "default")
+                           for k in MCP_DEFAULTS},
         }
 
     def persona_lookup() -> dict[str, str]:
@@ -710,6 +741,12 @@ def create_app(data_dir, api_key: str | None = None,
                     for s in clients_hub.online_tool_specs():
                         if permission_for(s.name, "client", s.risk, permissions) != "never":
                             specs.append(s)
+                    # MCP tools (R2-M): mcp_<server>__<tool>, the manager's
+                    # per-server tool_permissions override beats the map
+                    for s in mcp_manager.tool_specs():
+                        if permission_for(s.name, "mcp", s.risk, permissions,
+                                          s.permission_override) != "never":
+                            specs.append(s)
                 offered_names = [s.name for s in specs if s.available]
 
                 system = persona["system_prompt"]
@@ -888,6 +925,23 @@ def create_app(data_dir, api_key: str | None = None,
                     cleaned_perms[str(name)[:80]] = str(perm)
                 saved_tools["permissions"] = cleaned_perms
             store.set_json("tools", saved_tools)
+        if "mcp" in body:
+            mcp = body["mcp"]
+            if not isinstance(mcp, dict):
+                return err(422, "mcp must be an object")
+            if "servers" in mcp:
+                saved_mcp = stored_mcp()
+                try:
+                    cleaned_servers = validate_mcp_servers(
+                        mcp["servers"], saved_mcp.get("servers") or [])
+                except ValueError as e:
+                    return err(422, str(e))
+                saved_mcp["servers"] = cleaned_servers
+                store.set_json("mcp", saved_mcp)
+                try:
+                    mcp_manager.sync(cleaned_servers)
+                except Exception as e:  # never fail the save on the reconnect
+                    events.publish("mcp_error", error=f"{type(e).__name__}: {e}"[:300])
         bump_state()
         return settings_response()
 
@@ -909,11 +963,14 @@ def create_app(data_dir, api_key: str | None = None,
             changed |= store.del_json("tts")
         if body.get("tools"):
             changed |= store.del_json("tools")
+        if body.get("mcp"):
+            changed |= store.del_json("mcp")
+            mcp_manager.sync(mcp_servers())
         if body.get("switch_phrases"):
             changed |= store.del_json("switch_phrases")
         if not (body.get("llm") or body.get("tts") or body.get("tools")
-                or body.get("switch_phrases")):
-            return err(422, 'set "llm", "tts", "tools" and/or "switch_phrases" to true')
+                or body.get("mcp") or body.get("switch_phrases")):
+            return err(422, 'set "llm", "tts", "tools", "mcp" and/or "switch_phrases" to true')
         if changed:
             bump_state()
         return settings_response()
@@ -1278,6 +1335,11 @@ def create_app(data_dir, api_key: str | None = None,
                           "permission": permission_for(s.name, "client", s.risk,
                                                        permissions),
                           "client_id": s.client_id})
+        for s in mcp_manager.tool_info():
+            tools.append({**s,
+                          "permission": permission_for(s["name"], "mcp", s["risk"],
+                                                       permissions,
+                                                       s["permission_override"])})
         return {"tools": tools, "settings": cfg, "defaults": default_tools(),
                 "status": tools_status_response()}
 
@@ -1292,6 +1354,23 @@ def create_app(data_dir, api_key: str | None = None,
     @app.get("/api/tools/status")
     def get_tools_status():
         return tools_status_response()
+
+    # ── MCP plug-ins (docs/ROUNDS.md R2-M, docs/API.md) ────────────────
+    @app.get("/api/mcp/status")
+    def get_mcp_status():
+        """One row per configured server: {name, transport, state
+        (starting|ready|error|disabled|unavailable), error, tools, last_ok}."""
+        return mcp_manager.status(mcp_servers())
+
+    @app.post("/api/mcp/{name}/restart")
+    def post_mcp_restart(name: str):
+        """Reconnect a server now (skips the reconnect backoff)."""
+        outcome = mcp_manager.restart(name)
+        if outcome == "unknown":
+            return err(404, f"no MCP server '{name}'")
+        if outcome == "disabled":
+            return err(409, f"MCP server '{name}' is disabled")
+        return {"ok": True}
 
     # ── client-tool channel (docs/ROUNDS.md R1-B) ──────────────────────
     @app.get("/api/clients")
@@ -1366,6 +1445,21 @@ def create_app(data_dir, api_key: str | None = None,
     # ── standalone ──────────────────────────────────────────────────────
     app.state.store = store
     app.state.brain = brain
+    app.state.mcp = mcp_manager
+
+    # MCP servers from a previous run connect in the background as soon as
+    # the app exists (works in local mode too, where the parent app may not
+    # forward lifespan events); clean shutdown closes the sessions.
+    try:
+        mcp_manager.sync(mcp_servers())
+    except Exception as e:
+        events.publish("mcp_error", error=f"startup sync failed: "
+                                          f"{type(e).__name__}: {e}"[:300])
+
+    @app.on_event("shutdown")
+    async def _mcp_shutdown():
+        await run_in_threadpool(mcp_manager.shutdown)
+
     return app
 
 
@@ -1395,7 +1489,8 @@ def main():
     port = int(os.getenv("RIKO_HUB_PORT", "8002"))
     print(f"[hub] data={data_dir} llm={llm_defaults['base_url'] or '(not configured)'} "
           f"tts={tts_defaults['base_url'] or '(off)'} "
-          f"searxng={tools_defaults['searxng_url'] or '(off)'}")
+          f"searxng={tools_defaults['searxng_url'] or '(off)'} "
+          f"mcp={'on' if mcp_available() else 'unavailable: mcp package not installed'}")
     uvicorn.run(app, host=host, port=port)
 
 

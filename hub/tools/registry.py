@@ -29,6 +29,9 @@ class ToolSpec:
     label: object        # label(args: dict) -> short human phrase (events)
     client_id: str | None = None   # set for client tools
     available: bool = True         # False: listed in /api/tools, not offered
+    # explicit per-tool permission from the tool's own source (MCP servers
+    # carry tool_permissions per server); wins over the settings map
+    permission_override: str = ""
 
 
 def full_tool_name(kind: str, name: str) -> str:
@@ -41,8 +44,13 @@ def full_tool_name(kind: str, name: str) -> str:
     return full
 
 
-def permission_for(name: str, source: str, risk: str, permissions: dict) -> str:
-    """Effective permission for a tool name under the saved permissions map."""
+def permission_for(name: str, source: str, risk: str, permissions: dict,
+                   override: str = "") -> str:
+    """Effective permission for a tool name under the saved permissions map.
+    `override` (e.g. an MCP server's own tool_permissions entry) wins over
+    the map; both only apply when the value is a real permission."""
+    if override in PERMISSIONS:
+        return override
     explicit = str((permissions or {}).get(name) or "")
     if explicit in PERMISSIONS:
         return explicit
