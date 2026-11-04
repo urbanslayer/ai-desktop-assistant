@@ -24,11 +24,26 @@
 
 let lastReadTabId = null;       // where the last browser_read happened
 let linkState = "down";         // what the link tab's WebSocket says
-const settingsCache = { token: "", port: 8766, paused: false, allowlist: [] };
+let linkTabId = null;           // the tab currently hosting link_relay.js
+let lastCloseTs = 0;            // when the user closed the link tab (manual)
+let probeFailStreak = 0;        // consecutive /hello probe failures
+let nextProbeAt = 0;            // fake-clock-agnostic backoff gate (Date.now)
+const settingsCache = {
+  token: "", port: 8766, paused: false, allowlist: [], autoReopen: true,
+};
+
+// Probe/backoff policy: never spend a tab (or a console line) on a desktop
+// that isn't running. Failures double the wait: 1 -> 2 -> 4 min, capped, and
+// the 1-min 'riko-link' alarm carries the retries. A manual tab close gets a
+// flat 60 s cooldown so closing it doesn't start a reopen storm.
+const PROBE_TIMEOUT_MS = 2000;
+const PROBE_BASE_MS = 60 * 1000;
+const PROBE_CAP_MS = 4 * 60 * 1000;
+const REOPEN_COOLDOWN_MS = 60 * 1000;
 
 const storageGet = async () => {
   const got = await browser.storage.local.get({
-    token: "", port: 8766, paused: false, allowlist: [],
+    token: "", port: 8766, paused: false, allowlist: [], autoReopen: true,
   });
   Object.assign(settingsCache, got);
   return got;
@@ -39,7 +54,7 @@ const setBadge = (text, color = "#ffb020") => {
   browser.action.setBadgeText({ text }).catch(() => {});
 };
 
-// ── Messages from the link tab ───────────────────────────────
+// ── Messages from the link tab / popup ───────────────────────
 browser.runtime.onMessage.addListener((msg) => {
   if (msg && msg.rikoState) {
     linkState = String(msg.rikoState);
@@ -49,6 +64,16 @@ browser.runtime.onMessage.addListener((msg) => {
     browser.storage.local.set({ link: linkState }).catch(() => {});
     return;
   }
+  if (msg && msg.cmd === "connect") {
+    // popup Connect: probe NOW (ignore backoff/cooldown — the user asked)
+    return (async () => {
+      await storageGet();
+      const online = await probeDesktop();
+      browser.storage.local.set({ desktopOnline: online }).catch(() => {});
+      if (online) await ensureLinkTab({ force: true }).catch(() => {});
+      return { online };
+    })();
+  }
   if (msg && msg.riko && msg.riko.id != null) {
     const { id, method, params } = msg.riko;
     return handleCommand(method, params || {}).then((answer) => ({ id, ...answer }));
@@ -56,22 +81,76 @@ browser.runtime.onMessage.addListener((msg) => {
 });
 
 // ── The link tab ─────────────────────────────────────────────
-const LINK_PREFIX = () => `http://127.0.0.1:${settingsCache.port}/link`;
-const isLinkTab = (t) =>
-  (t.url || "").startsWith(LINK_PREFIX()) ||
-  (t.url || "").includes(`127.0.0.1%3A${settingsCache.port}%2Flink`); // error page
+function linkPrefix() { return `http://127.0.0.1:${settingsCache.port}/link`; }
+function linkErrorMark() { return `127.0.0.1%3A${settingsCache.port}%2Flink`; }
+function isLinkTab(t) {
+  const url = t.url || "";
+  return url.startsWith(linkPrefix()) || url.includes(linkErrorMark());
+}
 
-async function ensureLinkTab() {
+// GET /hello on the desktop's bridge port (no auth, CORS *). Any answer that
+// isn't exactly our identity counts as offline — never throw, never log: the
+// offline case is the NORMAL state when the app isn't running.
+async function probeDesktop(timeoutMs = PROBE_TIMEOUT_MS) {
+  if (typeof fetch !== "function" || typeof AbortController !== "function") {
+    return false;  // node/vm harness without a fetch stub
+  }
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${settingsCache.port}/hello`,
+                            { cache: "no-store", signal: ctl.signal });
+    if (!res.ok) return false;
+    const j = await res.json();
+    return !!(j && j.ok === true && j.name === "riko-desktop");
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function probeBackoffMs(streak) {
+  return Math.min(PROBE_BASE_MS * 2 ** Math.max(streak - 1, 0), PROBE_CAP_MS);
+}
+
+async function ensureLinkTab(opts = {}) {
   await storageGet();
+  const force = !!opts.force;   // popup Connect: bypass toggle + cooldown + backoff
   const tabs = await browser.tabs.query({});
   const hit = tabs.find(isLinkTab);
   if (hit) {
-    if (linkState !== "up" && !(hit.url || "").startsWith("about:")) {
-      await browser.tabs.reload(hit.id).catch(() => {});  // stalled relay
+    linkTabId = hit.id;
+    probeFailStreak = 0; nextProbeAt = 0;   // tab exists: forget probe backoff
+    if (linkState !== "up") {
+      if (!(hit.url || "").startsWith("about:")) {
+        await browser.tabs.reload(hit.id).catch(() => {});  // stalled relay
+      } else if (await probeDesktop()) {
+        // error page from a down desktop: reload only once it's back
+        await browser.tabs.reload(hit.id).catch(() => {});
+      }
     }
     return;
   }
-  const tab = await browser.tabs.create({ url: LINK_PREFIX(), active: false });
+  // No tab. If the desktop went away while one existed, the close listener
+  // keeps the tab (the status page + relay backoff handle recovery), so
+  // reaching here without a tab means it was never opened or was closed.
+  if (!force) {
+    if (!settingsCache.autoReopen) return;
+    if (lastCloseTs && Date.now() - lastCloseTs < REOPEN_COOLDOWN_MS) return;
+    if (Date.now() < nextProbeAt) return;
+  }
+  const online = await probeDesktop();
+  browser.storage.local.set({ desktopOnline: online }).catch(() => {});
+  if (!online) {
+    probeFailStreak += 1;
+    nextProbeAt = Date.now() + probeBackoffMs(probeFailStreak);
+    return;  // no tab, no console noise; the alarm retries on the schedule
+  }
+  probeFailStreak = 0; nextProbeAt = 0;
+  const tab = await browser.tabs.create({ url: linkPrefix(), active: false });
+  linkTabId = tab.id;
+  lastCloseTs = 0;
   try { await browser.tabs.hide(tab.id); } catch { /* headless or last window */ }
 }
 
@@ -261,20 +340,45 @@ async function doClose(params) {
 }
 
 // ── Startup & link supervision ───────────────────────────────
-browser.runtime.onStartup.addListener(() => { storageGet().then(ensureLinkTab); });
-browser.runtime.onInstalled.addListener(() => { storageGet().then(ensureLinkTab); });
-browser.tabs.onRemoved.addListener(() => {
+// Firefox start / install: probe immediately (a fresh session is not a
+// manual close, so the stored lastCloseTs must not gate it).
+const startupLink = () => {
+  storageGet().then(() => { lastCloseTs = 0; return ensureLinkTab(); })
+    .catch(() => {});
+};
+browser.runtime.onStartup.addListener(startupLink);
+browser.runtime.onInstalled.addListener(startupLink);
+browser.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === linkTabId) {
+    // manual close: honour a 60 s cooldown before spending a new tab on it
+    linkTabId = null;
+    lastCloseTs = Date.now();
+    browser.storage.local.set({ lastCloseTs }).catch(() => {});
+  }
   // cheap no-op unless the link tab was the one that vanished
-  setTimeout(ensureLinkTab, 1200);
+  setTimeout(() => { ensureLinkTab().catch(() => {}); }, 1200);
 });
 browser.storage.onChanged.addListener((changes) => {
-  if ("port" in changes) { linkState = "down"; storageGet().then(ensureLinkTab); }
+  if ("port" in changes) {
+    // the owner moved the app: everything derived from the old port is stale
+    linkState = "down";
+    linkTabId = null;
+    probeFailStreak = 0; nextProbeAt = 0; lastCloseTs = 0;
+    storageGet().then(() => ensureLinkTab()).catch(() => {});
+  }
 });
 browser.alarms.create("riko-link", { periodInMinutes: 1 });
+browser.alarms.create("riko-status", { periodInMinutes: 0.5 });  // popup line
 browser.alarms.onAlarm.addListener(async (a) => {
+  if (a.name === "riko-status") {
+    await storageGet();
+    const online = await probeDesktop();
+    browser.storage.local.set({ desktopOnline: online }).catch(() => {});
+    return;
+  }
   if (a.name !== "riko-link") return;
   await storageGet();
   if (linkState === "up") return;
-  await ensureLinkTab();
+  await ensureLinkTab().catch(() => {});
 });
-storageGet().then(ensureLinkTab);
+storageGet().then(() => ensureLinkTab()).catch(() => {});

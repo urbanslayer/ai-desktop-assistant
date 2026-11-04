@@ -1093,6 +1093,28 @@ with `approved: true/false`. Clients may run **multiple concurrent**
 requests (different `request_id`s) — the hub issues independent calls in
 parallel.
 
+### The browser link (desktop ↔ Riko Helper, loopback only)
+
+The desktop's `BrowserBridge` (`riko/client_tools.py`) listens on
+`desktop.client.browser_port` (default 8766, 127.0.0.1 only) and answers
+three plain GET routes next to its token-authenticated WebSocket:
+
+- `GET /hello` → `{"ok": true, "name": "riko-desktop", "version": "…"}` —
+  **no auth**, `Access-Control-Allow-Origin: *`. This is the extension's
+  reachability probe: it opens its link tab only when this answers with our
+  identity within 2 s; anything else (refused, 404, foreign JSON) means
+  offline, and then no tab opens at all. Retries ride a 1-minute alarm with
+  exponential backoff capped at 4 minutes; a manual tab close gets a 60 s
+  reopen cooldown, and the options page can disable auto-reopen entirely
+  (the popup's Connect then opens it on demand).
+- `GET /riko-pair` → the pairing token as `text/plain` (also CORS `*`).
+- `GET /link` → the quiet host page (`text/html`, CORS `*`) whose tab
+  carries the actual `ws://127.0.0.1:<port>/` connection: an http origin is
+  the only place Firefox still allows plaintext `ws://` (the extension's own
+  secure context force-upgrades to `wss://`). It is a friendly status page
+  ("Riko is online/offline", auto-reconnect notice) — when the desktop is
+  down the tab simply isn't there, so no raw browser error page shows.
+
 ## A minimal Android flow
 
 1. `GET /api/health` → reachable? then `GET /api/state` with the key → cache
