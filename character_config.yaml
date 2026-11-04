@@ -97,6 +97,25 @@ desktop:
                        # riding her startup wave). false = stay quiet until you
                        # talk to her.
 
+  # Ears: how you talk to her.
+  #   push_to_talk = the classic: hold Space, the 'listening…' pill shows,
+  #                  release to send.
+  #   always       = hands-free: a voice activity detector (VAD) listens on a
+  #                  continuous mic stream and sends each utterance it hears.
+  #                  No pill at all while she hears you; she pauses her ears
+  #                  while she speaks or thinks so she never hears herself.
+  # This value only seeds the INITIAL default: switching at runtime (tray
+  # item, L key, riko-ctl listen-mode) is remembered in
+  # ~/.config/riko/listen_mode.json and wins on the next start.
+  listen_mode: push_to_talk   # push_to_talk | always
+
+  # Tuning for always mode (riko/vad.py; sensible defaults, rarely needed).
+  always_listen:
+    threshold: 0.5            # speech probability above which a frame counts as voiced
+    min_speech_ms: 200        # keep talking this long before it counts as speech
+    silence_ms: 800           # this much quiet ends the utterance
+    max_seconds: 30           # cap: an utterance longer than this is cut and sent
+
   # Roam: strip (docs/WALK_MEMORY.md "W"). "off" = the small window always
   # (old behaviour). "strip" = a full-width see-through band at the BOTTOM
   # edge of the screen instead: she wanders along it, everything around her
@@ -138,5 +157,6 @@ desktop:
     wave: "W"                       # she waves at you
     persona_next: "P"               # switch to the next persona
     hide: "H"                       # hide her (the tray icon brings her back)
+    listen_mode: "L"                # push-to-talk <-> always listen
     forget: "Ctrl+Shift+Backspace"  # forget the chat (press again within 3 s to confirm)
     quit: "Ctrl+Q"                  # quit (also in the tray menu)

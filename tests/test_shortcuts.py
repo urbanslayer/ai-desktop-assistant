@@ -6,6 +6,7 @@ EXPECTED_DEFAULTS = {
     "talk": ["Space"],
     "persona_next": ["P"],
     "hide": ["H"],
+    "listen_mode": ["L"],
     "wave": ["W"],
     "forget": ["Ctrl+Shift+Backspace"],
     "quit": ["Ctrl+Q"],

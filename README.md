@@ -415,6 +415,7 @@ Instead of a browser tab, she can live in a small borderless, transparent, alway
 |---|---|
 | Type to her | `/` or **Enter** — type, **Enter** sends, **Esc** gives up |
 | Push-to-talk | Hold **Space**, speak, release to send |
+| Always listen / back to push-to-talk | **L** (also the tray's *Always listen* tick) |
 | She waves at you | **W** (always works: it cuts in, never waits on the greeting cooldown) |
 | Next persona | **P** |
 | Hide her | **H** (the tray icon brings her back) |
@@ -423,7 +424,9 @@ Instead of a browser tab, she can live in a small borderless, transparent, alway
 
 Keys are written as optional `Ctrl` / `Alt` / `Shift` modifiers plus one key name matching `KeyboardEvent.key` (letters — case doesn't matter — `Space`, `Enter`, `Escape`, `Backspace`, `Tab`, `F1`–`F12`, `/`). Use a list for several keys per action (`type: ["Enter", "/"]`), and `""` or `[]` to switch an action off. Typos, unknown keys and duplicate bindings are reported in the terminal at startup and ignored; anything you leave out keeps its default.
 
-**Optional: global keys.** Want to reach her without focusing the window first? `bin/riko-ctl <command>` talks to the running app over its local port — `type` (open her input and focus the window), `talk` / `talk-start` / `talk-stop`, `show` / `hide` / `toggle`, `status`, `forget`, `personas`, `persona <name>`, `persona-next`, `quit` — handy in a compositor keybind or a script. The shipped `desktop/hyprland/` files are examples of exactly that: window rules plus suggested global binds (**Ctrl+Alt+T** type, hold **Ctrl+Alt+Space** talk, **Ctrl+Alt+H** show/hide, **Ctrl+Alt+P** next persona). They stay off the Super key on purpose, and they're only suggestions: check `hyprctl binds` for clashes and pick other keys if needed.
+**Always listen.** Press **L** (or tick *Always listen* in the tray menu, or run `riko-ctl listen-mode`) and her ears go hands-free: instead of waiting for Space, a voice activity detector watches the mic continuously and sends each thing it hears — no *listening…* pill at all, she just answers. She pauses her own ears while she thinks and while she speaks (plus a short echo tail), so she never hears herself; holding Space still works too, with the usual pill. Whatever you pick is remembered across restarts (`desktop.listen_mode:` in `character_config.yaml` only seeds the first default). Privacy: in always mode the audio never leaves your PC until speech is actually detected — only finished utterances go to your ASR server — and the ears are fully closed while she talks. If the mic can't be opened, she says so once in the terminal and stays on push-to-talk.
+
+**Optional: global keys.** Want to reach her without focusing the window first? `bin/riko-ctl <command>` talks to the running app over its local port — `type` (open her input and focus the window), `talk` / `talk-start` / `talk-stop`, `listen-mode` (push-to-talk ↔ always listen, or `listen-mode always`), `show` / `hide` / `toggle`, `status`, `forget`, `personas`, `persona <name>`, `persona-next`, `quit` — handy in a compositor keybind or a script. The shipped `desktop/hyprland/` files are examples of exactly that: window rules plus suggested global binds (**Ctrl+Alt+T** type, hold **Ctrl+Alt+Space** talk, **Ctrl+Alt+H** show/hide, **Ctrl+Alt+P** next persona). They stay off the Super key on purpose, and they're only suggestions: check `hyprctl binds` for clashes and pick other keys if needed.
 
 **Window rules.** `desktop.py` asks Hyprland to float, size and pin her on its own. For best results add the shipped rules so it happens the instant she maps:
 

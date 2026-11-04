@@ -10,6 +10,7 @@ desktop.shortcuts in character_config.yaml; defaults:
     W                        she waves at you
     P                        next persona
     H                        hide her (the tray icon brings her back)
+    L                        push-to-talk <-> always listen (hands-free VAD)
     Ctrl+Shift+Backspace     forget the chat (press again within 3 s to confirm)
     Ctrl+Q                   quit (also in the tray menu)
 With the mouse:
@@ -656,6 +657,10 @@ def main():
             {"toggle": toggle_window, "show": show_window, "hide": win.hide}[cmd]()
         elif cmd == "quit":
             app.quit()
+        elif cmd.startswith("listen-ui:"):  # reflect a mode change on the tray
+            always = cmd.partition(":")[2] == "always"
+            listen_action.setChecked(always)
+            tray.setToolTip("Riko — always listening (L switches back)" if always else "Riko")
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
 
@@ -699,7 +704,17 @@ def main():
             win.input_open = False
             print("[ctl] input closed", flush=True)
         elif cmd == "status":
-            return {"ok": True, "recording": session.recorder.recording, "visible": win.isVisible()}
+            return {"ok": True, "recording": session.recorder.recording,
+                    "visible": win.isVisible(), "listen_mode": session.listen_mode}
+        elif cmd == "listen-mode":
+            want = str(args.get("mode", "")).strip().lower()
+            if want:
+                if want not in ("push_to_talk", "always"):
+                    return {"ok": False, "error": "listen-mode: push_to_talk | always"}
+                session.set_listen_mode(want)
+            else:
+                session.toggle_listen_mode()
+            return {"ok": True, "listen_mode": session.listen_mode}
         elif cmd in ("approve", "deny"):
             if runtime is None:
                 return {"ok": False, "error": "client tools are off (desktop.client.enabled: false)"}
@@ -800,14 +815,33 @@ def main():
     persona_menu.aboutToShow.connect(rebuild_persona_menu)
     rebuild_persona_menu()
     menu.addMenu(persona_menu)
+
+    # Always listen: hands-free VAD ears with no listening pill, vs today's
+    # hold-Space push-to-talk. Checkable; the check + tooltip also follow
+    # toggles made by the L shortcut, riko-ctl or the page (listen-ui event).
+    listen_action = QAction(f"Always listen{hint('listen_mode')}", menu)
+    listen_action.setCheckable(True)
+    listen_action.setToolTip("hands-free ears: no pill while she hears you; "
+                             "pauses while she speaks")
+    listen_action.triggered.connect(lambda checked=None: session.toggle_listen_mode())
+
     for label, fn in ((f"Type to her{hint('type')}", lambda: on_command("type")),
-                      (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle),
-                      (f"Show / hide{hint('hide')}", toggle_window),
+                      (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle)):
+        action = QAction(label, menu)
+        action.triggered.connect(fn)
+        menu.addAction(action)
+    menu.addAction(listen_action)
+    for label, fn in ((f"Show / hide{hint('hide')}", toggle_window),
                       (f"Forget the chat{hint('forget')}", session.forget),
                       (f"Quit{hint('quit')}", app.quit)):
         action = QAction(label, menu)
         action.triggered.connect(fn)
         menu.addAction(action)
+    listen_action.setChecked(session.listen_mode == "always")
+    if session.listen_mode == "always":
+        tray.setToolTip("Riko — always listening (L switches back)")
+    # keep the tray honest when the mode changes elsewhere (L key, riko-ctl)
+    session.on_listen_mode = lambda mode: bridge.command.emit(f"listen-ui:{mode}")
     tray.setContextMenu(menu)
     tray.activated.connect(lambda reason: toggle_window() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
     if QSystemTrayIcon.isSystemTrayAvailable():
@@ -841,6 +875,7 @@ def main():
     code = app.exec()
     if session.recorder.recording:
         session.recorder.stop()
+    session.close()  # releases the always-listen mic stream if it is open
     if runtime is not None:
         runtime.stop()  # unregister from the hub's client channel
     print("Bye!")

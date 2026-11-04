@@ -8,6 +8,7 @@ asr: groq   -> Groq's online Whisper
 """
 import io
 import os
+import re
 import threading
 
 import numpy as np
@@ -15,6 +16,7 @@ import sounddevice as sd
 import soundfile as sf
 from openai import OpenAI
 
+from riko import vad as vad_mod
 from riko.config import need_key
 
 SAMPLE_RATE = 16000                # what Whisper expects
@@ -111,6 +113,203 @@ def record():
     rec.start()
     input("Recording... press ENTER to stop")
     return rec.stop()
+
+
+class AlwaysListener:
+    """Hands-free ears: one continuous 16 kHz mono stream, cut into utterances
+    by the VAD in riko/vad.py. Each finished segment goes to on_segment(wav)
+    — the SAME path push-to-talk uses (submit_audio -> transcribe -> turn).
+
+    Deliberately silent to the UI: the point of always mode is that there is
+    no listening indicator, so this never emits a 'listening' status.
+    pause()/resume() drop frames and reset the segmenter (she is speaking, or
+    a turn is thinking); suspend()/release() hand the mic device itself to
+    the push-to-talk Recorder while Space is held. A device error mid-stream
+    retries with backoff; start() raises so the caller can fall back to
+    push-to-talk. Thread-safe: everything runs on one reader thread.
+    """
+
+    def __init__(self, on_segment, cfg=None, sd_module=None, vad=None,
+                 retry_delay=0.5, retry_max=10.0):
+        self.on_segment = on_segment
+        self._sd = sd_module or sd
+        self._cfg = dict(vad_mod.DEFAULTS, **(cfg or {}))
+        self._vad = vad          # None -> backend chosen at start()
+        self.vad_name = getattr(vad, "name", "injected") if vad else None
+        self._segmenter = None
+        self._stream = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._pause = threading.Event()      # frames dropped, stream stays open
+        self._suspend = threading.Event()    # device handed to the Recorder
+        self._resume = threading.Event()     # released / resumed, loop wakes up
+        self._retry_delay = retry_delay
+        self._retry_max = retry_max
+        self._lock = threading.Lock()
+
+    @property
+    def running(self):
+        return self._thread is not None
+
+    def start(self):
+        """Open the stream and start the reader thread; raises if the mic won't open."""
+        with self._lock:
+            if self._thread is not None:
+                return
+            if self._vad is None:
+                self._vad, self.vad_name = vad_mod.make_vad()
+                print(f"[listen] VAD backend: {self.vad_name}")
+            self._segmenter = vad_mod.Segmenter(
+                threshold=self._cfg["threshold"],
+                min_speech_ms=self._cfg["min_speech_ms"],
+                silence_ms=self._cfg["silence_ms"],
+                pre_roll_ms=self._cfg["pre_roll_ms"],
+                max_seconds=self._cfg["max_seconds"],
+                min_voiced_ms=self._cfg["min_voiced_ms"],
+            )
+            self._stop.clear()
+            self._pause.clear()
+            self._suspend.clear()
+            self._resume.set()
+            self._stream = self._open_stream()  # first failure must reach the caller
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="riko-vad")
+            self._thread.start()
+
+    def _open_stream(self):
+        stream = self._sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                                      dtype="float32")
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            raise
+        return stream
+
+    def close(self):
+        """Stop the reader and release the device (shutdown)."""
+        with self._lock:
+            thread, self._thread = self._thread, None
+            stream, self._stream = self._stream, None
+        self._stop.set()
+        self._resume.set()  # wake a suspended reader so join is quick
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if thread is not None:
+            thread.join(timeout=3)
+
+    def pause(self):
+        """Drop frames and forget the half-built segment (she is speaking)."""
+        self._pause.set()
+
+    def resume(self):
+        self._pause.clear()
+
+    def suspend(self):
+        """Give the mic device to the push-to-talk Recorder (Space held)."""
+        self._suspend.set()
+
+    def release(self):
+        if self._suspend.is_set():
+            self._suspend.clear()
+            self._resume.set()
+
+    # ── the reader thread ─────────────────────────────────────
+    def _run(self):
+        delay = self._retry_delay
+        while not self._stop.is_set():
+            if self._suspend.is_set():
+                self._close_quiet()
+                self._resume.wait(timeout=0.2)
+                continue
+            try:
+                if self._stream is None:
+                    self._stream = self._open_stream()
+                    delay = self._retry_delay
+                    print("[listen] mic stream back up")
+                frame, _overflowed = self._stream.read(vad_mod.FRAME_SAMPLES)
+            except Exception as e:
+                if self._stop.is_set() or self._suspend.is_set():
+                    continue
+                self._close_quiet()
+                print(f"[listen] mic stream failed ({type(e).__name__}: {e}); "
+                      f"retrying in {delay:.1f}s")
+                if self._stop.wait(delay) or self._suspend.wait(0) :
+                    continue
+                delay = min(delay * 2, self._retry_max)
+                continue
+            if self._pause.is_set() or self._suspend.is_set():
+                self._segmenter.reset()
+                continue
+            end = self._segmenter.push(np.asarray(frame).reshape(-1),
+                                       float(self._vad(frame)))
+            if end is None:
+                continue
+            if end.audio is None:
+                print(f"[asr] always-listen: dropped a {end.seconds:.1f}s blip "
+                      f"({end.voiced_seconds:.2f}s of speech)")
+                continue
+            wav = io.BytesIO()
+            sf.write(wav, end.audio, SAMPLE_RATE, format="WAV")
+            print(f"[asr] always-listen: caught {end.seconds:.1f}s")
+            try:
+                self.on_segment(wav.getvalue())
+            except Exception as e:  # a segment must not kill the reader
+                print(f"[asr] always-listen: segment dropped ({type(e).__name__}: {e})")
+
+    def _close_quiet(self):
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+# Whisper's favourites when it hears nothing: classic word-hallucinations on
+# short noise segments. Compared case-insensitively, without surrounding
+# punctuation; the subtitles-by pattern catches the credit-line family.
+NOISE_TEXTS = {
+    "thank you", "thanks", "thank you!", "thanks for watching", "thanks for watching!",
+    "thank you for watching", "you", "bye", "bye bye", "bye.", "goodbye",
+    "yes", "so", "okay", "ok", "hmm", "oh", "the end", "please subscribe",
+    "you. ", "mm hm", "mhm", "aha", "ooh", "wow",
+}
+_SUBS_LINE = re.compile(r"subt?itles? (?:by|readings? by)|captioned? (?:by|in)", re.I)
+NOISE_HALLUCINATION_MAX_SECONDS = 1.5  # only short segments are "noise"
+
+
+def hallucination_reason(text, wav_bytes):
+    """Why this transcript is probably Whisper inventing words: a reason str,
+    or None when the text looks real. Empty/punctuation-only always count;
+    the classic word-hallucinations only on short (< ~1.5 s) segments."""
+    t = (text or "").strip()
+    if not t:
+        return "no words"
+    if not any(c.isalnum() for c in t):
+        return "punctuation only"
+    seconds = 0.0
+    try:
+        seconds = sf.info(io.BytesIO(wav_bytes)).duration
+    except Exception:
+        pass
+    if seconds < NOISE_HALLUCINATION_MAX_SECONDS:
+        core = t.lower().strip(" \t.!?~*-–—…")
+        if core in NOISE_TEXTS or _SUBS_LINE.search(t):
+            return f"noise phrase on a {seconds:.1f}s clip"
+    return None
 
 
 def transcribe(wav_bytes, cfg):

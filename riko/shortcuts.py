@@ -31,6 +31,7 @@ DEFAULTS = {
     "wave": ("W",),                       # she waves at you
     "persona_next": ("P",),               # next persona
     "hide": ("H",),                       # hide her (tray icon brings her back)
+    "listen_mode": ("L",),                # push-to-talk <-> always listen
     "forget": ("Ctrl+Shift+Backspace",),  # forget the chat (press twice to confirm)
     "quit": ("Ctrl+Q",),
 }
