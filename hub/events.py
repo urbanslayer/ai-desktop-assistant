@@ -7,8 +7,8 @@ client consumes via the long-poll route — no websockets, so any HTTP client
 
 Event types: turn_started {persona, source}, tool_started {call_id, tool,
 label}, tool_finished {call_id, tool, ok, ms}, approval_needed {request_id,
-client_id, tool, summary}, turn_finished {persona, message_id, emotion},
-state_changed {version}.
+client_id, tool, summary}, turn_finished {persona, message_id, emotion,
+actions}, state_changed {version}.
 """
 import threading
 import time

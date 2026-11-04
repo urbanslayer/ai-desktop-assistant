@@ -12,7 +12,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Voice migration for personas written before the voice round (docs/VOICE.md):
 # a bland design-mode voice with a random seed, so they keep talking after the
@@ -130,6 +130,19 @@ class Store:
             if "tools" not in cols:
                 self.db.execute("ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT ''")
             self.db.executescript(_SCHEMA_V3)
+            self.db.execute("PRAGMA user_version=3")
+            self.db.commit()
+        if version < 4:  # embodiment round (docs/BODY.md)
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(personas)")}
+            if "appearance" not in cols:
+                self.db.execute("ALTER TABLE personas ADD COLUMN appearance TEXT NOT NULL DEFAULT ''")
+            if "embodied" not in cols:
+                # embodied defaults ON: pre-round personas act embodied
+                # whenever an embodied client is online.
+                self.db.execute("ALTER TABLE personas ADD COLUMN embodied INTEGER NOT NULL DEFAULT 1")
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+            if "actions" not in cols:
+                self.db.execute("ALTER TABLE messages ADD COLUMN actions TEXT NOT NULL DEFAULT ''")
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.db.commit()
 
@@ -186,6 +199,8 @@ class Store:
             "greeting": row["greeting"],
             "tts_voice": row["tts_voice"],
             "emotes": bool(row["emotes"]),
+            "appearance": row["appearance"],
+            "embodied": bool(row["embodied"]),
             "voice": voice,
             "voice_version": row["voice_version"],
             "avatar_version": row["avatar_version"],
@@ -209,17 +224,20 @@ class Store:
 
     def add_persona(self, pid: str, name: str, keywords: list[str], system_prompt: str,
                     greeting: str, tts_voice: str, voice: dict | None = None,
-                    emotes: bool = True) -> dict:
+                    emotes: bool = True, appearance: str = "",
+                    embodied: bool = True) -> dict:
         ts = now_iso()
         if voice is None:
             voice = default_voice()
         with self._lock:
             self.db.execute(
                 "INSERT INTO personas(id,name,keywords,system_prompt,greeting,tts_voice,"
-                "avatar_version,has_avatar,created_at,updated_at,voice,voice_version,emotes) "
-                "VALUES(?,?,?,?,?,?,0,0,?,?,?,?,?)",
+                "avatar_version,has_avatar,created_at,updated_at,voice,voice_version,emotes,"
+                "appearance,embodied) "
+                "VALUES(?,?,?,?,?,?,0,0,?,?,?,?,?,?,?)",
                 (pid, name, json.dumps(keywords), system_prompt, greeting, tts_voice,
-                 ts, ts, json.dumps(voice), 1, 1 if emotes else 0))
+                 ts, ts, json.dumps(voice), 1, 1 if emotes else 0,
+                 str(appearance or "")[:1000], 1 if embodied else 0))
             self.db.commit()
         persona = self.get_persona(pid)
         assert persona is not None
@@ -234,6 +252,12 @@ class Store:
         if "emotes" in fields:
             sets.append("emotes=?")
             vals.append(1 if fields["emotes"] else 0)
+        if "appearance" in fields:
+            sets.append("appearance=?")
+            vals.append(str(fields["appearance"] or "")[:1000])
+        if "embodied" in fields:
+            sets.append("embodied=?")
+            vals.append(1 if fields["embodied"] else 0)
         if "keywords" in fields:
             sets.append("keywords=?")
             vals.append(json.dumps(fields["keywords"]))
@@ -274,16 +298,19 @@ class Store:
 
     # ── messages ────────────────────────────────────────────────────────
     def add_message(self, persona: str, role: str, content: str, source: str,
-                    emotion: str | None = None, tools: list | None = None) -> int:
+                    emotion: str | None = None, tools: list | None = None,
+                    actions: list | None = None) -> int:
         """`emotion` only makes sense on assistant messages (docs/ROUNDS.md:
         null for user messages). `tools` is the compact tools_used list
-        [{tool, label}] stored on the assistant reply."""
+        [{tool, label}] stored on the assistant reply. `actions` is the
+        parsed body-action list [{name, at}] (docs/BODY.md)."""
         with self._lock:
             cur = self.db.execute(
-                "INSERT INTO messages(persona,role,content,source,created_at,emotion,tools) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (persona, role, content, source, now_iso(),
-                 emotion, json.dumps(tools) if tools else ""))
+                "INSERT INTO messages(persona,role,content,source,created_at,emotion,"
+                "tools,actions) VALUES(?,?,?,?,?,?,?,?)",
+                (persona, role, content, source, now_iso(), emotion,
+                 json.dumps(tools) if tools else "",
+                 json.dumps(actions) if actions else ""))
             self.db.commit()
             assert cur.lastrowid is not None
             return cur.lastrowid
@@ -319,9 +346,16 @@ class Store:
                 tools = json.loads(row["tools"])
             except ValueError:
                 tools = []
+        actions = []
+        if row["actions"]:
+            try:
+                actions = json.loads(row["actions"])
+            except ValueError:
+                actions = []
         return {"id": row["id"], "persona": row["persona"], "role": row["role"],
                 "content": row["content"], "source": row["source"],
                 "emotion": row["emotion"], "tools_used": tools,
+                "actions": actions,
                 "created_at": row["created_at"]}
 
     def clear_messages(self, persona: str) -> int:

@@ -8,6 +8,8 @@ every 30 s and count as offline 75 s after the last contact. Approval-gated
 requests wait up to 120 s, then the outcome is "not approved".
 
 The model sees client tools as `<kind>__<name>` (e.g. `desktop__open_url`).
+A client may also register a `body` (body.actions / body.expressions,
+docs/BODY.md); the union over online clients is the body set (`body_actions()`).
 """
 import json
 import re
@@ -51,13 +53,15 @@ class ClientHub:
         self._cond = threading.Condition(self._lock)  # signals queued requests
 
     # ── registration ───────────────────────────────────────────────────
-    def register(self, client_id: str, name: str, kind: str, tools: list) -> dict:
+    def register(self, client_id: str, name: str, kind: str, tools: list,
+                 body: dict | None = None) -> dict:
         client_id = str(client_id or "").strip()
         kind = str(kind or "").strip().lower()
         if not CLIENT_ID_RE.match(client_id):
             raise ValueError("client_id must match ^[A-Za-z0-9_-]{1,64}$")
         if not KIND_RE.match(kind):
             raise ValueError("kind must match ^[a-z0-9]{1,16}$ (desktop, android, …)")
+        clean_body = _clean_body(body)
         clean_tools: dict[str, dict] = {}
         for raw in tools or []:
             if not isinstance(raw, dict):
@@ -80,7 +84,7 @@ class ClientHub:
             }
         record = {"client_id": client_id, "name": str(name or client_id)[:100],
                   "kind": kind, "tools": clean_tools, "last_seen": time.monotonic(),
-                  "queued": []}
+                  "body": clean_body, "queued": []}
         with self._lock:
             old = self._clients.get(client_id)
             # a re-register must not lose requests queued since the last poll
@@ -112,7 +116,22 @@ class ClientHub:
     def _public_locked(self, rec: dict) -> dict:
         return {"client_id": rec["client_id"], "name": rec["name"], "kind": rec["kind"],
                 "seconds_since_seen": round(now_elapsed(rec["last_seen"]), 1),
+                "body": dict(rec["body"]),
                 "tools": [dict(t) for t in rec["tools"].values()]}
+
+    def body_actions(self) -> list[str]:
+        """The BODY SET (docs/BODY.md §1): union of every ONLINE client's
+        body.actions, first-seen order, empty when nobody embodied is online."""
+        now = time.monotonic()
+        out: list[str] = []
+        with self._lock:
+            for rec in self._clients.values():
+                if not self._is_online(rec, now):
+                    continue
+                for name in rec["body"]["actions"]:
+                    if name not in out:
+                        out.append(name)
+        return out
 
     # ── tool visibility + dispatch ─────────────────────────────────────
     def online_tool_specs(self) -> list[ToolSpec]:
@@ -262,6 +281,34 @@ class ClientHub:
 
 def now_elapsed(mono: float) -> float:
     return time.monotonic() - mono
+
+
+BODY_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+
+
+def _clean_body(raw) -> dict:
+    """Normalise a registration `body` object (docs/BODY.md §1) into
+    {actions: [...], expressions: [...]} of bare lowercase names.
+    None/absent = no body (a text-only client)."""
+    if raw is None:
+        return {"actions": [], "expressions": []}
+    if not isinstance(raw, dict):
+        raise ValueError("body must be an object")
+    out: dict[str, list[str]] = {}
+    for key in ("actions", "expressions"):
+        items = raw.get(key) or []
+        if not isinstance(items, list):
+            raise ValueError(f"body.{key} must be a list of names")
+        names: list[str] = []
+        for item in items:
+            name = str(item or "").strip().lower().replace(" ", "_")
+            if not BODY_NAME_RE.match(name):
+                raise ValueError(f"body.{key} name '{item}' must match "
+                                 "^[A-Za-z0-9_-]{1,64}$")
+            if name not in names:
+                names.append(name)
+        out[key] = names
+    return out
 
 
 def summarize(tool_display: str, arguments: dict) -> str:
