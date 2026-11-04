@@ -25,6 +25,7 @@ if (THREE) {
   const { AvatarMotion } = await import('./motion.js');
   const { Director } = await import('./director.js');
   const { GESTURES } = await import('./gestures.js');
+  const { WALK_LIMITS } = await import('./walk.js');
 
   // deterministic Math.random for the whole motion layer (blinks, saccades,
   // glances, look-away picks)
@@ -69,6 +70,12 @@ if (THREE) {
       const la = mk(`${side}LowerArm`, ua, 0, -0.28, 0);
       mk(`${side}Hand`, la, 0, -0.25, 0);
     }
+    // legs: a straight down-chain, like a standing rig (walk.js probes this)
+    for (const [side, s] of [['left', 1], ['right', -1]]) {
+      const ul = mk(`${side}UpperLeg`, hips, 0.08 * s, -0.05, 0);
+      const ll = mk(`${side}LowerLeg`, ul, 0, -0.42, 0);
+      mk(`${side}Foot`, ll, 0, -0.40, 0.05);
+    }
     // eyes (the rig profile measures head size from eye spacing when present)
     mk('eyeLeft', bones.neck, 0.032, 0.05, 0.05);
     mk('eyeRight', bones.neck, -0.032, 0.05, 0.05);
@@ -90,9 +97,11 @@ if (THREE) {
   const finite = (o) => Number.isFinite(o.x) && Number.isFinite(o.y) && Number.isFinite(o.z);
 
   // envelope relative to rest — motion.js HEAD_LIMITS + a little float slack
-  const HEAD = { x: [-0.200001, 0.250001], y: [-0.350001, 0.350001], z: [-0.120001, 0.120001] };
-  const MAX_COMBINED_YAW = 0.45;   // gesture + gaze on neck AND head, worst case
+  // (head-only gaze: the neck never receives gaze/sway/tilt, only gestures)
+  const HEAD = { x: [-0.200001, 0.250001], y: [-0.400001, 0.400001], z: [-0.120001, 0.120001] };
+  const MAX_COMBINED_YAW = 0.70;   // gesture-driven neck + gaze-driven head, worst case
   const MAX_SPINE = 0.45;          // spine-chain bones are gesture-driven only
+  const MAX_HIP_YAW = 0.600001;    // spine-chain slack, except hips: big-glance body turn ±0.6
   const MAX_ARM_ANGLE = 2.7;       // rad between rest and current (stretch is ~2.3)
 
   function inBounds(e, lim) {
@@ -177,7 +186,8 @@ if (THREE) {
         const node = motion._node(b);
         if (!node) continue;
         const e = offsetEuler(rest.get(b), node.quaternion);
-        if (!finite(e) || Math.max(Math.abs(e.x), Math.abs(e.y), Math.abs(e.z)) > MAX_SPINE) {
+        const cap = b === 'hips' ? MAX_HIP_YAW : MAX_SPINE;   // hips also gets the body turn
+        if (!finite(e) || Math.max(Math.abs(e.x), Math.abs(e.y), Math.abs(e.z)) > cap) {
           throw new Error(`${b} wild at t=${now.toFixed(2)}s`);
         }
       }
@@ -273,6 +283,143 @@ if (THREE) {
       assert.ok(Math.hypot(ra.x, ra.y, ra.z) < 0.2, 'arm should hang down at rest');
       assert.equal(motion.gesture, null);
       assert.equal(motion._ghost, null);
+    } finally { restore(); }
+  });
+
+  test('walk cycle on a real bone tree: 10 min bounded, knee one-sided, clean rest after', need, () => {
+    const restore = seedRandom(777);
+    try {
+      const vrm = fakeVRM();
+      const camera = new THREE.PerspectiveCamera(30, 2.8, 0.1, 20);
+      camera.position.set(0, 1.55, 2.0);
+      const scene = new THREE.Scene();
+      scene.add(vrm.scene);
+      const motion = new AvatarMotion(THREE, { scene, camera });
+      motion.attach(vrm);
+      // the rig probe must have measured the fake legs and their directions
+      const legs = motion.rig.legs;
+      assert.ok(legs, 'no leg profile probed');
+      const l1 = vrm.bones.leftUpperLeg.position.length();   // hips->knee offsets
+      void l1;
+      const len = vrm.bones.leftUpperLeg.getWorldPosition(new THREE.Vector3())
+        .distanceTo(vrm.bones.leftLowerLeg.getWorldPosition(new THREE.Vector3()))
+        + vrm.bones.leftLowerLeg.getWorldPosition(new THREE.Vector3())
+          .distanceTo(vrm.bones.leftFoot.getWorldPosition(new THREE.Vector3()));
+      assert.ok(Math.abs(legs.legLen - len) < 1e-6, `legLen ${legs.legLen} != ${len}`);
+
+      const rest = new Map();
+      for (const b of ['hips', 'leftUpperLeg', 'leftLowerLeg', 'leftFoot',
+                       'rightUpperLeg', 'rightLowerLeg', 'rightFoot',
+                       'leftUpperArm', 'rightUpperArm']) {
+        rest.set(b, motion._rest.get(b));
+        assert.ok(rest.get(b), `rest snapshot missing for ${b}`);
+      }
+      motion.setWalk(1, 0.6);
+      const dt = 1 / 60;
+      const LEGS = ['leftUpperLeg', 'leftLowerLeg', 'leftFoot',
+                    'rightUpperLeg', 'rightLowerLeg', 'rightFoot',
+                    'leftUpperArm', 'rightUpperArm'];
+      let kneeSawFlex = 0, thighSawSwing = 0;
+      for (let f = 0; f < 600 * 60; f++) {
+        if (f === 300 * 60) motion.setWalk(-1, 0.6);     // turnaround mid-run
+        motion.update(dt);
+        for (const b of LEGS) {
+          const e = offsetEuler(rest.get(b), motion._node(b).quaternion);
+          assert.ok(finite(e), `${b} not finite at frame ${f}`);
+          const lim = WALK_LIMITS[b];
+          assert.ok(Math.abs(e.x) <= lim + 1e-6 && Math.abs(e.y) <= lim + 1e-6
+                    && Math.abs(e.z) <= lim + 1e-6,
+            `${b} out of walk bounds at frame ${f}: ${JSON.stringify(e)}`);
+        }
+        for (const s of ['left', 'right']) {
+          const e = offsetEuler(rest.get(`${s}LowerLeg`), motion._node(`${s}LowerLeg`).quaternion);
+          const bend = e.x * legs.kneeSign;
+          assert.ok(bend >= -1e-6, `${s} knee hyperextended (${e.x})`);
+          if (bend > 0.3) kneeSawFlex++;
+        }
+        const th = offsetEuler(rest.get('leftUpperLeg'), motion._node('leftUpperLeg').quaternion);
+        if (Math.abs(th.x) > 0.15) thighSawSwing++;
+        // hips bob must stay small and finite
+        assert.ok(Math.abs(motion._node('hips').position.y - motion._restPos.y)
+                  <= 0.05 * legs.legLen + 1e-6, 'hips bob too big');
+      }
+      assert.ok(kneeSawFlex > 1000, 'knee never really flexed');
+      assert.ok(thighSawSwing > 1000, 'thighs never swung');
+      // stop: everything must blend back to rest and STAY there
+      motion.setWalk(0);
+      for (let s = 0; s < 1.5; s += dt) motion.update(dt);
+      assert.equal(motion.__debug().walking, 0);
+      for (const b of LEGS) {
+        const e = offsetEuler(rest.get(b), motion._node(b).quaternion);
+        assert.ok(Math.hypot(e.x, e.y, e.z) < 0.02, `${b} did not return to rest`);
+      }
+      assert.ok(Math.abs(motion._node('hips').position.y - motion._restPos.y) < 1e-6,
+        'hips bob not restored');
+    } finally { restore(); }
+  });
+
+  test('gaze is head-only; a big glance turns the whole body from the hips', need, () => {
+    const restore = seedRandom(4242);
+    try {
+      const vrm = fakeVRM();
+      const camera = new THREE.PerspectiveCamera(30, 1.6, 0.1, 20);
+      camera.position.set(0, 1.55, 2.0);
+      camera.lookAt(0, 1.4, 0);
+      const scene = new THREE.Scene();
+      scene.add(vrm.scene);
+      const motion = new AvatarMotion(THREE, { scene, camera });
+      motion.attach(vrm);
+      const rest = {};
+      for (const b of ['head', 'neck', 'hips', 'spine', 'chest', 'upperChest']) {
+        rest[b] = motion._rest.get(b).clone();
+      }
+      const dt = 1 / 60;
+      const run = (secs) => { for (let f = 0; f < Math.round(secs * 60); f++) motion.update(dt); };
+      const off = (b) => offsetEuler(rest[b], motion._node(b).quaternion);
+
+      // Moderate glance (direction within the head's comfort range): the
+      // head bone turns, the neck and torso do NOT move at all.
+      motion.setGazeOverride({ yaw: 0.5, pitch: 0 });
+      run(4);
+      let h = off('head'), n = off('neck');
+      assert.ok(Math.abs(h.y) > 0.2, `head must follow a moderate glance (y=${h.y})`);
+      assert.ok(Math.abs(h.y) <= 0.400001, `head yaw within ±0.4 (y=${h.y})`);
+      assert.ok(Math.abs(n.x) < 0.02 && Math.abs(n.y) < 0.02 && Math.abs(n.z) < 0.02,
+        `neck must never take gaze (${JSON.stringify(n)})`);
+      assert.ok(Math.abs(off('hips').y) < 0.12, 'moderate glance barely turns the body');
+
+      // Big glance (direction past BIG_GLANCE_YAW=0.45): the excess turns
+      // the whole body from the HIPS; head stays in its envelope; the
+      // spine-chain never twists for gaze.
+      motion.setGazeOverride({ yaw: 1.6, pitch: 0 });
+      run(4);
+      h = off('head');
+      const hp = off('hips');
+      assert.ok(hp.y > 0.45, `body must turn toward a big glance (hips y=${hp.y})`);
+      assert.ok(hp.y <= 0.600001 + 1e-6, `hips yaw must respect ±0.6 (y=${hp.y})`);
+      assert.ok(Math.abs(h.y) <= 0.400001, `head still inside ±0.4 (y=${h.y})`);
+      for (const b of ['spine', 'chest', 'upperChest']) {
+        assert.ok(Math.abs(off(b).y) < 0.02, `${b} must not twist for gaze`);
+      }
+      n = off('neck');
+      assert.ok(Math.abs(n.y) < 0.02 && Math.abs(n.x) < 0.02, 'neck still untouched by gaze');
+
+      // Look up: pitch lands on the head bone only, within its envelope.
+      motion.setGazeOverride({ yaw: 0, pitch: 0.5 });
+      run(4);
+      h = off('head');
+      assert.ok(Math.abs(h.x) > 0.05, `head must pitch (x=${h.x})`);
+      assert.ok(h.x <= 0.250001 && h.x >= -0.200001, `head pitch within -0.2..0.25 (x=${h.x})`);
+      assert.ok(Math.abs(off('neck').x) < 0.02 && Math.abs(off('chest').x) < 0.02,
+        'neck/chest must not take the lookup');
+
+      // Gaze ends: body and head come back to face the viewer. (Idle glances
+      // re-armed by saccades would legitimately turn the body too — pin them
+      // out for this return-to-front check.)
+      motion.setGazeOverride(null);
+      for (let f = 0; f < 360; f++) { motion._nextGlance = 1e9; motion.update(dt); }
+      assert.ok(Math.abs(off('hips').y) < 0.02, 'body returns to face the viewer');
+      assert.ok(Math.abs(off('head').y) < 0.12, `head returns near front (y=${off('head').y})`);
     } finally { restore(); }
   });
 }

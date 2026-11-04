@@ -27,7 +27,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import sounddevice as sd
 import soundfile as sf
 
-from riko import hub_client, shortcuts
+from riko import hub_client, roam, shortcuts
 from riko.config import ROOT
 
 HOST = "127.0.0.1"  # 127.0.0.1, not localhost: behaves the same on Windows and Linux
@@ -196,6 +196,7 @@ def _desktop_settings(cfg):
     for w in warnings:
         print(f"[shortcuts] {w}", flush=True)
     settings["shortcuts"] = resolved
+    settings["roam_x"] = roam.load_x()   # where she stood on the strip last time
     return settings
 
 

@@ -18,6 +18,11 @@ def base_url():
     import os
     port = free_port()
     os.environ["RIKO_PORT"] = str(port)
+    # isolate the roam state file: these tests must not read/write the real one
+    import pathlib
+    import tempfile
+    roam_file = pathlib.Path(tempfile.mkdtemp(prefix="riko-roam-")) / "roam_x.json"
+    os.environ["RIKO_ROAM_STATE"] = str(roam_file)
     try:
         cfg = {"desktop": {"width": 420, "height": 680, "bubble_seconds": 8}}
         server = viewer.start(cfg)
@@ -27,6 +32,7 @@ def base_url():
         server.server_close()
     finally:
         os.environ.pop("RIKO_PORT", None)
+        os.environ.pop("RIKO_ROAM_STATE", None)
 
 
 def drain(url):
@@ -57,7 +63,7 @@ def test_settings_returns_desktop_section_plus_active_persona(base_url, hub_conn
     defaults, _ = resolve(None, warn=False)
     body = requests.get(f"{base_url}/settings", timeout=5).json()
     assert body == {"width": 420, "height": 680, "bubble_seconds": 8,
-                    "shortcuts": defaults, "persona_name": "Riko"}
+                    "shortcuts": defaults, "persona_name": "Riko", "roam_x": None}
 
 
 def test_desktop_settings_resolves_and_warns(capsys):

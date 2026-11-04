@@ -25,6 +25,13 @@
 //         blend the VRM expression to `value` (null = back to neutral);
 //         `tilt` = lean the head, `away` = glance away (embarrassed)
 //
+// Walk actions (only when a WalkDirector is attached — docs/WALK_MEMORY.md W):
+//   {type:'walk_start', dir, targetX, seconds}  start a wander
+//   {type:'walk_turn', dir}                     turnaround at a strip edge
+//   {type:'walk_stop', reason}                  stop walking (arrive/busy/forced)
+// Gestures never start while she walks (they queue behind it), except forced
+// ones (W, asked-for actions, persona waves) which stop the walk first.
+//
 // Rules honoured (docs/ROUNDS.md R1-A):
 //   - a running one-shot gesture is never interrupted (loops can be swapped
 //     or preempted by a high-priority gesture like the persona wave);
@@ -123,8 +130,9 @@ const ACTION_QUEUE_S = 3;        // a natural action waits at most this long for
 const LOOP_ACTION_HOLD = 6;      // a loop that came from a reply stops after this long
 
 export class Director {
-  constructor({ random = Math.random } = {}) {
+  constructor({ random = Math.random, walk = null } = {}) {
     this.random = random;
+    this.walk = walk;         // optional WalkDirector (roam: strip); null = no walking
     this.state = 'boot';
     this.gesture = null;        // {name, loop, endsAt}
     this.pending = null;        // {name, priority, expiresAt}
@@ -161,6 +169,7 @@ export class Director {
     this.lastActivity = now;
     this.state = 'idle';  // until the session says otherwise
     this.nextIdleAt = now + this._idleGap();
+    this.walk?.armIdle(now);
     return this.#play('wave', now, { priority: PRIO_RETURN });
   }
 
@@ -177,7 +186,9 @@ export class Director {
     this.returnWave = false;
     this.scheduled = [];      // the old persona's pending reply actions are stale
     this.lastUserText = '';
-    return this.#play('wave', now, { priority: PRIO_PERSONA, noCooldown: true });
+    // the wave beats the walk: stop first, like every forced gesture
+    const acts = this.walk ? this.walk.stopWalk(now, 'forced') : [];
+    return acts.concat(this.#play('wave', now, { priority: PRIO_PERSONA, noCooldown: true }));
   }
 
   heard(now, text = '') {
@@ -197,13 +208,15 @@ export class Director {
    */
   requestWave(now) {
     this.lastActivity = now;
+    // walking? the forced wave stops it FIRST (docs/WALK_MEMORY.md W)
+    const walkActs = this.walk ? this.walk.stopWalk(now, 'forced') : [];
     if (this.gesture?.name === 'wave') {
       // already waving: answer the press by dropping any queued wave echo,
       // so she waves once now, not twice in a row
       if (this.pending?.name === 'wave') this.pending = null;
-      return [];
+      return walkActs;
     }
-    const acts = [];
+    const acts = [...walkActs];
     if (this.gesture) {  // blend out the running one-shot or loop
       acts.push({ type: 'gesture_stop', name: this.gesture.name });
       this.gesture = null;
@@ -255,7 +268,8 @@ export class Director {
     if (!state || state === this.state) return [];
     this.state = state;
     this.#prunePending();
-    const acts = [];
+    // walking policy first: any social state stops an in-progress walk
+    const acts = this.walk ? this.walk.status(now, state) : [];
     if (state !== 'idle') acts.push(...this.#activity(now));
 
     const stopLoop = (name) => {
@@ -296,6 +310,7 @@ export class Director {
         stopLoop('think');
         stopLoop('listen');
         this.nextTalkAt = Infinity;
+        this.walk?.armIdle(now);   // roam window re-arms when she's free again
         if (!this.gesture) this.nextIdleAt = Math.min(this.nextIdleAt, now + this._idleGap());
         else this.pendingIdle = true;  // re-arm the gap once the body frees up
         break;
@@ -306,6 +321,8 @@ export class Director {
   say(now, { emotion = 'neutral', seconds = 0, text = '', actions = [] } = {}) {
     const acts = [];
     this.lastActivity = now;
+    // she never walks while speaking: a line stops an in-progress wander
+    if (this.walk) acts.push(...this.walk.stopWalk(now, 'speaking'));
     // Reply actions from the hub (docs/BODY.md §5): schedule each at
     // `at * speech duration` — the clip length, or ~14 chars/s from the text.
     // One of them being `wave` suppresses the greeting-text wave below, so a
@@ -351,7 +368,7 @@ export class Director {
     return acts;
   }
 
-  tick(now) {
+  tick(now, dt = 1 / 60) {
     const acts = [];
     // one-shot finished?
     if (this.gesture && !this.gesture.loop && now >= this.gesture.endsAt) {
@@ -365,7 +382,8 @@ export class Director {
     // preempt a loop)
     this.#prunePending();
     if (this.pending) {
-      const free = !this.gesture || (this.gesture.loop && this.pending.priority >= PRIO_PERSONA);
+      const free = (!this.gesture && !(this.walk && this.walk.walking))
+        || (this.gesture.loop && this.pending.priority >= PRIO_PERSONA);
       if (now >= this.pending.expiresAt) this.pending = null;
       else if (free) {
         const p = this.pending; this.pending = null;
@@ -377,8 +395,9 @@ export class Director {
       this.expression = null;
       acts.push({ type: 'expression', name: null, value: 0, hold: 0, tilt: false, away: false });
     }
-    // sprinkle talk gestures through a long answer
-    if (this.state === 'speaking' && now >= this.nextTalkAt && !this.gesture) {
+    // sprinkle talk gestures through a long answer (never while mid-walk)
+    if (this.state === 'speaking' && now >= this.nextTalkAt && !this.gesture
+        && !(this.walk && this.walk.walking)) {
       const choices = TALK_GESTURES.filter((g) => g !== this.lastTalk && this.#ready(g, now));
       if (choices.length) {
         const pick = choices[Math.floor(this.random() * choices.length)];
@@ -389,8 +408,10 @@ export class Director {
         this.nextTalkAt = now + 2;  // all on cooldown; check again shortly
       }
     }
-    // idle gestures
-    if (this.state === 'idle' && !this.gesture && !this.returnWave && now >= this.nextIdleAt) {
+    // idle gestures (a walk in progress owns the body; the roam scheduler
+    // runs in the walk tick below)
+    if (this.state === 'idle' && !this.gesture && !this.returnWave
+        && !(this.walk && this.walk.walking) && now >= this.nextIdleAt) {
       const choices = IDLE_GESTURES.filter((g) => this.#ready(g, now));
       if (choices.length) {
         acts.push(...this.#play(choices[Math.floor(this.random() * choices.length)],
@@ -402,6 +423,8 @@ export class Director {
     if (this.state === 'idle' && !this.returnWave && now - this.lastActivity >= RETURN_AFTER_IDLE) {
       this.returnWave = true;
     }
+    // roam schedule + root motion (walk.js); a no-op without a WalkDirector
+    if (this.walk) acts.push(...this.walk.tick(now, dt));
     return acts;
   }
 
@@ -458,8 +481,8 @@ export class Director {
   #forceAction(name, now) {
     const g = this.gestures[name];
     if (!g) return [];
-    if (this.gesture?.name === name) return [];  // she is already doing it
-    const acts = [];
+    const acts = this.walk ? this.walk.stopWalk(now, 'forced') : [];
+    if (this.gesture?.name === name) return acts;  // she is already doing it
     if (this.gesture) {
       acts.push({ type: 'gesture_stop', name: this.gesture.name });
       this.gesture = null;
@@ -480,7 +503,9 @@ export class Director {
     if (!noCooldown && !this.#ready(name, now)) return [];
     const busyOneShot = this.gesture && !this.gesture.loop;
     const busyLoop = this.gesture && this.gesture.loop;
+    const walking = !!(this.walk && this.walk.walking);
     const blocked = busyOneShot
+      || walking                                    // a walk owns the body (walk.js)
       || (busyLoop && !g.loop && priority < PRIO_PERSONA)  // one-shots don't interrupt loops...
       || (busyLoop && name === this.gesture.name);         // ...nor does the same loop restart
     if (blocked) {

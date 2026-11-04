@@ -97,6 +97,21 @@ desktop:
                        # riding her startup wave). false = stay quiet until you
                        # talk to her.
 
+  # Roam: strip (docs/WALK_MEMORY.md "W"). "off" = the small window always
+  # (old behaviour). "strip" = a full-width see-through band at the BOTTOM
+  # edge of the screen instead: she wanders along it, everything around her
+  # is click-through, only her body catches clicks (desktop.py shapes the
+  # input region from the page's /control/bbox posts, ~10 Hz). Needs a
+  # compositor path that supports shaped input: XWayland (xcb) always,
+  # wlr-layer-shell where the bundled Qt can use it; otherwise desktop.py
+  # says so and keeps the small window.
+  roam: off            # off | strip
+  roam_speed: 1.0      # multiplier on her walking pace (0.6 m/s x her height)
+  roam_every: [60, 240]  # seconds between roams while idle [min, max]
+  roam_margin: 40      # pixels of screen kept free at each edge of the strip
+  roam_backend: auto   # auto | layer | xcb: which windowing path the strip uses
+                       # (auto = layer-shell if usable, else XWayland)
+
   # The client-tool channel (docs/API.md "client tools"): she registers this PC
   # with the hub and runs what the model asks — open_url, clipboard_read,
   # clipboard_write, notify, and the browser_* tools relayed to the Riko Helper

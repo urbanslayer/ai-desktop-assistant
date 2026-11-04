@@ -29,13 +29,14 @@ import subprocess
 import sys
 import time
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from riko import asr, client_tools, hub_client, shortcuts, tts, viewer
+from riko import roam as roam_state
 from riko.config import load_config
 from riko.session import Session
 
@@ -103,6 +104,7 @@ class AvatarWindow(QWebEngineView):
         if (event.type() == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton
                 and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                and not getattr(self, "roam_strip", False)   # strip: drags move HER, not the window
                 and not (self.input_open and event.position().y() > self.height() - 80)):
             self.windowHandle().startSystemMove()
             return True
@@ -128,6 +130,324 @@ def _tray_icon():
 
 
 HYPR_RULE = "riko-avatar-runtime"
+
+
+# ── Roam strip (docs/WALK_MEMORY.md "W") ─────────────────────────────────
+# desktop.roam: strip turns the window into a full-width see-through band at
+# the BOTTOM edge of the screen: she wanders along it and everything around
+# her is click-through — only her body (the page's /control/bbox posts,
+# ~10 Hz) catches clicks. Method selection, per the contract:
+#   1. wlr-layer-shell + shaped input region — needs a layer-shell shell
+#      plugin inside the app's own Qt AND a per-window input-region API.
+#      Probed at startup (see _layer_shell_probe); PySide6's bundled Qt
+#      builds (6.12 as of writing) ship no layer-shell plugin, and Qt has no
+#      public QWindow input-region API, so this path is normally unusable.
+#   2. XWayland (xcb): an override-redirect, frameless top-level (Qt's
+#      BypassWindowManagerHint) that no WM repositions, placed by
+#      XMoveResizeWindow along the bottom edge, click-through shaped with
+#      XFixes input regions. This is the method that actually works today.
+#   3. Neither usable → keep the small window and print a clear message.
+
+class _XShape:
+    """The few xcb calls the strip needs, via ctypes (no extra deps)."""
+
+    def __init__(self):
+        import ctypes
+        import ctypes.util
+        self.ct = ctypes
+        xcb = ctypes.util.find_library("xcb")
+        if not xcb:
+            raise RuntimeError("libxcb not loadable")
+        self.lib = ctypes.CDLL(xcb)
+        # SHAPE/XFIXES live in their own libs on Linux, not in libxcb itself.
+        # find_library only maps SONAMEs here, so try the soname. CDLL has no
+        # symbol enumeration, so pull the exact symbols we call.
+        need = {"xcb-shape": ("xcb_shape_query_version",),
+                "xcb-xfixes": ("xcb_xfixes_create_region",
+                               "xcb_xfixes_destroy_region",
+                               "xcb_xfixes_set_window_shape_region",
+                               "xcb_xfixes_get_cursor_image")}
+        for name, syms in need.items():
+            p = ctypes.util.find_library(name) or f"lib{name}.so.0"
+            try:
+                extra = ctypes.CDLL(p)
+            except OSError:
+                continue
+            for sym in syms:
+                try:
+                    setattr(self.lib, sym, getattr(extra, sym))
+                except AttributeError:
+                    pass
+        # xcb Rect { int16 x, y; uint16 w, h; }
+        self.Rect = type("Rect", (ctypes.Structure,), {"_fields_": [
+            ("x", ctypes.c_int16), ("y", ctypes.c_int16),
+            ("w", ctypes.c_uint16), ("h", ctypes.c_uint16)]})
+        self.fixes = None
+        self.display = None
+        # fail fast if the shaping symbols are not reachable at all
+        for sym in ("xcb_xfixes_create_region", "xcb_xfixes_set_window_shape_region",
+                    "xcb_generate_id", "xcb_flush"):
+            getattr(self.lib, sym)   # AttributeError -> caller falls back
+
+    def connect(self):
+        import ctypes
+        # restype BEFORE the first call: default c_int truncates the 64-bit
+        # connection pointer and the next call dereferences garbage (segfault)
+        self.lib.xcb_connect.restype = ctypes.c_void_p
+        self.lib.xcb_connect.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+        self.lib.xcb_connection_has_error.argtypes = [ctypes.c_void_p]
+        self.display = self.lib.xcb_connect(None, None)
+        if not self.display or self.lib.xcb_connection_has_error(self.display):
+            self.display = None
+            raise RuntimeError("xcb connect failed")
+        print("[roam] xcb connected (XWayland)", flush=True)
+        # No extension-presence probe: xcb_get_extension_data blocks reading a
+        # reply here; XWayland always provides SHAPE + XFIXES, and the symbol
+        # check in __init__ plus the smoke test cover real failures.
+        self.shape = True
+        self.fixes = True
+
+        self.lib.xcb_generate_id.argtypes = [ctypes.c_void_p]
+        self.lib.xcb_generate_id.restype = ctypes.c_uint32
+        self.lib.xcb_xfixes_create_region.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        self.lib.xcb_xfixes_destroy_region.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self.lib.xcb_xfixes_set_window_shape_region.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint8, ctypes.c_int16, ctypes.c_int16, ctypes.c_uint32]
+        self.lib.xcb_flush.argtypes = [ctypes.c_void_p]
+        self._region = None
+
+    def create_region(self, rects):
+        """rects: list of (x, y, w, h). Returns a region id (caller destroys)."""
+        if not rects:
+            return 0
+        arr = (self.Rect * len(rects))(*[self.Rect(x, y, w, h) for x, y, w, h in rects])  # type: ignore[operator]
+        rid = self.lib.xcb_generate_id(self.display)
+        self.lib.xcb_xfixes_create_region(self.display, rid, len(rects), arr)
+        return rid
+
+    def destroy_region(self, rid):
+        if rid:
+            self.lib.xcb_xfixes_destroy_region(self.display, rid)
+
+    def set_input_region(self, xid, region):
+        # ShapeSO = 0, so Kind = "bounding" is 0; "Input" kind for SHAPE is 1
+        # (xcb shape: 0 bounding, 1 clip, 2 input... X ShapeInput = 2)
+        self.lib.xcb_xfixes_set_window_shape_region(self.display, xid, 2, 0, 0, region)
+        self.lib.xcb_flush(self.display)
+
+
+def _layer_shell_probe():
+    """(usable, why) for the layer-shell method from this Qt build."""
+    try:
+        import PySide6
+        q = os.path.join(os.path.dirname(PySide6.__file__), "Qt", "plugins",
+                         "wayland-shell-integration")
+        plugins = [f for f in os.listdir(q) if "layer" in f.lower()] if os.path.isdir(q) else []
+    except Exception:
+        plugins = []
+    if not plugins:
+        return False, ("Qt ships no layer-shell shell-integration plugin "
+                       f"(looked in {q!r})")
+    return False, ("layer-shell plugin present, but Qt exposes no per-window "
+                   "input-region API — shaped click-through needs XWayland")
+
+
+class RoamController(QObject):
+    """Owns strip placement + the click-through input region (docs/WALK_MEMORY.md W)."""
+
+    def __init__(self, win, cfg, tray=None):
+        super().__init__()
+        d = cfg.get("desktop") or {}
+        self.win = win
+        self.tray = tray
+        self.enabled = str(d.get("roam", "off")).lower() == "strip"
+        self.want = str(d.get("roam_backend", "auto")).lower()  # auto | layer | xcb
+        self.backend = None            # None | "xcb" ("layer" reserved)
+        self.in_strip = False
+        self.x = None                  # (x, y, w, h) window coords of her body
+        self._sent = None
+        self.xcb = None
+        self.xid = 0
+        self.warned = ""
+        self._printed = False
+        # strip size: full screen width, the configured window height (clamped
+        # to 60% of the screen so a tall monitor keeps a visible "band" feel)
+        scr = QGuiApplication.primaryScreen()
+        geo = scr.availableGeometry()
+        self.strip_h = max(200, min(int(d.get("height", 680)), int(geo.height() * 0.6)))
+        self.strip_geom = (geo.x(), geo.y() + geo.height() - self.strip_h,
+                           geo.width(), self.strip_h)
+        # native events (X11 ButtonPress forwarding) only matter on the xcb path
+        self._bypass = False
+
+    # ── method selection ──────────────────────────────────────────────
+    def pick_backend(self):
+        if self.want == "layer":
+            ok, why = _layer_shell_probe()
+            self._fallback(f"roam_backend: layer is not usable ({why}); keeping the small window")
+            return None
+        if self.want in ("auto", "xcb"):
+            ok, why = _layer_shell_probe()
+            if ok:
+                self.backend = "layer"      # reserved; no Qt input-region API today
+                return self.backend
+            print(f"[roam] layer-shell method not workable: {why} -> XWayland (xcb)",
+                  flush=True)
+            try:
+                self.xcb = _XShape()
+                self.xcb.connect()
+                self.backend = "xcb"
+                return "xcb"
+            except Exception as e:  # noqa: BLE001
+                if self.want == "xcb":
+                    self._fallback(f"xcb strip failed: {e}")
+                else:
+                    self._fallback(f"no usable strip backend (layer-shell unusable; {e})")
+        return None
+
+    def _fallback(self, why):
+        if self.warned == why:
+            return
+        self.warned = why
+        print(f"[roam] roam strip OFF: {why}", flush=True)
+        if self.tray is not None and self.tray.isVisible():
+            self.tray.showMessage("Riko", f"roam strip off — {why}", 8000)
+
+    # ── entering / leaving the strip ──────────────────────────────────
+    def strip_flags(self):
+        return (Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.BypassWindowManagerHint)
+
+    def enter_strip(self):
+        if not self.enabled or self.in_strip:
+            return
+        if not self.backend and not self.pick_backend():
+            return
+        if self.backend == "xcb":
+            x, y, w, h = self.strip_geom
+            # recreate the platform window with bypass-WM flags, sized before show
+            print("[roam] enter_strip: flags", flush=True)
+            self.win.setWindowFlags(self.strip_flags())
+            self.win.setFixedSize(w, h)
+            self.win.resize(w, h)
+            print("[roam] enter_strip: show", flush=True)
+            self.win.show()
+            print("[roam] enter_strip: winId", flush=True)
+            self.xid = int(self.win.windowHandle().winId())
+            print(f"[roam] enter_strip: place xid={self.xid:x}", flush=True)
+            self._place(x, y, w, h)
+            self.apply_bbox()          # empty region until the page posts one
+            # focus so keyboard shortcuts still reach her (no WM to do it for us)
+            self._focus()
+            self.in_strip = True
+            print(f"[roam] strip ON ({self.backend}): {w}x{h} at ({x},{y}); "
+                  "click-through everywhere except her body", flush=True)
+
+    def leave_strip(self):
+        if not self.in_strip:
+            return
+        self.in_strip = False
+        d = self.win.property("riko_normal_flags")
+        flags = d if d is not None else (Qt.WindowType.FramelessWindowHint
+                                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.win.setWindowFlags(Qt.WindowType(flags))
+        self.win.setFixedSize(16777215, 16777215)   # QWIDGETSIZE_MAX: free resize again
+        self._clear_region()
+        self.win.show()
+        print("[roam] back to the small window", flush=True)
+
+    # ── X plumbing ─────────────────────────────────────────────────────
+    def _place(self, x, y, w, h):
+        if not (self.xcb and self.xcb.display and self.xid):
+            return
+        self.xcb.lib.xcb_configure_window.argtypes = [
+            self.xcb.ct.c_void_p, self.xcb.ct.c_uint32, self.xcb.ct.c_uint32,
+            self.xcb.ct.c_void_p]
+
+        class_vals = (self.xcb.ct.c_uint32 * 7)()
+        # values order per mask bits: x, y, width, height, border, sibling, stack
+        for i, v in enumerate([x, y, w, h, 0, 0, 0]):
+            class_vals[i] = v
+        mask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6)  # x,y,w,h,above
+        self.xcb.lib.xcb_configure_window(self.xcb.display, self.xid, mask,
+                                          self.xcb.ct.addressof(class_vals))
+        self.xcb.lib.xcb_flush(self.xcb.display)
+
+    def _focus(self):
+        if not (self.xcb and self.xcb.display and self.xid):
+            return
+        lib = self.xcb.lib
+        lib.xcb_set_input_focus.argtypes = [self.xcb.ct.c_void_p, self.xcb.ct.c_uint8,
+                                            self.xcb.ct.c_uint32, self.xcb.ct.c_uint32]
+        lib.xcb_set_input_focus(self.xcb.display, 1, self.xid, 0)  # revert_to=PointerRoot
+        lib.xcb_flush(self.xcb.display)
+
+    def apply_bbox(self):
+        """Shape the window's input region to her projected body (or nothing)."""
+        if not (self.in_strip and self.backend == "xcb" and self.xcb and self.xcb.display):
+            return
+        rect = self._clipped_bbox()
+        if rect == self._sent:
+            return
+        self._sent = rect
+        if not self._printed:
+            self._printed = True
+            print(f"[roam] input region -> {rect}", flush=True)
+        new = self.xcb.create_region([rect] if rect else [])
+        self.xcb.set_input_region(self.xid, new)
+        self.xcb.destroy_region(new)
+
+    def _clear_region(self):
+        self._sent = None
+        if self.in_strip or (self.xcb and self.xcb.display and self.xid):
+            try:
+                self.xcb.set_input_region(self.xid, 0)   # RegionNone: whole window
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _clipped_bbox(self):
+        if not self.x or not self.in_strip:
+            return None
+        x, y, w, h = self.x
+        _, _, sw, sh = self.strip_geom
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(sw, x + w), min(sh, y + h)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return None
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    # ── from the page / viewer ─────────────────────────────────────────
+    def update_bbox(self, x, y, w, h):
+        self.x = (int(x), int(y), int(w), int(h))
+        self.apply_bbox()
+
+    # ── click forwarding (xcb path) ────────────────────────────────────
+    def native_event(self, event_type, message):
+        """QAbstractNativeEventFilter hook; returns True if the event was consumed."""
+        if self.backend != "xcb" or not self.in_strip:
+            return False
+        if bytes(event_type) != b"xcb_generic_event_t":
+            return False
+        try:
+            import ctypes
+            ev = ctypes.cast(message, ctypes.POINTER(ctypes.c_uint8))
+            code = ev[0] & 0x7F
+            if code not in (4, 5):          # ButtonPress / ButtonRelease
+                return False
+            # raw X11 ButtonPress wire layout (xcb_generic_event_t):
+            # 0 type, 1 detail(button), 2 seq, 4 time, 8 root, 12 event, 16 child,
+            # 20 root_x, 22 root_y, 24 event_x, 26 event_y (16-bit, event-relative)
+            ex = int.from_bytes(bytes(ev[24:26]), "little")
+            ey = int.from_bytes(bytes(ev[26:28]), "little")
+        except Exception:  # noqa: BLE001
+            return False
+        rect = self._clipped_bbox()
+        inside = bool(rect) and rect[0] <= ex < rect[0] + rect[2] and rect[1] <= ey < rect[1] + rect[3]
+        kind = "pointerdown" if code == 4 else "pointerup"
+        print(f"[roam] forward {kind} ({ex},{ey})", flush=True)
+        if inside:
+            self.win.js(f"window.__rikoClick && __rikoClick({kind!r}, {ex}, {ey})")
+            self._focus()
+        return bool(inside)
 
 
 def _hyprland_rule(width, height):
@@ -199,6 +519,20 @@ def _hyprland_setup(width, height, ruled):
     return False
 
 
+class _NativeFilter(QAbstractNativeEventFilter):
+    """Routes X11 button events to the roam controller for click forwarding."""
+
+    def __init__(self, roamc):
+        super().__init__()
+        self.roamc = roamc
+
+    def nativeEventFilter(self, event_type, message):
+        try:
+            return self.roamc.native_event(event_type, message), 0
+        except Exception:  # noqa: BLE001 — never eat the event queue on a parse slip
+            return False, 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Riko as a floating desktop avatar.")
     parser.add_argument("--asr", choices=["remote", "local", "groq"], help="speech to text (overrides the config)")
@@ -207,6 +541,8 @@ def main():
 
     # Line-buffer stdout even when piped to a log file, so tail -f shows things as they happen.
     sys.stdout.reconfigure(line_buffering=True)
+    import faulthandler
+    faulthandler.register(signal.SIGUSR1)  # kill -USR1 -> python backtrace (hang debugging)
 
     cfg = load_config()
     cfg["asr"] = args.asr or cfg["asr"]
@@ -228,6 +564,20 @@ def main():
           f"  |  ears: {cfg['asr']}  |  voice: {cfg['tts']} ===")
 
     QGuiApplication.setDesktopFileName(APP_ID)  # becomes the Wayland app_id
+    # Roam strip (docs/WALK_MEMORY.md W): the shaped click-through method that
+    # works today is XWayland, so under Wayland we run the xcb platform unless
+    # the user forced a platform themselves.
+    _roam_wanted = str(((cfg.get("desktop") or {}).get("roam") or "off")).lower() == "strip"
+    _roam_backend = str(((cfg.get("desktop") or {}).get("roam_backend") or "auto")).lower()
+    if _roam_wanted and _roam_backend in ("auto", "xcb") and os.environ.get("WAYLAND_DISPLAY"):
+        cur = os.environ.get("QT_QPA_PLATFORM")
+        # A session-wide "wayland" default must not defeat the strip: shaped
+        # click-through only exists on the X side. Honour a deliberate choice
+        # (xcb, or e.g. vnc/offscreen for CI) but upgrade "wayland"/unset to xcb.
+        if cur in (None, "", "wayland"):
+            os.environ["QT_QPA_PLATFORM"] = "xcb"
+            print(f"[roam] forcing QT_QPA_PLATFORM=xcb (XWayland strip with shaped input; was {cur!r})",
+                  flush=True)
     app = QApplication([sys.argv[0]])
     app.setApplicationName(APP_ID)
     app.setQuitOnLastWindowClosed(False)  # hiding the window keeps her running in the tray
@@ -238,12 +588,22 @@ def main():
 
     # Ask the compositor to float/size/pin her before the window maps (Hyprland only;
     # mapping tiled and resizing afterwards leaves QtWebEngine's surface short).
+    # In strip mode the window is override-redirect (unmanaged), so rules don't apply.
     d = cfg.get("desktop") or {}
-    ruled = _hyprland_rule(int(d.get("width", 420)), int(d.get("height", 680)))
+    ruled = False if _roam_wanted else _hyprland_rule(int(d.get("width", 420)), int(d.get("height", 680)))
     win = AvatarWindow(cfg)
     bridge = Bridge()
+    roamc = RoamController(win, cfg)
+    win.roam_strip = False
+    app.installNativeEventFilter(_NativeFilter(roamc))
 
     def show_window():
+        if roamc.enabled and not roamc.in_strip:
+            roamc.enter_strip()      # strip flags + size + bottom-edge placement
+            if roamc.in_strip:
+                win.roam_strip = True
+                win.activateWindow()
+                return
         win.show()
         win.raise_()
         win.activateWindow()
@@ -340,6 +700,20 @@ def main():
             if runtime is None:
                 return {"ok": False, "error": "client tools are off (desktop.client.enabled: false)"}
             return runtime.set_body(args)
+        elif cmd == "walk-state":
+            # roam strip (docs/WALK_MEMORY.md W): remember where she stopped
+            x = args.get("x")
+            if x is not None and not roam_state.save_x(x):
+                return {"ok": False, "error": f"bad walk-state x: {x!r}"}
+            return {"ok": True}
+        elif cmd == "bbox":
+            # her projected body box (page coords = window coords), ~10 Hz:
+            # desktop.py shapes the click-through input region from this
+            try:
+                roamc.update_bbox(args["x"], args["y"], args["w"], args["h"])
+            except (KeyError, TypeError, ValueError):
+                return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
+            return {"ok": True}
         elif cmd in PAGE_CMDS:  # type / hide-input / toggle / show / hide / quit / wave
             bridge.command.emit(cmd)
         else:
@@ -428,7 +802,9 @@ def main():
     tray.setContextMenu(menu)
 
     show_window()
-    QTimer.singleShot(400, lambda: _hyprland_setup(int(d.get("width", 420)), int(d.get("height", 680)), ruled))
+    roamc.tray = tray
+    if not _roam_wanted:
+        QTimer.singleShot(400, lambda: _hyprland_setup(int(d.get("width", 420)), int(d.get("height", 680)), ruled))
 
     code = app.exec()
     if session.recorder.recording:

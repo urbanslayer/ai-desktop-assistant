@@ -445,6 +445,18 @@ To start her with the session, copy `desktop/riko.desktop` to `~/.config/autosta
 > [!NOTE]
 > Under Hyprland, do the float+size as a window rule if you can. Mapping her tiled and resizing the window afterwards can leave a black strip at the bottom of the web view (a long-standing QtWebEngine/Wayland resize bug).
 
+**Roam strip — she lives on the bottom edge.** Set `desktop.roam: strip` in `character_config.yaml` (default `off`) and restart the desktop app: her window becomes a see-through band along the bottom of the screen, full width, and she wanders along it on her own — walking, turning at the edges, stopping to gesture. Everything in the band is click-through except her body, so you can work straight through the strip and still click on her. A left-drag on the strip drags *her* along it (not the window); where she parked is where she'll be next start. She never walks while you're typing to her, while an approval is waiting, or while a forced gesture is playing (a forced gesture stops her mid-step).
+
+| Setting (`desktop:`) | Default | What it does |
+|---|---|---|
+| `roam` | `off` | `off` = the small window, `strip` = bottom-edge roam mode |
+| `roam_speed` | `1.0` | Walking pace multiplier (her pace is ~0.6 m/s scaled by her height) |
+| `roam_every` | `[60, 240]` | She picks a new stroll every N seconds, random in this range |
+| `roam_margin` | `40` | Pixels she keeps from the screen edges |
+| `roam_backend` | `auto` | `auto`/`layer`/`xcb` — see below |
+
+Method selection, in order: a **wlr-layer-shell** band with a shaped input region would be ideal, but Qt ships no layer-shell shell-integration plugin its own apps can use (the system one is a different ABI), so today the strip runs on **XWayland (xcb)**: an override-redirect window placed at the bottom edge and shaped with an XFIXES input region that follows her projected bounding box ~10× a second — that's what makes everything but her body click-through. If neither method works on your system she keeps the small window and the terminal says why. The strip is transparent everywhere, so any compositor (or X11 compositor) is fine; it deliberately bypasses the window manager, so no window rules apply to it.
+
 <a id="three-ways"></a>
 ## 💎 Three ways to have Riko
 

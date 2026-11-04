@@ -11,7 +11,9 @@ load_dotenv(ROOT / ".env")
 
 
 def load_config():
-    with open(ROOT / "character_config.yaml", encoding="utf-8") as f:
+    # RIKO_CONFIG points at an alternate yaml (tests / nested smoke runs)
+    path = os.environ.get("RIKO_CONFIG") or ROOT / "character_config.yaml"
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 

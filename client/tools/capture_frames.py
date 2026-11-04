@@ -69,6 +69,7 @@ SCENARIOS = {
     ]),
     "think": ("think@0", []),
     "wave": ("wave@0", []),
+    "walk": ("walk@0.5", []),  # gait photos: use a wide --size, e.g. 1920x680
 }
 
 
@@ -156,6 +157,8 @@ def main():
                     help="viewport WxH (default 420x680 = the desktop window)")
     ap.add_argument("--desktop", action="store_true",
                     help="open the page with ?desktop=1 (the desktop.py framing)")
+    ap.add_argument("--gaze", default=None,
+                    help="page ?gaze= offset 'yaw,pitch' in degrees (forced gaze)")
     args = ap.parse_args()
 
     force, events = SCENARIOS[args.scenario]
@@ -181,6 +184,8 @@ def main():
         url += "&desktop=1"
     if force:
         url += f"&force={force}"
+    if args.gaze:
+        url += f"&gaze={args.gaze}"
     maxsec = max(float(s) for s in args.secs.split(","))
     dur = args.runtime if args.runtime else maxsec + 8
     cmd = [

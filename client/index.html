@@ -37,6 +37,14 @@
     }
     #heard.show, #status.show { opacity: 1; }
     #status { align-self: center; }
+    /* Roam strip: the bubble and the status pill follow her along the strip
+       (the page sets --roam-x to her projected screen offset) */
+    html.desktop.roam #bubble {
+      left: calc(50% + var(--roam-x, 0px)); right: auto; width: max-content;
+      max-width: min(60vw, 560px); transform: translate(-50%, -8px);
+    }
+    html.desktop.roam #bubble.show { transform: translate(-50%, 0); }
+    html.desktop.roam #status { transform: translateX(var(--roam-x, 0px)); }
     #status.listening { background: rgba(200, 40, 70, 0.88); }
     #status.listening::before { content: "● "; animation: blink 1s infinite; }
     /* Approval ask: "Can I …? Enter = yes, Esc = no" (desktop.py, R2-F) */
@@ -83,6 +91,7 @@
     import { GESTURES, vowelWeights, IK_ARM_GESTURES } from './js/gestures.js';
     import { gestureEnvelope } from './js/ik.js';
     import { AvatarMotion } from './js/motion.js';
+    import { WalkDirector } from './js/walk.js';
 
     // desktop.py opens this page with ?desktop=1: see-through background, no click-to-start,
     // and the whole body in frame. In a normal browser it looks like it always did.
@@ -101,6 +110,15 @@
     // built-in gesture(s) at the given seconds after she woke up, so poses can
     // be photographed and measured at exact times.
     const FORCE = new URLSearchParams(location.search).get('force');
+    // QA hook (?gaze=-25,0): force a gaze offset (degrees yaw,pitch) after
+    // attach, so renders can photograph look-left/right/up and big glances.
+    const GAZE_PARAM = new URLSearchParams(location.search).get('gaze');
+    // QA hook (?roam=1): force roam-strip mode even without desktop settings.
+    const ROAM_PARAM = new URLSearchParams(location.search).has('roam');
+    // In ?force= mode the director is silenced: only the forced items move her.
+    // Exception: force=walk@N must still flow, or the capture harness could
+    // never photograph the gait (it also implies ?roam=1 for the walk director).
+    const FORCE_WALK = !!FORCE && FORCE.split(',').some((s) => s.trim().startsWith('walk'));
     if (DESKTOP) {
       // Both elements paint a white background by default; on HTML it is not covered
       // by the body rule, and Qt would happily show that white as an opaque box.
@@ -109,6 +127,11 @@
     }
     const settings = await fetch('/settings').then((r) => r.json()).catch(() => ({}));
     const BUBBLE_SECONDS = settings.bubble_seconds ?? 8;
+    // Roam: strip (docs/WALK_MEMORY.md W) — desktop.py puts the window as a
+    // see-through strip at the bottom of the screen; here she wanders inside
+    // it and the desktop shapes the click-through region from our POSTs.
+    const ROAM = ROAM_PARAM || FORCE_WALK || (DESKTOP && settings.roam === 'strip');
+    if (ROAM) document.documentElement.classList.add('roam');
 
     // ── Scene ──
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: DESKTOP, preserveDrawingBuffer: !!CAPTURE });
@@ -129,6 +152,7 @@
       camera.aspect = innerWidth / innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(innerWidth, innerHeight);
+      if (typeof updateWalkBounds === 'function') updateWalkBounds();
     });
 
     // ── Load her ──
@@ -219,6 +243,13 @@
       vrm.scene.updateMatrixWorld(true);
 
       motion.attach(vrm);   // re-targets bones, gaze, and gestures onto the new body
+      if (GAZE_PARAM) {
+        const [gy, gp] = GAZE_PARAM.split(',').map(Number);
+        motion.setGazeOverride({ yaw: (gy || 0) * Math.PI / 180,
+                                 pitch: (gp || 0) * Math.PI / 180 });
+      }
+      window.__rikoGaze = (yaw, pitch) => motion.setGazeOverride(
+        yaw == null ? null : { yaw, pitch });
 
       // ── Gesture-aware framing: fit her whole body AND the wave/think
       //    envelope (raised hand included, measured from THIS rig) inside the
@@ -242,6 +273,10 @@
         camera.position.set(0, (yTop + yBot) / 2, dist);
         controls.target.set(0, (yTop + yBot) / 2, 0);
         camera.updateProjectionMatrix();
+        if (director.walk) {   // strip width in metres = the visible canvas
+          updateWalkBounds();
+          vrm.scene.position.x = director.walk.x;
+        }
       } else {  // rig too incomplete to measure: old head-height heuristic
         const headY = vrm.humanoid.getNormalizedBoneNode('head')?.getWorldPosition(new THREE.Vector3())?.y ?? 1.4;
         camera.position.set(0, headY * 0.68, headY * 2.6);
@@ -259,7 +294,11 @@
     //    Desktop: drag moves the window, right-drag rotates, shift-drag moves her, scroll zooms. ──
     const controls = new OrbitControls(camera, renderer.domElement);
     if (DESKTOP) {
-      controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+      // Roam: the left button drags HER along the strip (page-side handler
+      // below), not the window — desktop.py stops intercepting drags then.
+      controls.mouseButtons = ROAM
+        ? { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }
+        : { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
     } else {
       controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
     }
@@ -271,7 +310,121 @@
 
     // ── The director: decides what she does, motion.js does the moving ──
     const T = () => performance.now() / 1000;
-    const director = new Director();
+    // Roam: strip — the walk schedule lives in walk.js (pure, node-tested);
+    // this page feeds it, applies its actions, and owns x persistence.
+    const walkOpts = {};
+    if (Array.isArray(settings.roam_every) && settings.roam_every.length === 2) {
+      walkOpts.every = settings.roam_every.map(Number);
+    }
+    if (Number.isFinite(+settings.roam_speed)) walkOpts.speedMul = +settings.roam_speed;
+    const walkDirector = ROAM ? new WalkDirector(walkOpts) : null;
+    const director = new Director({ walk: walkDirector });
+    if (walkDirector && Number.isFinite(+settings.roam_x)) walkDirector.setX(0, +settings.roam_x);
+    let faceWant = 0;         // vrm.scene.rotation.y target (face travel direction)
+    let lastXSent = null;
+    function persistWalkX() {
+      if (!director.walk) return;
+      lastXSent = director.walk.x;
+      fetch('/control/walk-state', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ x: director.walk.x, walking: director.walk.walking }),
+      }).catch(() => {});
+    }
+    // ── Roam-strip page glue: strip bounds in metres, the 10 Hz input-region
+    //    POST desktop.py shapes its click-through mask from, bubble follow,
+    //    and the left-drag that moves her along the strip ──
+    function stripGeometry() {
+      const halfFovY = Math.tan((camera.fov * Math.PI) / 360);
+      const dist = Math.max(0.3, camera.position.distanceTo(controls.target));
+      const halfW = halfFovY * dist * camera.aspect;   // visible world half-width at her depth
+      return { halfW, mPerPx: (2 * halfW) / Math.max(1, innerWidth) };
+    }
+    function updateWalkBounds() {
+      const w = director?.walk;
+      if (!w || !vrm) return;
+      const rig = motion.rig;
+      if (!rig) return;
+      const { halfW, mPerPx } = stripGeometry();
+      // desktop.roam_margin px kept clear at each screen edge, plus her body
+      const margin = ((+settings.roam_margin || 40) * mPerPx) + rig.shoulderWidth / 2 + 0.1;
+      const lim = Math.max(0.2, halfW - margin);
+      w.configure({ bounds: { min: -lim, max: lim }, height: rig.height });
+    }
+    const _bboxV = new THREE.Vector3();
+    let bboxAt = 0, xPostAt = 0;
+    function postBbox() {
+      const w = director?.walk;
+      const rig = motion.rig;
+      if (!w || !rig) return;
+      const half = rig.shoulderWidth / 2 + 0.12
+        + (motion.gesture && IK_ARM_GESTURES[motion.gesture.name] ? 0.35 : 0);
+      const yTop = rig.bboxTop + 0.02, yBot = Math.min(rig.bboxBottom, 0) - 0.02;
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const sx of [-half, half]) {
+        for (const sy of [yTop, (yTop + yBot) / 2, yBot]) {
+          _bboxV.set(w.x + sx, sy, 0.15).project(camera);
+          const px = (_bboxV.x * 0.5 + 0.5) * innerWidth;
+          const py = (-_bboxV.y * 0.5 + 0.5) * innerHeight;
+          x0 = Math.min(x0, px); x1 = Math.max(x1, px);
+          y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+        }
+      }
+      const pad = 16;
+      const x = Math.max(0, Math.round(x0 - pad)), y = Math.max(0, Math.round(y0 - pad));
+      const bw = Math.min(innerWidth - x, Math.round(x1 - x0 + pad * 2));
+      const bh = Math.min(innerHeight - y, Math.round(y1 - y0 + pad * 2));
+      fetch('/control/bbox', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ x, y, w: bw, h: bh }),
+      }).catch(() => {});
+    }
+    function walkHousekeeping(now) {
+      updateWalkBounds();                       // tracks zoom / resize / persona
+      if (now - bboxAt >= 0.1) { bboxAt = now; postBbox(); }
+      if (now - xPostAt >= 5 && Math.abs(director.walk.x - (lastXSent ?? 0)) > 0.05) {
+        xPostAt = now; persistWalkX();
+      }
+      // bubble + status pill follow her projected head down the strip
+      const rig = motion.rig;
+      if (rig) {
+        _bboxV.set(director.walk.x, rig.headTop + 0.12, 0.15).project(camera);
+        const px = (_bboxV.x * 0.5 + 0.5) * innerWidth;
+        document.documentElement.style.setProperty(
+          '--roam-x', `${Math.round(px - innerWidth / 2)}px`);
+      }
+    }
+    // Left-drag along the strip: drag HER (not the window — desktop.py only
+    // intercepts drags outside the walk region… in strip mode it never does).
+    // desktop.py forwards real X clicks on her body here as synthetic events.
+    window.__rikoClick = (kind, x, y) => {
+      const el = document.elementFromPoint(x, y) || renderer.domElement;
+      el.dispatchEvent(new PointerEvent(kind, {
+        clientX: x, clientY: y, button: 0, buttons: kind === 'pointerdown' ? 1 : 0,
+        bubbles: true, cancelable: true, pointerId: 1, isPrimary: true,
+      }));
+    };
+    if (DESKTOP) {
+      renderer.domElement.addEventListener('pointerdown', (e) => {
+        console.log(`[page] pointerdown button=${e.button} at ${Math.round(e.clientX)},${Math.round(e.clientY)}`);
+        if (!ROAM || !director.walk || e.button !== 0) return;
+        const w = director.walk;
+        feed(w.setBlocked(T(), 'dragging', true));
+        let lastPx = e.clientX;
+        const move = (ev) => {
+          const dx = (ev.clientX - lastPx) * stripGeometry().mPerPx;
+          lastPx = ev.clientX;
+          w.x = Math.min(w.bounds.max, Math.max(w.bounds.min, w.x + dx));
+        };
+        const up = () => {
+          removeEventListener('pointermove', move);
+          removeEventListener('pointerup', up);
+          feed(w.setBlocked(T(), 'dragging', false));
+          persistWalkX();
+        };
+        addEventListener('pointermove', move);
+        addEventListener('pointerup', up);
+      });
+    }
     let lastExpression = null;
     function applyAction(a) {
       // one bad action must not kill the rest of this event batch
@@ -298,13 +451,28 @@
           motion.tilt(a.tilt);
           if (a.away) motion.lookAway(a.hold || 2);
           lastExpression = a.name ? a : null;
+        } else if (a.type === 'walk_start' || a.type === 'walk_turn') {
+          // walk.js decided WHERE; motion.js moves the legs from the rig's
+          // own leg geometry; the page turns her to face the way she goes
+          motion.setWalk(a.dir, director.walk ? director.walk.speed : 0.6);
+          faceWant = a.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+        } else if (a.type === 'walk_stop') {
+          motion.setWalk(0);              // blends the gait out smoothly
+          faceWant = 0;                   // back to the viewer
+          persistWalkX();
         }
       } catch (e) {
         console.warn('gesture action failed', a && a.type, a && a.name, e);
       }
     }
-    // In ?force= mode the director is silenced: only the forced gestures move her.
-    const feed = (actions) => { if (FORCE || !vrm) return; for (const a of actions) applyAction(a); };
+    const feed = (actions) => {
+      if (FORCE && !FORCE_WALK) return;
+      if (!vrm) return;
+      for (const a of actions) {
+        if (FORCE && FORCE_WALK && !a.type.startsWith('walk')) continue;
+        applyAction(a);
+      }
+    };
     // re-issue whatever was running after a persona swap (new bones, new clips)
     function resumeLife() {
       const g = director.gesture;
@@ -375,7 +543,9 @@
       if (!vrm) return null;
       const names = ['hips', 'spine', 'chest', 'upperChest', 'neck', 'head',
                      'leftShoulder', 'rightShoulder', 'leftUpperArm', 'rightUpperArm',
-                     'leftLowerArm', 'rightLowerArm', 'leftHand', 'rightHand'];
+                     'leftLowerArm', 'rightLowerArm', 'leftHand', 'rightHand',
+                     'leftUpperLeg', 'rightUpperLeg', 'leftLowerLeg', 'rightLowerLeg',
+                     'leftFoot', 'rightFoot', 'eyeLeft', 'eyeRight'];
       const bones = {};
       for (const n of names) {
         const b = vrm.humanoid.getNormalizedBoneNode(n);
@@ -424,6 +594,32 @@
           elbowInCanvas: inCanvas(elbowNdc),
           leftHandInCanvas: inCanvas(lHandNdc),
           leftElbowInCanvas: inCanvas(lElbowNdc),
+          gazeDbg: motion.__debug(),
+          // world pos of the eyes node (VRM0 rigs have no normalized eye
+          // bones): ground truth for where the face points in renders
+          eyesWorld: (() => {
+            const n = vrm.scene.getObjectByName('両目') || vrm.scene.getObjectByName('leftEye');
+            if (!n) return null;
+            const p = n.getWorldPosition(new THREE.Vector3());
+            return [+p.x.toFixed(4), +p.y.toFixed(4), +p.z.toFixed(4)];
+          })(),
+          ...(director?.walk ? {
+            walkX: director.walk.x,
+            walkSpeed: director.walk.speed,
+            walking: director.walk.walking ? 1 : 0,
+            walkBlend: motion.walkActive ? motion.walkActive.w : 0,
+            walkPhase: motion.walkActive ? motion.walkActive.phase : 0,
+            sceneRotY: vrm.scene.rotation.y,
+            // head-forward vector: midpoint(eyes) - head, in world space.
+            // Facing the camera (+z) reads (0,0,+); screen-right (+x) reads (+,0,0).
+            facingVec: bones.eyeLeft && bones.eyeRight && h
+              ? [(bones.eyeLeft[0] + bones.eyeRight[0]) / 2 - h[0],
+                 0,
+                 (bones.eyeLeft[2] + bones.eyeRight[2]) / 2 - h[2]] : null,
+            // which foot leads along the world x axis (travel dir = sign of walkSpeed*dir)
+            footLeadX: bones.leftFoot && bones.rightFoot
+              ? bones.leftFoot[0] - bones.rightFoot[0] : null,
+          } : {}),
           ...(window.__waveTrack && Number.isFinite(window.__waveTrack.min) ? {
             waveLateralSwing: window.__waveTrack.max - window.__waveTrack.min,
             wavePeakAboveShoulderY: window.__waveTrack.peakY,
@@ -438,8 +634,15 @@
     if (FORCE) {
       for (const item of String(FORCE).split(',')) {
         const [name, at = '0'] = item.trim().split('@');
+        const atMs = Math.max(0, Number(at) || 0) * 1000;
+        if (name === 'walk' && director.walk) {
+          // QA: start a long forced walk (capture_frames walk cycle shots);
+          // roamNow() is idempotent while walking so several @times are fine
+          setTimeout(() => feed(director.walk.roamNow(T(), { dir: 1, seconds: 120 })), atMs);
+          continue;
+        }
         if (!GESTURES[name]) continue;
-        setTimeout(() => motion.playGesture(name), Math.max(0, Number(at) || 0) * 1000);
+        setTimeout(() => motion.playGesture(name), atMs);
       }
       // Per-frame tracker for the wave acceptance numbers (a 4-frame
       // snapshot cadence would miss the oscillation extremes):
@@ -526,11 +729,13 @@
     let approvalOpen = false;
     function showApproval(summary, seconds) {
       approvalOpen = true;
+      if (director.walk) feed(director.walk.setBlocked(T(), 'approval', true));
       flash(approval, `Can I ${summary}?  Enter = yes, Esc = no`, 0);
     }
     function hideApproval(answered) {
       if (!approvalOpen) return;
       approvalOpen = false;
+      if (director.walk) feed(director.walk.setBlocked(T(), 'approval', false));
       approval.classList.remove('show');
       if (answered) flash(status, answered === 'yes' ? 'thank you :)' : 'ok, not then', 3);
     }
@@ -552,11 +757,13 @@
     function openInput() {
       input.classList.add('show');
       input.focus();
+      if (director.walk) feed(director.walk.setBlocked(T(), 'typing', true));
       control('input-opened');
     }
     function closeInput() {
       input.classList.remove('show');
       input.blur();
+      if (director.walk) feed(director.walk.setBlocked(T(), 'typing', false));
       control('input-closed');
     }
     input.addEventListener('keydown', (e) => {
@@ -733,7 +940,16 @@
     const clock = new THREE.Clock();
     renderer.setAnimationLoop(() => {
       const dt = clock.getDelta();
-      feed(director.tick(T()));  // idle gestures, gesture endings, expression decay
+      feed(director.tick(T(), dt));  // idle gestures, endings, decay, roam schedule
+      if (ROAM && director.walk && vrm) {
+        // root motion: the scene carries her along the strip; the camera
+        // stays put so the visible canvas IS the strip width, and turns her
+        // toward the direction of travel (and back to the viewer on stop)
+        vrm.scene.position.x = director.walk.x;
+        const ry = vrm.scene.rotation.y;
+        vrm.scene.rotation.y = ry + (faceWant - ry) * (1 - Math.exp(-dt / 0.16));
+        walkHousekeeping(T());
+      }
       feedVowel();
       motion.update(dt);
       vrm.update(dt);
