@@ -102,7 +102,7 @@ desktop:
     # id: my-desktop       # hub-side identity; default is <user>-desktop, remembered
                            # in ~/.config/riko/client_id (keep it ^[A-Za-z0-9_-]{1,64}$)
     name: Riko desktop     # what shows in GET /api/clients
-    browser_port: 8765     # ws://127.0.0.1:<port> the Firefox extension pairs with
+    browser_port: 8766     # ws://127.0.0.1:<port> the Firefox extension pairs with
                            # (token: riko-ctl browser-token, or the tray menu)
     approval_timeout: 120  # seconds to wait for Enter/Esc/riko-ctl approve; timeout = deny
 

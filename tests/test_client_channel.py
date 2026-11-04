@@ -366,3 +366,16 @@ def test_start_desktop_disabled(fake_hub, hub_connected, tmp_path, monkeypatch):
     rt, br = client_tools.start_desktop({"desktop": {"client": {"enabled": False}}},
                                         hub_connected, viewer_module=None)
     assert rt is None and br is None
+
+
+def test_link_page_is_served(bridge):
+    """GET /link hosts the extension's WebSocket tab (http origin, so Firefox
+    doesn't force-upgrade its ws:// to wss://). GET /riko-pair hands out the
+    token for auto-pairing."""
+    import urllib.request
+    with urllib.request.urlopen(f"http://127.0.0.1:{bridge.port}/link", timeout=5) as r:
+        body = r.read().decode()
+        assert r.headers["Content-Type"].startswith("text/html")
+    assert "Riko Helper" in body and "riko-link" in body
+    with urllib.request.urlopen(f"http://127.0.0.1:{bridge.port}/riko-pair", timeout=5) as r:
+        assert r.read().decode() == "tok"

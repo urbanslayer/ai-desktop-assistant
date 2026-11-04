@@ -27,6 +27,7 @@ Nothing in here needs Qt; desktop.py passes the UI callbacks in.
 import asyncio
 import concurrent.futures
 import json
+import logging
 import os
 import re
 import secrets
@@ -38,7 +39,44 @@ from urllib.parse import urlparse
 
 from riko import hub_client
 
-DEFAULT_BROWSER_PORT = 8765
+DEFAULT_BROWSER_PORT = 8766
+
+# Quiet host page for the extension's WebSocket (served at /link). The real
+# work is done by the extension's link_relay.js content script; this page
+# only prints the link state the relay broadcasts via postMessage.
+LINK_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Riko Helper link</title>
+<style>
+ body { font: 13.5px/1.6 system-ui, sans-serif; background: #14101c;
+        color: #cfc6e4; display: flex; align-items: center;
+        justify-content: center; height: 100vh; margin: 0; }
+ main { text-align: center; max-width: 34rem; }
+ h1 { font-size: 15px; font-weight: 600; }
+ #s { color: #8f83ad; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Riko Helper &lt;-&gt; Riko desktop</h1>
+  <p>Keep this tab open; it carries Riko's link to your Firefox.
+     Closing it just reconnects in a moment. Pause her anytime from the
+     toolbar icon.</p>
+  <div id="s">connecting…</div>
+</main>
+<script>
+ addEventListener("message", (e) => {
+   const d = e.data;
+   if (d && d.source === "riko-link")
+     document.getElementById("s").textContent =
+       {up: "linked", down: "reconnecting…", reject: "token rejected"}[d.state] || d.state;
+ });
+</script>
+</body>
+</html>
+"""
 DEFAULT_APPROVAL_TIMEOUT = 120.0   # the hub's own gate matches this (API.md)
 RELAY_TIMEOUT = 60.0               # one browser command round-trip
 POLL_WAIT = 25.0                   # long-poll cadence, seconds
@@ -293,6 +331,11 @@ class BrowserBridge:
                 / {"ok":false,"needs_confirmation":true,"reason":"..."}
       ext -> us: {"type":"event", ...}  (fire and forget; currently ignored)
     One extension at a time; a newer hello replaces the older connection.
+
+    The same port also answers GET /riko-pair with the token over plain HTTP,
+    so the extension can auto-pair without the owner pasting anything (only
+    localhost can reach the socket; the token still keeps *other* local
+    processes from posing as the extension after the handshake).
     """
 
     def __init__(self, token, host="127.0.0.1", port=DEFAULT_BROWSER_PORT):
@@ -327,11 +370,38 @@ class BrowserBridge:
             self._start_error = str(e)
             self._ready.set()
 
+    async def _process_request(self, connection, request):
+        path = (request.path or "").split("?")[0]
+        from websockets.datastructures import Headers
+        from websockets.http11 import Response
+        if path == "/riko-pair":
+            return Response(200, "OK", Headers([
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Access-Control-Allow-Origin", "*"),
+                # we hang up right after this body; without this header Firefox
+                # keeps the socket in its keep-alive pool and then rides the
+                # dead socket for the WebSocket upgrade — handshake vanishes.
+                ("Connection", "close"),
+            ]), self.token.encode())
+        if path == "/link":
+            # The Riko Helper extension keeps its WebSocket inside a tab on
+            # this page: an http:// origin (unlike the extension's own secure
+            # context, where Firefox 157 force-upgrades ws:// to wss:// and
+            # never falls back). link_relay.js (content script) does the work;
+            # this page is just a quiet host with a status line.
+            return Response(200, "OK", Headers([
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ]), LINK_PAGE.encode())
+        return None  # otherwise: ordinary WebSocket handshake
+
     async def _serve(self):
         from websockets.asyncio.server import serve
         try:
             async with serve(self._handle, self.host, self.port,
-                             max_size=32 * 1024 * 1024):
+                             max_size=32 * 1024 * 1024,
+                             process_request=self._process_request):
                 self._ready.set()
                 await asyncio.get_running_loop().create_future()  # forever
         except OSError as e:
@@ -362,10 +432,13 @@ class BrowserBridge:
     # handler
     async def _handle(self, ws):
         from websockets.exceptions import ConnectionClosed
+        log = logging.getLogger(__name__)
+        log.debug("browser bridge: socket open origin=%r", ws.request.headers.get("Origin"))
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=15)
             hello = json.loads(raw)
-        except Exception:
+        except Exception as e:
+            log.debug("browser bridge: bad hello: %r", e)
             await ws.close(code=4400, reason="say hello first")
             return
         if not isinstance(hello, dict) or hello.get("token") != self.token:
