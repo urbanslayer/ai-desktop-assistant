@@ -782,6 +782,11 @@ def create_app(data_dir, api_key: str | None = None,
                 body_actions = clients_hub.body_actions()
                 if persona.get("embodied", True) and body_actions:
                     system += "\n\n" + _body.body_prompt(body_actions)
+                    # one-line nudge when this very message asks for a
+                    # gesture: cheap and raises tag compliance
+                    asked_for = _body.detect_action_request(text, body_actions)
+                    if asked_for:
+                        system += "\n\n" + _body.request_hint(asked_for)
                 appearance = str(persona.get("appearance") or "").strip()
                 if appearance:
                     system += "\n\n" + _body.appearance_prompt(appearance)
@@ -811,6 +816,13 @@ def create_app(data_dir, api_key: str | None = None,
                 answer, actions, ignored = _body.parse_actions(answer, body_actions)
                 if ignored:
                     log.info("ignored_actions persona=%s names=%s", pid, ",".join(ignored))
+                # docs/BODY.md §3 asked-for fallback: tag emission is
+                # stochastic (worse at high temperature), so an explicit
+                # request the reply forgot is added anyway; the model's own
+                # matching tag is just flagged. Only for embodied personas
+                # with a body that can play it (empty set otherwise).
+                actions = _body.apply_asked(
+                    text, actions, body_actions if persona.get("embodied", True) else [])
                 tools_used = out["tools_used"]
 
                 user_id = store.add_message(pid, "user", text, source)

@@ -338,3 +338,187 @@ def test_switch_greeting_waves_only_with_wave_in_body_set(tmp_path, fake_llm):
     client.put("/api/personas/asuka", json={"embodied": False})
     res = client.post("/api/chat", json={"text": "asuka"}).json()
     assert res["actions"] == []
+
+
+# ── asked-for requests: matcher, fallback, prompt hint ───────────────────────
+
+# (user text, expected canonical action or None) — conservative matcher
+REQUEST_TABLE = [
+    # wave requests
+    ("wave at me!", "wave"),
+    ("Wave at me", "wave"),
+    ("can you wave?", "wave"),
+    ("could you wave to me", "wave"),
+    ("do a wave", "wave"),
+    ("give me a wave", "wave"),
+    ("hey, wave hello", "wave"),
+    ("please wave", "wave"),
+    ("wave bye", "wave"),
+    ("I miss you. wave at me", "wave"),
+    ("hey riko, wave at me!", "wave"),
+    # nod
+    ("nod", "nod"),
+    ("can you nod?", "nod"),
+    ("nod for me", "nod"),
+    ("Nod yes", "nod"),
+    ("please nod your head", "nod"),
+    # shake_head
+    ("shake your head", "shake_head"),
+    ("can you shake your head?", "shake_head"),
+    # think: only demo/pose requests
+    ("show me your thinking pose", "think"),
+    ("show me how you think", "think"),
+    ("strike a thinking pose", "think"),
+    ("thinking pose please", "think"),
+    # stretch / look_around / laugh / pout / hair_touch / fidget
+    ("stretch", "stretch"),
+    ("can you stretch?", "stretch"),
+    ("do a stretch", "stretch"),
+    ("look around", "look_around"),
+    ("can you look around?", "look_around"),
+    ("laugh", "laugh"),
+    ("laugh for me", "laugh"),
+    ("pout", "pout"),
+    ("please pout", "pout"),
+    ("touch your hair", "hair_touch"),
+    ("can you touch your hair?", "hair_touch"),
+    ("fidget", "fidget"),
+    ("can you fidget a bit?", "fidget"),
+    # mentions, NOT requests
+    ("I waved at my friend today", None),
+    ("what do you think?", None),
+    ("I think so", None),
+    ("wave function", None),
+    ("don't wave", None),
+    ("waves are cool", None),
+    ("the crowd waved", None),
+    ("she nodded at me", None),
+    ("he shook his head", None),
+    ("I need to think about it", None),
+    ("do you think cats are nice?", None),
+    ("I did a stretch this morning", None),
+    ("stretch marks hurt", None),
+    ("I looked around the room", None),
+    ("that made me laugh", None),
+    ("you pout too much", None),
+    ("her hair is long", None),
+    ("stop fidgeting", None),
+    ("tell me about wave functions in physics", None),
+    ("nobody waved", None),
+    ("do you like thinking games?", None),
+    ("I touched my hair", None),
+    ("laughing at a meme", None),
+    ("head shake experiment results", None),
+]
+
+
+@pytest.mark.parametrize("text,want", REQUEST_TABLE,
+                         ids=[t[:28] for t, _ in REQUEST_TABLE])
+def test_request_matcher_table(text, want):
+    assert body_mod.detect_action_request(text) == want
+
+
+def test_request_matcher_respects_body_set():
+    # a request for a gesture the body cannot play is not an action request
+    assert body_mod.detect_action_request("wave at me", ["nod"]) is None
+    assert body_mod.detect_action_request("wave at me", ["wave"]) == "wave"
+    assert body_mod.detect_action_request("wave at me", []) is None
+    # name normalisation on the body side
+    assert body_mod.detect_action_request("shake your head", ["Shake-Head"]) == "shake_head"
+
+
+def test_apply_asked_flags_model_tag_and_forces_missing():
+    # model tagged it: just flag it, no duplicate, position untouched
+    acts = [{"name": "wave", "at": 0.4}]
+    out = body_mod.apply_asked("wave at me!", acts, B)
+    assert out == [{"name": "wave", "at": 0.4, "asked": True}]
+    # model forgot it: added at the start of the reply, flagged
+    out = body_mod.apply_asked("wave at me!", [], B)
+    assert out == [{"name": "wave", "at": 0.0, "asked": True}]
+    # other model actions keep their shape (additive field only)
+    out = body_mod.apply_asked("wave at me!", [{"name": "nod", "at": 0.5}], B)
+    assert out == [{"name": "wave", "at": 0.0, "asked": True},
+                   {"name": "nod", "at": 0.5}]
+    # no recognized request: untouched
+    acts = [{"name": "nod", "at": 0.5}]
+    assert body_mod.apply_asked("what do you think?", acts, B) == acts
+    # body set lacks the requested gesture: untouched
+    assert body_mod.apply_asked("wave at me!", [], ["nod"]) == []
+    # MAX_ACTIONS cap holds
+    three = [{"name": "nod", "at": 0.0}, {"name": "think", "at": 0.3},
+             {"name": "laugh", "at": 0.6}]
+    out = body_mod.apply_asked("wave at me!", list(three), B)
+    assert out == three
+
+
+def test_request_hint_text():
+    assert body_mod.request_hint("wave") == \
+        "The user just asked you to wave: include [wave] in your reply."
+
+
+# ── chat integration of the fallback ────────────────────────────────────────
+
+def test_fallback_adds_action_when_llm_replies_in_prose(tmp_path, fake_llm):
+    """The whole point: at high temperature the model often ignores the tags
+    and 'wave at me!' must still move her (docs/BODY.md §3)."""
+    client = hub_client(tmp_path, fake_llm)      # reply: "Sure thing, senpai."
+    register(client)
+    res = client.post("/api/chat", json={"text": "wave at me!"}).json()
+    assert res["actions"] == [{"name": "wave", "at": 0.0, "asked": True}]
+    ai = [m for m in client.get("/api/history").json()["messages"]
+          if m["role"] == "assistant"][0]
+    assert ai["actions"] == [{"name": "wave", "at": 0.0, "asked": True}]
+    evs = client.get("/api/events?after=0&wait=0").json()["events"]
+    fin = [e for e in evs if e["type"] == "turn_finished"][-1]
+    assert fin["actions"] == [{"name": "wave", "at": 0.0, "asked": True}]
+
+
+def test_fallback_flags_model_tag_without_duplicating(tmp_path):
+    llm = FakeHubLLM(reply=f"{tag('wave')} hi there")
+    client = hub_client(tmp_path, llm)
+    register(client)
+    res = client.post("/api/chat", json={"text": "wave at me"}).json()
+    assert res["actions"] == [{"name": "wave", "at": 0.0, "asked": True}]
+    llm.stop()
+
+
+def test_fallback_not_applied(tmp_path, fake_llm):
+    client = hub_client(tmp_path, fake_llm)
+    register(client, body={"actions": ["nod"]})   # body lacks wave
+    assert client.post("/api/chat", json={"text": "wave at me"}).json()["actions"] == []
+    client.delete("/api/clients/desk1")
+    register(client)
+    client.put("/api/personas/riko", json={"embodied": False})
+    assert client.post("/api/chat", json={"text": "wave at me"}).json()["actions"] == []
+    client.put("/api/personas/riko", json={"embodied": True})
+    client.delete("/api/clients/desk1")           # no embodied client online
+    assert client.post("/api/chat", json={"text": "wave at me"}).json()["actions"] == []
+    # a mention is not a request
+    register(client)
+    res = client.post("/api/chat", json={"text": "I waved at my friend today"}).json()
+    assert res["actions"] == []
+
+
+def test_untouched_turns_have_no_asked_flag(tmp_path, fake_llm):
+    client = hub_client(tmp_path, fake_llm)
+    register(client)
+    res = client.post("/api/chat", json={"text": "what do you think about cats?"}).json()
+    assert res["actions"] == []
+
+
+def test_prompt_hint_only_on_matching_request(tmp_path, fake_llm):
+    client = hub_client(tmp_path, fake_llm)
+    register(client)
+    hint = "The user just asked you to wave"
+    client.post("/api/chat", json={"text": "wave at me!"})
+    sys = fake_llm.chat_requests[-1]["messages"][0]["content"]
+    assert hint in sys and "include [wave]" in sys
+    client.post("/api/chat", json={"text": "I waved at my friend today"})
+    sys = fake_llm.chat_requests[-1]["messages"][0]["content"]
+    assert hint not in sys
+    # no hint when the body cannot play it
+    client.delete("/api/clients/desk1")
+    register(client, body={"actions": ["nod"]})
+    client.post("/api/chat", json={"text": "wave at me!"})
+    sys = fake_llm.chat_requests[-1]["messages"][0]["content"]
+    assert hint not in sys

@@ -114,7 +114,8 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
 you passed to `/api/chat` (`desktop`, `android`, `web`, `terminal`,
 `import`, …). `emotion` is one of the fixed emotion ids (see *Emotion tags*)
 and `content` **never contains the raw tag**; `actions` is the parsed
-body-action list (see *Body actions*) and `content` never contains the raw
+body-action list (see *Body actions*, where an action may carry the additive
+`"asked": true` flag) and `content` never contains the raw
 action tags either; `tools_used` is the compact trace of which tools the turn
 called (full history in `/api/tools/log`).
 
@@ -675,9 +676,11 @@ actions from the set immediately. `GET /api/tools` reports the current set as
 **Prompt.** When the body set is non-empty *and* the persona has
 `embodied: true`, the system prompt gains a short block naming the actual
 actions ("You have a 3D body… Available actions: wave, think, nod, …"), so
-the model pepper its reply with action tags. The persona's `appearance` line
-(`Your appearance: …`) is appended whenever `appearance` is non-empty — body
-online or not.
+the model pepper its reply with action tags. When the current user message
+explicitly asks her body for one of those actions, the block also gains a
+one-line nudge (`The user just asked you to wave: include [wave] in your
+reply.`). The persona's `appearance` line (`Your appearance: …`) is appended
+whenever `appearance` is non-empty — body online or not.
 
 **Parsing (what the hub accepts).** Applied to the final reply *after*
 emotion-tag stripping; names are matched case-insensitively, hyphens and
@@ -694,6 +697,25 @@ Clean text: no tags/asterisk actions remain in stored or spoken text
 (spaces/punctuation collapsed; Breeze audio is built from the clean text).
 **Limits:** at most 3 actions per reply (extras dropped), adjacent
 duplicates merged.
+
+**Asked-for fallback (docs/BODY.md §3).** Whether the model emits tags is
+stochastic (worse at high temperature), so the hub also inspects the **user's
+message**: if it explicitly asks her body for an action of the current body
+set — conservative imperative/request forms like "wave at me!", "can you
+nod?", "give me a wave", "show me your thinking pose", "touch your hair"
+(mentions do **not** count: "I waved at my friend", "what do you think?",
+"wave function", "don't wave") — then:
+* if the reply's `actions` already contain it, that action object gains
+  **`"asked": true`**;
+* if they don't, `{"name": ..., "at": 0.0, "asked": true}` is **added at the
+  start of the reply** (within the 3-action cap).
+The fallback never runs for a non-embodied persona, with no embodied client
+online, or for a gesture outside the body set. `asked` is an **additive
+field** — present only when `true`; action objects otherwise keep their
+shape, so old clients ignore it. Embodied clients should treat
+`asked: true` as the docs/BODY.md §5 "asked for" class: always play it,
+bypassing cooldowns (this replaces client-side verb matching of the user's
+text).
 
 **Timing.** Each action carries `at`, the 0..1 fraction of the *cleaned*
 reply's length where the tag appeared (`0` = before the first word). Clients
