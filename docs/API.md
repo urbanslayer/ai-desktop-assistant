@@ -309,6 +309,10 @@ Query params: `persona` (default: active), `after` (message id, default 0),
 `after=<id>` → messages with `id > after` (fetch a delta). Unknown persona →
 `404`; non-integer `after`/`limit` → `400`.
 
+Messages carry the same `speech` field as ChatResults (assistant rows: the
+cleaned spoken text, never a URL — filled on read for rows stored before the
+spoken-text round; `""` on user rows). `content` stays the full display text.
+
 ```bash
 curl -s -H "$AUTH" "$HUB/api/history?limit=200"                   # tail of active persona
 curl -s -H "$AUTH" "$HUB/api/history?persona=asuka&after=42"      # everything after id 42
@@ -333,6 +337,7 @@ Body: `{"text": "…", "source": "android", "persona": optional id,
 ```json
 {
   "reply": "It is 21 C and sunny in Tokyo today, senpai.",
+  "speech": "It is 21 C and sunny in Tokyo today, senpai.",
   "persona": "riko",
   "switched": false,
   "emotion": "happy",
@@ -349,6 +354,7 @@ Two outcomes:
 1. **Switch command** (see below): `switched: true`, `reply` is the target's
    greeting, `message_ids: []`, `emotion: null`, `tools_used: []` — **nothing
    is stored** and the target becomes active (which bumps `state.version`).
+   `speech` is that greeting's spoken text (see below).
    `audio_url` points at the greeting WAV:
    `/api/personas/<id>/greeting/audio?v=<voice_version>`.
    `actions` is `[{"name": "wave", "at": 0.0}]` when the target persona is
@@ -371,6 +377,18 @@ comes from the **final** reply only (see *Body actions*). `tools_used` is
 `GET /api/events` (see *Events*). A turn that uses tools can take noticeably
 longer than a plain one (each tool step is another model call): keep your
 chat timeout generous (minutes, not seconds).
+
+`speech` is what she **says**; `reply` is what she **shows**. The hub
+synthesizes its audio from `speech`, not `reply`: URLs dropped (markdown
+links keep only their label), code blocks and inline code dropped, markdown
+furniture and emoji dropped, source citations like `[1]` dropped, and only
+the **first paragraph** — everything after the first blank line (the links
+and details section) stays on screen and is never spoken (docs/TOOLS.md A).
+A reply whose first paragraph was links only speaks a short fallback line
+("I put the link on screen."). The rule set is versioned (the hub's audio
+cache keys on it); clients that run their own TTS (`tts: openai/sovits/fish`)
+must speak `speech` — never `reply` — or apply the identical cleaner
+(`riko/speech.py`). Display `reply` in full: links stay visible.
 
 `audio_url` is `null` when `speak: false`, when TTS is off/unconfigured, or
 when that persona's `voice.mode` is `off`. **The chat never waits for
@@ -511,11 +529,13 @@ nothing was synthesised.
 ### GET /api/messages/{id}/audio
 
 The WAV of one **assistant** message in its persona's voice. `404` for user
-messages / unknown ids. Cache key server-side is `(message_id,
-voice_version, emotion)`: editing the persona voice re-synthesises on the
-next fetch; old replies keep their old audio until asked again. The stored
-emotion adds a matching delivery hint to the synthesis (see *Emotion tags*)
-— the tag itself is never spoken.
+messages / unknown ids. It speaks the message's `speech` text, never its raw
+`content` (see *POST /api/chat → ChatResult*): no spoken URLs, markdown or
+emoji. Cache key server-side is `(message_id, voice_version, emotion,
+speech-rules version)`: editing the persona voice — or the hub upgrading its
+speech rules — re-synthesises on the next fetch; old replies keep their old
+audio until asked again. The stored emotion adds a matching delivery hint to
+the synthesis (see *Emotion tags*) — the tag itself is never spoken.
 
 ### GET /api/personas/{id}/greeting/audio
 
@@ -527,8 +547,10 @@ Same, for the greeting (`?v=` informational). This is what a switch's
 One-shot WAV for a line that is not in any transcript (client-side
 narration): body `{"text": "…", "persona": optional id, "emotion": optional
 one of the emotion ids}`, ≤ **1000 characters** (`422`), never cached,
-`Content-Type: audio/wav`. The `emotion` only steers delivery (same hint as
-below); unknown emotion → `422`.
+`Content-Type: audio/wav`. The text goes through the same spoken-text
+cleaner as chat audio, so posting a raw reply (markdown and all) still
+speaks clean words; nothing speakable after cleaning → `422`. The `emotion`
+only steers delivery (same hint as below); unknown emotion → `422`.
 
 ```bash
 curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \

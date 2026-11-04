@@ -73,6 +73,7 @@ class FakeHub:
         self.audio_requests = []      # path of every audio GET (or /api/tts body)
         self.emotion = None           # when set, chat replies carry this ChatResult.emotion
         self.actions = None           # when set, chat replies carry this ChatResult.actions
+        self.speech = None            # when set, chat replies carry this ChatResult.speech
         self.register_count = 0       # how many register POSTs arrived
         self.last_auth = None         # Authorization header of the last API call
         # Client-tool channel (docs/API.md), server side, simplified:
@@ -337,6 +338,8 @@ class FakeHub:
                     resp["emotion"] = self.emotion
                 if self.actions is not None:  # body-action-aware hub
                     resp["actions"] = self.actions
+                if self.speech is not None:  # spoken-text-aware hub (hub/speech.py)
+                    resp["speech"] = self.speech
                 return resp
             pid = self.active
             ids = []
@@ -361,6 +364,8 @@ class FakeHub:
                 resp["emotion"] = self.emotion
             if self.actions is not None:  # body-action-aware hub
                 resp["actions"] = self.actions
+            if self.speech is not None:  # spoken-text-aware hub (hub/speech.py)
+                resp["speech"] = self.speech
             return resp
 
     def _greeting_audio_url(self, p):

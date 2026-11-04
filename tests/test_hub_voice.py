@@ -221,7 +221,7 @@ def test_message_audio_synthesizes_once_then_serves_cache(client, fake_breeze, t
     assert r2.status_code == 200
     assert r2.content == r.content
     assert len(fake_breeze.speech_requests) == 1  # made once, then cached
-    assert (tmp_path / "hubdata" / "audio" / "2-v1.wav").exists()
+    assert (tmp_path / "hubdata" / "audio" / "2-v1-r1.wav").exists()  # -r1 = speech rules v1
 
 
 def test_audio_cache_keyed_on_voice_version(client, fake_breeze, tmp_path):
@@ -232,7 +232,7 @@ def test_audio_cache_keyed_on_voice_version(client, fake_breeze, tmp_path):
     assert v.json()["voice_version"] == 2
     assert client.get("/api/messages/2/audio").status_code == 200
     assert len(fake_breeze.speech_requests) == 2  # re-synthesised for the new voice
-    assert (tmp_path / "hubdata" / "audio" / "2-v2.wav").exists()
+    assert (tmp_path / "hubdata" / "audio" / "2-v2-r1.wav").exists()
 
 
 def test_switch_gives_greeting_audio_url(client, fake_breeze, tmp_path):
@@ -245,7 +245,7 @@ def test_switch_gives_greeting_audio_url(client, fake_breeze, tmp_path):
     assert g.status_code == 200
     readable_wav(g.content)
     assert fake_breeze.speech_requests[-1]["input"] == "Asuka here!"  # the greeting
-    assert (tmp_path / "hubdata" / "audio" / "greeting-asuka-v1.wav").exists()
+    assert (tmp_path / "hubdata" / "audio" / "greeting-asuka-v1-r1.wav").exists()
 
 
 def test_speak_false_skips_audio(client):
@@ -537,7 +537,7 @@ def test_cache_evicts_oldest_over_cap(client, fake_breeze, tmp_path, monkeypatch
         assert client.get(f"/api/messages/{mid}/audio").status_code == 200
     remaining = sorted(f.name for f in audio_dir.glob("*.wav"))
     assert len(remaining) == 2  # oldest evicted, newest kept
-    assert "6-v1.wav" in remaining
+    assert "6-v1-r1.wav" in remaining
 
 
 def test_delete_persona_removes_its_audio_and_clip(client, fake_breeze, tmp_path):
@@ -561,7 +561,7 @@ def test_clear_history_removes_message_audio_keeps_greeting(client, fake_breeze,
     assert client.delete("/api/history?persona=asuka").status_code == 204
     audio_dir = tmp_path / "hubdata" / "audio"
     names = [f.name for f in audio_dir.glob("*.wav")]
-    assert names == ["greeting-asuka-v1.wav"]  # message audio went with the rows
+    assert names == ["greeting-asuka-v1-r1.wav"]  # message audio went with the rows
 
 
 # ── voice editing rules ──────────────────────────────────────────────────────

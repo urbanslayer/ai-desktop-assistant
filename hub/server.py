@@ -30,6 +30,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from . import brain as _brain
     from . import clients as _clients
     from . import emotion as _emotion
+    from . import speech as _speech
     from . import voice as _voice
     from .clients import ClientHub
     from .events import EventBus
@@ -44,6 +45,7 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     import brain as _brain  # type: ignore[no-redef]
     import clients as _clients  # type: ignore[no-redef]
     import emotion as _emotion  # type: ignore[no-redef]
+    import speech as _speech  # type: ignore[no-redef]
     import voice as _voice  # type: ignore[no-redef]
     from clients import ClientHub  # type: ignore[no-redef]
     from events import EventBus  # type: ignore[no-redef]
@@ -665,7 +667,13 @@ def create_app(data_dir, api_key: str | None = None,
             limit = min(500, max(1, int(request.query_params.get("limit") or 50)))
         except ValueError:
             return err(400, "after and limit must be integers")
-        return {"persona": pid, "messages": store.messages_after(pid, after, limit)}
+        messages = store.messages_after(pid, after, limit)
+        # rows stored before the spoken-text round have speech ''; fill it so
+        # clients doing their own TTS always get clean words, never a URL.
+        for m in messages:
+            if m["role"] == "assistant" and not m["speech"]:
+                m["speech"] = _speech.speech_text(m["content"])
+        return {"persona": pid, "messages": messages}
 
     @app.delete("/api/history", status_code=204)
     def delete_history(request: Request):
@@ -742,6 +750,7 @@ def create_app(data_dir, api_key: str | None = None,
                                    actions=greet_actions)
                     return ("ok", {"reply": reply, "persona": target, "switched": True,
                                    "emotion": None, "tools_used": [], "actions": greet_actions,
+                                   "speech": _speech.speech_text(reply),
                                    "message_ids": [], "state_version": store.version(),
                                    "audio_url": audio_url})
 
@@ -826,9 +835,12 @@ def create_app(data_dir, api_key: str | None = None,
                 tools_used = out["tools_used"]
 
                 user_id = store.add_message(pid, "user", text, source)
+                # the spoken text is the cleaned reply (hub/speech.py): audio
+                # and any client-side TTS use it, the bubble keeps all of it.
+                spoken = _speech.speech_text(answer)
                 assistant_id = store.add_message(pid, "assistant", answer, source,
                                                  emotion=emotion, tools=tools_used,
-                                                 actions=actions)
+                                                 actions=actions, speech=spoken)
                 bump_state()
                 events.publish("turn_finished", persona=pid,
                                message_id=assistant_id, emotion=emotion,
@@ -840,7 +852,7 @@ def create_app(data_dir, api_key: str | None = None,
                     audio_url = f"/api/messages/{assistant_id}/audio"
                 return ("ok", {"reply": answer, "persona": pid, "switched": False,
                                "emotion": emotion, "tools_used": tools_used,
-                               "actions": actions,
+                               "actions": actions, "speech": spoken,
                                "message_ids": [user_id, assistant_id],
                                "state_version": store.version(),
                                "audio_url": audio_url})
@@ -1080,9 +1092,14 @@ def create_app(data_dir, api_key: str | None = None,
         emotion = message.get("emotion")
         # 'neutral' sounds like no hint at all: same cache file, no duplicate WAV
         suffix = "" if not emotion or emotion == "neutral" else f"-{emotion}"
-        return serve_cached_audio(f"{message_id}-v{persona['voice_version']}{suffix}.wav",
-                                  persona, message["content"],
-                                  None if not emotion or emotion == "neutral" else emotion)
+        # audio speaks the CLEANED text (no URLs/markdown, first paragraph —
+        # hub/speech.py); always recomputed so rule upgrades beat stale rows.
+        # -r<N> in the name is the rules version: old clips never survive it.
+        return serve_cached_audio(
+            f"{message_id}-v{persona['voice_version']}"
+            f"-r{_speech.SPEECH_RULES_VERSION}{suffix}.wav",
+            persona, _speech.speech_text(message["content"]),
+            None if not emotion or emotion == "neutral" else emotion)
 
     @app.get("/api/personas/{persona_id}/greeting/audio")
     def get_greeting_audio(persona_id: str, request: Request):
@@ -1091,8 +1108,9 @@ def create_app(data_dir, api_key: str | None = None,
             return err(404, f"no persona '{persona_id}'")
         # ?v= is informational (clients cache by it); the on-disk key is server-side
         return serve_cached_audio(
-            f"greeting-{persona_id}-v{persona['voice_version']}.wav",
-            persona, default_speech_text(persona))
+            f"greeting-{persona_id}-v{persona['voice_version']}"
+            f"-r{_speech.SPEECH_RULES_VERSION}.wav",
+            persona, _speech.speech_text(default_speech_text(persona)))
 
     @app.post("/api/tts")
     async def post_tts(request: Request):
@@ -1108,6 +1126,11 @@ def create_app(data_dir, api_key: str | None = None,
             return err(422, "text is required")
         if len(text) > MAX_TTS_TEXT:
             return err(422, f"text is over {MAX_TTS_TEXT} characters")
+        # same spoken-text rules as chat audio: a client that posts a raw
+        # reply (markdown and all) still hears clean speech
+        text = _speech.speech_text(text)
+        if not text:
+            return err(422, "nothing speakable in text")
         pid = str(body.get("persona") or "") or store.active()
         persona = store.get_persona(pid)
         if not persona:

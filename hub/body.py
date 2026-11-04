@@ -64,7 +64,8 @@ PROMPT_TEMPLATE = (
     "you MUST include its tag or you stay frozen, e.g. \"wave at me\" -> "
     "\"[wave] Hey senpai!\" (you may say a few words about it). Otherwise "
     "use them sparingly and naturally, like a person gesturing while "
-    "talking; usually zero or one per reply."
+    "talking; usually zero or one per reply. Never search the web for a GIF "
+    "or picture of a gesture to 'show' one: the tag IS the gesture."
 )
 
 

@@ -12,7 +12,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Voice migration for personas written before the voice round (docs/VOICE.md):
 # a bland design-mode voice with a random seed, so they keep talking after the
@@ -143,6 +143,14 @@ class Store:
             cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
             if "actions" not in cols:
                 self.db.execute("ALTER TABLE messages ADD COLUMN actions TEXT NOT NULL DEFAULT ''")
+            self.db.execute("PRAGMA user_version=4")
+            self.db.commit()
+        if version < 5:  # spoken-text round: the cleaned TTS text of a reply
+            # (hub/speech.py). Display keeps `content`; clients doing their own
+            # TTS speak `speech`. Old rows stay '' and get cleaned on read.
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+            if "speech" not in cols:
+                self.db.execute("ALTER TABLE messages ADD COLUMN speech TEXT NOT NULL DEFAULT ''")
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.db.commit()
 
@@ -299,18 +307,20 @@ class Store:
     # ── messages ────────────────────────────────────────────────────────
     def add_message(self, persona: str, role: str, content: str, source: str,
                     emotion: str | None = None, tools: list | None = None,
-                    actions: list | None = None) -> int:
+                    actions: list | None = None, speech: str = "") -> int:
         """`emotion` only makes sense on assistant messages (docs/ROUNDS.md:
         null for user messages). `tools` is the compact tools_used list
         [{tool, label}] stored on the assistant reply. `actions` is the
-        parsed body-action list [{name, at}] (docs/BODY.md)."""
+        parsed body-action list [{name, at}] (docs/BODY.md). `speech` is the
+        cleaned spoken text of the reply (hub/speech.py); '' on user rows."""
         with self._lock:
             cur = self.db.execute(
                 "INSERT INTO messages(persona,role,content,source,created_at,emotion,"
-                "tools,actions) VALUES(?,?,?,?,?,?,?,?)",
+                "tools,actions,speech) VALUES(?,?,?,?,?,?,?,?,?)",
                 (persona, role, content, source, now_iso(), emotion,
                  json.dumps(tools) if tools else "",
-                 json.dumps(actions) if actions else ""))
+                 json.dumps(actions) if actions else "",
+                 str(speech or "")))
             self.db.commit()
             assert cur.lastrowid is not None
             return cur.lastrowid
@@ -352,10 +362,11 @@ class Store:
                 actions = json.loads(row["actions"])
             except ValueError:
                 actions = []
+        speech = row["speech"] if "speech" in row.keys() else ""
         return {"id": row["id"], "persona": row["persona"], "role": row["role"],
                 "content": row["content"], "source": row["source"],
                 "emotion": row["emotion"], "tools_used": tools,
-                "actions": actions,
+                "actions": actions, "speech": speech,
                 "created_at": row["created_at"]}
 
     def clear_messages(self, persona: str) -> int:

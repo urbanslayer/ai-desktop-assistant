@@ -112,9 +112,11 @@ class HubClient:
         return self._json("POST", "/api/active", json={"persona": name_or_id})
 
     def chat(self, text, source="desktop", persona=None):
-        """One turn. Returns the ChatResult: {reply, persona, switched,
-        message_ids, state_version}. A keyword turn (e.g. 'switch to asuka')
-        comes back as switched=true with the persona's greeting as reply."""
+        """One turn. Returns the ChatResult: {reply, speech, persona, switched,
+        message_ids, state_version}. `speech` is the cleaned spoken text
+        (docs/API.md): speak it, display `reply`. A keyword turn (e.g.
+        'switch to asuka') comes back as switched=true with the persona's
+        greeting as reply."""
         body = {"text": text, "source": source}
         if persona:
             body["persona"] = persona

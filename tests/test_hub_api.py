@@ -202,7 +202,8 @@ def test_chat_stores_both_messages(client, fake_llm):
     r = client.post("/api/chat", json={"text": "hi", "source": "web"})
     assert r.status_code == 200
     res = r.json()
-    assert res == {"reply": REPLY, "persona": "riko", "switched": False,
+    assert res == {"reply": REPLY, "speech": REPLY,  # nothing to clean: speech == reply
+                   "persona": "riko", "switched": False,
                    "emotion": "neutral", "tools_used": [], "actions": [],
                    "message_ids": [1, 2], "state_version": st0["version"] + 1,
                    "audio_url": None}  # no TTS configured on this hub
