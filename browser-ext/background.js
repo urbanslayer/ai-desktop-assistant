@@ -104,21 +104,39 @@ function allowed(url) {
   return list.some((o) => o.trim() && origin === o.trim().replace(/\/$/, ""));
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function toTab(tabId, msg) {
   let firstError = null;
   try {
     return await browser.tabs.sendMessage(tabId, msg);
   } catch (e) {
     firstError = e;
+    // a page that loaded seconds ago may still be registering its content script
+    await sleep(400);
+    try {
+      return await browser.tabs.sendMessage(tabId, msg);
+    } catch (e2) {
+      firstError = e2;
+    }
   }
   // fresh page (or page loaded before the extension started): inject and retry
-  try {
-    await browser.scripting.executeScript({ target: { tabId }, files:
-      ["lib/risk.js", "lib/snapshot.js", "content.js"] });
-  } catch (injectError) {
-    throw new Error(`no access to that tab (check the site permission in the options page): ${firstError.message} / inject: ${injectError.message}`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await browser.scripting.executeScript({ target: { tabId }, files:
+        ["lib/risk.js", "lib/snapshot.js", "content.js"] });
+      break;
+    } catch (injectError) {
+      firstError = injectError;
+      await sleep(500); // host permission propagation can lag tab creation
+    }
   }
-  return browser.tabs.sendMessage(tabId, msg);
+  await sleep(200); // let the injected script finish wiring its listener
+  try {
+    return await browser.tabs.sendMessage(tabId, msg);
+  } catch (finalError) {
+    throw new Error(`no access to that tab (site permission?): ${firstError && firstError.message} / ${finalError.message}`);
+  }
 }
 
 const banner = (tabId, on) => browser.tabs.sendMessage(tabId, { cmd: "banner", on }).catch(() => {});
