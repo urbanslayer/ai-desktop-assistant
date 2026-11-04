@@ -86,6 +86,10 @@
     // desktop.py opens this page with ?desktop=1: see-through background, no click-to-start,
     // and the whole body in frame. In a normal browser it looks like it always did.
     const DESKTOP = new URLSearchParams(location.search).has('desktop');
+    // Headless visual QA hook (?capture=2,10,30): POST a PNG of the canvas to
+    // /capture?t=<sec> that many seconds after she woke up. Nothing else
+    // changes; see tests / the capture harness in $TMPDIR/riko-anim-frames.
+    const CAPTURE = new URLSearchParams(location.search).get('capture');
     if (DESKTOP) {
       // Both elements paint a white background by default; on HTML it is not covered
       // by the body rule, and Qt would happily show that white as an opaque box.
@@ -96,7 +100,7 @@
     const BUBBLE_SECONDS = settings.bubble_seconds ?? 8;
 
     // ── Scene ──
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: DESKTOP });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: DESKTOP, preserveDrawingBuffer: !!CAPTURE });
     renderer.setPixelRatio(devicePixelRatio);
     renderer.setSize(innerWidth, innerHeight);
     document.body.prepend(renderer.domElement);
@@ -123,6 +127,11 @@
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser));
     loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
+
+    // Which persona body the page is showing ('<id>:<avatar_version>'), so
+    // duplicated 'persona' events for the same body are ignored. Unknown
+    // until the first event (the initial load always serves the active one).
+    let attachedKey = null;
 
     const motion = new AvatarMotion(THREE, { scene, camera });
     let vrm = null;
@@ -250,6 +259,23 @@
       catch { start.textContent = 'Waiting for her avatar...'; await new Promise((r) => setTimeout(r, 2000)); }
     }
     feed(director.start(T()));
+
+    // ── visual QA capture: PNGs at fixed seconds after she woke up ──
+    window.rikoCapture = () => renderer.domElement.toDataURL('image/png');
+    if (CAPTURE) {
+      const wokeAt = performance.now();
+      for (const s of String(CAPTURE).split(',').map(Number).filter((n) => n > 0)) {
+        setTimeout(async () => {
+          try {
+            const t = (performance.now() - wokeAt) / 1000;
+            await fetch(`/capture?t=${t.toFixed(2)}`, {
+              method: 'POST', headers: { 'Content-Type': 'text/plain' },
+              body: window.rikoCapture(),
+            });
+          } catch { /* harness gone; whatever it captured is captured */ }
+        }, Math.max(0, s * 1000 - (performance.now() - wokeAt)));
+      }
+    }
 
     // ── Lip sync: band energies from the voice pick a vowel shape (aa/ih/ee/oh/ou) ──
     const voice = document.getElementById('voice');
@@ -429,15 +455,21 @@
         flash(status, ev.label ? `using ${ev.label}` : 'using a tool…', 20, 'thinking');
       } else if (ev.type === 'open_input') openInput();
       else if (ev.type === 'close_input') closeInput();
-      else if (ev.type === 'persona')
+      else if (ev.type === 'persona') {
         // Someone switched the persona (web page, riko-ctl, or she switched herself):
-        // fetch her new body and swap without reloading; her greeting arrives as 'say'.
-        loadVRM(`avatar.vrm?v=${encodeURIComponent(`${ev.id}-${ev.avatar_version}`)}`)
+        // fetch her new body and swap without reloading; her greeting arrives as a 'say'.
+        // Duplicated events for the SAME persona+version are ignored — the hub
+        // poller (or a replay after a hub restart) must not re-load and re-wave.
+        const key = `${ev.id}:${ev.avatar_version}`;
+        if (key === attachedKey) return;
+        loadVRM(`avatar.vrm?v=${encodeURIComponent(key)}`)
           .then((model) => {
             attach(model);          // motion re-targets gestures + expression on the new bones
-            feed(director.persona(T()));
+            attachedKey = key;
+            feed(director.persona(T(), ev));
           })
           .catch(() => location.reload());  // if her new body won't load, reload the page
+      }
     }
 
     async function checkForVoice() {
@@ -459,7 +491,7 @@
       if (DESKTOP) console.log(`Riko page ready, viewport ${innerWidth}x${innerHeight}`);
       setInterval(checkForVoice, DESKTOP ? 150 : 250);
     }
-    if (DESKTOP) begin();
+    if (DESKTOP || CAPTURE) begin();  // capture mode: no click available in a headless run
     else {
       start.textContent = 'Click to start';
       start.onclick = begin;

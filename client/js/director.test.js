@@ -225,3 +225,71 @@ test('a long happy line earns the laugh, a short one just a nod', () => {
   d.tick(5);  // nod over
   assert.deepEqual(names(d.say(30, { emotion: 'happy', seconds: 9 })), ['laugh']);
 });
+
+// ── calm-by-default behaviour (the owner bug: "the animation runs constantly") ──
+
+test('30 simulated idle minutes: sparse idle gestures, gaps >= 60 s, < 15 % gesture time', () => {
+  const d = new Director({ random: seq(0.5, 0.31, 0.72, 0.05, 0.64, 0.48, 0.9, 0.22) });
+  d.start(0);
+  const starts = [];   // [name, t]
+  let endsAt = -1;     // when the running one-shot ends (loops would run longer; none idle)
+  let gestureSeconds = 0;
+  let t = 0;
+  for (let i = 0; i < 1800 * 4 && t <= 1800; i++) {
+    t = Math.min(1800, i * 0.25);
+    for (const a of d.tick(t)) {
+      if (a.type === 'gesture') {
+        starts.push([a.name, t]);
+        endsAt = t + a.duration;
+        gestureSeconds += Math.min(a.duration, 1800 - t);
+      }
+    }
+  }
+  const idleFires = starts.filter(([n]) => n !== 'wave');
+  // after 10 quiet minutes she arms the welcome-back wave and goes still
+  // (RETURN_AFTER_IDLE), so expect idle gestures in the first ~10 minutes
+  assert.ok(idleFires.length >= 4 && idleFires.length <= 20,
+    `expected a sparse run of idle gestures in 30 min, got ${idleFires.length}`);
+  for (let i = 1; i < idleFires.length; i++) {
+    const gap = idleFires[i][1] - idleFires[i - 1][1];
+    assert.ok(gap >= 60 - 0.01, `idle gestures ${idleFires[i - 1]} -> ${idleFires[i]} only ${gap.toFixed(1)}s apart`);
+  }
+  const frac = gestureSeconds / 1800;
+  assert.ok(frac < 0.15, `gesture time ${Math.round(frac * 100)}% of the half hour — too busy`);
+  void endsAt;
+});
+
+test('repeated identical status events never restart gestures or re-arm timers', () => {
+  const d = new Director({ random: seq(0.5, 0.5, 0.5) });
+  assert.deepEqual(names(d.status(0, 'thinking')), ['think']);
+  const running = { ...d.gesture };
+  const idleAt = d.nextIdleAt;
+  for (let t = 1; t < 60; t += 1) {
+    assert.deepEqual(d.status(t, 'thinking'), [], 'same status must be a no-op');
+    assert.deepEqual(d.status(t, 'thinking'), []);
+  }
+  assert.deepEqual({ ...d.gesture }, running, 'the think loop was restarted by status spam');
+  assert.equal(d.nextIdleAt, idleAt);
+  // a spammed idle status is a no-op too
+  d.status(60, 'idle');
+  const g = { ...d.gesture };
+  for (let t = 61; t < 90; t++) assert.deepEqual(d.status(t, 'idle'), []);
+  assert.deepEqual({ ...d.gesture }, g);
+  // a status event without a state (old hub / malformed) is ignored, not a crash
+  assert.deepEqual(d.status(91, undefined), []);
+  assert.deepEqual(d.status(92, null), []);
+});
+
+test('persona events for the same id + avatar_version do not re-wave', () => {
+  const d = new Director({ random: seq(0.5, 0.5) });
+  assert.deepEqual(names(d.persona(0, { id: 'riko', avatar_version: 3 })), ['wave']);
+  d.tick(3);  // wave over
+  assert.deepEqual(d.persona(3, { id: 'riko', avatar_version: 3 }), [], 'stale echo ignored');
+  assert.deepEqual(names(d.persona(4, { id: 'asuka', avatar_version: 1 })), ['wave'], 'a real switch still waves');
+  d.tick(7);
+  assert.deepEqual(names(d.persona(10, { id: 'riko', avatar_version: 3 })), ['wave'], 'and switching back waves');
+  d.tick(13);
+  // legacy callers without info still wave
+  assert.deepEqual(names(d.persona(20)), ['wave']);
+});
+

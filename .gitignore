@@ -15,3 +15,7 @@ hub_data/
 chat_history.json.imported
 tts/data/*
 !tts/data/.gitkeep
+
+# node dev deps for client/js tests
+client/node_modules/
+client/package-lock.json

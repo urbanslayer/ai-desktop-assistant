@@ -8,7 +8,7 @@
 //   status(now, state)            listening / hearing / thinking / speaking / idle
 //   say(now, {emotion, seconds})  a spoken line (emotion from the hub, may be absent)
 //   heard(now)                    the user's words arrived
-//   persona(now)                  the persona (and body) changed
+//   persona(now, info)              the persona (and body) changed; info = {id, avatar_version}
 //   error(now)                    something went wrong
 //   tick(now)                     every frame; runs timers (gesture end, cooldowns,
 //                                 idle gestures, talk gestures, 10-min idle)
@@ -81,6 +81,7 @@ export class Director {
     this.nextIdleAt = Infinity;
     this.nextTalkAt = Infinity;
     this.lastTalk = null;
+    this._personaKey = null;      // last persona id+version the page was told about
   }
 
   // ── inputs ──────────────────────────────────────────────────
@@ -91,7 +92,15 @@ export class Director {
     return this.#play('wave', now, { priority: PRIO_RETURN });
   }
 
-  persona(now) {
+  /**
+   * The persona (and body) changed. Pass the event's `{id, avatar_version}`
+   * when you have it: repeated events for the SAME persona/version are
+   * ignored, so a re-emitted hub event never re-waves or re-loads her.
+   */
+  persona(now, info = {}) {
+    const key = info && info.id != null ? `${info.id}:${info.avatar_version}` : null;
+    if (key && key === this._personaKey) return [];   // same persona, stale echo
+    if (key) this._personaKey = key;
     this.lastActivity = now;
     this.returnWave = false;
     return this.#play('wave', now, { priority: PRIO_PERSONA, noCooldown: true });
@@ -116,7 +125,10 @@ export class Director {
   }
 
   status(now, state) {
-    if (state === this.state) return [];
+    // repeated identical status (a state poll re-announcing the same state, a
+    // hub replaying events after a restart) is a no-op: it must never restart
+    // a running loop or re-arm timers
+    if (!state || state === this.state) return [];
     this.state = state;
     this.#prunePending();
     const acts = [];

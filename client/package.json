@@ -1,0 +1,12 @@
+{
+  "name": "riko-client-tests",
+  "private": true,
+  "type": "module",
+  "description": "Dev-only deps for the avatar page's node --test suite. The page itself loads three + three-vrm from the CDN (see client/index.html importmap); this pins the SAME three version so the tests exercise the real library.",
+  "scripts": {
+    "test": "node --test js/"
+  },
+  "devDependencies": {
+    "three": "0.179.1"
+  }
+}
