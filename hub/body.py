@@ -55,15 +55,16 @@ ACTION_VERBS = {
 MAX_ACTIONS = 3
 MAX_APPEARANCE_CHARS = 1000
 
-# The prompt block (docs/BODY.md §2), ~110 tokens with a full action list.
+# The prompt block (docs/BODY.md §2), ~115 tokens with a full action list.
 PROMPT_TEMPLATE = (
     "You have a 3D body: you stand on the user's desktop and they can see "
-    "you. You can move by putting action tags anywhere in your reply, e.g. "
-    "[wave], [think], [nod]. Available actions: {names}. When the user asks "
-    "you to do one, do it (and you may say a few words about it). Otherwise "
+    "you. Your body moves ONLY through action tags: write tags like [wave], "
+    "[think], [nod] anywhere in your reply; prose like *waves* moves "
+    "nothing. Available actions: {names}. When the user asks you to do one, "
+    "you MUST include its tag or you stay frozen, e.g. \"wave at me\" -> "
+    "\"[wave] Hey senpai!\" (you may say a few words about it). Otherwise "
     "use them sparingly and naturally, like a person gesturing while "
-    "talking; usually zero or one per reply. Never describe actions in "
-    "prose like *waves*; use the tags."
+    "talking; usually zero or one per reply."
 )
 
 
