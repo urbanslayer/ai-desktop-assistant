@@ -121,7 +121,7 @@ def test_tts_route_cleans_before_breeze(tmp_path, fake_llm, fake_breeze):
     client = make_client(tmp_path, llm=fake_llm, tts=fake_breeze)
     r = client.post("/api/tts", json={"text": "Look https://x.example/y.gif, cute!\n\nmore"})
     assert r.status_code == 200
-    assert fake_breeze.speech_requests[-1]["input"] == "Look, cute!"
+    assert fake_breeze.speech_requests[-1]["input"] == "Look that website, cute!"
     # nothing speakable at all -> 422, never empty audio
     assert client.post("/api/tts", json={"text": "\U0001F602\U0001F602"}).status_code == 422
 
@@ -157,4 +157,5 @@ def test_prompt_tells_her_not_to_read_urls(tmp_path, fake_llm):
                                                 "http://127.0.0.1:9"}})
     client.post("/api/chat", json={"text": "hi"})
     system = fake_llm.chat_requests[-1]["messages"][0]["content"]
-    assert "instead of reading URLs aloud" in system
+    assert "never write a URL or website address" in system
+    assert "name the site instead" in system

@@ -6,23 +6,30 @@ text keeps everything; the AUDIO gets this cleaned text instead:
 
   * fenced code blocks and inline code spans are dropped (nobody dictates code),
   * markdown images are dropped; markdown links keep only the label,
-  * bare http(s):// and www. URLs are dropped,
-  * so are bare website names ("docs.godotengine.org"), hosts with a
-    path/port/query, and email addresses — while version numbers (3.10.2),
-    file names (config.yaml, main.py), decimals, abbreviations (e.g., U.S.)
-    and tech names (Node.js, ASP.NET, Socket.IO) stay,
-  * bracketed/parenthetical source citations like [1], [2, 3] or (source: x) go,
-  * markdown furniture goes: heading '#', '>' quotes, '-'/ '*' bullets,
-    emphasis '**' '*' '_' '~~', horizontal rules (the WORDS all stay),
+  * a bare URL, website name ("blender.org/download") or email that sits
+    INSIDE a sentence is spoken as a short site name, never dictated:
+    blender.org -> "Blender", docs.godotengine.org -> "the Godot Engine
+    docs" (well-known names, a subdomain hint like docs./wiki./forum./
+    store./shop./blog., a compound-label split, else title-cased label);
+    an email in a sentence becomes "their email address". Version numbers
+    (3.10.2), file names (config.yaml, main.py), decimals, abbreviations
+    (e.g., U.S.) and tech names (Node.js, ASP.NET, Socket.IO) stay as-is,
+  * URLs/domains that ARE the whole line, or dangle after a sentence end
+    ("Found one! https://..."), are still dropped, as are everything after
+    the first blank line, bracketed/parenthetical source citations like
+    [1], [2, 3] or (source: x), and markdown furniture: heading '#', '>'
+    quotes, '-'/ '*' bullets, emphasis '**' '*' '_' '~~', horizontal rules
+    (the WORDS of prose lines all stay),
   * emoji and other pictographs are dropped (breeze reads their names),
   * per docs/TOOLS.md A the spoken answer is the part before the first blank
     line: when the reply has a details/links section after one, only the first
     paragraph is spoken. If that first paragraph has nothing speakable left
     (it was all links), a short fallback line is spoken instead — a reply
     with words never becomes empty audio,
-  * seams left by link-shaped removals are tidied: "gave you, x.org ." is
+  * seams left by link-shaped REMOVALS are tidied: "gave you, x.org ." is
     spoken "gave you." (never ",." ";." ":." "— ." or a trailing ","/":"),
     and "( )", '""', a stranded dash or a dangling "at/on/from" go away.
+    A domain that became a site name fills its own gap and needs no tidy-up.
 
 `riko/speech.py` is the client-side mirror (the hub deploys standalone and the
 client must clean identically for tts: openai/sovits/fish). The two files are
@@ -34,7 +41,7 @@ a spoken URL in them) are regenerated.
 """
 import re
 
-SPEECH_RULES_VERSION = 3
+SPEECH_RULES_VERSION = 4
 
 # Spoken when the first paragraph had words but nothing speakable survived
 # (it was links / citations only).
@@ -122,18 +129,116 @@ _EMPTY_PAIR = re.compile(r"[\[(]\s*[\])]")
 _SENT_PUNCT = ".,;:!?'\""
 _DASH = "\u2013\u2014"  # en/em dashes only; a plain hyphen is too common in prose
 
+# ── speakable site names ─────────────────────────────────────────────────────
+# An email inside a sentence is never dictated letter by letter.
+EMAIL_PHRASE = "their email address"
+# Well-known brands keyed by registered domain (host minus subdomains).
+_SITE_NAMES = {
+    "github.com": "GitHub",
+    "youtube.com": "YouTube", "youtu.be": "YouTube",
+    "wikipedia.org": "Wikipedia",
+    "reddit.com": "Reddit",
+    "stackoverflow.com": "Stack Overflow",
+    "google.com": "Google",
+    "amazon.com": "Amazon", "amazon.co.uk": "Amazon",
+    "godotengine.org": "Godot Engine",
+    "python.org": "Python",
+    "blender.org": "Blender",
+    "mozilla.org": "Mozilla",
+    "x.com": "X", "twitter.com": "X",
+}
+# Brands whose name is the main label whatever the TLD is (amazon.de, ...).
+_SITE_LABELS = {"amazon": "Amazon"}
+# Subdomains say WHICH part of the site: docs.blender.org -> "the Blender docs".
+_SITE_HINTS = {"docs": "docs", "doc": "docs", "wiki": "wiki",
+               "forum": "forum", "forums": "forum",
+               "store": "store", "shop": "shop", "blog": "blog"}
+# Second-level TLDs: bbc.co.uk has its main label one deeper (bbc).
+_CC_SECOND = {"co", "com", "net", "org", "gov", "ac", "edu", "or", "ne", "in"}
+# Compound labels split on a known tail word: godotengine -> "Godot Engine",
+# archlinux -> "Arch Linux" (longest tails first).
+_SITE_WORDS = ("engine", "labs", "lab", "wiki", "docs", "doc", "apps", "app",
+               "tools", "tool", "linux", "space", "base", "zone", "world",
+               "works", "cloud", "news", "mag", "tube", "book")
+# Short brands title() would mangle into "Bbc".
+_SITE_ACRONYMS = {"bbc", "cnn", "npr", "ibm", "nasa", "espn", "fbi", "cia",
+                  "mit", "nhs", "usa", "uk"}
+# Sentence ends: words behind one belong to another sentence, so a domain
+# after "Found one!" is a dangling link, not a sentence constituent.
+_SENT_END = ".!?\u2026"
+# Leading characters that never make text after a link "continue the sentence".
+_STRIP_FRONT = ")]}\\\"'\u201c\u201d\u2019\u2026\u2014\u2013,;:- \t"
 
-def _trim_url(match) -> str:
+
+def _split_tail(u: str):
     """A bare URL eats every non-space after it, but sentence punctuation at
-    its tail is prose ('...gif, cute!') — put that punctuation back."""
-    u, kept = match.group(0), ""
+    its tail is prose ('...gif, cute!') — split it off as (url, kept)."""
+    kept = ""
     while u:
         ch = u[-1]
         if ch in _SENT_PUNCT or (ch == ")" and "(" not in u):
             kept, u = ch + kept, u[:-1]
         else:
             break
-    return kept
+    return u, kept
+
+
+def _trim_url(match) -> str:
+    """Kept sentence punctuation of a dropped URL-ish match."""
+    return _split_tail(match.group(0))[1]
+
+
+def _prettify_label(label: str) -> str:
+    """'godotengine' -> 'Godot Engine'; 'bbc' -> 'BBC'; unsure -> title-cased."""
+    word = label.lower().replace("-", "").replace("_", "")
+    if not word:
+        return "that website"
+    if word in _SITE_ACRONYMS:
+        return word.upper()
+    for tail in _SITE_WORDS:
+        if word.endswith(tail) and len(word) > len(tail):
+            return word[: -len(tail)].title() + " " + tail.title()
+    return word.title()
+
+
+def _site_name(host: str) -> str:
+    """Short speakable name for a host: 'blender.org/download's host
+    'blender.org' -> 'Blender'; 'docs.godotengine.org' -> 'the Godot Engine
+    docs'; unknown single-letter labels -> 'that website'."""
+    labels = [p for p in str(host).lower().split(".") if p]
+    if len(labels) > 2 and labels[0] == "www":
+        labels = labels[1:]
+    if len(labels) < 2:
+        return labels[0].title() if labels else "that website"
+    if len(labels) >= 3 and labels[-2] in _CC_SECOND:
+        main, root = labels[-3], ".".join(labels[-3:])
+    else:
+        main, root = labels[-2], ".".join(labels[-2:])
+    name = _SITE_NAMES.get(root) or _SITE_LABELS.get(main)
+    if name is None:
+        name = _prettify_label(main) if len(main) > 1 else "that website"
+    hint = _SITE_HINTS.get(labels[0])
+    if hint and len(labels) >= 3 and name != "that website":
+        name = "the %s %s" % (name, hint)
+    return name
+
+
+def _in_sentence(match) -> bool:
+    """True when the link-shaped match sits INSIDE a sentence — other words
+    of the same sentence before it, or the sentence continuing after it.
+    A link that is the whole line, or dangles after a sentence end
+    ("Found one! https://..."), is not a constituent and stays dropped."""
+    s = match.string
+    line_start = s.rfind("\n", 0, match.start()) + 1
+    line_end = s.find("\n", match.end())
+    line_end = len(s) if line_end < 0 else line_end
+    before = s[line_start:match.start()]
+    after = s[match.end():line_end]
+    if not (_HAS_WORD.search(before) or _HAS_WORD.search(after)):
+        return False
+    same_sentence = re.split("[%s]" % _SENT_END, before)[-1]
+    return bool(_HAS_WORD.search(same_sentence)
+                or _HAS_WORD.search(after.lstrip(_STRIP_FRONT)))
 
 
 def _domain_survives(match) -> bool:
@@ -144,10 +249,36 @@ def _domain_survives(match) -> bool:
             or host.rsplit(".", 1)[-1] in _FILE_EXTS)
 
 
+def _name_url(match) -> str:
+    core, kept = _split_tail(match.group(0))
+    if not _in_sentence(match):
+        return kept
+    host = re.split(r"[/?#:]", re.sub(r"^(?:https?://|www\.)", "", core,
+                                      flags=re.I), maxsplit=1)[0]
+    return _site_name(host) + kept
+
+
+def _name_angle(match) -> str:
+    inner = re.sub(r"^(?:https?://|www\.|mailto:)", "",
+                   match.group(0).strip("<> \t"), flags=re.I)
+    if not _in_sentence(match):
+        return " "
+    if "@" in inner:
+        return EMAIL_PHRASE
+    return _site_name(re.split(r"[/?#:]", inner, maxsplit=1)[0])
+
+
+def _name_email(match) -> str:
+    return EMAIL_PHRASE if _in_sentence(match) else " "
+
+
 def _drop_domain(match) -> str:
     if _domain_survives(match):
         return match.group(0)
-    return _trim_url(match)  # keeps sentence punctuation at the tail of a path
+    kept = _trim_url(match)  # keeps sentence punctuation at the tail of a path
+    if not _in_sentence(match):
+        return kept
+    return _site_name(match.group("host")) + kept
 
 
 def _collapse(text: str) -> str:
@@ -155,17 +286,18 @@ def _collapse(text: str) -> str:
 
 
 def clean_body(reply: str) -> str:
-    """All removal rules over the whole reply (paragraph split comes after,
-    so a URL-only paragraph still 'counts' as the first paragraph)."""
+    """All removal/replacement rules over the whole reply (paragraph split
+    comes after, so a URL-only paragraph still 'counts' as the first
+    paragraph)."""
     text = str(reply or "")
     text = _FENCE.sub(" ", text)
     text = _FENCE_MARK.sub(" ", text)
     text = _INLINE_CODE.sub(" ", text)
     text = _MD_IMAGE.sub(" ", text)
     text = _MD_LINK.sub(lambda m: m.group(1), text)
-    text, n_angle = _ANGLE_URL.subn(" ", text)
-    text, n_url = _URL.subn(_trim_url, text)
-    text, n_mail = _EMAIL.subn(" ", text)
+    text, n_angle = _ANGLE_URL.subn(_name_angle, text)
+    text, n_url = _URL.subn(_name_url, text)
+    text, n_mail = _EMAIL.subn(_name_email, text)
     text, n_dom = _DOMAIN.subn(_drop_domain, text)
     # did a link-shaped removal strand a preposition or dash on the seam?
     left_gaps = bool(n_angle or n_url or n_mail or n_dom)
@@ -182,9 +314,12 @@ def clean_body(reply: str) -> str:
     # tidy seams left by removals: "words , more" / "words . more" / " ,".
     # Only where the punctuation really ends a clause (space/punct/EOL after
     # it): otherwise "the .NET runtime" loses the space before a file-name-
-    # style token like ".NET".
+    # style token like ".NET". Stray spaces inside brackets/quotes ("(x )")
+    # go wherever they show up — named replacements leave those too.
     text = re.sub(r"[ \t]+([,.;:!?])(?=[\s,.;:!?\u2013\u2014]|\Z)", r"\1", text)
     text = re.sub(r"(?m)^[,.;:!?][ \t]+", "", text)
+    text = re.sub(r"([\[(])[ \t]+", r"\1", text)
+    text = re.sub(r"[ \t]+([\])])", r"\1", text)
     if left_gaps:
         # "senpai —, the" -> "senpai — the"; a dash stranded before sentence
         # punctuation / EOL, doubled dashes, and an 'at/on/from' left

@@ -5,19 +5,19 @@
     "expect": "Hey senpai, nothing to clean here."
   },
   {
-    "name": "bare https url dropped",
+    "name": "trailing url after sentence end stays dropped",
     "input": "Found one! https://i.imgur.com/cat.gif",
     "expect": "Found one!"
   },
   {
-    "name": "url mid sentence dropped",
+    "name": "url mid sentence named",
     "input": "The docs live at https://docs.godotengine.org/en/latest/ by the way.",
-    "expect": "The docs live at by the way."
+    "expect": "The docs live at the Godot Engine docs by the way."
   },
   {
-    "name": "www url dropped",
+    "name": "www url named",
     "input": "Check www.example.com for it, senpai.",
-    "expect": "Check for it, senpai."
+    "expect": "Check Example for it, senpai."
   },
   {
     "name": "markdown link keeps label",
@@ -150,14 +150,14 @@
     "expect": "Hey senpai, nothing to clean here."
   },
   {
-    "name": "angle url dropped",
+    "name": "angle url named",
     "input": "Link is <https://x.example/y> for you.",
-    "expect": "Link is for you."
+    "expect": "Link is that website for you."
   },
   {
     "name": "url with trailing punctuation",
     "input": "Try godotengine.org. No — try https://godotengine.org!",
-    "expect": "Try. No — try!"
+    "expect": "Try Godot Engine. No — try Godot Engine!"
   },
   {
     "name": "empty brackets tidied",
@@ -182,87 +182,87 @@
   {
     "name": "url trailing comma stays prose",
     "input": "Look https://x.example/y.gif, cute!",
-    "expect": "Look, cute!"
+    "expect": "Look that website, cute!"
   },
   {
-    "name": "url in parens leaves no empty pair",
+    "name": "url in parens named",
     "input": "See (https://x.example) for more.",
-    "expect": "See for more."
+    "expect": "See (that website) for more."
   },
   {
-    "name": "bare website name dropped after dash",
+    "name": "bare website name named after dash",
     "input": "Here you go, senpai — docs.godotengine.org, the official Godot docs.",
-    "expect": "Here you go, senpai — the official Godot docs."
+    "expect": "Here you go, senpai — the Godot Engine docs, the official Godot docs."
   },
   {
-    "name": "bare domain mid sentence dropped",
+    "name": "bare domain mid sentence named",
     "input": "I checked github.com and it works.",
-    "expect": "I checked and it works."
+    "expect": "I checked GitHub and it works."
   },
   {
-    "name": "domain with path dropped",
+    "name": "domain with path named",
     "input": "See godotengine.org/docs/manual, it's great.",
-    "expect": "See, it's great."
+    "expect": "See Godot Engine, it's great."
   },
   {
-    "name": "domain with port and path dropped",
+    "name": "domain with port and path named",
     "input": "Check example.com:8080/status first.",
-    "expect": "Check first."
+    "expect": "Check Example first."
   },
   {
-    "name": "domain with query dropped",
+    "name": "domain with query named",
     "input": "I opened riko.app/settings?tab=voice, neat.",
-    "expect": "I opened, neat."
+    "expect": "I opened Riko, neat."
   },
   {
-    "name": "multi-dot unknown tld dropped",
+    "name": "multi-dot unknown tld named",
     "input": "ping api.foo.bar twice",
-    "expect": "ping twice"
+    "expect": "ping Foo twice"
   },
   {
-    "name": "unknown tld with port dropped, dangling on goes",
+    "name": "unknown tld with port named",
     "input": "The hub runs on eve.local:8080.",
-    "expect": "The hub runs."
+    "expect": "The hub runs on Eve."
   },
   {
-    "name": "cc tld chain dropped",
+    "name": "cc tld chain acronym named",
     "input": "Visit bbc.co.uk for news.",
-    "expect": "Visit for news."
+    "expect": "Visit BBC for news."
   },
   {
-    "name": "uppercase domain dropped",
+    "name": "uppercase domain named",
     "input": "GOOGLE.COM is down",
-    "expect": "is down"
+    "expect": "Google is down"
   },
   {
-    "name": "dangling at dropped with domain",
+    "name": "domain after at named",
     "input": "Hosted at example.com",
-    "expect": "Hosted"
+    "expect": "Hosted at Example"
   },
   {
-    "name": "dangling from dropped with domain",
+    "name": "domain after from named",
     "input": "Copied from archlinux.org.",
-    "expect": "Copied."
+    "expect": "Copied from Arch Linux."
   },
   {
-    "name": "email dropped",
+    "name": "email in sentence named",
     "input": "Email riko@example.com to reach me.",
-    "expect": "Email to reach me."
+    "expect": "Email their email address to reach me."
   },
   {
-    "name": "mailto email dropped",
+    "name": "mailto email named",
     "input": "Contact mailto:riko@example.com anytime.",
-    "expect": "Contact anytime."
+    "expect": "Contact their email address anytime."
   },
   {
     "name": "email after at leaves no dangling prep",
     "input": "Reach me at riko@example.com, senpai!",
-    "expect": "Reach me, senpai!"
+    "expect": "Reach me at their email address, senpai!"
   },
   {
-    "name": "email mid sentence dropped",
+    "name": "email mid sentence named",
     "input": "Emailed senpai@riko.dev already.",
-    "expect": "Emailed already."
+    "expect": "Emailed their email address already."
   },
   {
     "name": "domain-only reply fallback",
@@ -277,12 +277,12 @@
   {
     "name": "domain path keeps sentence period",
     "input": "Read example.com/docs. It helps.",
-    "expect": "Read. It helps."
+    "expect": "Read Example. It helps."
   },
   {
     "name": "domain in first para, url in details",
     "input": "Details: godotengine.org\n\nDocs at https://godotengine.org/docs",
-    "expect": "Details."
+    "expect": "Details: Godot Engine"
   },
   {
     "name": "version number kept",
@@ -360,78 +360,168 @@
     "expect": "app.js has a bug."
   },
   {
-    "name": "clause-end domain leaves no dangling comma",
+    "name": "clause-end domain named",
     "input": "Here it is again, senpai — the same link I already gave you, docs.godotengine.org.",
-    "expect": "Here it is again, senpai — the same link I already gave you."
+    "expect": "Here it is again, senpai — the same link I already gave you, the Godot Engine docs."
   },
   {
     "name": "trailing domain without punctuation",
     "input": "I saw it on reddit.com",
-    "expect": "I saw it"
+    "expect": "I saw it on Reddit"
   },
   {
-    "name": "domain inside parentheses falls back",
+    "name": "domain inside parentheses named",
     "input": "(see docs.godotengine.org)",
-    "expect": "I put the link on screen."
+    "expect": "(see the Godot Engine docs)"
   },
   {
     "name": "email before comma clause kept",
     "input": "email me at a@b.com, okay?",
-    "expect": "email me, okay?"
+    "expect": "email me at their email address, okay?"
   },
   {
     "name": "domain before bang",
     "input": "visit docs.godotengine.org!",
-    "expect": "visit!"
+    "expect": "visit the Godot Engine docs!"
   },
   {
     "name": "domain before question mark",
     "input": "did you see docs.godotengine.org?",
-    "expect": "did you see?"
+    "expect": "did you see the Godot Engine docs?"
   },
   {
-    "name": "trailing colon after domain becomes ending",
+    "name": "trailing colon before domain kept",
     "input": "link: docs.godotengine.org",
-    "expect": "link."
+    "expect": "link: the Godot Engine docs"
   },
   {
     "name": "trailing comma after domain becomes ending",
     "input": "the link is example.com,",
-    "expect": "the link is."
+    "expect": "the link is Example."
   },
   {
     "name": "dash dot seam after domain",
     "input": "thanks again — docs.godotengine.org.",
-    "expect": "thanks again."
+    "expect": "thanks again — the Godot Engine docs."
   },
   {
     "name": "at dot seam after domain",
     "input": "meet me at example.com.",
-    "expect": "meet me."
+    "expect": "meet me at Example."
   },
   {
     "name": "semicolon dot seam after domain",
     "input": "hosted; example.com.",
-    "expect": "hosted."
+    "expect": "hosted; Example."
   },
   {
     "name": "doubled comma seam after domain",
     "input": "the link, example.com , works fine",
-    "expect": "the link, works fine"
+    "expect": "the link, Example, works fine"
   },
   {
     "name": "empty quotes after quoted domain",
     "input": "I read \"docs.godotengine.org\" once",
-    "expect": "I read once"
+    "expect": "I read \"the Godot Engine docs\" once"
   },
   {
     "name": "space before closer parens after domain",
     "input": "the site (docs.godotengine.org ) is great",
-    "expect": "the site is great"
+    "expect": "the site (the Godot Engine docs) is great"
   },
   {
     "name": "dash space dot seam mid reply",
     "input": "all set — docs.godotengine.org . enjoy",
-    "expect": "all set. enjoy"
+    "expect": "all set — the Godot Engine docs. enjoy"
+  },
+  {
+    "name": "live example: obsessive link named not deleted",
+    "input": "Senpai, you're getting a bit obsessive, aren't you? Same link: docs.godotengine.org — and it's already open in your Firefox tab too.",
+    "expect": "Senpai, you're getting a bit obsessive, aren't you? Same link: the Godot Engine docs — and it's already open in your Firefox tab too."
+  },
+  {
+    "name": "live example: blender download source named",
+    "input": "Right here, senpai — blender.org/download is the official source, free and open source forever.",
+    "expect": "Right here, senpai — Blender is the official source, free and open source forever."
+  },
+  {
+    "name": "youtube named in sentence",
+    "input": "Watch it on youtube.com later, senpai.",
+    "expect": "Watch it on YouTube later, senpai."
+  },
+  {
+    "name": "wikipedia language subdomain named",
+    "input": "According to en.wikipedia.org, Godot started in Argentina.",
+    "expect": "According to Wikipedia, Godot started in Argentina."
+  },
+  {
+    "name": "stackoverflow named",
+    "input": "Someone already asked on stackoverflow.com.",
+    "expect": "Someone already asked on Stack Overflow."
+  },
+  {
+    "name": "wiki subdomain hint",
+    "input": "Ping me on wiki.riko.dev, senpai.",
+    "expect": "Ping me on the Riko wiki, senpai."
+  },
+  {
+    "name": "forum subdomain hint",
+    "input": "Fans argue about it on forum.blender.org daily.",
+    "expect": "Fans argue about it on the Blender forum daily."
+  },
+  {
+    "name": "blog subdomain hint",
+    "input": "Read the announcement at blog.mozilla.org.",
+    "expect": "Read the announcement at the Mozilla blog."
+  },
+  {
+    "name": "store subdomain hint",
+    "input": "Buy it at store.blender.org if you like.",
+    "expect": "Buy it at the Blender store if you like."
+  },
+  {
+    "name": "docs hint with compound brand label",
+    "input": "The tutorial is on docs.python.org.",
+    "expect": "The tutorial is on the Python docs."
+  },
+  {
+    "name": "docs hint on unknown compound site",
+    "input": "See docs.myapp.io for details.",
+    "expect": "See the My App docs for details."
+  },
+  {
+    "name": "unknown domain falls back to title-cased label",
+    "input": "The mod lives on somerandomsite.xyz, senpai.",
+    "expect": "The mod lives on Somerandomsite, senpai."
+  },
+  {
+    "name": "single-letter label unknown site phrase",
+    "input": "Open z.dev right now.",
+    "expect": "Open that website right now."
+  },
+  {
+    "name": "twitter maps to X",
+    "input": "Trending on twitter.com today.",
+    "expect": "Trending on X today."
+  },
+  {
+    "name": "amazon whatever tld",
+    "input": "It's cheaper on amazon.de, senpai.",
+    "expect": "It's cheaper on Amazon, senpai."
+  },
+  {
+    "name": "whole-line domain inside first para dropped",
+    "input": "Got it.\nblender.org\n\nDetails later.",
+    "expect": "Got it."
+  },
+  {
+    "name": "url after sentence end stays dropped",
+    "input": "Nice! https://youtube.com/watch?v=abc",
+    "expect": "Nice!"
+  },
+  {
+    "name": "email inside sentence with comma",
+    "input": "Send feedback to hello@riko.dev, please.",
+    "expect": "Send feedback to their email address, please."
   }
 ]
