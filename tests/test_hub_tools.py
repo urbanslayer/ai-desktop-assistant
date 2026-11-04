@@ -302,7 +302,8 @@ def test_api_tools_lists_builtins(tmp_path):
     client, _ = llm_client(tmp_path, [{"content": "ok"}])  # no searxng url
     out = client.get("/api/tools").json()
     by = {t["name"]: t for t in out["tools"]}
-    assert set(by) == {"web_search", "fetch_page", "get_time"}
+    assert set(by) == {"web_search", "fetch_page", "get_time",
+                       "remember", "recall", "forget_fact"}  # memory round M
     assert by["web_search"]["available"] is False   # no SearXNG configured
     assert by["get_time"]["available"] is True
     assert all(t["permission"] == "always" and t["source"] == "hub" for t in by.values())

@@ -30,6 +30,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from . import brain as _brain
     from . import clients as _clients
     from . import emotion as _emotion
+    from . import memory as _memory
     from . import speech as _speech
     from . import voice as _voice
     from .clients import ClientHub
@@ -38,6 +39,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
                              sdk_available as mcp_available,
                              validate_servers as validate_mcp_servers)
     from .toolloop import run_turn
+    from .tools.memory_tools import build_memory_specs
     from .tools.registry import build_hub_specs, hub_tool_info, permission_for, tools_prompt
     from .store import Store, default_voice, now_iso
 except ImportError:  # standalone: modules sit next to this file (Docker: /app)
@@ -45,6 +47,7 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     import brain as _brain  # type: ignore[no-redef]
     import clients as _clients  # type: ignore[no-redef]
     import emotion as _emotion  # type: ignore[no-redef]
+    import memory as _memory  # type: ignore[no-redef]
     import speech as _speech  # type: ignore[no-redef]
     import voice as _voice  # type: ignore[no-redef]
     from clients import ClientHub  # type: ignore[no-redef]
@@ -54,6 +57,7 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
                             sdk_available as mcp_available,
                             validate_servers as validate_mcp_servers)
     from toolloop import run_turn  # type: ignore[no-redef]
+    from tools.memory_tools import build_memory_specs  # type: ignore[no-redef]
     from tools.registry import (build_hub_specs, hub_tool_info,  # type: ignore[no-redef]
                                 permission_for, tools_prompt)
     from store import Store, default_voice, now_iso  # type: ignore[no-redef]
@@ -93,6 +97,14 @@ TOOLS_DEFAULTS = {
 # MCP settings defaults (docs/ROUNDS.md R2-M): no servers out of the box.
 MCP_DEFAULTS = {"servers": []}
 
+# Long-term memory settings (docs/WALK_MEMORY.md M). No env defaults: the
+# block is exactly the built-in defaults plus what the owner saved.
+MEMORY_DEFAULTS = {
+    "enabled": True,             # off = no prompt block, no memory tools
+    "prompt_budget_tokens": 600,  # cap for the "What you remember" block
+    "auto_remember": True,       # false = only remember when explicitly asked
+}
+
 # Seed persona: the system prompt copied from character_config.yaml at build
 # time (the Docker image has no access to that file).
 SEED_PERSONA = {
@@ -130,7 +142,8 @@ def normalize_switch_text(text: str) -> str:
 def create_app(data_dir, api_key: str | None = None,
                llm_defaults: dict | None = None,
                tts_defaults: dict | None = None,
-               tools_defaults: dict | None = None) -> FastAPI:
+               tools_defaults: dict | None = None,
+               memory_defaults: dict | None = None) -> FastAPI:
     """Build the hub app over `data_dir` (SQLite + avatars live there).
 
     api_key None/empty disables auth. llm_defaults fills any LLM settings
@@ -158,6 +171,7 @@ def create_app(data_dir, api_key: str | None = None,
     llm_defaults = dict(llm_defaults or {})
     tts_defaults = dict(tts_defaults or {})
     tools_defaults = dict(tools_defaults or {})
+    memory_defaults = dict(memory_defaults or {})
     app = FastAPI(title="riko-hub", version=HUB_VERSION, docs_url=None, redoc_url=None)
     chat_lock = threading.Lock()  # one chat at a time; concurrent requests queue
     events = EventBus()           # GET /api events ring buffer (R1-B)
@@ -271,6 +285,25 @@ def create_app(data_dir, api_key: str | None = None,
 
     tools_status = ToolsStatus()
 
+    # ── memory settings (docs/WALK_MEMORY.md M) ─────────────────────────
+    # No blank-means-unset keys: every memory key is a bool/int, and a blank
+    # in the page just means "don't change it" (the page omits the key).
+    def stored_memory() -> dict:
+        saved = store.get_json("memory", {})
+        return dict(saved) if isinstance(saved, dict) else {}
+
+    def default_memory() -> dict:
+        merged = dict(MEMORY_DEFAULTS)
+        merged.update(memory_defaults)
+        merged["enabled"] = bool(merged.get("enabled"))
+        merged["auto_remember"] = bool(merged.get("auto_remember", True))
+        return merged
+
+    def memory_settings() -> dict:
+        merged = default_memory()
+        merged.update(stored_memory())
+        return merged
+
     # ── MCP settings + manager (docs/ROUNDS.md R2-M) ───────────────────
     # settings `mcp.servers` has no env default: the list is exactly what
     # the user saved. The manager owns one asyncio loop thread for all
@@ -300,20 +333,26 @@ def create_app(data_dir, api_key: str | None = None,
         tools_source = {k: ("saved" if k in saved_tools else "default")
                         for k in TOOLS_DEFAULTS}
         has_mcp = isinstance(stored_mcp().get("servers"), list)
+        saved_memory = stored_memory()
+        memory_source = {k: ("saved" if k in saved_memory else "default")
+                         for k in MEMORY_DEFAULTS}
         return {
             "llm": public_llm(llm_settings()),
             "tts": tts_settings(),
             "tools": tools_settings(),
+            "memory": memory_settings(),
             "mcp": {"servers": public_mcp_servers(mcp_servers())},
             "switch_phrases": switch_phrases(),
             "defaults": {"llm": defaults_public,
                          "tts": default_tts(),
                          "tools": default_tools(),
+                         "memory": default_memory(),
                          "mcp": dict(MCP_DEFAULTS, servers=[]),
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES)},
             "llm_source": source,
             "tts_source": tts_source,
             "tools_source": tools_source,
+            "memory_source": memory_source,
             "mcp_source": {k: ("saved" if has_mcp else "default")
                            for k in MCP_DEFAULTS},
         }
@@ -588,11 +627,14 @@ def create_app(data_dir, api_key: str | None = None,
             return err(409, "cannot delete the last persona")
         was_active = store.active() == persona_id
         message_ids = store.message_ids(persona_id)
-        store.delete_persona(persona_id)
+        fact_ids = store.delete_persona(persona_id)
         (avatars_dir / f"{persona_id}.vrm").unlink(missing_ok=True)
         reference_path(persona_id).unlink(missing_ok=True)
         delete_message_audio(message_ids)
         delete_persona_audio(persona_id)
+        # memory round: the persona's private notes died with it
+        for fid in fact_ids:
+            events.publish("memory_changed", id=fid, op="deleted")
         if was_active:
             store.set_active(remaining[0])
         bump_state()
@@ -765,10 +807,20 @@ def create_app(data_dir, api_key: str | None = None,
                 # offered tools: hub built-ins + online client tools, minus
                 # anything the permission table says `never` (docs/ROUNDS.md)
                 tools_cfg = tools_settings()
+                mem_cfg = memory_settings()
+                memory_writes: list = []
                 specs: list = []
                 if tools_cfg.get("enabled"):
                     permissions = tools_cfg.get("permissions") or {}
-                    for s in build_hub_specs(tools_cfg):
+                    hub_specs = build_hub_specs(tools_cfg)
+                    # memory round (docs/WALK_MEMORY.md M): remember/recall/
+                    # forget_fact ride the tool loop, default permission
+                    # always, and vanish when memory or tools are off
+                    if mem_cfg.get("enabled"):
+                        hub_specs += build_memory_specs(
+                            store, events, pid, memory_writes,
+                            auto_remember=bool(mem_cfg.get("auto_remember", True)))
+                    for s in hub_specs:
                         if permission_for(s.name, "hub", s.risk, permissions) != "never":
                             specs.append(s)
                     for s in clients_hub.online_tool_specs():
@@ -799,6 +851,20 @@ def create_app(data_dir, api_key: str | None = None,
                 appearance = str(persona.get("appearance") or "").strip()
                 if appearance:
                     system += "\n\n" + _body.appearance_prompt(appearance)
+                # memory round: the "What you remember" block goes in even
+                # when the tool loop is off (facts stay useful as notes); the
+                # memory tools themselves only exist while tools are on.
+                memory_facts: list = []
+                if mem_cfg.get("enabled"):
+                    ordered_facts = _memory.gather_facts(store, text, pid)
+                    block, memory_facts = _memory.build_memory_block(
+                        ordered_facts,
+                        bool(mem_cfg.get("auto_remember", True)),
+                        any(s.name == "remember" for s in specs),
+                        int(mem_cfg.get("prompt_budget_tokens") or 600))
+                    if block:
+                        system += "\n\n" + block
+                        store.touch_facts([f["id"] for f in memory_facts])
                 if offered_names:
                     system += "\n\n" + tools_prompt(offered_names)
 
@@ -840,7 +906,8 @@ def create_app(data_dir, api_key: str | None = None,
                 spoken = _speech.speech_text(answer)
                 assistant_id = store.add_message(pid, "assistant", answer, source,
                                                  emotion=emotion, tools=tools_used,
-                                                 actions=actions, speech=spoken)
+                                                 actions=actions, speech=spoken,
+                                                 memory_writes=memory_writes)
                 bump_state()
                 events.publish("turn_finished", persona=pid,
                                message_id=assistant_id, emotion=emotion,
@@ -853,6 +920,7 @@ def create_app(data_dir, api_key: str | None = None,
                 return ("ok", {"reply": answer, "persona": pid, "switched": False,
                                "emotion": emotion, "tools_used": tools_used,
                                "actions": actions, "speech": spoken,
+                               "memory_writes": memory_writes,
                                "message_ids": [user_id, assistant_id],
                                "state_version": store.version(),
                                "audio_url": audio_url})
@@ -990,6 +1058,24 @@ def create_app(data_dir, api_key: str | None = None,
                     cleaned_perms[str(name)[:80]] = str(perm)
                 saved_tools["permissions"] = cleaned_perms
             store.set_json("tools", saved_tools)
+        if "memory" in body:
+            mem = body["memory"]
+            if not isinstance(mem, dict):
+                return err(422, "memory must be an object")
+            saved_mem = stored_memory()
+            for key in ("enabled", "auto_remember"):
+                if key in mem:
+                    if not isinstance(mem[key], bool):
+                        return err(422, f"memory.{key} must be a boolean")
+                    saved_mem[key] = mem[key]
+            if "prompt_budget_tokens" in mem:
+                raw = mem["prompt_budget_tokens"]
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                        or not 100 <= int(raw) <= 4000:
+                    return err(422, "memory.prompt_budget_tokens must be "
+                                    "an integer between 100 and 4000")
+                saved_mem["prompt_budget_tokens"] = int(raw)
+            store.set_json("memory", saved_mem)
         if "mcp" in body:
             mcp = body["mcp"]
             if not isinstance(mcp, dict):
@@ -1028,14 +1114,18 @@ def create_app(data_dir, api_key: str | None = None,
             changed |= store.del_json("tts")
         if body.get("tools"):
             changed |= store.del_json("tools")
+        if body.get("memory"):
+            changed |= store.del_json("memory")
         if body.get("mcp"):
             changed |= store.del_json("mcp")
             mcp_manager.sync(mcp_servers())
         if body.get("switch_phrases"):
             changed |= store.del_json("switch_phrases")
         if not (body.get("llm") or body.get("tts") or body.get("tools")
-                or body.get("mcp") or body.get("switch_phrases")):
-            return err(422, 'set "llm", "tts", "tools", "mcp" and/or "switch_phrases" to true')
+                or body.get("memory") or body.get("mcp")
+                or body.get("switch_phrases")):
+            return err(422, 'set "llm", "tts", "tools", "memory", "mcp" '
+                            'and/or "switch_phrases" to true')
         if changed:
             bump_state()
         return settings_response()
@@ -1432,6 +1522,149 @@ def create_app(data_dir, api_key: str | None = None,
     @app.get("/api/tools/status")
     def get_tools_status():
         return tools_status_response()
+
+    # ── long-term memory (docs/WALK_MEMORY.md M) ────────────────────────
+    def valid_fact_scope(scope: str) -> bool:
+        return scope == "user" or (
+            scope.startswith("persona:")
+            and store.persona_exists(scope[len("persona:"):]))
+
+    @app.get("/api/memory")
+    def get_memory(scope: str = "", q: str = "", limit: int = 200, offset: int = 0):
+        """Facts newest-first, or FTS-ranked when q is set. scope filters to
+        'user' or one persona's notes; blank = everything."""
+        limit = max(1, min(500, limit))
+        offset = max(0, offset)
+        scopes = None
+        if scope:
+            if not valid_fact_scope(scope):
+                return err(422, "scope must be 'user' or 'persona:<id>' of "
+                                "an existing persona")
+            scopes = [scope]
+        if q.strip():
+            facts = store.search_facts(q, scopes=scopes, limit=limit)
+            return {"facts": facts, "total": len(facts), "query": q.strip()}
+        facts, total = store.list_facts(scopes=scopes, limit=limit, offset=offset)
+        return {"facts": facts, "total": total}
+
+    @app.get("/api/memory/export")
+    def get_memory_export():
+        return {"version": 1, "exported_at": now_iso(),
+                "facts": store.export_facts()}
+
+    @app.post("/api/memory/import")
+    async def post_memory_import(request: Request):
+        """Feed facts back in (the export shape works as-is). Body
+        {facts: [{text, scope?, pinned?}], replace?: false}. New ids are
+        assigned; unknown persona scopes and empty texts reject the whole
+        import (all-or-nothing beats a half-restored memory)."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict) or not isinstance(body.get("facts"), list):
+            return err(422, 'body must be {"facts": [...]}')
+        items = body["facts"][:5000]
+        cleaned = []
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                return err(422, f"facts[{i}] must be an object")
+            text = _memory.clamp_fact_text(item.get("text"))
+            if not text:
+                return err(422, f"facts[{i}].text is required")
+            scope = str(item.get("scope") or "user")
+            if not valid_fact_scope(scope):
+                return err(422, f"facts[{i}].scope '{scope}' is not 'user' or "
+                                "an existing 'persona:<id>'")
+            cleaned.append((text, scope, bool(item.get("pinned"))))
+        deleted = 0
+        if body.get("replace"):
+            deleted = len(store.delete_all_facts())
+        imported = [store.add_fact(t, scope=s, pinned=p)
+                    for (t, s, p) in cleaned]
+        for f in imported:
+            events.publish("memory_changed", id=f["id"], op="added")
+        bump_state()
+        return {"imported": len(imported), "replaced": deleted}
+
+    @app.post("/api/memory", status_code=201)
+    async def post_memory(request: Request):
+        """Add a fact from the page: {text, scope?, pinned?}. Near-identical
+        text in the same scope updates the existing fact (same dedup as the
+        remember tool), so {"updated": true} can come back with 201."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        text = _memory.clamp_fact_text(body.get("text"))
+        if not text:
+            return err(422, "text is required")
+        scope = str(body.get("scope") or "user")
+        if not valid_fact_scope(scope):
+            return err(422, "scope must be 'user' or 'persona:<id>' of an "
+                            "existing persona")
+        fact, updated = store.upsert_fact(text, scope=scope,
+                                          pinned=bool(body.get("pinned")))
+        events.publish("memory_changed", id=fact["id"],
+                       op="updated" if updated else "added")
+        bump_state()
+        return {**fact, "updated": updated}
+
+    @app.put("/api/memory/{fact_id}")
+    async def put_memory(fact_id: int, request: Request):
+        """Edit a fact: {text?, pinned?} (inline edit / pin toggle)."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        text, pinned = None, None
+        if "text" in body:
+            text = _memory.clamp_fact_text(body.get("text"))
+            if not text:
+                return err(422, "text must not be empty")
+        if "pinned" in body:
+            if not isinstance(body["pinned"], bool):
+                return err(422, "pinned must be a boolean")
+            pinned = body["pinned"]
+        if text is None and pinned is None:
+            return err(422, "nothing to change: send text and/or pinned")
+        fact = store.update_fact(fact_id, text=text, pinned=pinned)
+        if not fact:
+            return err(404, f"no memory fact {fact_id}")
+        events.publish("memory_changed", id=fact_id, op="updated")
+        bump_state()
+        return fact
+
+    @app.delete("/api/memory/{fact_id}", status_code=204)
+    def delete_memory(fact_id: int):
+        if not store.delete_fact(fact_id):
+            return err(404, f"no memory fact {fact_id}")
+        events.publish("memory_changed", id=fact_id, op="deleted")
+        bump_state()
+        return Response(status_code=204)
+
+    @app.delete("/api/memory")
+    def delete_memory_all(scope: str = "all", confirm: str = ""):
+        """Forget everything. Needs confirm=yes (the page makes the user type
+        the word); scope selects 'all', 'user' or one persona's notes."""
+        if confirm != "yes":
+            return err(400, "confirm=yes required")
+        if scope == "all":
+            ids = store.delete_all_facts()
+        elif valid_fact_scope(scope):
+            ids = store.delete_facts_by_scope(scope)
+        elif scope.startswith("persona:"):
+            return err(404, f"no persona '{scope[len('persona:'):]}'")
+        else:
+            return err(422, "scope must be 'all', 'user' or 'persona:<id>'")
+        for fid in ids:
+            events.publish("memory_changed", id=fid, op="deleted")
+        bump_state()
+        return {"deleted": len(ids)}
 
     # ── MCP plug-ins (docs/ROUNDS.md R2-M, docs/API.md) ────────────────
     @app.get("/api/mcp/status")

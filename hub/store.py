@@ -12,7 +12,12 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+try:  # package import (repo root) vs standalone (`python server.py` in hub/)
+    from . import memory as _memory
+except (ImportError, SystemError):  # standalone: hub/ is on sys.path
+    import memory as _memory  # type: ignore[no-redef]
+
+SCHEMA_VERSION = 6
 
 # Voice migration for personas written before the voice round (docs/VOICE.md):
 # a bland design-mode voice with a random seed, so they keep talking after the
@@ -76,6 +81,38 @@ CREATE TABLE IF NOT EXISTS tool_log(
 );
 """
 
+# Long-term memory round (docs/WALK_MEMORY.md M): a facts table plus an FTS5
+# index. The FTS index is a plain content table kept in sync by triggers —
+# if this Python's SQLite has no FTS5 module the hub degrades to LIKE search
+# (Store.fts_enabled is then False) and nothing else changes.
+_SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS facts(
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  text              TEXT NOT NULL,
+  scope             TEXT NOT NULL DEFAULT 'user',   -- user | persona:<id>
+  pinned            INTEGER NOT NULL DEFAULT 0,
+  source_message_id INTEGER,                        -- the user message it came from
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  last_used_at      TEXT,                           -- last time it entered a prompt
+  use_count         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_facts_scope ON facts(scope, id);
+"""
+
+_SCHEMA_V6_FTS = """
+CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(text);
+CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+  INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+  DELETE FROM facts_fts WHERE rowid = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE OF text ON facts BEGIN
+  UPDATE facts_fts SET text = new.text WHERE rowid = new.id;
+END;
+"""
+
 
 def now_iso() -> str:
     """ISO-8601 UTC, second precision, e.g. 2026-11-03T18:00:00Z."""
@@ -91,6 +128,7 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
+        self.fts_enabled = True   # set False by _migrate when SQLite has no FTS5
         self._migrate()
 
     def close(self):
@@ -146,13 +184,38 @@ class Store:
             self.db.execute("PRAGMA user_version=4")
             self.db.commit()
         if version < 5:  # spoken-text round: the cleaned TTS text of a reply
-            # (hub/speech.py). Display keeps `content`; clients doing their own
-            # TTS speak `speech`. Old rows stay '' and get cleaned on read.
+            # (hub/speech.py). Display keeps `content`; clients doing their
+            # own TTS speak `speech`. Old rows stay '' and get cleaned on read.
             cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
             if "speech" not in cols:
                 self.db.execute("ALTER TABLE messages ADD COLUMN speech TEXT NOT NULL DEFAULT ''")
-            self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self.db.execute("PRAGMA user_version=5")
             self.db.commit()
+        if version < 6:  # memory round (docs/WALK_MEMORY.md M)
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+            if "memory_writes" not in cols:
+                # JSON [{id,text}]: facts this assistant reply saved, for the
+                # 🧠 remembered chip
+                self.db.execute("ALTER TABLE messages ADD COLUMN memory_writes "
+                                "TEXT NOT NULL DEFAULT ''")
+            self.db.executescript(_SCHEMA_V6)
+        # FTS5 is best-effort: a SQLite without the module keeps the hub on
+        # LIKE search (search_facts branches on self.fts_enabled). When the
+        # index first appears on a DB that already has facts (e.g. this
+        # Python grew FTS5 support), it is backfilled from the table.
+        had_fts = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='facts_fts'").fetchone() is not None
+        try:
+            self.db.executescript(_SCHEMA_V6_FTS)
+            self.fts_enabled = True
+            if not had_fts:
+                self.db.execute("DELETE FROM facts_fts")
+                self.db.execute("INSERT INTO facts_fts(rowid, text) "
+                                "SELECT id, text FROM facts")
+        except sqlite3.OperationalError:
+            self.fts_enabled = False
+        self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        self.db.commit()
 
     # ── state version & active persona ─────────────────────────────────
     def _meta(self, key, default=None):
@@ -277,11 +340,19 @@ class Store:
                 self.db.commit()
         return self.get_persona(pid)
 
-    def delete_persona(self, pid: str) -> None:
+    def delete_persona(self, pid: str) -> list[int]:
+        """Delete a persona, its messages and its private notes. Returns the
+        ids of the persona:<pid> facts that went away (memory round, so the
+        server can emit memory_changed for each)."""
         with self._lock:
+            scope = f"persona:{pid}"
+            ids = [r["id"] for r in self.db.execute(
+                "SELECT id FROM facts WHERE scope=?", (scope,)).fetchall()]
+            self.db.execute("DELETE FROM facts WHERE scope=?", (scope,))
             self.db.execute("DELETE FROM personas WHERE id=?", (pid,))
             self.db.execute("DELETE FROM messages WHERE persona=?", (pid,))
             self.db.commit()
+            return ids
 
     def bump_avatar(self, pid: str) -> dict | None:
         with self._lock:
@@ -307,20 +378,24 @@ class Store:
     # ── messages ────────────────────────────────────────────────────────
     def add_message(self, persona: str, role: str, content: str, source: str,
                     emotion: str | None = None, tools: list | None = None,
-                    actions: list | None = None, speech: str = "") -> int:
+                    actions: list | None = None, speech: str = "",
+                    memory_writes: list | None = None) -> int:
         """`emotion` only makes sense on assistant messages (docs/ROUNDS.md:
         null for user messages). `tools` is the compact tools_used list
         [{tool, label}] stored on the assistant reply. `actions` is the
         parsed body-action list [{name, at}] (docs/BODY.md). `speech` is the
-        cleaned spoken text of the reply (hub/speech.py); '' on user rows."""
+        cleaned spoken text of the reply (hub/speech.py); '' on user rows.
+        `memory_writes` is [{id, text}] — facts this reply saved via the
+        remember tool (docs/WALK_MEMORY.md M, the 🧠 chip)."""
         with self._lock:
             cur = self.db.execute(
                 "INSERT INTO messages(persona,role,content,source,created_at,emotion,"
-                "tools,actions,speech) VALUES(?,?,?,?,?,?,?,?,?)",
+                "tools,actions,speech,memory_writes) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (persona, role, content, source, now_iso(), emotion,
                  json.dumps(tools) if tools else "",
                  json.dumps(actions) if actions else "",
-                 str(speech or "")))
+                 str(speech or ""),
+                 json.dumps(memory_writes) if memory_writes else ""))
             self.db.commit()
             assert cur.lastrowid is not None
             return cur.lastrowid
@@ -363,10 +438,18 @@ class Store:
             except ValueError:
                 actions = []
         speech = row["speech"] if "speech" in row.keys() else ""
+        mem_writes = []
+        raw_mw = row["memory_writes"] if "memory_writes" in row.keys() else ""
+        if raw_mw:
+            try:
+                mem_writes = json.loads(raw_mw)
+            except ValueError:
+                mem_writes = []
         return {"id": row["id"], "persona": row["persona"], "role": row["role"],
                 "content": row["content"], "source": row["source"],
                 "emotion": row["emotion"], "tools_used": tools,
                 "actions": actions, "speech": speech,
+                "memory_writes": mem_writes,
                 "created_at": row["created_at"]}
 
     def clear_messages(self, persona: str) -> int:
@@ -386,6 +469,184 @@ class Store:
         with self._lock:
             row = self.db.execute("SELECT MAX(id) AS m FROM messages").fetchone()
         return row["m"] or 0
+
+    # ── long-term memory facts (docs/WALK_MEMORY.md M) ─────────────────
+    # scope: "user" (shared across personas) or "persona:<id>" (private note)
+    def _fact_dict(self, row) -> dict:
+        return {"id": row["id"], "text": row["text"], "scope": row["scope"],
+                "pinned": bool(row["pinned"]),
+                "source_message_id": row["source_message_id"],
+                "created_at": row["created_at"], "updated_at": row["updated_at"],
+                "last_used_at": row["last_used_at"], "use_count": row["use_count"]}
+
+    def add_fact(self, text: str, scope: str = "user", pinned: bool = False,
+                 source_message_id: int | None = None) -> dict:
+        """Insert a fact verbatim (no dedup here — upsert_fact dedups)."""
+        text = _memory.clamp_fact_text(text)
+        ts = now_iso()
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT INTO facts(text,scope,pinned,source_message_id,created_at,"
+                "updated_at) VALUES(?,?,?,?,?,?)",
+                (text, scope, 1 if pinned else 0, source_message_id, ts, ts))
+            new_id = cur.lastrowid
+            self.db.commit()
+        assert new_id is not None
+        return self.get_fact(new_id) or {}
+
+    def upsert_fact(self, text: str, scope: str = "user", pinned: bool = False,
+                    source_message_id: int | None = None):
+        """remember-tool semantics: near-identical text in the same scope
+        updates the existing fact instead of duplicating it. Returns
+        (fact, updated_existing)."""
+        text = _memory.clamp_fact_text(text)
+        norm = _memory.normalize_text(text)
+        with self._lock:
+            existing = None
+            keep_pinned = False
+            for row in self.db.execute(
+                    "SELECT id, text, pinned FROM facts WHERE scope=? ORDER BY id",
+                    (scope,)):
+                if _memory.similar(norm, _memory.normalize_text(row["text"])) >= 0.92:
+                    existing = row["id"]
+                    keep_pinned = bool(row["pinned"])
+                    break
+            updated = existing is not None
+            if existing is not None:
+                self.db.execute(
+                    "UPDATE facts SET text=?, pinned=?, updated_at=? WHERE id=?",
+                    (text, 1 if (pinned or keep_pinned) else 0, now_iso(), existing))
+            else:
+                cur = self.db.execute(
+                    "INSERT INTO facts(text,scope,pinned,source_message_id,created_at,"
+                    "updated_at) VALUES(?,?,?,?,?,?)",
+                    (text, scope, 1 if pinned else 0, source_message_id,
+                     now_iso(), now_iso()))
+                existing = cur.lastrowid
+            self.db.commit()
+        return self.get_fact(existing or 0) or {}, updated
+
+    def get_fact(self, fact_id: int) -> dict | None:
+        with self._lock:
+            row = self.db.execute("SELECT * FROM facts WHERE id=?",
+                                  (fact_id,)).fetchone()
+        return self._fact_dict(row) if row else None
+
+    def list_facts(self, scopes: list[str] | None = None, limit: int = 200,
+                   offset: int = 0) -> tuple[list[dict], int]:
+        """Facts newest-first (updated_at, then id). scopes=None = every scope.
+        Returns (page, total)."""
+        where, params = "", []
+        if scopes is not None:
+            if not scopes:
+                return [], 0
+            where = "WHERE scope IN (" + ",".join("?" * len(scopes)) + ")"
+            params = list(scopes)
+        with self._lock:
+            total = self.db.execute(
+                f"SELECT COUNT(*) AS c FROM facts {where}", params).fetchone()["c"]
+            rows = self.db.execute(
+                f"SELECT * FROM facts {where} ORDER BY updated_at DESC, id DESC "
+                "LIMIT ? OFFSET ?", params + [limit, offset]).fetchall()
+        return [self._fact_dict(r) for r in rows], total
+
+    def search_facts(self, query: str, scopes: list[str] | None = None,
+                     limit: int = 10) -> list[dict]:
+        """FTS5 OR-match over the query's words, ranked (bm25); SQLite without
+        FTS5 (or a query with no usable words) falls back to LIKE. Scoped."""
+        match = _memory.fts_match(query)
+        scope_sql, scope_params = "", []
+        if scopes is not None:
+            if not scopes:
+                return []
+            scope_sql = "AND f.scope IN (" + ",".join("?" * len(scopes)) + ")"
+            scope_params = list(scopes)
+        with self._lock:
+            if self.fts_enabled and match:
+                rows = self.db.execute(
+                    "SELECT f.*, bm25(facts_fts) AS score FROM facts_fts "
+                    "JOIN facts f ON f.id = facts_fts.rowid "
+                    f"WHERE facts_fts MATCH ? {scope_sql} "
+                    "ORDER BY score LIMIT ?", [match] + scope_params + [limit]).fetchall()
+                return [self._fact_dict(r) for r in rows]
+            like = f"%{_memory.clamp_fact_text(query).lower()}%"
+            rows = self.db.execute(
+                "SELECT f.* FROM facts f WHERE lower(f.text) LIKE ? "
+                f"{scope_sql} ORDER BY f.updated_at DESC LIMIT ?",
+                [like] + scope_params + [limit]).fetchall()
+        return [self._fact_dict(r) for r in rows]
+
+    def recent_facts(self, scopes: list[str], exclude_ids: set[int],
+                     limit: int = 10) -> list[dict]:
+        """Facts by recency (last_used first, then updated) for the prompt
+        block's fill tier."""
+        if not scopes:
+            return []
+        excl = ",".join("?" * len(exclude_ids)) if exclude_ids else None
+        params = list(scopes)
+        where = "scope IN (" + ",".join("?" * len(scopes)) + ")"
+        if excl:
+            where += f" AND id NOT IN ({excl})"
+            params += sorted(exclude_ids)
+        with self._lock:
+            rows = self.db.execute(
+                f"SELECT * FROM facts WHERE {where} ORDER BY "
+                "COALESCE(last_used_at,'') DESC, updated_at DESC, id DESC LIMIT ?",
+                params + [limit]).fetchall()
+        return [self._fact_dict(r) for r in rows]
+
+    def update_fact(self, fact_id: int, text: str | None = None,
+                    pinned: bool | None = None) -> dict | None:
+        """Edit a fact's text and/or pin. Returns None when the id is unknown."""
+        with self._lock:
+            if not self.db.execute("SELECT 1 FROM facts WHERE id=?",
+                                   (fact_id,)).fetchone():
+                return None
+            if text is not None:
+                self.db.execute("UPDATE facts SET text=?, updated_at=? WHERE id=?",
+                                (_memory.clamp_fact_text(text), now_iso(), fact_id))
+            if pinned is not None:
+                self.db.execute("UPDATE facts SET pinned=?, updated_at=? WHERE id=?",
+                                (1 if pinned else 0, now_iso(), fact_id))
+            self.db.commit()
+        return self.get_fact(fact_id)
+
+    def delete_fact(self, fact_id: int) -> bool:
+        with self._lock:
+            cur = self.db.execute("DELETE FROM facts WHERE id=?", (fact_id,))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def delete_facts_by_scope(self, scope: str) -> list[int]:
+        """Forget everything in one scope ('user' or 'persona:<id>')."""
+        with self._lock:
+            ids = [r["id"] for r in self.db.execute(
+                "SELECT id FROM facts WHERE scope=?", (scope,)).fetchall()]
+            self.db.execute("DELETE FROM facts WHERE scope=?", (scope,))
+            self.db.commit()
+            return ids
+
+    def delete_all_facts(self) -> list[int]:
+        with self._lock:
+            ids = [r["id"] for r in self.db.execute("SELECT id FROM facts").fetchall()]
+            self.db.execute("DELETE FROM facts")
+            self.db.commit()
+            return ids
+
+    def touch_facts(self, fact_ids: list[int]):
+        """Usage bump for facts that entered a prompt block."""
+        if not fact_ids:
+            return
+        ts = now_iso()
+        with self._lock:
+            self.db.executemany(
+                "UPDATE facts SET last_used_at=?, use_count=use_count+1 WHERE id=?",
+                [(ts, i) for i in fact_ids])
+            self.db.commit()
+
+    def export_facts(self) -> list[dict]:
+        rows, _ = self.list_facts(scopes=None, limit=1_000_000, offset=0)
+        return rows
 
     # ── settings (JSON blobs under named keys) ─────────────────────────
     def get_json(self, key: str, default):

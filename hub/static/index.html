@@ -105,6 +105,7 @@
   <nav>
     <button data-tab="personas" class="on">Personas</button>
     <button data-tab="history">History</button>
+    <button data-tab="memory">Memory</button>
     <button data-tab="settings">Settings</button>
     <button data-tab="chat">Chat test</button>
   </nav>
@@ -207,6 +208,35 @@
     </div>
   </section>
 
+  <!-- ──────────────────────────── memory ── -->
+  <section id="tab-memory" hidden>
+    <div class="card">
+      <h2>Memory <span class="chip" id="mcount"></span></h2>
+      <div class="row" style="align-items:end">
+        <div><label>Scope</label><select id="mscope"></select></div>
+        <div style="flex:1"><label>Search</label><input id="msearch" placeholder="keyword search"></div>
+        <div><label>&nbsp;</label><button class="btn" id="memreload">Reload</button></div>
+      </div>
+      <div class="row" style="margin-top:8px;align-items:end">
+        <div style="flex:1"><label>Add a fact (saved to the selected scope; “about you” is shared across personas)</label>
+          <input id="mnew" placeholder="My cat is called Miso"></div>
+        <div><label>&nbsp;</label><label style="margin:0"><input type="checkbox" id="mnewpin" style="width:auto"> pin</label></div>
+        <div><label>&nbsp;</label><button class="btn primary" id="madd">Add</button></div>
+      </div>
+      <div id="mlist" style="margin-top:10px"></div>
+      <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center">
+        <button class="btn danger" id="mforgetall">Forget everything…</button>
+        <button class="btn" id="mexport">Export JSON</button>
+        <label class="btn" style="cursor:pointer">Import JSON<input type="file" id="mimport" accept="application/json,.json" hidden></label>
+      </div>
+      <p class="hint">Facts <b>about you</b> are shared with every persona; persona notes are private
+        and vanish when the persona is deleted. A 🧠 chip on a reply means she saved facts that turn.
+        The block budget and the memory switch live in Settings; remember / recall / forget_fact
+        permissions live in the Tools permission table.</p>
+      <div class="err" id="memerr"></div>
+    </div>
+  </section>
+
   <!-- ──────────────────────────── settings ── -->
   <section id="tab-settings" hidden>
     <div class="card">
@@ -276,6 +306,16 @@
       <div id="tbodyset" class="hint">…</div>
       <div style="margin-top:8px"><button class="btn small" id="tlogreload">Show recent tool calls</button></div>
       <div id="tlog" class="hint" style="margin-top:4px; white-space:pre-wrap"></div>
+
+      <h3 style="margin-top:12px">Long-term memory <span class="src" id="smemsrc"></span></h3>
+      <label><input type="checkbox" id="smemenabled" style="width:auto; vertical-align:middle">
+        Remember across conversations (facts block + remember · recall · forget_fact)</label>
+      <label style="margin-top:2px"><input type="checkbox" id="smemauto" style="width:auto; vertical-align:middle">
+        Auto-remember lasting facts (off = only when she's explicitly asked)</label>
+      <div class="row" style="max-width:240px"><div><label>Prompt budget (tokens)</label>
+        <input id="smembudget" type="number" min="100" max="4000"></div></div>
+      <p class="hint">Cap for the “What you remember” block (pinned facts first, then matches for
+        the message, then recently used). Manage the facts themselves on the Memory tab.</p>
 
       <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap">
         <button class="btn primary" id="ssave" disabled>Save settings</button>
@@ -386,6 +426,7 @@ function show(tab) {
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((s) => { s.hidden = s.id !== "tab-" + tab; });
   if (tab === "history") loadHistory();
+  if (tab === "memory") loadMemory();
   if (tab === "chat") eventsLoop();  // restart if it died (key set later, hub was down)
 }
 
@@ -402,6 +443,7 @@ async function poll() {
       renderPicker();
       $("cpersona").textContent = state.active.name;
       if (!$("tab-history").hidden && $("hauto").checked) loadHistory();
+      if (!$("tab-memory").hidden) loadMemory();
     }
   } catch (e) {
     $("status").textContent = e.message.startsWith("401") ? "key needed" : "hub unreachable";
@@ -671,6 +713,7 @@ async function loadHistory() {
         ? m.actions.map((a) => `<span class="act">↝ ${esc(a.name)}</span>`).join("") : "") +
       `<div class="meta">#${m.id} · ${esc(m.created_at)} · via ${esc(m.source || "?")}` +
       (m.tools_used && m.tools_used.length ? ` · tools: ${esc(m.tools_used.map((t) => t.tool).join(", "))}` : "") +
+      (m.memory_writes && m.memory_writes.length ? ` · 🧠 ${esc(m.memory_writes.map((w) => w.text).join("; ").slice(0, 80))}` : "") +
       `</div></div>`
     ).join("") || `<p class="hint">no history yet</p>`;
     $("htx").scrollTop = $("htx").scrollHeight;
@@ -683,9 +726,111 @@ $("hclear").onclick = async () => {
   catch (e) { $("herr").textContent = e.message; }
 };
 
+/* ── memory (docs/WALK_MEMORY.md M) ───────────────────────────────── */
+let memFilter = "";     // "" = everything | "user" | "persona:<id>"
+let memQuery = "";
+function memScopeLabel(s) {
+  if (s === "user") return "about you · shared";
+  if (String(s).startsWith("persona:")) {
+    const id = s.slice(8);
+    const p = (state && state.personas || []).find((x) => x.id === id);
+    return "private note · " + (p ? p.name : id);
+  }
+  return s;
+}
+async function loadMemory() {
+  try {
+    if (!state) state = await api("/api/state");
+    const sel = $("mscope");
+    const keep = memFilter;
+    sel.innerHTML = `<option value="">everything</option>` +
+      `<option value="user">About you (shared)</option>` +
+      state.personas.map((p) =>
+        `<option value="persona:${esc(p.id)}">Notes · ${esc(p.name)}</option>`).join("");
+    sel.value = keep; memFilter = sel.value;
+    const h = await api("/api/memory?scope=" + encodeURIComponent(memFilter) +
+                        "&q=" + encodeURIComponent(memQuery));
+    $("mcount").textContent = h.total + (memQuery ? " match" : " fact") + (h.total === 1 ? "" : "s");
+    $("mlist").innerHTML = h.facts.map((f) =>
+      `<div class="msg" style="margin:6px 0">` +
+      `<div>${f.pinned ? "📌 " : ""}${esc(f.text)}</div>` +
+      `<div class="meta">#${f.id} · ${esc(memScopeLabel(f.scope))} · used ${f.use_count}× · ${esc(f.updated_at)}` +
+      ` <button class="btn small mpin" data-id="${f.id}">${f.pinned ? "unpin" : "pin"}</button>` +
+      ` <button class="btn small medit" data-id="${f.id}" data-text="${esc(f.text)}">edit</button>` +
+      ` <button class="btn small danger mdel" data-id="${f.id}">delete</button></div></div>`).join("") ||
+      `<p class="hint">nothing remembered yet — tell her something worth keeping</p>`;
+    $("memerr").textContent = "";
+  } catch (e) { $("memerr").textContent = e.message; }
+}
+$("mscope").onchange = () => { memFilter = $("mscope").value; loadMemory(); };
+$("msearch").oninput = () => { memQuery = $("msearch").value.trim(); loadMemory(); };
+$("memreload").onclick = loadMemory;
+$("madd").onclick = async () => {
+  const text = $("mnew").value.trim();
+  if (!text) return;
+  try {
+    await api("/api/memory", { method: "POST", json: {
+      text, scope: memFilter === "" ? "user" : memFilter, pinned: $("mnewpin").checked } });
+    $("mnew").value = ""; $("mnewpin").checked = false;
+    await poll(); loadMemory();
+  } catch (e) { $("memerr").textContent = e.message; }
+};
+$("mlist").onclick = async (ev) => {
+  const b = ev.target.closest("button");
+  if (!b) return;
+  const id = b.dataset.id;
+  try {
+    if (b.classList.contains("mdel")) {
+      await api(`/api/memory/${id}`, { method: "DELETE" });
+    } else if (b.classList.contains("mpin")) {
+      await api(`/api/memory/${id}`, { method: "PUT", json: { pinned: b.textContent.trim() === "pin" } });
+    } else if (b.classList.contains("medit")) {
+      const text = prompt("Edit fact:", b.dataset.text);
+      if (text == null || !text.trim()) return;
+      await api(`/api/memory/${id}`, { method: "PUT", json: { text: text.trim() } });
+    } else return;
+    await poll(); loadMemory();
+  } catch (e) { $("memerr").textContent = e.message; }
+};
+$("mforgetall").onclick = async () => {
+  const scope = memFilter || "all";
+  const what = scope === "all" ? "EVERY fact in every scope"
+    : "all facts in scope “" + memScopeLabel(scope) + "”";
+  const typed = prompt(`Type "forget" to erase ${what}:`);
+  if (typed === null) return;
+  if (typed.trim() !== "forget") { $("memerr").textContent = 'type exactly "forget" to erase everything'; return; }
+  try {
+    await api(`/api/memory?scope=${encodeURIComponent(scope)}&confirm=yes`, { method: "DELETE" });
+    await poll(); loadMemory();
+  } catch (e) { $("memerr").textContent = e.message; }
+};
+$("mexport").onclick = async () => {
+  try {
+    const data = await api("/api/memory/export");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+    a.download = "riko-memory-export.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) { $("memerr").textContent = e.message; }
+};
+$("mimport").onchange = async () => {
+  const file = $("mimport").files[0];
+  if (!file) return;
+  try {
+    const data = JSON.parse(await file.text());
+    if (!data || !Array.isArray(data.facts)) throw new Error("not a memory export (missing facts[])");
+    if (!confirm(`Import ${data.facts.length} facts? This adds to memory (facts get new ids; duplicates show up side by side).`)) return;
+    const r = await api("/api/memory/import", { method: "POST", json: { facts: data.facts } });
+    await poll(); loadMemory();
+    $("memerr").textContent = ""; $("mcount").textContent = "imported " + r.imported + " ✔";
+  } catch (e) { $("memerr").textContent = e.message; }
+  $("mimport").value = "";
+};
+
 /* ── settings ─────────────────────────────────────────────────────── */
 const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "sttsbase", "sttstimeout",
-                     "stoolsteps", "stoolsecs", "stoolchars", "stsearxng"];
+                     "stoolsteps", "stoolsecs", "stoolchars", "stsearxng", "smembudget"];
 let settingsSnap = null;    // field values as loaded — the diff base for Save
 let permSnap = {};          // saved per-tool permission overrides ("" = default)
 let apikeyTyped = false;    // the user typed into the key field (autofill does not count... mostly)
@@ -697,6 +842,8 @@ function snapSettings() {
   s.sttsenabled = $("sttsenabled").checked ? "1" : "0";
   s.stoolsenabled = $("stoolsenabled").checked ? "1" : "0";
   s.stoolpriv = $("stoolpriv").checked ? "1" : "0";
+  s.smemenabled = $("smemenabled").checked ? "1" : "0";
+  s.smemauto = $("smemauto").checked ? "1" : "0";
   return s;
 }
 
@@ -732,6 +879,12 @@ async function loadSettings() {
     if (defTools.searxng_url) $("stsearxng").placeholder = defTools.searxng_url;
     $("stoolsrc").textContent = toolsrc.searxng_url === "default" ? "· using server default" : "";
     $("stoolpriv").checked = !!tools.allow_private_fetch;
+    const mem = s.memory || {};
+    $("smemenabled").checked = !!mem.enabled;
+    $("smemauto").checked = mem.auto_remember !== false;
+    $("smembudget").value = mem.prompt_budget_tokens == null ? "" : mem.prompt_budget_tokens;
+    const memsrc = s.memory_source || {};
+    $("smemsrc").textContent = Object.values(memsrc).includes("saved") ? "· saved overrides" : "· defaults";
     loadTools();
     loadMcp();
     $("apikey").value = "";
@@ -826,6 +979,15 @@ $("ssave").onclick = async () => {
   });
   if (Object.keys(perms).length) tools.permissions = perms;
   if (Object.keys(tools).length) body.tools = tools;
+  const memory = {};
+  if (changed("smemenabled")) memory.enabled = now.smemenabled === "1";
+  if (changed("smemauto")) memory.auto_remember = now.smemauto === "1";
+  if (changed("smembudget")) {
+    const v = parseInt(now.smembudget, 10);
+    if (!Number.isFinite(v)) { setSerr("memory.prompt_budget_tokens must be a number"); return; }
+    memory.prompt_budget_tokens = v;
+  }
+  if (Object.keys(memory).length) body.memory = memory;
   if (!Object.keys(body).length) { setSerr("nothing changed", true); return; }
   try {
     await api("/api/settings", { method: "PUT", json: body });
@@ -845,10 +1007,10 @@ $("skeyclear").onclick = async () => {
   } catch (e) { setSerr(e.message); }
 };
 $("sreset").onclick = async () => {
-  if (!confirm("Drop the saved LLM settings, TTS settings, tools settings, MCP servers and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* / RIKO_SEARXNG_URL env) apply?")) return;
+  if (!confirm("Drop the saved LLM settings, TTS settings, tools settings, memory settings, MCP servers and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* / RIKO_SEARXNG_URL env) apply?")) return;
   setSerr("");
   try {
-    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, tools: true, mcp: true, switch_phrases: true } });
+    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, tools: true, memory: true, mcp: true, switch_phrases: true } });
     setSerr("reset to server defaults ✔", true);
     await loadSettings(); await poll();
     await reportLlmState();
@@ -1062,6 +1224,12 @@ async function sendChat() {
         const d = document.createElement("div");
         d.className = "hint";
         d.textContent = "🔧 used: " + r.tools_used.map((t) => t.tool).join(", ");
+        $("ctx").appendChild(d);
+      }
+      if (r.memory_writes && r.memory_writes.length) {   // docs/WALK_MEMORY.md M
+        const d = document.createElement("div");
+        d.className = "hint";
+        d.textContent = "🧠 remembered: " + r.memory_writes.map((w) => w.text).join("; ");
         $("ctx").appendChild(d);
       }
     }

@@ -105,6 +105,9 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   "tools_used": [                  // [] unless the turn ran tools
     {"tool": "web_search", "label": "searching the web for “tokyo weather”"}
   ],
+  "memory_writes": [               // [] unless the turn saved facts (memory round M)
+    {"id": 7, "text": "User's cat is called Miso"}
+  ],
   "created_at": "2026-11-03T18:00:00Z"
 }
 ```
@@ -117,7 +120,9 @@ and `content` **never contains the raw tag**; `actions` is the parsed
 body-action list (see *Body actions*, where an action may carry the additive
 `"asked": true` flag) and `content` never contains the raw
 action tags either; `tools_used` is the compact trace of which tools the turn
-called (full history in `/api/tools/log`).
+called (full history in `/api/tools/log`); `memory_writes` lists the long-term
+facts the turn saved via `remember` — render it as a "remembered" chip (see
+*Memory*).
 
 ### State
 
@@ -132,7 +137,8 @@ called (full history in `/api/tools/log`).
 ```
 
 `version` increments on **any** change: switch, persona create/edit/delete,
-avatar upload, new message, history cleared, settings change. `llm_model` is
+avatar upload, new message, history cleared, settings change, memory add/edit/
+forget. `llm_model` is
 the currently believed model id (for `model: "auto"` it appears after the
 first successful chat).
 
@@ -178,6 +184,13 @@ transcript with `after=0`).
 | `DELETE /api/history` | clear a persona's transcript |
 | `POST /api/history/import` | bulk-import old logs |
 | `POST /api/chat` | the only writing route in daily use |
+| `GET /api/memory` | list/search long-term facts (scope filter) |
+| `POST /api/memory` | add a fact by hand (dedups) |
+| `PUT /api/memory/{id}` | edit a fact's text / pin |
+| `DELETE /api/memory/{id}` | forget one fact |
+| `DELETE /api/memory` | forget everything (`confirm=yes`; optional `scope`) |
+| `GET /api/memory/export` | all facts as JSON |
+| `POST /api/memory/import` | restore exported facts (`replace?`) |
 | `GET /api/events` | long-poll live events (turn/tool progress, approvals) |
 | `GET /api/tools` | built-in + online client tools, permissions, settings, status |
 | `GET /api/tools/log` | recent tool-call log entries |
@@ -343,6 +356,7 @@ Body: `{"text": "…", "source": "android", "persona": optional id,
   "emotion": "happy",
   "actions": [{"name": "wave", "at": 0.0}],
   "tools_used": [{"tool": "web_search", "label": "searching the web for “tokyo weather”"}],
+  "memory_writes": [{"id": 7, "text": "User's cat is called Miso"}],
   "message_ids": [41, 42],
   "audio_url": "/api/messages/42/audio",
   "state_version": 17
@@ -373,7 +387,10 @@ off or the model gave no/unknown tag) — drive your VRM expression from it,
 the raw `[tag]` is **never** in `reply` (see *Emotion tags*). `actions` is
 **always present**, `[]` when the turn did not act; on tool-loop turns it
 comes from the **final** reply only (see *Body actions*). `tools_used` is
-`[]` when no tools ran; while a turn runs you can watch live progress on
+`[]` when no tools ran; `memory_writes` is likewise **always present** and
+lists the long-term facts this turn saved with `remember`
+(`[{id, text}]`) — render it as a "remembered" chip on the reply (see
+*Memory*); while a turn runs you can watch live progress on
 `GET /api/events` (see *Events*). A turn that uses tools can take noticeably
 longer than a plain one (each tool step is another model call): keep your
 chat timeout generous (minutes, not seconds).
@@ -429,6 +446,8 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
   "mcp": {"servers": [{"name": "time", "transport": "stdio", "enabled": true,
                        "command": "uvx", "args": ["mcp-server-time"], "env": {},
                        "tool_permissions": {}, "timeout": 60}]},
+  "memory": {"enabled": true, "prompt_budget_tokens": 600,
+             "auto_remember": true},
   "switch_phrases": ["switch to", "change to", "become", "persona",
                      "talk to", "i want to talk to"],
   "defaults": {"llm": {"base_url": "http://192.0.2.51:8000/v1", "model": "auto",
@@ -440,12 +459,16 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                          "max_result_chars": 12000, "searxng_url": "",
                          "allow_private_fetch": false, "permissions": {}},
                "mcp": {"servers": []},
+               "memory": {"enabled": true, "prompt_budget_tokens": 600,
+                          "auto_remember": true},
                "switch_phrases": ["switch to", "..."]},
   "llm_source": {"base_url": "saved", "model": "default", "api_key": "default",
                  "temperature": "default", "...": "...", "switch_phrases": "default"},
   "tts_source": {"base_url": "default", "enabled": "default", "...": "..."},
   "tools_source": {"enabled": "default", "searxng_url": "saved", "...": "..."},
-  "mcp_source": {"servers": "saved"}
+  "mcp_source": {"servers": "saved"},
+  "memory_source": {"enabled": "default", "prompt_budget_tokens": "default",
+                    "auto_remember": "saved"}
 }
 ```
 
@@ -488,6 +511,10 @@ Semantics (made so a careless form save cannot break the hub):
   replaced wholesale** when sent: `{tool_name: "always" | "ask" | "never"}`,
   and a `null` value for one name removes that explicit override (back to
   the risk-based default).
+- **The `memory` block** (see *Memory*): `enabled` and `auto_remember` are
+  booleans; `prompt_budget_tokens` an integer 100–4000 (the cap for the
+  "What you remember" prompt block). Missing keys stay at their saved (or
+  built-in) values — same blank-field semantics as the other blocks.
 - **The `mcp` block** (see *MCP servers*): `servers` **is replaced wholesale**
   when sent (the web page edits one row at a time by PUTting the whole list).
   Per-server `env` / `headers` **values are write-only** like `llm.api_key`:
@@ -499,7 +526,8 @@ Semantics (made so a careless form save cannot break the hub):
   temperature/max_tokens/max_history, or non-object `extra_body`.
 
 `POST /api/settings/reset` with `{"llm": true, "tts": true, "tools": true,
-"mcp": true, "switch_phrases": true}` (each side optional, `422` if none)
+"memory": true, "mcp": true, "switch_phrases": true}` (each side optional,
+`422` if none)
 drops the saved overrides so the defaults apply again. Returns the same body
 as `GET`.
 
@@ -513,6 +541,89 @@ disabled in settings"`; auth failures surface here). Never reveals the key.
 Changing any LLM setting re-resolves `model: "auto"` on the next chat; the
 state `version` bumps on every `PUT` and on a `reset` that actually removed
 something.
+
+## Memory (long-term facts, docs/WALK_MEMORY.md M)
+
+Beyond the transcript, the hub keeps a small table of **facts** — lasting
+things she may need weeks from now ("the user's cat is called Miso"). Three
+models-side tools plus owner-side routes and a page tab revolve around it.
+
+**Scopes.** `user` = about the user, shared by every persona.
+`persona:<id>` = a private note only that persona ever sees (and it dies with
+the persona — `DELETE /api/personas/{id}` removes its notes and publishes a
+`memory_changed` for each). Facts carry `id, text, scope, pinned,
+source_message_id, created_at, updated_at, last_used_at, use_count`; text is
+clamped to one line, ≤500 chars.
+
+**The tools** (`GET /api/tools` lists them; default permission `always`,
+editable like any other tool — `never` hides them from the model entirely):
+
+- `remember(text, scope? = "user", pinned? = false)` — stores one fact.
+  Near-identical text in the same scope **updates** the existing fact instead
+  of duplicating it (response says `"updated": true`). At most 5 facts per
+  turn; the turn's saves come back on ChatResult / the assistant message as
+  `memory_writes` ("remembered" chip).
+- `recall(query, limit? = 5)` — FTS5 keyword search over her scopes
+  (`user` + her own notes), ranked; bumps `use_count`. Returns
+  `{count, facts: [{id, text, scope, pinned}]}`.
+- `forget_fact(id? , text?)` — deletes by id, or by text when it clearly
+  matches exactly one fact (exact normalized match wins; a lone search hit
+  is also deleted). Ambiguous text returns an error + `candidates` so the
+  model can retry with the right id.
+
+**The prompt block.** When memory is enabled, every chat turn gets a
+`What you remember` block appended to the system prompt, budget-capped to
+`memory.prompt_budget_tokens` (rough char/4 estimate). Ordering: all pinned
+facts, then FTS5 matches for the user's current message, then the most
+recently used facts; whatever fits keeps its rank, the rest is cut, and the
+facts that made it in get their usage bumped. No facts → no block. With
+`auto_remember` on, the block also instructs her to call `remember` on her
+own when the user shares something lasting; with it off she only saves when
+explicitly asked.
+
+Storage note: facts live in the hub SQLite DB with an FTS5 index; on a SQLite
+built without FTS5 the store falls back to LIKE search (and backfills the
+index if FTS5 appears later).
+
+### GET /api/memory
+
+`?scope=user|persona:<id>` (blank = every scope), `?q=` for FTS-ranked
+search, `limit` (1–500, default 200) + `offset` paging. Returns
+`{"facts": […], "total": n}` (`query` echoed when `q` is set). `422` on an
+unknown scope.
+
+### POST /api/memory → `201`
+
+Add a fact by hand: `{"text": "…", "scope"? , "pinned"?}`. Same dedup as the
+`remember` tool — a near-identical fact comes back with `"updated": true`
+and the existing id. `422` on empty text or unknown scope.
+
+### PUT /api/memory/{fact_id}
+
+`{"text"? , "pinned"?}` — inline edit / pin toggle from the page. `404`
+unknown id, `422` empty text, non-bool `pinned`, or nothing to change.
+
+### DELETE /api/memory/{fact_id} → `204`
+
+Forget one fact (`404` unknown id).
+
+### DELETE /api/memory → `{deleted: n}`
+
+Forget everything. `confirm=yes` is **required** (the page makes the user
+type the word first); `scope` picks `all` (default), `user`, or one
+persona's notes. Missing confirm → `400`, unknown scope → `404`.
+
+### GET /api/memory/export · POST /api/memory/import
+
+Export: `{"version": 1, "exported_at": …, "facts": [{text, scope, pinned}…]}`.
+Import takes that shape (`{"facts": […], "replace"?}`): new ids are
+assigned, persona scopes must exist, one bad entry rejects the whole import,
+`replace: true` wipes first → `{"imported": n, "replaced": m}`.
+
+```bash
+curl -s -H "$AUTH" $HUB/api/memory | jq '.facts[] | [.id, .scope, .text]'
+curl -s -X DELETE -H "$AUTH" "$HUB/api/memory?scope=user&confirm=yes"
+```
 
 ## Voice & audio (docs/VOICE.md)
 
@@ -881,8 +992,9 @@ curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 #   {"seq":14,"time":"…","type":"tool_finished","call_id":"…","tool":"web_search","ok":true,"ms":812},
 #   {"seq":15,"time":"…","type":"approval_needed","request_id":"…","client_id":"my-desktop","tool":"desktop__do_thing","summary":"do_thing {}"},
 #   {"seq":16,"time":"…","type":"turn_finished","persona":"riko","message_id":42,"emotion":"happy","actions":[{"name":"wave","at":0.0}]},
-#   {"seq":17,"time":"…","type":"state_changed","version":18}
-# ],"last":17}
+#   {"seq":17,"time":"…","type":"memory_changed","id":7,"op":"added"},
+#   {"seq":18,"time":"…","type":"state_changed","version":18}
+# ],"last":18}
 ```
 
 Loop: keep `last`, pass it back as `after`, `wait` ≤ 30 s (default 25). The
@@ -893,7 +1005,11 @@ your `after` is older than that you get everything still buffered). Show
 `tool_started.label` as activity text ("🔧 searching the web…") while your
 chat POST is still in flight; `turn_finished` tells you the turn is done.
 `state_changed` mirrors the `/api/state` version bumps, so you can replace
-part of your state polling with this one connection.
+part of your state polling with this one connection. `memory_changed`
+(`{id, op}` with `op` = `added` / `updated` / `deleted`) fires whenever a
+fact is saved, edited or forgotten — by the memory tools, the routes, or a
+persona delete that took its private notes with it; refresh your memory view
+on it.
 
 ## Client tool channel (desktop / Android tools the model can call)
 

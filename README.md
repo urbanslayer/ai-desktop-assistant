@@ -186,6 +186,16 @@ Half of her lives in `character_config.yaml` on your PC — her ears, her voice,
 | **Memory** | The chat history: read it, edit a message, wipe it. |
 | **Hub TTS** | Settings → TTS: turn hub voice on/off and point it at Breeze (`http://breeze-tts:8137` by default). |
 
+**Memory.** Long-term memory lives on the hub, past the chat logs: the page's
+**Memory** tab is where you see, search, edit, pin and delete what she
+remembers about you. Facts scoped *about you* are shared by every persona;
+per-persona notes are private and vanish with the persona. She saves facts
+herself when you tell her something lasting (or only when asked — Settings →
+Long-term memory), and every reply that taught her something shows a 🧠 chip.
+The **What you remember** block in her prompt is budgeted (Settings), pinned
+facts always make it, and "forget everything" asks you to type the word.
+Details in [docs/API.md — Memory](docs/API.md).
+
 **On your PC** (`character_config.yaml`, restart to apply):
 
 | To change her... | Edit |

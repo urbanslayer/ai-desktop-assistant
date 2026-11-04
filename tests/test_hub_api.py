@@ -205,6 +205,7 @@ def test_chat_stores_both_messages(client, fake_llm):
     assert res == {"reply": REPLY, "speech": REPLY,  # nothing to clean: speech == reply
                    "persona": "riko", "switched": False,
                    "emotion": "neutral", "tools_used": [], "actions": [],
+                   "memory_writes": [],  # memory round M: facts this turn saved
                    "message_ids": [1, 2], "state_version": st0["version"] + 1,
                    "audio_url": None}  # no TTS configured on this hub
 

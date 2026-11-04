@@ -69,13 +69,23 @@ HUB_TOOL_DESCRIPTIONS = {
                    "search result you need more of."),
     "get_time": ("Current date and time (ISO) plus the weekday, optionally in an "
                  "IANA timezone. The only reliable clock you have."),
+    "remember": ("Save one lasting fact to long-term memory so it survives "
+                 "across conversations (scope 'user' shared, 'persona' private "
+                 "to this persona). Never store secrets or one-off trivia."),
+    "recall": ("Search long-term memory by keywords; returns "
+               "[{id, text, scope, pinned}]."),
+    "forget_fact": ("Delete a fact from long-term memory, by id or by its "
+                    "exact text when it clearly matches one fact."),
 }
 
 
-def build_hub_specs(tools_cfg: dict) -> list[ToolSpec]:
-    """The three built-ins under the current merged tools settings.
+def build_hub_specs(tools_cfg: dict, memory_ctx: dict | None = None) -> list[ToolSpec]:
+    """The built-in hub tools under the current merged tools settings.
     web_search is `available: False` (listed but not offered) while no
-    SearXNG URL is configured."""
+    SearXNG URL is configured. `memory_ctx` (memory round) is a dict
+    {store, events, persona_id, writes, auto_remember}; without it the
+    memory tools are listed for Settings but carry a stub run (GET
+    /api/tools never executes them)."""
     searxng = str(tools_cfg.get("searxng_url") or "").strip()
     allow_private = bool(tools_cfg.get("allow_private_fetch"))
     specs = [
@@ -103,6 +113,13 @@ def build_hub_specs(tools_cfg: dict) -> list[ToolSpec]:
             label=lambda args: "checking the date and time",
         ),
     ]
+    if memory_ctx:
+        # memory round (docs/WALK_MEMORY.md M): function-level import keeps
+        # the registry -> tools/memory_tools dependency one-way
+        from . import memory_tools
+        specs += memory_tools.build_memory_specs(
+            memory_ctx["store"], memory_ctx["events"], memory_ctx["persona_id"],
+            memory_ctx["writes"], auto_remember=memory_ctx.get("auto_remember", True))
     return specs
 
 
@@ -141,11 +158,20 @@ def now_iso_static() -> str:
 
 
 def hub_tool_info(tools_cfg: dict, permissions: dict) -> list[dict]:
-    """GET /api/tools rows for the built-in hub tools."""
+    """GET /api/tools rows for the built-in hub tools. The memory tools are
+    always listed (their permissions must stay editable in Settings even
+    while memory is off); a turn only offers them when the memory settings
+    enable them (docs/WALK_MEMORY.md M)."""
     out = []
     for s in build_hub_specs(tools_cfg):
         out.append({"name": s.name, "display": s.display, "source": "hub",
                     "risk": s.risk, "available": s.available,
                     "description": s.description,
                     "permission": permission_for(s.name, "hub", s.risk, permissions)})
+    for name, risk in (("remember", "act"), ("recall", "read"),
+                       ("forget_fact", "act")):
+        out.append({"name": name, "display": name, "source": "hub",
+                    "risk": risk, "available": True,
+                    "description": HUB_TOOL_DESCRIPTIONS[name],
+                    "permission": permission_for(name, "hub", risk, permissions)})
     return out
