@@ -64,6 +64,7 @@ class Handler(SimpleHTTPRequestHandler):
     t0 = time.monotonic()
     queue = []
     timeline = None
+    body_report = None
     vrm_path = DEFAULT_VRM
 
     def do_GET(self):
@@ -85,18 +86,24 @@ class Handler(SimpleHTTPRequestHandler):
         body = self.rfile.read(n).decode() if n else ""
         if m:
             try:
-                self.timeline = json.loads(body)
+                Handler.timeline = json.loads(body)
             except json.JSONDecodeError:
-                self.timeline = []
-            print(f"[timeline] received {len(self.timeline)} entries", flush=True)
+                Handler.timeline = []
+            print(f"[timeline] received {len(Handler.timeline)} entries", flush=True)
             return self._json({"ok": True})
+        if self.path == "/control/body-capabilities":
+            try:
+                Handler.body_report = json.loads(body or "{}")
+            except json.JSONDecodeError:
+                Handler.body_report = {}
+            print(f"[body] page reported: {Handler.body_report}", flush=True)
         # /control/body-capabilities and friends: accept and ignore
         return self._json({"ok": True})
 
     def _due(self):
         now = time.monotonic() - self.t0
-        due = [ev for (at, ev) in self.queue if at <= now]
-        self.queue = [(at, ev) for (at, ev) in self.queue if at > now]
+        due = [ev for (at, ev) in Handler.queue if at <= now]
+        Handler.queue = [(at, ev) for (at, ev) in Handler.queue if at > now]
         return due
 
     def _json(self, obj):
@@ -114,18 +121,24 @@ class Handler(SimpleHTTPRequestHandler):
         pass
 
 
-def check(timeline):
+def check(timeline, body_report):
     """Assert the schedule against the say marker; returns (ok, report lines)."""
+    report = []
+    ok = True
+    # the page must also teach the desktop its real library (docs/BODY.md §1)
+    acts = (body_report or {}).get("actions") or []
+    good = "wave" in acts and "think" in acts and not any(a.startswith("talk_") for a in acts)
+    ok = ok and good
+    report.append(f"{'ok  ' if good else 'FAIL'}: page reported body capabilities "
+                  f"({len(acts)} actions, internal talk_* excluded)")
     say = next((e for e in timeline if e.get("type") == "say"), None)
     if say is None:
-        return False, ["FAIL: no say marker in the timeline"]
+        return False, report + ["FAIL: no say marker in the timeline"]
     t0 = say["t"]
     starts = [e for e in timeline if e.get("type") == "gesture"]
     stops = [e for e in timeline if e.get("type") == "gesture_stop"]
     wave = next((e for e in starts if e["name"] == "wave" and e["t"] >= t0 - 0.05), None)
     think = next((e for e in starts if e["name"] == "think" and e["t"] >= t0 - 0.05), None)
-    report = []
-    ok = True
     if wave is None:
         ok = False
         report.append("FAIL: wave never started after the say")
@@ -158,8 +171,8 @@ def check(timeline):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--runtime", type=float, default=38.0,
-                    help="browser lifetime (default 38 s)")
+    ap.add_argument("--runtime", type=float, default=40.0,
+                    help="browser lifetime (default 40 s)")
     ap.add_argument("--vrm", default=DEFAULT_VRM)
     args = ap.parse_args()
 
@@ -204,7 +217,7 @@ def main():
         return 1
     for e in timeline:
         print("   ", json.dumps(e))
-    ok, report = check(timeline)
+    ok, report = check(timeline, Handler.body_report)
     print("\n".join(report))
     print("ACTIONS CHECK:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

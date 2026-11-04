@@ -465,16 +465,8 @@ export class Director {
       this.gesture = null;
     }
     this.pending = null;
-    this.gesture = { name, loop: g.loop, endsAt: now + g.duration };
-    this.cooldowns[name] = now + (COOLDOWNS[name] || 0);
-    acts.push({ type: 'gesture', name, loop: g.loop, duration: g.duration });
-    if (name === 'wave') {  // waves keep the happy face
-      const hold = g.duration + 1.5;
-      this.expression = { name: 'happy', until: now + hold, tilt: false, away: false };
-      acts.push({ type: 'expression', name: 'happy', value: 0.8, hold,
-                  tilt: false, away: false });
-    }
-    return acts;
+    acts.push(...this.#play(name, now, { priority: PRIO_GREET, noCooldown: true }));
+    return this.#happyFace(acts, now);  // waves keep the happy face
   }
 
   #ready(name, now) {

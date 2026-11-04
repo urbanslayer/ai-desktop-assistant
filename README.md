@@ -258,6 +258,18 @@ which is why nothing is bundled in the repo) and the VRoid Hub motion tag
 (<https://hub.vroid.com/en/tags/4530169210384817001>). Check each pack's licence
 before shipping it.
 
+**She knows her body.** The page tells the desktop which gestures this body can
+actually play (built-ins plus any `.vrma` drop-ins), and the desktop registers
+that list with the hub as her body capabilities — drop in `curtsy.vrma` and she
+can suddenly curtsy in replies. Ask for a move in your own words — *wave at me*,
+*think about it*, *nod*, *stretch*… — and her reply performs it right away, cut
+into the sentence at the tagged moment (`at × speech length`); an on-demand ask
+bypasses cooldowns like the `W` key does. Actions she picks herself are polite:
+they wait for her hands to be free and respect cooldowns. Appearance and
+embodied settings (the body set she may use) live on the hub web page under
+each persona. `python client/tools/actions_check.py` verifies the timing
+headlessly.
+
 <a id="personas"></a>
 ## 🎭 Switching characters
 

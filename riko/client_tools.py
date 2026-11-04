@@ -105,7 +105,9 @@ def _clean_body(raw):
     for key in ("actions", "expressions"):
         names = []
         for item in (raw.get(key) or []):
-            name = re.sub(r"\s+", "_", str(item or "").strip().lower())
+            # same normalisation as the hub's / the director's: spaces and
+            # dashes collapse to underscores ('Shake-Head' -> 'shake_head')
+            name = re.sub(r"[\s-]+", "_", str(item or "").strip().lower()).strip("_")
             if not BODY_NAME_OK.match(name) or name in names:
                 continue
             names.append(name)
@@ -642,13 +644,14 @@ class ClientRuntime:
         self.body = new
         note_body(new)
         print(f"[client] body updated: {', '.join(new['actions']) or '(no actions)'}")
-        if self._registered.is_set():
-            try:
-                self._register()
-            except hub_client.HubError as e:
-                print(f"[client] the body changed but the hub refused a re-register: {e}")
-                return {"ok": False, "changed": True, "error": str(e),
-                        "actions": list(new["actions"])}
+        # re-register right away (idempotent; also covers the tiny window where
+        # the first register landed on the hub but our thread has not resumed)
+        try:
+            self._register()
+        except hub_client.HubError as e:
+            print(f"[client] the body changed but the hub refused a re-register: {e}")
+            return {"ok": False, "changed": True, "error": str(e),
+                    "actions": list(new["actions"])}
         return {"ok": True, "changed": True, "actions": list(new["actions"])}
 
     # ── threads ──────────────────────────────────────────────

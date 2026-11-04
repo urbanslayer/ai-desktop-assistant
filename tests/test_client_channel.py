@@ -379,3 +379,40 @@ def test_link_page_is_served(bridge):
     assert "Riko Helper" in body and "riko-link" in body
     with urllib.request.urlopen(f"http://127.0.0.1:{bridge.port}/riko-pair", timeout=5) as r:
         assert r.read().decode() == "tok"
+
+
+# ── body capabilities (docs/BODY.md §1/§5) ───────────────────────────
+def test_register_announces_the_default_body(runtime, fake_hub):
+    runtime()  # until the avatar page reports its real library, the
+    body = fake_hub.registered[CID]["body"]  # built-in gesture list is registered
+    assert body == {"actions": client_tools.DEFAULT_BODY_ACTIONS,
+                    "expressions": client_tools.DEFAULT_BODY_EXPRESSIONS}
+    assert "wave" in body["actions"] and "talk_1" not in body["actions"]
+
+
+def test_body_report_reregisters_and_normalises(runtime, fake_hub, monkeypatch):
+    monkeypatch.setattr(client_tools, "_current_body",
+                        dict(client_tools._current_body))  # keep the module global clean
+    rt = runtime()
+    n0 = fake_hub.register_count
+    out = rt.set_body({"actions": ["Curtsy", "shake head", "Curtsy", "", "bad!name"],
+                       "expressions": ["HAPPY"]})
+    assert out["ok"] and out["changed"]
+    assert out["actions"] == ["curtsy", "shake_head"]  # normalized, deduped, junk dropped
+    assert fake_hub.register_count == n0 + 1            # re-registered with the hub
+    body = fake_hub.registered[CID]["body"]
+    assert body["actions"] == ["curtsy", "shake_head"]
+    assert body["expressions"] == ["happy"]
+    assert client_tools.current_body_actions() == ["curtsy", "shake_head"]
+    # the same library again: quiet, no re-register
+    again = rt.set_body({"actions": ["curtsy", "Shake-Head"], "expressions": ["happy"]})
+    assert again["changed"] is False
+    assert fake_hub.register_count == n0 + 1
+
+
+def test_runtime_can_start_with_a_reported_body(runtime, fake_hub, monkeypatch):
+    monkeypatch.setattr(client_tools, "_current_body",
+                        dict(client_tools._current_body))
+    runtime(body={"actions": ["curtsy"], "expressions": ["happy"]})
+    assert fake_hub.registered[CID]["body"]["actions"] == ["curtsy"]
+    assert client_tools.current_body_actions() == ["curtsy"]  # greeting waves follow it

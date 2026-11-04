@@ -279,3 +279,41 @@ def test_greet_on_start_can_be_switched_off(turn_env):
         time.sleep(0.05)
     assert not [e for e in drain if e["type"] == "say"], f"she greeted despite greet_on_start: false -> {drain}"
     assert fake_hub.audio_requests == []  # no voice work at all
+
+
+# ── reply body actions (docs/BODY.md §5) ─────────────────────────────────
+
+def test_reply_actions_reach_the_say_event(turn_env):
+    cfg, url, fake_hub = turn_env
+    fake_hub.actions = [{"name": "wave", "at": 0.0}, {"name": "think", "at": 0.6}]
+    s = session.Session(cfg, source="desktop")
+    s.submit_text("wave at me")
+    say = next(e for e in collect_events(url, [], {"say"}) if e["type"] == "say")
+    assert say["actions"] == [{"name": "wave", "at": 0.0}, {"name": "think", "at": 0.6}]
+
+
+def test_say_actions_empty_for_hubs_without_actions(turn_env):
+    cfg, url, fake_hub = turn_env  # fake_hub.actions is None: old-hub reply shape
+    s = session.Session(cfg, source="desktop")
+    s.submit_text("hello")
+    say = next(e for e in collect_events(url, [], {"say"}) if e["type"] == "say")
+    assert say["actions"] == []
+
+
+def test_switch_greeting_waves_when_the_body_can_wave(turn_env):
+    cfg, url, fake_hub = turn_env
+    s = session.Session(cfg, source="desktop")
+    s.switch_persona("asuka")  # switch greetings earn a wave (docs/BODY.md §3)
+    say = next(e for e in collect_events(url, [], {"say"}) if e["type"] == "say")
+    assert say["actions"] == [{"name": "wave", "at": 0}]
+
+
+def test_switch_greeting_without_wave_in_the_body(turn_env, monkeypatch):
+    from riko import client_tools
+    monkeypatch.setattr(client_tools, "_current_body",
+                        {"actions": ["spin"], "expressions": []})  # e.g. a body set without wave
+    cfg, url, fake_hub = turn_env
+    s = session.Session(cfg, source="desktop")
+    s.switch_persona("asuka")
+    say = next(e for e in collect_events(url, [], {"say"}) if e["type"] == "say")
+    assert say["actions"] == []
