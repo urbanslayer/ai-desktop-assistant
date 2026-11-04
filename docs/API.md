@@ -60,6 +60,9 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   },
   "voice_version": 1,              // +1 on every voice/reference/lock change
   "emotes": true,                  // emotion tags on/off (see *Emotion tags*)
+  "appearance": "long white-and-blue hair, blue eyes, a blue tailcoat…",
+                                   // how she looks (≤ 1000 chars, see *Body actions*)
+  "embodied": true,                // may act with the 3D body (see *Body actions*)
   "updated_at": "2026-11-03T18:00:00Z"
 }
 ```
@@ -80,6 +83,13 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   an emotion tag and hands you the parsed emotion as structured metadata (see
   *Emotion tags*). Default **true**, including for personas that existed
   before this field existed.
+* `appearance` — free text (≤ 1000 chars, `422` above that) describing how
+  she looks; when set the hub appends `Your appearance: …` to the system
+  prompt so she can describe herself, **even in text-only chats with no body
+  online** (see *Body actions*). Default `""`.
+* `embodied` — when false the body block is **never** added for this persona
+  and switch greetings never auto-wave, even with an embodied client online
+  (see *Body actions*). Default **true**, including for existing personas.
 
 ### Message
 
@@ -91,6 +101,7 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   "content": "hi",
   "source": "android",
   "emotion": "teasing",            // assistant messages only, else null
+  "actions": [{"name": "wave", "at": 0.0}],  // assistant messages; [] unless the turn acted
   "tools_used": [                  // [] unless the turn ran tools
     {"tool": "web_search", "label": "searching the web for “tokyo weather”"}
   ],
@@ -102,8 +113,10 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
 `after` cursor. `role` is `user` or `assistant`. `source` is the client name
 you passed to `/api/chat` (`desktop`, `android`, `web`, `terminal`,
 `import`, …). `emotion` is one of the fixed emotion ids (see *Emotion tags*)
-and `content` **never contains the raw tag**; `tools_used` is the compact
-trace of which tools the turn called (full history in `/api/tools/log`).
+and `content` **never contains the raw tag**; `actions` is the parsed
+body-action list (see *Body actions*) and `content` never contains the raw
+action tags either; `tools_used` is the compact trace of which tools the turn
+called (full history in `/api/tools/log`).
 
 ### State
 
@@ -322,6 +335,7 @@ Body: `{"text": "…", "source": "android", "persona": optional id,
   "persona": "riko",
   "switched": false,
   "emotion": "happy",
+  "actions": [{"name": "wave", "at": 0.0}],
   "tools_used": [{"tool": "web_search", "label": "searching the web for “tokyo weather”"}],
   "message_ids": [41, 42],
   "audio_url": "/api/messages/42/audio",
@@ -336,16 +350,22 @@ Two outcomes:
    is stored** and the target becomes active (which bumps `state.version`).
    `audio_url` points at the greeting WAV:
    `/api/personas/<id>/greeting/audio?v=<voice_version>`.
-2. **Normal turn**: the hub builds `system_prompt + emotion/tools prompt
-   lines + last <max_history> stored messages + your text`, runs the model
-   (possibly through the tool loop — see *Tools*), strips any emotion tag,
-   then stores your message and the clean reply (both with your `source`,
-   the assistant one with `emotion` + `tools_used`) and returns both ids.
-   `audio_url` is `/api/messages/<assistant_id>/audio`.
+   `actions` is `[{"name": "wave", "at": 0.0}]` when the target persona is
+   `embodied` and the online body set has `wave` (see *Body actions*), else
+   `[]`.
+2. **Normal turn**: the hub builds `system_prompt + emotion/body/appearance
+   prompt lines + last <max_history> stored messages + your text`, runs the
+   model (possibly through the tool loop — see *Tools*), strips any emotion
+   tag and action tags, then stores your message and the clean reply (both
+   with your `source`, the assistant one with `emotion` + `actions` +
+   `tools_used`) and returns both ids. `audio_url` is
+   `/api/messages/<assistant_id>/audio`.
 
 `emotion` is the parsed emotion id (`neutral` when the persona has `emotes`
 off or the model gave no/unknown tag) — drive your VRM expression from it,
-the raw `[tag]` is **never** in `reply` (see *Emotion tags*). `tools_used` is
+the raw `[tag]` is **never** in `reply` (see *Emotion tags*). `actions` is
+**always present**, `[]` when the turn did not act; on tool-loop turns it
+comes from the **final** reply only (see *Body actions*). `tools_used` is
 `[]` when no tools ran; while a turn runs you can watch live progress on
 `GET /api/events` (see *Events*). A turn that uses tools can take noticeably
 longer than a plain one (each tool step is another model call): keep your
@@ -617,7 +637,7 @@ client can replay the greeting) but leaves `state.version` alone.
 | `401` | missing/wrong hub key | `{"detail": "invalid api key"}` |
 | `404` | unknown persona id/keyword, unknown message id, missing reference clip | `{"detail": "…"}` |
 | `409` | persona slug exists / delete of last persona / voice lock on a non-design voice / audio for a persona with `voice.mode: "off"` | `{"detail": "…"}` |
-| `422` | validation (empty name, bad import rows, non-object extra_body, empty `text`, over-long `/api/tts` text, bad voice/tts field values) | `{"detail": "…"}` (FastAPI may return its own validation shape) |
+| `422` | validation (empty name, bad import rows, non-object extra_body, empty `text`, over-long `/api/tts` text, over-long persona `appearance`, bad voice/tts field values, bad client registration incl. malformed `body`) | `{"detail": "…"}` (FastAPI may return its own validation shape) |
 | `502` | LLM call failed — **nothing was stored**, safe to retry. Also: breeze synthesis/registration failed | `{"detail": "<ExceptionType>: <reason>"}` |
 | `503` | no `llm.base_url` configured; or TTS off/unreachable on an audio route | `{"detail": "LLM not configured"}` / `{"detail": "TTS …"}` |
 
@@ -641,6 +661,54 @@ e.g. `[teasing] Sure thing, senpai.` The hub then:
 metadata — you never parse the text, and old clients that ignore it keep
 working. The set matches StoryLine's emotion vocabulary, so a client can
 share its expression table.
+
+## Body actions (embodiment, docs/BODY.md)
+
+When an **embodied client** (the desktop avatar) is online it registers the
+gestures it can actually play (see *Client tool channel*, step 1: the
+optional `body` object). The hub keeps each online client's body; the
+**body set** is the union of the online clients' `actions` and is **empty
+when no embodied client is online** — a client going offline removes its
+actions from the set immediately. `GET /api/tools` reports the current set as
+`body_actions`.
+
+**Prompt.** When the body set is non-empty *and* the persona has
+`embodied: true`, the system prompt gains a short block naming the actual
+actions ("You have a 3D body… Available actions: wave, think, nod, …"), so
+the model pepper its reply with action tags. The persona's `appearance` line
+(`Your appearance: …`) is appended whenever `appearance` is non-empty — body
+online or not.
+
+**Parsing (what the hub accepts).** Applied to the final reply *after*
+emotion-tag stripping; names are matched case-insensitively, hyphens and
+spaces fold to `_`:
+
+| model writes | in body set | not in body set |
+|---|---|---|
+| `[wave]` anywhere in the reply | action `wave` | known gesture name → **stripped + logged as ignored**; otherwise left in the text untouched (`[sad]`, `[note]`, `[Stardust](url)` survive) |
+| `[action:spin]` / `[action-spin]` | action `spin` | **always stripped**, logged as ignored (an explicit request the body can't do) |
+| `*waves*` `*nods*` `*thinks*` `*shakes head*` `*stretches*` `*looks around*` `*laughs*` `*pouts*` `*touches hair*` | mapped via the verb table (`waves → wave`, …) and stripped | stripped + logged as ignored |
+| `*smiles*` (not in the verb table) | left alone (prose emphasis survives) | |
+
+Clean text: no tags/asterisk actions remain in stored or spoken text
+(spaces/punctuation collapsed; Breeze audio is built from the clean text).
+**Limits:** at most 3 actions per reply (extras dropped), adjacent
+duplicates merged.
+
+**Timing.** Each action carries `at`, the 0..1 fraction of the *cleaned*
+reply's length where the tag appeared (`0` = before the first word). Clients
+play it at `at * speech duration` — the hub does not know your audio length.
+
+**Where actions show up:** `ChatResult.actions` (always present, `[]` when
+none), `Message.actions` on stored assistant messages, `turn_finished`
+events, and switch greetings (`[{"name": "wave", "at": 0.0}]` when the
+persona is embodied and the body set has `wave`). On tool-loop turns actions
+come from the **final** reply only. Like emotions, this is plain metadata:
+`reply`/`content` never contain the raw tags and old clients that ignore
+`actions` keep working.
+
+**Client job (embodied clients):** play each action against the speech
+(docs/BODY.md §5); ignore unknown names with a console note.
 
 ## Tools
 
@@ -674,7 +742,8 @@ answers and marks `rejected` until a later turn works again.
 ```bash
 curl -s -H "$AUTH" $HUB/api/tools
 # {"tools":[{"name":"web_search","source":"hub","risk":"read","permission":"always","available":true,"description":"…"}, …],
-#  "settings":{…merged tools block…},"function_calling":"ok"}
+#  "settings":{…merged tools block…},"function_calling":"ok",
+#  "body_actions":["wave","think","nod",…]}   // online body set (see *Body actions*)
 
 curl -s -H "$AUTH" "$HUB/api/tools/log?limit=50"
 # {"entries":[{"id":9,"created_at":"…","persona":"riko","tool":"web_search",
@@ -763,7 +832,7 @@ curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 #   {"seq":13,"time":"…","type":"tool_started","call_id":"…","tool":"web_search","label":"searching the web for “tokyo weather”"},
 #   {"seq":14,"time":"…","type":"tool_finished","call_id":"…","tool":"web_search","ok":true,"ms":812},
 #   {"seq":15,"time":"…","type":"approval_needed","request_id":"…","client_id":"my-desktop","tool":"desktop__do_thing","summary":"do_thing {}"},
-#   {"seq":16,"time":"…","type":"turn_finished","persona":"riko","message_id":42,"emotion":"happy"},
+#   {"seq":16,"time":"…","type":"turn_finished","persona":"riko","message_id":42,"emotion":"happy","actions":[{"name":"wave","at":0.0}]},
 #   {"seq":17,"time":"…","type":"state_changed","version":18}
 # ],"last":17}
 ```
@@ -788,11 +857,18 @@ Protocol (client side, all with `$AUTH`):
 
 1. **Register** at startup — `POST /api/clients/{id}/register` with
    `{name, kind, platform?, version?, tools: [{name, description,
-   parameters?, risk?}]}`. `id` matches `[A-Za-z0-9_-]{1,64}` (e.g.
+   parameters?, risk?}], body?}`. `id` matches `[A-Za-z0-9_-]{1,64}` (e.g.
    `my-desktop`), `kind` is a lowercase word (`desktop`, later `android`),
    tool `name` matches `[A-Za-z0-9_-]{1,64}`, `risk` is `read` (default),
    `act` or `danger`. Re-register with the same `id` any time your tool
    list changes — it replaces the whole registration.
+   `body` is optional and declares what a 3D body can do right now (see
+   *Body actions*): `{"actions": ["wave", "think", …], "expressions":
+   ["happy", …]}` — lists of gesture/expression names matching
+   `[a-zA-Z0-9_-]{1,64}` (a client without a body sends no `body`; `422` on
+   a malformed one). The hub keeps it per online client and drops it when
+   the client goes offline; re-register whenever the gesture library
+   changes (a `.vrma` drop-in).
 2. **Long-poll for work** — `GET /api/clients/{id}/requests?wait=25`
    (wait ≤ 60 s) returns immediately when there is queued work, else after
    `wait`; body is `{"requests": [...], "approval_timeout_s": 120}` with an
@@ -826,7 +902,10 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' -d '{
              "description": "Open a URL in the user's default browser",
              "parameters": {"type": "object",
                             "properties": {"url": {"type": "string"}},
-                            "required": ["url"]}}]
+                            "required": ["url"]}}],
+  "body": {"actions": ["wave", "think", "nod", "shake_head", "look_around",
+                       "stretch", "fidget", "hair_touch", "laugh", "pout", "listen"],
+           "expressions": ["happy", "angry", "sad", "relaxed", "surprised"]}
 }' $H/api/clients/my-desktop/register
 # {"ok":true,"model_tools":["desktop__open_url"],"heartbeat_seconds":30,...}
 

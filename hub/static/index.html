@@ -87,6 +87,8 @@
   .tbl select { width: auto; padding: 2px 6px; }
   .emo { font-size: 11px; color: var(--muted); background: var(--chip); border-radius: 6px;
          padding: 1px 6px; margin-left: 6px; }
+  .act { font-size: 11px; color: var(--accent); background: var(--chip); border-radius: 6px;
+         padding: 1px 6px; margin-left: 6px; }
 </style>
 </head>
 <body>
@@ -131,6 +133,11 @@
         <div><label>Emotions</label><label style="margin:0"><input type="checkbox" id="pemotes" checked
              style="width:auto"> Emote — start replies with an emotion tag (stripped before storage/speech)</label></div>
       </div>
+      <label>Appearance <span class="hint">how she looks: hair, eyes, outfit, …; she uses it to describe
+        herself (max 1000 chars)</span></label>
+      <textarea id="pappearance" maxlength="1000" placeholder="long white-and-blue hair, blue eyes, a blue tailcoat and a small top hat"></textarea>
+      <div><label style="margin:0"><input type="checkbox" id="pembodied" checked style="width:auto">
+        Embodied — may act with the 3D body (action tags) while an embodied client is online</label></div>
       <label>Avatar (.vrm, max 200 MB)</label>
       <div class="row" style="align-items:center">
         <div><input type="file" id="pvrm" accept=".vrm,application/octet-stream"></div>
@@ -264,6 +271,9 @@
         <span class="hint" id="tclientshint"></span>
       </div>
       <div id="tclients" class="hint" style="margin-top:4px"></div>
+      <label style="margin-top:8px">Online body set <span class="hint">what she can do right now
+        (union over online embodied clients; docs/BODY.md)</span></label>
+      <div id="tbodyset" class="hint">…</div>
       <div style="margin-top:8px"><button class="btn small" id="tlogreload">Show recent tool calls</button></div>
       <div id="tlog" class="hint" style="margin-top:4px; white-space:pre-wrap"></div>
 
@@ -432,6 +442,8 @@ async function startEdit(pid) {
   $("pprompt").value = p.system_prompt; $("pgreet").value = p.greeting;
   $("ptts").value = p.tts_voice; $("perr").textContent = "";
   $("pemotes").checked = p.emotes !== false;
+  $("pappearance").value = p.appearance || "";
+  $("pembodied").checked = p.embodied !== false;
   showAvatarInfo(p);
   fillVoicePanel(p);
   $("pname").scrollIntoView({ behavior: "smooth", block: "center" });
@@ -440,8 +452,9 @@ function startCreate() {
   editing = null;
   $("pformtitle").textContent = "New persona";
   $("psave").textContent = "Create"; $("pcancel").hidden = true;
-  ["pname", "pkeys", "pprompt", "pgreet", "ptts"].forEach((i) => $(i).value = "");
+  ["pname", "pkeys", "pprompt", "pgreet", "ptts", "pappearance"].forEach((i) => $(i).value = "");
   $("pemotes").checked = true;
+  $("pembodied").checked = true;
   $("psize").textContent = ""; $("pvrm").value = ""; $("pupload").disabled = true;
   fillVoicePanel(null);
 }
@@ -460,6 +473,8 @@ async function savePersona() {
     greeting: $("pgreet").value,
     tts_voice: $("ptts").value.trim(),
     emotes: $("pemotes").checked,
+    appearance: $("pappearance").value,
+    embodied: $("pembodied").checked,
   };
   $("perr").textContent = "";
   try {
@@ -652,6 +667,8 @@ async function loadHistory() {
       `${m.role === "user" ? "you" : esc(h.persona)}: ${esc(m.content)}` +
       (m.role !== "user" && m.emotion && m.emotion !== "neutral"
         ? `<span class="emo">${esc(m.emotion)}</span>` : "") +
+      (m.role !== "user" && m.actions && m.actions.length
+        ? m.actions.map((a) => `<span class="act">↝ ${esc(a.name)}</span>`).join("") : "") +
       `<div class="meta">#${m.id} · ${esc(m.created_at)} · via ${esc(m.source || "?")}` +
       (m.tools_used && m.tools_used.length ? ` · tools: ${esc(m.tools_used.map((t) => t.tool).join(", "))}` : "") +
       `</div></div>`
@@ -862,13 +879,17 @@ async function loadTools() {
     $("tperm").innerHTML = rows.length
       ? `<tr><th>tool</th><th>source</th><th>risk</th><th></th><th>permission</th></tr>` + rows.join("")
       : `<tr><td class="hint">no tools right now — turn tools on and check SearXNG; client tools appear when a client is online</td></tr>`;
+    $("tbodyset").textContent = (t.body_actions && t.body_actions.length)
+      ? t.body_actions.join(", ")   // online body set (docs/BODY.md)
+      : "none — no embodied client online (she has no body right now)";
   } catch (e) { $("tperm").innerHTML = `<tr><td class="hint">tools unavailable: ${esc(e.message)}</td></tr>`; }
   try {
     const c = await api("/api/clients");
     $("tclientshint").textContent = c.clients.length + " client(s) online (heartbeat every " +
       c.heartbeat_s + " s, offline after " + c.offline_after_s + " s)";
     $("tclients").textContent = c.clients.map((cl) =>
-      `${cl.name} [${cl.kind}] · ${cl.tools.map((x) => x.model_name + "/" + x.risk).join(", ") || "no tools"} · ${cl.seconds_since_seen}s ago`
+      `${cl.name} [${cl.kind}] · ${cl.tools.map((x) => x.model_name + "/" + x.risk).join(", ") || "no tools"}` +
+      ` · body: ${(cl.body && cl.body.actions || []).join(", ") || "none"} · ${cl.seconds_since_seen}s ago`
     ).join("\n") || "none";
   } catch (e) { $("tclientshint").textContent = e.message; }
 }
@@ -1036,7 +1057,7 @@ async function sendChat() {
       d.textContent = "⇄ switched to " + r.persona;
       $("ctx").appendChild(d);
     } else {
-      addChat("ai", r.persona, r.reply, r.emotion);
+      addChat("ai", r.persona, r.reply, r.emotion, r.actions);
       if (r.tools_used && r.tools_used.length) {
         const d = document.createElement("div");
         d.className = "hint";
@@ -1053,11 +1074,12 @@ async function sendChat() {
   } catch (e) { $("cerr").textContent = e.message; }
   $("csend").disabled = false; $("cinput").focus();
 }
-function addChat(cls, who, text, emotion) {
+function addChat(cls, who, text, emotion, actions) {
   const d = document.createElement("div");
   d.className = "msg " + (cls === "user" ? "user" : "ai");
   const emo = emotion && emotion !== "neutral" ? `<span class="emo">${esc(emotion)}</span>` : "";
-  d.innerHTML = `${cls === "user" ? "you" : esc(who)}: ${esc(text)}${emo}`;
+  const acts = (actions || []).map((a) => `<span class="act">↝ ${esc(a.name)}</span>`).join("");
+  d.innerHTML = `${cls === "user" ? "you" : esc(who)}: ${esc(text)}${emo}${acts}`;
   $("ctx").appendChild(d);
 }
 

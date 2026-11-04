@@ -8,6 +8,7 @@ API contract: docs/DESIGN.md at the repo root; full reference in docs/API.md.
 """
 import hmac
 import json
+import logging
 import os
 import re
 import sys
@@ -25,6 +26,7 @@ from fastapi.concurrency import run_in_threadpool  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
 
 try:  # package import (repo root: `from hub.server import create_app`)
+    from . import body as _body
     from . import brain as _brain
     from . import clients as _clients
     from . import emotion as _emotion
@@ -38,6 +40,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from .tools.registry import build_hub_specs, hub_tool_info, permission_for, tools_prompt
     from .store import Store, default_voice, now_iso
 except ImportError:  # standalone: modules sit next to this file (Docker: /app)
+    import body as _body  # type: ignore[no-redef]
     import brain as _brain  # type: ignore[no-redef]
     import clients as _clients  # type: ignore[no-redef]
     import emotion as _emotion  # type: ignore[no-redef]
@@ -54,6 +57,7 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     from store import Store, default_voice, now_iso  # type: ignore[no-redef]
 
 HUB_VERSION = "1"
+log = logging.getLogger("riko.hub")
 STATIC_DIR = _HERE / "static"
 DEFAULT_AVATAR = _HERE / "assets" / "default_avatar.vrm"
 MAX_AVATAR_BYTES = 200 * 1024 * 1024  # 200 MB
@@ -514,12 +518,17 @@ def create_app(data_dir, api_key: str | None = None,
         keywords = [str(k).strip().lower() for k in (body.get("keywords") or []) if str(k).strip()]
         if pid not in keywords:
             keywords.insert(0, pid)
+        appearance = str(body.get("appearance") or "")
+        if len(appearance) > _body.MAX_APPEARANCE_CHARS:
+            return err(422, f"appearance is over {_body.MAX_APPEARANCE_CHARS} characters")
         persona = store.add_persona(
             pid, name, keywords,
             str(body.get("system_prompt") or ""),
             str(body.get("greeting") or ""),
             str(body.get("tts_voice") or ""),
             emotes=body["emotes"] if "emotes" in body else True,
+            appearance=appearance,
+            embodied=body["embodied"] if "embodied" in body else True,
         )
         bump_state()
         return JSONResponse(public_persona(persona), status_code=201)
@@ -553,6 +562,13 @@ def create_app(data_dir, api_key: str | None = None,
                 fields[key] = str(body[key] or "")
         if "emotes" in body:
             fields["emotes"] = bool(body["emotes"])
+        if "appearance" in body:
+            appearance = str(body["appearance"] or "")
+            if len(appearance) > _body.MAX_APPEARANCE_CHARS:
+                return err(422, f"appearance is over {_body.MAX_APPEARANCE_CHARS} characters")
+            fields["appearance"] = appearance
+        if "embodied" in body:
+            fields["embodied"] = bool(body["embodied"])
         if "keywords" in body:
             if not isinstance(body["keywords"], list):
                 return err(422, "keywords must be a list")
@@ -709,15 +725,23 @@ def create_app(data_dir, api_key: str | None = None,
                         bump_state()
                     persona = store.get_persona(target) or {}
                     reply = persona.get("greeting") or f"{persona.get('name', target)} here."
+                    # docs/BODY.md: a switch greets with a wave when the
+                    # online body set can do it and the persona is embodied.
+                    greet_actions = (
+                        [{"name": "wave", "at": 0.0}]
+                        if persona.get("embodied", True)
+                        and "wave" in clients_hub.body_actions()
+                        else [])
                     audio_url = None
                     if speak and tts_on() and (persona.get("voice") or {}).get("mode") != "off":
                         audio_url = (f"/api/personas/{target}/greeting/audio"
                                      f"?v={persona.get('voice_version', 1)}")
                     events.publish("turn_started", persona=target, source=source)
                     events.publish("turn_finished", persona=target,
-                                   message_id=None, emotion=None)
+                                   message_id=None, emotion=None,
+                                   actions=greet_actions)
                     return ("ok", {"reply": reply, "persona": target, "switched": True,
-                                   "emotion": None, "tools_used": [],
+                                   "emotion": None, "tools_used": [], "actions": greet_actions,
                                    "message_ids": [], "state_version": store.version(),
                                    "audio_url": audio_url})
 
@@ -752,6 +776,15 @@ def create_app(data_dir, api_key: str | None = None,
                 system = persona["system_prompt"]
                 if persona.get("emotes"):
                     system += "\n\n" + _emotion.PROMPT_RULE
+                # docs/BODY.md: the body block only when an embodied client
+                # is online AND the persona is embodied; the appearance line
+                # always (text-only chats can describe her too).
+                body_actions = clients_hub.body_actions()
+                if persona.get("embodied", True) and body_actions:
+                    system += "\n\n" + _body.body_prompt(body_actions)
+                appearance = str(persona.get("appearance") or "").strip()
+                if appearance:
+                    system += "\n\n" + _body.appearance_prompt(appearance)
                 if offered_names:
                     system += "\n\n" + tools_prompt(offered_names)
 
@@ -773,14 +806,21 @@ def create_app(data_dir, api_key: str | None = None,
 
                 # the emotion tag never reaches the stored reply or the TTS
                 emotion, answer = _emotion.parse_emotion(out["text"])
+                # body actions are parsed from the FINAL reply only (the
+                # tool loop may have streamed several model turns)
+                answer, actions, ignored = _body.parse_actions(answer, body_actions)
+                if ignored:
+                    log.info("ignored_actions persona=%s names=%s", pid, ",".join(ignored))
                 tools_used = out["tools_used"]
 
                 user_id = store.add_message(pid, "user", text, source)
                 assistant_id = store.add_message(pid, "assistant", answer, source,
-                                                 emotion=emotion, tools=tools_used)
+                                                 emotion=emotion, tools=tools_used,
+                                                 actions=actions)
                 bump_state()
                 events.publish("turn_finished", persona=pid,
-                               message_id=assistant_id, emotion=emotion)
+                               message_id=assistant_id, emotion=emotion,
+                               actions=actions)
                 # The chat never waits for audio: audio_url points at the audio
                 # route, which synthesises lazily (and caches on disk).
                 audio_url = None
@@ -788,6 +828,7 @@ def create_app(data_dir, api_key: str | None = None,
                     audio_url = f"/api/messages/{assistant_id}/audio"
                 return ("ok", {"reply": answer, "persona": pid, "switched": False,
                                "emotion": emotion, "tools_used": tools_used,
+                               "actions": actions,
                                "message_ids": [user_id, assistant_id],
                                "state_version": store.version(),
                                "audio_url": audio_url})
@@ -1341,7 +1382,9 @@ def create_app(data_dir, api_key: str | None = None,
                                                        permissions,
                                                        s["permission_override"])})
         return {"tools": tools, "settings": cfg, "defaults": default_tools(),
-                "status": tools_status_response()}
+                "status": tools_status_response(),
+                # online body set (docs/BODY.md §1): what she can do right now
+                "body_actions": clients_hub.body_actions()}
 
     @app.get("/api/tools/log")
     def get_tools_log(request: Request):
@@ -1391,7 +1434,8 @@ def create_app(data_dir, api_key: str | None = None,
         try:
             out = clients_hub.register(client_id, str(body.get("name") or ""),
                                        str(body.get("kind") or ""),
-                                       body.get("tools") or [])
+                                       body.get("tools") or [],
+                                       body=body.get("body"))
         except ValueError as e:
             return err(422, str(e))
         return out
