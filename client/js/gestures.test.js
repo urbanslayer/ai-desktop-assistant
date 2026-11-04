@@ -53,7 +53,9 @@ test('samplePose loops wrap continuously', () => {
     for (let i = 0; i < 3; i++) assert.ok(Math.abs(a[bone][i] - b[bone][i]) < 0.05);
   }
   const c = samplePose('think', -0.01), d = samplePose('think', 3.99);
-  for (let i = 0; i < 3; i++) assert.ok(Math.abs(c.leftLowerArm[i] - d.leftLowerArm[i]) < 0.05);
+  // (the arms are IK-driven now — ik.test.js checks the arm loop wrap on the
+  // wrist targets; euler-wise the shared head/neck keys must match)
+  for (let i = 0; i < 3; i++) assert.ok(Math.abs(c.neck[i] - d.neck[i]) < 0.05);
 });
 
 test('gesture table has the set ROUNDS.md asks for', () => {
@@ -66,27 +68,48 @@ test('gesture table has the set ROUNDS.md asks for', () => {
   assert.equal(GESTURES.wave.loop, false);
 });
 
-test('wave wrist + arm oscillators swing and ease in/out', () => {
+test('wave wrist flap + IK arm rock ease in/out', () => {
   const s0 = sampleGesture('wave', 0.4);
-  const hand = [], arm = [];
+  const hand = [];
   for (let t = 0.55; t <= 2.05; t += 0.05) {
     const s = sampleGesture('wave', t);
     hand.push(s.rightHand[2]);
-    arm.push(s.rightUpperArm[2]);
   }
   const handSpread = Math.max(...hand) - Math.min(...hand);
-  const armSpread = Math.max(...arm) - Math.min(...arm);
   assert.ok(handSpread > 0.5, `wrist should flap, got ${handSpread}`);
-  assert.ok(armSpread > 0.3, `arm should rock, got ${armSpread}`);
+  // the arm rock lives on the IK target track now (see ik.test.js for the
+  // swing measured against synthetic rigs); it must exist and be generous
+  const armOsc = GESTURES.wave.arms.right.osc;
+  assert.ok(Array.isArray(armOsc) && armOsc.length, 'wave must rock the arm via the IK target');
+  assert.ok(armOsc[0].amp > 0.1 && armOsc[0].axis === 0, `arm rock spec: ${JSON.stringify(armOsc)}`);
   // 2-3 cycles over the ~1.55 s window (1.5 Hz): count wrist reversals
   let reversals = 0;
   for (let i = 1; i < hand.length - 1; i++) {
     if ((hand[i] - hand[i - 1]) * (hand[i + 1] - hand[i]) < 0) reversals++;
   }
   assert.ok(reversals >= 3, `expected several wrist reversals, got ${reversals}`);
-  // near the window edges the wobble is eased out
-  assert.ok(Math.abs(sampleGesture('wave', 0.56).rightHand[2] - s0.rightHand[2]) < 0.05);
-  assert.ok(Math.abs(sampleGesture('wave', 0.56).rightUpperArm[2] - s0.rightUpperArm[2]) < 0.05);
+  // near the window edges the wobble is eased in: at t=0.56 (0.06 s into the
+  // 0.25 s edge ramp) the flap+base must still be near the rest angle
+  assert.ok(Math.abs(sampleGesture('wave', 0.56).rightHand[2]) < 0.12);
+  // and the IK arm track is at rest at t=0 / back at rest at the end
+  assert.ok(!GESTURES.wave.arms.right.keys[0].target, 'wave must start from the rest arm pose');
+  assert.ok(!GESTURES.wave.arms.right.keys.at(-1).target, 'wave must end at the rest arm pose');
+});
+
+test('IK-driven gestures carry arm tracks that loop-match', () => {
+  for (const name of ['wave', 'think']) {
+    const g = GESTURES[name];
+    assert.ok(g.arms?.right, `${name} needs a right arm track`);
+    assert.equal(g.arms.right.keys[0].t, 0, name);
+    assert.equal(g.arms.right.keys.at(-1).t, g.duration, name);
+    if (g.loop) {  // loop poses must hold across the wrap
+      for (const side of Object.keys(g.arms)) {
+        const k = g.arms[side].keys;
+        assert.deepEqual(k[0].target, k.at(-1).target, `${name}.${side} loop mismatch`);
+        assert.deepEqual(k[0].pole, k.at(-1).pole, `${name}.${side} pole loop mismatch`);
+      }
+    }
+  }
 });
 
 test('mirrorPose flips upperArm z for VRM 0.x only', () => {

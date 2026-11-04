@@ -13,9 +13,20 @@
 // rightUpperArm.z = +1.3, matching the rest pose index.html sets in
 // attach()). Missing bones/axes mean the rest rotation.
 //
+// Euler poses encode ONE rig's bone axes and limb lengths. On other models
+// (the owner's VRM 0.x 'Furina' avatar: longer arms, different axes, no
+// chest bone) the same numbers put the arms anywhere. So the two signature
+// gestures that must always read correctly — wave and think — carry an
+// `arms` block instead: world-space WRIST target tracks solved per-rig by the
+// 2-bone IK in ik.js (see its header for the rig-profile and target-spec
+// format). Their `keys` only hold the bones that transfer fine across rigs
+// (neck, spine, shoulders, hand/finger curls); the upperArm/lowerArm eulers
+// that used to live there are gone.
+//
 // For VRM 0.x rigs the player mirrors the sign of every upperArm z, the
 // same convention attach() already uses to lower the arms (best effort:
-// VRM 0.x rigs are mirrored on this axis; other axes vary per rig).
+// VRM 0.x rigs are mirrored on this axis; other axes vary per rig). IK-driven
+// arms need no mirroring — the solver reads the rig's own geometry.
 //
 // Keys are [time, bones] pairs; the player interpolates between them with
 // smoothstep easing (gestures ease in and out of the rest pose on their
@@ -54,60 +65,86 @@ function curlRightHand(c = 1) {
 // name -> { loop, duration (s), keys: [{t, bones}], osc?: {bone, axis, base, amp, freq, from, until} | osc[] }
 // axis index into the [x,y,z] triplets below.
 export const GESTURES = {
-  // Greeting: right arm up beside the head with the hand above it, palm to
-  // the camera, wrist flapping while the arm rocks side to side (hand
-  // travels > 0.06 m laterally, > 0.15 m above the shoulder). Measured
-  // against sample_avatar.vrm: hand ~0.23 m above the shoulder at rest of
-  // the osc, ~0.13 m above the head bone.
+  // Greeting: right arm up beside the head, wrist at about head-top height
+  // and ~0.65 arm-lengths out from the centre line, palm-ish to the camera,
+  // wrist flapping (Euler osc on rightHand) while the whole arm rocks
+  // side-to-side (osc on the IK target, ±0.16 arm lengths). Every number is
+  // relative to THIS rig (head top / arm length), so short- and long-armed
+  // models wave at the same relative height — that is the whole point of the
+  // IK retarget. Elbow pole keeps the elbow low/out/back, away from the head.
   wave: {
     loop: false, duration: 2.4,
     keys: [
       { t: 0.0, bones: {} },
-      { t: 0.45, bones: { rightUpperArm: [-0.25, 0, -1.0], rightLowerArm: [0, 1.5, 0],
-                          rightHand: [0.35, 0, 0], neck: [0.05, 0, 0.1] } },
-      { t: 1.9, bones: { rightUpperArm: [-0.25, 0, -1.0], rightLowerArm: [0, 1.5, 0],
-                         rightHand: [0.35, 0, 0], neck: [0.05, 0, 0.1] } },
+      { t: 0.45, bones: { neck: [0.05, 0, 0.1] } },
+      { t: 1.9, bones: { neck: [0.05, 0, 0.1] } },
       { t: 2.4, bones: {} },
     ],
     osc: [
       { bone: 'rightHand', axis: 2, base: 0.35, amp: 0.6, freq: 1.5, from: 0.5, until: 2.05 },
-      { bone: 'rightUpperArm', axis: 2, base: -1.0, amp: 0.32, freq: 1.5, from: 0.5, until: 2.05 },
     ],
+    arms: {
+      right: {
+        keys: [
+          { t: 0.0 },  // rest (arm down)
+          { t: 0.45, target: { ref: 'headTop', unit: 'arm', off: [0.62, 0.14, 0.20] },
+            pole: [-0.55, -0.72, -0.35] },
+          { t: 1.9, target: { ref: 'headTop', unit: 'arm', off: [0.62, 0.14, 0.20] },
+            pole: [-0.55, -0.72, -0.35] },
+          { t: 2.4 },  // back to rest
+        ],
+        osc: [{ axis: 0, amp: 0.16, freq: 1.5, from: 0.5, until: 2.05 }],
+      },
+    },
   },
 
-  // Classic thinker, measured on sample_avatar.vrm: right elbow tucked low
-  // at her side in front of the ribs, resting on the left hand which lies
-  // palm-up across the waist; forearm angled up so the curled right hand
-  // touches the chin (hand bone within 0.06 m of the chin anchor, left hand
-  // within 0.06 m of the right elbow, nothing behind the chest plane). The
-  // hand is held the whole loop (entry/exit handled by the gesture blend);
-  // the pose breathes through a finger half-tap and a head micro-tilt at
-  // mid-loop. motion.js biases the gaze up-and-aside while this loops.
+  // Classic thinker, defined in rig-relative space (see ik.js): the right
+  // wrist IK-targets just below-and-right of the chin (a quarter of a head
+  // length away, so the curled fingers touch it), the left wrist cups the
+  // RIGHT elbow (solved first), elbows hang low and forward at the ribs,
+  // right hand curled + head micro-tilt stay Euler (they transfer fine).
+  // motion.js biases the gaze up-and-aside while this loops.
   think: {
     loop: true, duration: 4.0,
     keys: [
       { t: 0.0, bones: {
-          rightUpperArm: [-1.2, 0.49, 1.8], rightLowerArm: [0.53, 2.47, -0.06],
           rightShoulder: [-0.12, -0.45, 0.09], rightHand: [1.26, 0.16, 1.21],
           ...curlRightHand(1),
-          leftUpperArm: [-0.22, -0.19, -1.6], leftLowerArm: [0.2, -1.76, -0.2],
           leftShoulder: [-0.11, -0.28, 0],
           neck: [0.05, -0.08, 0.12], spine: [0.02, 0, 0] } },
       { t: 2.0, bones: {
-          rightUpperArm: [-1.2, 0.49, 1.8], rightLowerArm: [0.53, 2.47, -0.06],
           rightShoulder: [-0.12, -0.45, 0.09], rightHand: [1.26, 0.16, 1.21],
           ...curlRightHand(0.7),   // slow finger half-tap
-          leftUpperArm: [-0.22, -0.19, -1.6], leftLowerArm: [0.2, -1.76, -0.2],
           leftShoulder: [-0.11, -0.28, 0],
           neck: [0.07, -0.1, 0.14], spine: [0.03, 0, 0.01] } },  // head micro-tilt
       { t: 4.0, bones: {
-          rightUpperArm: [-1.2, 0.49, 1.8], rightLowerArm: [0.53, 2.47, -0.06],
           rightShoulder: [-0.12, -0.45, 0.09], rightHand: [1.26, 0.16, 1.21],
           ...curlRightHand(1),
-          leftUpperArm: [-0.22, -0.19, -1.6], leftLowerArm: [0.2, -1.76, -0.2],
           leftShoulder: [-0.11, -0.28, 0],
           neck: [0.05, -0.08, 0.12], spine: [0.02, 0, 0] } },
     ],
+    arms: {
+      right: {
+        keys: [
+          { t: 0.0, target: { ref: 'chin', unit: 'head', off: [0.16, -0.14, 0.16] },
+            pole: [-0.55, -0.80, 0.20] },
+          { t: 4.0, target: { ref: 'chin', unit: 'head', off: [0.16, -0.14, 0.16] },
+            pole: [-0.55, -0.80, 0.20] },
+        ],
+      },
+      left: {
+        // cups the right elbow (resolved after the right arm solves) from
+        // below-front; palm-up support of the thinker tripod. Stay close to
+        // the elbow — a far target would demand a cross-body reach beyond the
+        // rig's own arm length.
+        keys: [
+          { t: 0.0, target: { ref: 'otherElbow', unit: 'head', off: [0.04, -0.16, 0.16] },
+            pole: [0.55, -0.80, 0.25] },
+          { t: 4.0, target: { ref: 'otherElbow', unit: 'head', off: [0.04, -0.16, 0.16] },
+            pole: [0.55, -0.80, 0.25] },
+        ],
+      },
+    },
   },
 
   // Lean in and tilt the head while listening.
@@ -308,7 +345,7 @@ export function sampleGesture(name, t) {
     const edge = clamp(Math.min(t - o.from, o.until - t) / 0.25, 0, 1);
     const wob = Math.sin((t - o.from) * o.freq * Math.PI * 2) * o.amp * smoothstep(edge);
     const rot = pose[o.bone] || (pose[o.bone] = [0, 0, 0]);
-    rot[o.axis] += wob;
+    rot[o.axis] += (o.base || 0) * smoothstep(edge) + wob;
   }
   return pose;
 }
@@ -324,6 +361,13 @@ export function mirrorPose(pose, vrm1) {
   }
   return out;
 }
+
+/** Gestures whose arms are IK-driven (name -> {arms, loop, duration}); the
+ *  camera framing sweeps these to find the gesture envelope. */
+export const IK_ARM_GESTURES = Object.fromEntries(
+  Object.entries(GESTURES).filter(([, g]) => g.arms)
+    .map(([n, g]) => [n, { arms: g.arms, loop: g.loop, duration: g.duration }]),
+);
 
 // ── Cheap vowel lip sync ────────────────────────────────────────────
 //

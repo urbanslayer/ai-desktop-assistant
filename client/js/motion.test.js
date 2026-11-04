@@ -60,11 +60,18 @@ if (THREE) {
     for (const [side, s] of [['left', 1], ['right', -1]]) {
       const sh = mk(`${side}Shoulder`, upperChest, 0.1 * s, 0.12, 0);
       const ua = mk(`${side}UpperArm`, sh, 0.18 * s, -0.02, 0);
-      // arms-down rest, the same convention index.html attach() sets
-      ua.rotation.z = (side === 'right' ? 1.3 : -1.3);
+      // Arms-down rest. Real VRM rigs bake a per-side bone-axis frame into
+      // each normalized bone, so index.html's ±1.3 is side-dependent there;
+      // bare Object3D bones have no such frame, so the SIGN here is simply
+      // whichever one makes the chain hang down-and-outward (verified by the
+      // IK tests solving against this rig).
+      ua.rotation.z = (side === 'right' ? -1.3 : 1.3);
       const la = mk(`${side}LowerArm`, ua, 0, -0.28, 0);
       mk(`${side}Hand`, la, 0, -0.25, 0);
     }
+    // eyes (the rig profile measures head size from eye spacing when present)
+    mk('eyeLeft', bones.neck, 0.032, 0.05, 0.05);
+    mk('eyeRight', bones.neck, -0.032, 0.05, 0.05);
     return {
       meta: { metaVersion: '1' },
       scene,

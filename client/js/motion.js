@@ -29,6 +29,7 @@
 // neck instead, so nodding never fights looking at you.
 
 import { GESTURES, POSE_BONES, sampleGesture, mirrorPose } from './gestures.js';
+import { sampleArm, gestureEnvelope, solveTwoBoneIK } from './ik.js';
 
 const BLEND_IN = 0.35;   // gesture ease-in (s)
 const BLEND_OUT = 0.4;   // gesture ease-out (s)
@@ -42,6 +43,11 @@ const smoothK = (dt, tau) => 1 - Math.exp(-dt / tau);
 // combined head+neck turn stays inside these because the gaze layer splits
 // its own ±0.3 rad budget 40 % neck / 60 % head and sway adds only a little.
 const HEAD_LIMITS = { x: [-0.2, 0.25], y: [-0.35, 0.35], z: [-0.12, 0.12] };
+// safety net for IK-driven arms: a solved local target quaternion may never
+// sit further than this from the rest quaternion (radians, vs the rest pose).
+// Comfortably above every natural raise (~2.4 rad max here) so it only ever
+// catches a degenerate solve; the QA sim asserts bones stay under 2.7.
+const MAX_ARM_ANGLE = 2.6;
 const GAZE_FOLLOW = { yaw: 0.3, pitch: [-0.18, 0.22] };  // the gaze's own budget
 const NECK_SHARE = 0.4;                                    // neck takes 40 % ...
 const IDLE_AMBIENT = 0.4;                                  // ... sway shrinks to 40 % while idle
@@ -109,6 +115,7 @@ export class AvatarMotion {
     this._e1 = new THREE.Euler();
     this._v1 = new THREE.Vector3();
     this._v2 = new THREE.Vector3();
+    this._v3 = new THREE.Vector3();
   }
 
   // ── persona hot-swap: rebind everything to the new VRM ──
@@ -124,6 +131,10 @@ export class AvatarMotion {
     this.vrm1 = vrm.meta.metaVersion !== '0';
     this._boneCache = new Map();
     this._rest = new Map();
+    // the page has already lowered the arms and rotateVRM0()'d this model,
+    // but the matrices are stale until something renders — refresh before
+    // reading any world position (rest snapshot AND rig profile depend on it)
+    if (vrm.scene?.updateMatrixWorld) vrm.scene.updateMatrixWorld(true);
     for (const b of MOTION_BONES) {
       const n = vrm.humanoid.getNormalizedBoneNode(b);
       if (n) {
@@ -133,8 +144,78 @@ export class AvatarMotion {
         this._rest.set(b, n.quaternion.clone());
       }
     }
+    this.rig = this._buildRig();
     vrm.lookAt.target = this.eyeTarget;   // eyes follow the fast pivot
     this._resetGaze();
+  }
+
+  /**
+   * Everything the IK gestures and the camera framing need to know about
+   * THIS rig, measured from its rest pose (see ik.js for the shape). Returns
+   * null when the arm chain is incomplete — IK gestures then no-op on the
+   * arms instead of guessing proportions.
+   */
+  _buildRig() {
+    const T = this.THREE;
+    const node = (n) => this._boneCache.get(n)
+      || this.vrm.humanoid?.getNormalizedBoneNode(n) || null;
+    const wp = (n) => {
+      const b = node(n);
+      return b ? b.getWorldPosition(new T.Vector3()).toArray() : null;
+    };
+    const d = (a, b) => (a && b ? Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) : 0);
+    // rest WORLD quaternion of a bone (as array) — _applyArms needs it to turn
+    // a world-space direction solve into a local rotation for rigs whose bone
+    // local frames point anywhere (which is every real VRM)
+    const qwd = (n) => {
+      const b = node(n);
+      return b ? b.getWorldQuaternion(new T.Quaternion()).toArray() : [0, 0, 0, 1];
+    };
+    const arms = {};
+    for (const [side, sideSign] of [['right', -1], ['left', 1]]) {
+      const shoulder = wp(`${side}UpperArm`);   // the joint: upperArm node origin
+      const elbow = wp(`${side}LowerArm`);
+      const wrist = wp(`${side}Hand`);
+      if (!shoulder || !elbow || !wrist) continue;
+      const l1 = d(shoulder, elbow), l2 = d(elbow, wrist);
+      if (!(l1 > 1e-4 && l2 > 1e-4)) continue;
+      const nrm = (a, b) => {
+        const v = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        const l = Math.hypot(...v) || 1;
+        return v.map((x) => x / l);
+      };
+      arms[side] = { side, sideSign, shoulder, elbow, wrist, l1, l2, len: l1 + l2,
+                     restDirUpper: nrm(shoulder, elbow), restDirLower: nrm(elbow, wrist),
+                     restWorldUpper: qwd(`${side}UpperArm`), restWorldLower: qwd(`${side}LowerArm`) };
+    }
+    if (!arms.right && !arms.left) return null;
+    const head = wp('head') || [0, 1.4, 0];
+    const neck = wp('neck') || [head[0], head[1] - 0.12, head[2]];
+    const eL = wp('eyeLeft'), eR = wp('eyeRight');
+    // head length: eye spacing is the most transferable head measurement
+    // VRMs carry; fall back to the neck->head bone distance
+    const headLen = eL && eR && d(eL, eR) > 1e-4
+      ? Math.min(0.34, Math.max(0.12, 2.3 * d(eL, eR)))
+      : Math.min(0.34, Math.max(0.12, 1.3 * d(head, neck)));
+    // visual top/bottom (clothes, hats, feet) for camera framing
+    let bboxTop = head[1] + 0.6 * headLen, bboxBottom = 0;
+    try {
+      const box = new T.Box3().setFromObject(this.vrm.scene);
+      if (box.isFinite?.() !== false && !box.isEmpty()) {
+        bboxTop = box.max.y;
+        bboxBottom = Math.min(0, box.min.y);
+      }
+    } catch { /* procedural rig (tests): no geometry, use the estimate */ }
+    const chest = wp('chest') || wp('upperChest') || wp('spine') || [0, (head[1] + neck[1]) / 2, 0];
+    const shW = Math.abs((arms.right?.shoulder[0] ?? 0) - (arms.left?.shoulder[0] ?? 0)) || 0.3;
+    return {
+      arms,
+      shoulderWidth: shW,
+      headLen,
+      headTop: head[1] + 0.62 * headLen,   // top of the skull (hats excluded; bboxTop covers them)
+      head, neck, chin: [head[0], head[1] - 0.5 * headLen, head[2] + 0.35 * headLen],
+      chest, bboxTop, bboxBottom,
+    };
   }
 
   detach(vrm) {
@@ -261,6 +342,7 @@ export class AvatarMotion {
       if (d && gh.w > 0.001) {
         const t = gh.loop ? gh.t % d.duration : Math.min(gh.t, d.duration);
         this._applyPose(mirrorPose(sampleGesture(gh.name, t), this.vrm1), gh.w, GESTURE_BONES[gh.name]);
+        if (d.arms) this._applyArms(d.arms, t, { loop: d.loop, duration: d.duration, weight: gh.w });
         if (GESTURE_BONES[gh.name].includes('neck')) gestureW = gh.w;
       } else this._ghost = null;
     }
@@ -277,6 +359,7 @@ export class AvatarMotion {
         let t = g.loop ? g.t % dur : Math.min(g.t, dur);
         gesturePose = mirrorPose(sampleGesture(g.name, t), this.vrm1);
         this._applyPose(gesturePose, g.w, GESTURE_BONES[g.name]);
+        if (d.arms) this._applyArms(d.arms, t, { loop: d.loop, duration: dur, weight: g.w });
         if (GESTURE_BONES[g.name].includes('neck')) gestureW = Math.max(gestureW, g.w);
       }
       if (g.ending && (g.w <= 0.001 || !d)) this.gesture = null;
@@ -374,6 +457,74 @@ export class AvatarMotion {
       q.slerp(rest, 1 - w);
       node.quaternion.copy(q);
     }
+  }
+
+  /**
+   * Drive one gesture's IK arms (wave/think): sample the world wrist target,
+   * solve shoulder->elbow->wrist with the 2-bone solver, orient the two arm
+   * bones by rotating their REST bone directions onto the solved directions
+   * (pure geometry — VRM0/VRM1 bone-axis conventions never enter), then
+   * slerp from the arms-down rest by the key weight. Returns true if it
+   * touched anything. Call AFTER _applyPose (euler shoulders etc. are baked
+   * into the world matrices the solver reads).
+   */
+  _applyArms(armsSpec, t, { loop = false, duration = Infinity, weight = 1 } = {}) {
+    if (!armsSpec || !this.rig || !this.vrm || weight < 1e-3) return false;
+    const T = this.THREE;
+    this.vrm.scene.updateMatrixWorld(true);  // euler shoulders/spine moved joints this frame
+    const solvedElbows = {};
+    let any = false;
+    // right first: think's left wrist cups the solved RIGHT elbow
+    for (const side of ['right', 'left']) {
+      const track = armsSpec[side];
+      const arm = this.rig.arms[side];
+      const upNode = this._node(`${side}UpperArm`);
+      const loNode = this._node(`${side}LowerArm`);
+      if (!track || !arm || !upNode || !loNode) continue;
+      const s = sampleArm(side, track, t, this.rig, {
+        loop, duration, ctx: { otherElbow: solvedElbows[side === 'right' ? 'left' : 'right'] },
+      });
+      if (!s || s.w < 1e-3 || !s.target) continue;
+      const blend = Math.min(1, s.w * weight);
+      const S = upNode.getWorldPosition(this._v1);
+      const sol = solveTwoBoneIK(S.toArray(), s.target, arm.l1, arm.l2, s.pole);
+      if (!sol) continue;
+      solvedElbows[side] = sol.elbow;
+      // desired world orientations: minimal-arc from the rest bone direction.
+      // A bone's geometry direction is baked into its local frame, so the
+      // world-space arc must PRE-multiply the bone's rest WORLD quaternion;
+      // only then convert to local with the parent's live world rotation.
+      const qU = new T.Quaternion().setFromUnitVectors(
+        this._v2.fromArray(arm.restDirUpper), this._v3.fromArray(sol.dirUpper));
+      const qL = new T.Quaternion().setFromUnitVectors(
+        this._v1.fromArray(arm.restDirLower), this._v2.set(...sol.dirLower));
+      const qWorldU = qU.clone().multiply(new T.Quaternion().fromArray(arm.restWorldUpper));
+      const qWorldL = qL.clone().multiply(new T.Quaternion().fromArray(arm.restWorldLower));
+      const parentQ = upNode.parent
+        ? upNode.parent.getWorldQuaternion(new T.Quaternion()) : new T.Quaternion();
+      const localU = parentQ.invert().multiply(qWorldU);
+      const localL = qWorldU.clone().invert().multiply(qWorldL);
+      // safety net: no IK target may fold a limb past a sane range of motion
+      const clampToRest = (restQ, qT) => {
+        const a = restQ.angleTo(qT);
+        return a > MAX_ARM_ANGLE ? restQ.clone().slerp(qT, MAX_ARM_ANGLE / a) : qT;
+      };
+      const restU = this._rest.get(`${side}UpperArm`), restL = this._rest.get(`${side}LowerArm`);
+      upNode.quaternion.copy(restU).slerp(clampToRest(restU, localU), blend);
+      loNode.quaternion.copy(restL).slerp(clampToRest(restL, localL), blend);
+      any = true;
+    }
+    return any;
+  }
+
+  /** Calibration/QA hook: slap a whole gesture (eulers + IK arms) on right now. */
+  previewGesture(name, t) {
+    if (!this.vrm) return;
+    const d = GESTURES[name];
+    if (!d) return;
+    this._resetPose();
+    this._applyPose(mirrorPose(sampleGesture(name, t), this.vrm1), 1, Object.keys(sampleGesture(name, t)));
+    if (d.arms) this._applyArms(d.arms, t, { loop: d.loop, duration: d.duration });
   }
 
   // ── blink, with the occasional double ──

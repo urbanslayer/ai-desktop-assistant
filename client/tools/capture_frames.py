@@ -10,6 +10,7 @@ the page's ?capture=<secs> hook POST PNGs to /capture and pose metrics
 Usage:
     python client/tools/capture_frames.py <scenario> <outdir> <capture-secs>
                                           [--force spec] [--runtime SECS]
+                                          [--vrm PATH] [--size WxH] [--desktop]
 
 Scenarios: idle | thinking | say | think | wave
   think/wave drive the page with ?force= (the director is silenced and the
@@ -17,13 +18,24 @@ Scenarios: idle | thinking | say | think | wave
 --force accepts the page's spec directly, e.g. --force "wave@0.5,think@4".
 
 The metrics JSON is printed per capture (distances in metres, computed in
-the page against the real rig; chin point defined in client/index.html).
-Acceptance reference (owner request 2026-11):
-  think: handToChin < 0.07, leftHandToRightElbow < 0.12,
+the page against the real rig; chin point = rig.chin from client/js/motion.js
+— head bone + (0, -0.5·headLen, +0.35·headLen) with headLen from eye
+spacing). Acceptance is RELATIVE to the attached rig (works on any VRM):
+  wave:  wavePeakAboveShoulderY > 0.25 * armLen,
+         waveLateralSwing > 0.15 * forearmLen,
+         waveMaxHandNdcAbsX/Y <= 0.9 (raised hand inside the canvas with
+         >= 5 % margin at the default 420x680 window; NDC from the page's
+         own camera, so the near/far planes are included),
+         hand >= headTop - 0.05 (handX rows show the raise).
+  think: handToChin < 0.07 * (headLen / 0.12) — 0.07 m is the flat rule
+         measured on the sample avatar (whose headLen comes out 0.12 m from
+         eye spacing); scale by head size so big- and small-headed rigs get
+         the same relative pose. The classic thinker is a wrist-braced
+         pose: the curled fingers touch the chin, the wrist sits a bit
+         below it.
          hand/elbow not behind the chest plane (z >= chest.z, slack 0.05),
-         held at 1 s, 5 s and 20 s into the loop.
-  wave:  handAboveShoulderY > 0.15 at peak, lateral hand x swing > 0.06
-         peak-to-peak across the oscillation, hand >= head top - 5 cm.
+         handInCanvas / elbowInCanvas true, held at 1 s and 5 s into the
+         loop.
 """
 import argparse
 import base64
@@ -42,7 +54,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 CLIENT = str(REPO / "client")
-VRM = str(REPO / "character_files" / "sample_avatar.vrm")
+DEFAULT_VRM = str(REPO / "character_files" / "sample_avatar.vrm")
 TMP = os.environ.get("TMPDIR", str(Path.home() / ".hermes/cache/scratch"))
 
 # scenario -> (force spec for the page, queued /next events)
@@ -66,6 +78,7 @@ class Handler(SimpleHTTPRequestHandler):
     outdir = "."
     scenario = "idle"
     shots = 0
+    vrm_path = DEFAULT_VRM
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -74,7 +87,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/animations.json":
             return self._json({"animations": []})
         if path == "/avatar.vrm":
-            with open(VRM, "rb") as f:
+            with open(self.vrm_path, "rb") as f:
                 return self._send(f.read(), "model/gltf-binary")
         if path == "/next":
             return self._json({"audio": None, "events": self._due()})
@@ -137,15 +150,23 @@ def main():
     ap.add_argument("--force", default=None, help="page ?force= spec (overrides scenario)")
     ap.add_argument("--runtime", type=float, default=None,
                     help="browser lifetime (default: last capture + 8 s)")
+    ap.add_argument("--vrm", default=DEFAULT_VRM,
+                    help="VRM file to serve as /avatar.vrm (default: character_files/sample_avatar.vrm)")
+    ap.add_argument("--size", default="420x680",
+                    help="viewport WxH (default 420x680 = the desktop window)")
+    ap.add_argument("--desktop", action="store_true",
+                    help="open the page with ?desktop=1 (the desktop.py framing)")
     args = ap.parse_args()
 
     force, events = SCENARIOS[args.scenario]
     if args.force:
         force = args.force
+    w, h = (int(v) for v in args.size.lower().split("x"))
     os.makedirs(args.outdir, exist_ok=True)
     Handler.scenario = args.scenario
     Handler.outdir = args.outdir
     Handler.queue = list(events)
+    Handler.vrm_path = args.vrm
     Handler.t0 = time.monotonic()  # server clock vs page clock differ a bit; fine
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -156,6 +177,8 @@ def main():
     profile = os.path.join(TMP, "riko-chrome-profile")
     subprocess.run(["rm", "-rf", profile], check=False)  # temp profile, never the owner's
     url = f"http://127.0.0.1:{port}/?capture={args.secs}"
+    if args.desktop:
+        url += "&desktop=1"
     if force:
         url += f"&force={force}"
     maxsec = max(float(s) for s in args.secs.split(","))
@@ -163,7 +186,7 @@ def main():
     cmd = [
         "chromium", "--headless=new", f"--user-data-dir={profile}", "--no-sandbox",
         "--enable-unsafe-swiftshader", "--use-gl=angle", "--use-angle=swiftshader",
-        "--autoplay-policy=no-user-gesture-required", "--window-size=620,780",
+        "--autoplay-policy=no-user-gesture-required", f"--window-size={w},{h}",
         "--disable-dev-shm-usage", "--hide-scrollbars",
         "--allow-file-access", url,
     ]

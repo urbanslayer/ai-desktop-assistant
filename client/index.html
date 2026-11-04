@@ -80,7 +80,8 @@
     import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
     import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from '@pixiv/three-vrm-animation';
     import { Director } from './js/director.js';
-    import { GESTURES, vowelWeights, sampleGesture, mirrorPose } from './js/gestures.js';
+    import { GESTURES, vowelWeights, IK_ARM_GESTURES } from './js/gestures.js';
+    import { gestureEnvelope } from './js/ik.js';
     import { AvatarMotion } from './js/motion.js';
 
     // desktop.py opens this page with ?desktop=1: see-through background, no click-to-start,
@@ -187,19 +188,41 @@
       // Arms down. VRM 0.x models are mirrored on this axis, so the angle flips.
       // (motion.js blends gestures toward this same rest rotation.)
       const arm = vrm.meta.metaVersion === '0' ? -1.3 : 1.3;
-      vrm.humanoid.getNormalizedBoneNode('leftUpperArm').rotation.z = -arm;
-      vrm.humanoid.getNormalizedBoneNode('rightUpperArm').rotation.z = arm;
+      const lUa = vrm.humanoid.getNormalizedBoneNode('leftUpperArm');
+      const rUa = vrm.humanoid.getNormalizedBoneNode('rightUpperArm');
+      if (lUa) lUa.rotation.z = -arm;
+      if (rUa) rUa.rotation.z = arm;
+      vrm.scene.updateMatrixWorld(true);
 
-      // Reframe for this model's height so short and tall personas look the same.
-      const headY = vrm.humanoid.getNormalizedBoneNode('head').getWorldPosition(new THREE.Vector3()).y;
-      if (DESKTOP) {
-        camera.position.set(0, headY * 0.68, headY * 2.6);  // whole body, a little room above for the bubble
-        controls.target.set(0, headY * 0.62, 0);
-      } else {
-        camera.position.set(0, headY * 0.94, headY * 1.37);
-        controls.target.set(0, headY * 0.9, 0);
-      }
       motion.attach(vrm);   // re-targets bones, gaze, and gestures onto the new body
+
+      // ── Gesture-aware framing: fit her whole body AND the wave/think
+      //    envelope (raised hand included, measured from THIS rig) inside the
+      //    window at its current aspect. This only sets the default view per
+      //    persona — scroll zoom and drag keep working over it (OrbitControls).
+      const rig = motion.rig;
+      if (rig) {
+        const durs = Object.fromEntries(Object.entries(IK_ARM_GESTURES).map(([n, g]) => [n, g.duration]));
+        const env = gestureEnvelope(rig, IK_ARM_GESTURES, durs);
+        const yTop = Math.max(env.yTop, rig.bboxTop) + 0.03;
+        const yBot = Math.min(env.yBottom, rig.bboxBottom) - 0.03;
+        const halfFovY = Math.tan((camera.fov * Math.PI) / 360);
+        const needH = (yTop - yBot) * 1.06;                    // +6% margin
+        const needW = env.xHalf * 2 * 1.06;
+        const dist = Math.max(needH / 2 / halfFovY,
+                              needW / 2 / (halfFovY * camera.aspect), 0.8);
+        // near plane close enough that her raised hand never clips when the
+        // camera sits at this distance; far plane keeps room for user zoom-out
+        camera.near = Math.max(0.02, Math.min(0.1, dist * 0.01));
+        camera.far = Math.max(20, dist * 6);
+        camera.position.set(0, (yTop + yBot) / 2, dist);
+        controls.target.set(0, (yTop + yBot) / 2, 0);
+        camera.updateProjectionMatrix();
+      } else {  // rig too incomplete to measure: old head-height heuristic
+        const headY = vrm.humanoid.getNormalizedBoneNode('head')?.getWorldPosition(new THREE.Vector3())?.y ?? 1.4;
+        camera.position.set(0, headY * 0.68, headY * 2.6);
+        controls.target.set(0, headY * 0.62, 0);
+      }
       rebuildClips();
       resumeLife();         // whatever the director had running, replay on this body
     }
@@ -268,14 +291,15 @@
 
     // ── visual QA capture: PNGs (and pose metrics) at fixed seconds after wake ──
     window.rikoCapture = () => renderer.domElement.toDataURL('image/png');
-    // Pose metrics against the REAL rig. The chin point is defined here and
-    // used by client/tools/capture_frames.py acceptance checks:
-    //   anchor = head-bone world position + head-local (0, -0.08, +0.04)
-    //   chin   = midpoint(head, anchor)   (~8 cm below the head origin, forward)
-    // dist(hand, chin) and dist(leftHand, rightLowerArm-origin = right elbow)
-    // are the think checks; wave reads handY - shoulderY and the lateral x of
-    // the right hand across the oscillation; z vs chest.z flags a limb sunk
-    // into the torso (the character faces +z in this page).
+    // Pose metrics against the REAL rig, written for ANY VRM (0.x or 1.0;
+    // bones a rig lacks report null instead of throwing — the owner's Furina
+    // model has no chest bone, which used to kill every /measure POST).
+    //   chin = head bone + (0, -0.5*headLen, +0.35*headLen)  [rig.chin, from motion.js]
+    // with headLen from eye spacing (or neck->head bone distance). Metrics
+    // include the rig's own arm/forearm/head lengths so the harness can state
+    // acceptance thresholds RELATIVE to her size, and the NDC projection of
+    // both hands/elbows so "inside the canvas with margin" is measurable.
+    // (the character faces +z in this page; chest falls back to upperChest/spine)
     window.rikoMeasure = () => {
       if (!vrm) return null;
       const names = ['hips', 'spine', 'chest', 'upperChest', 'neck', 'head',
@@ -286,36 +310,60 @@
         const b = vrm.humanoid.getNormalizedBoneNode(n);
         bones[n] = b ? b.getWorldPosition(new THREE.Vector3()).toArray() : null;
       }
+      const rig = motion.rig;
       const h = bones.head;
       if (!h) return { bones, chin: null, metrics: null };
-      const hq = vrm.humanoid.getNormalizedBoneNode('head')
-        .getWorldQuaternion(new THREE.Quaternion());
-      const off = new THREE.Vector3(0, -0.08, 0.04).applyQuaternion(hq);
-      const chin = [h[0] + off.x / 2, h[1] + off.y / 2, h[2] + off.z / 2];
+      const chin = rig ? rig.chin
+        : [h[0], h[1] - 0.11, h[2] + 0.08];  // headless fallback, same shape
+      const chest = bones.chest || rig?.chest || bones.upperChest || bones.spine;
       const d = (a, b) => (a && b ? Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) : null);
+      // world -> NDC (-1..1 across the viewport). |x|,|y| <= 0.9 means "inside
+      // the canvas with >= 5% margin"; z is the clip-space depth (-1..1 =
+      // between the near and far planes).
+      const _p = new THREE.Vector3();
+      const ndc = (p) => {
+        if (!p) return null;
+        _p.set(p[0], p[1], p[2]).project(camera);
+        return [_p.x, _p.y, _p.z];
+      };
+      const inCanvas = (n) => (n ? Math.abs(n[0]) <= 0.9 && Math.abs(n[1]) <= 0.9 && n[2] >= -1 && n[2] <= 1 : null);
+      const rArm = rig?.arms?.right, lArm = rig?.arms?.left;
+      const handNdc = ndc(bones.rightHand), elbowNdc = ndc(bones.rightLowerArm);
+      const lHandNdc = ndc(bones.leftHand), lElbowNdc = ndc(bones.leftLowerArm);
       return {
         t: performance.now() / 1000, bones, chin,
+        rig: rig && {
+          headLen: rig.headLen, headTop: rig.headTop, shoulderWidth: rig.shoulderWidth,
+          armLen: rArm?.len ?? lArm?.len ?? null,
+          upperLen: rArm?.l1 ?? lArm?.l1 ?? null,
+          forearmLen: rArm?.l2 ?? lArm?.l2 ?? null,
+          bboxTop: rig.bboxTop, bboxBottom: rig.bboxBottom,
+        },
+        ndc: { rightHand: handNdc, rightElbow: elbowNdc, leftHand: lHandNdc, leftElbow: lElbowNdc },
         metrics: {
           handToChin: d(bones.rightHand, chin),
           leftHandToRightElbow: d(bones.leftHand, bones.rightLowerArm),
-          handAboveShoulderY: bones.rightHand[1] - bones.rightShoulder[1],
-          handAboveHeadY: bones.rightHand[1] - bones.head[1],
-          handZ_vs_chestZ: bones.rightHand[2] - bones.chest[2],
-          elbowZ_vs_chestZ: bones.rightLowerArm[2] - bones.chest[2],
-          handX: bones.rightHand[0],
+          handAboveShoulderY: bones.rightHand && bones.rightShoulder
+            ? bones.rightHand[1] - bones.rightShoulder[1] : null,
+          handAboveHeadY: bones.rightHand ? bones.rightHand[1] - h[1] : null,
+          handZ_vs_chestZ: bones.rightHand && chest ? bones.rightHand[2] - chest[2] : null,
+          elbowZ_vs_chestZ: bones.rightLowerArm && chest ? bones.rightLowerArm[2] - chest[2] : null,
+          handX: bones.rightHand ? bones.rightHand[0] : null,
+          handInCanvas: inCanvas(handNdc),
+          elbowInCanvas: inCanvas(elbowNdc),
+          leftHandInCanvas: inCanvas(lHandNdc),
+          leftElbowInCanvas: inCanvas(lElbowNdc),
           ...(window.__waveTrack && Number.isFinite(window.__waveTrack.min) ? {
             waveLateralSwing: window.__waveTrack.max - window.__waveTrack.min,
             wavePeakAboveShoulderY: window.__waveTrack.peakY,
+            waveMaxHandNdcAbsX: window.__waveTrack.maxNdcAbsX,
+            waveMaxHandNdcAbsY: window.__waveTrack.maxNdcAbsY,
           } : {}),
         },
       };
     };
-    // calibration helper: slap a gesture's pose onto the bones right now
-    window.rikoPreview = (name, t) => {
-      if (!vrm) return;
-      const pose = mirrorPose(sampleGesture(name, t), motion.vrm1);
-      motion._applyPose(pose, 1, Object.keys(pose));
-    };
+    // calibration helper: slap a gesture's pose (Eulers + IK arms) on right now
+    window.rikoPreview = (name, t) => motion.previewGesture(name, t);
     if (FORCE) {
       for (const item of String(FORCE).split(',')) {
         const [name, at = '0'] = item.trim().split('@');
@@ -324,8 +372,10 @@
       }
       // Per-frame tracker for the wave acceptance numbers (a 4-frame
       // snapshot cadence would miss the oscillation extremes):
-      // lateral x swing of the right hand + peak height over the shoulder.
-      window.__waveTrack = { min: Infinity, max: -Infinity, peakY: -Infinity };
+      // lateral x swing of the right hand + peak height over the shoulder +
+      // the hand's worst NDC excursion (inside |0.9| = in canvas, 5% margin).
+      window.__waveTrack = { min: Infinity, max: -Infinity, peakY: -Infinity,
+                             maxNdcAbsX: 0, maxNdcAbsY: 0 };
       const _vp = new THREE.Vector3(), _vs = new THREE.Vector3();
       const trackWave = () => {
         const g = motion.gesture;
@@ -339,6 +389,9 @@
             const w = window.__waveTrack;
             w.min = Math.min(w.min, p.x); w.max = Math.max(w.max, p.x);
             w.peakY = Math.max(w.peakY, p.y - s.y);
+            _vp.copy(p).project(camera);
+            w.maxNdcAbsX = Math.max(w.maxNdcAbsX, Math.abs(_vp.x));
+            w.maxNdcAbsY = Math.max(w.maxNdcAbsY, Math.abs(_vp.y));
           }
         }
         requestAnimationFrame(trackWave);
