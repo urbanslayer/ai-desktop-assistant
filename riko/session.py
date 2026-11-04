@@ -12,6 +12,7 @@ the VRM when the persona changes — by keyword, riko-ctl or another client.
 """
 import queue
 import threading
+import time
 
 from riko import asr, hub_client, tts, viewer
 
@@ -25,9 +26,46 @@ class Session:
         self.recorder = asr.Recorder()
         self._turns = queue.Queue()
         self._hub_audio_down = False  # hub voice trouble: print once, not per turn
+        self._start_greet_done = False  # the app-start hello happens exactly once
         threading.Thread(target=self._worker, daemon=True, name="riko-session").start()
 
     # ── Ways in ──────────────────────────────────────────────
+    def greet_on_start(self, page_timeout=120.0):
+        """Say hello once when the app starts (desktop.py / main.py call this
+        at startup; desktop.greet_on_start in character_config.yaml, on by
+        default).
+
+        Runs on its own thread, so startup never blocks: it waits for the
+        avatar page to be ready — its first /next poll lands when the VRM has
+        loaded and director.start() has begun the startup wave — then queues
+        the SAME greeting turn a persona switch speaks: the active persona's
+        greeting in a happy bubble, in her voice (the hub's greeting audio
+        with tts: hub, this PC's TTS otherwise, bubble only with tts: none).
+        Because it lands seconds after wake, it rides the startup wave instead
+        of adding a second one, and it never touches the hub's chat history.
+        A second call does nothing (reconnects and polls must not re-greet).
+        """
+        if self._start_greet_done:
+            return
+        self._start_greet_done = True
+        if not (self.cfg.get("desktop") or {}).get("greet_on_start", True):
+            return
+        active = hub_client.active_persona()
+        if not active:
+            print("[greet] the hub has no active persona; skipping the hello")
+            return
+
+        def wait_and_greet():
+            deadline = time.monotonic() + page_timeout
+            while not viewer.page_open() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if not viewer.page_open():
+                print("[greet] the avatar page never loaded; skipping the hello")
+                return
+            self._turns.put(("greet", dict(active)))
+
+        threading.Thread(target=wait_and_greet, daemon=True, name="riko-greet").start()
+
     def submit_text(self, text):
         text = str(text).strip()
         if not text:

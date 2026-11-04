@@ -224,7 +224,12 @@ characters she re-targets her whole repertoire onto the new body mid-motion.
 - **Gestures**: wave — unmistakable raised-hand side-to-side — on app start, a
   persona switch, after 10+ minutes apart, whenever you greet or leave her
   (hi/bye/good morning/…), when her own reply opens with a greeting, and on
-  demand (`W` or `riko-ctl wave`); hand-to-chin `think` with the elbow resting
+  demand (`W` or `riko-ctl wave`). An on-demand wave always plays right away:
+  the 25 s greeting cooldown never swallows it and it blends out whatever else
+  is mid-play (only an already-running wave makes it skip). When the desktop
+  app starts, she says her persona's greeting out loud in a happy bubble
+  riding that startup wave (`desktop.greet_on_start`, on by default).
+  Hand-to-chin `think` with the elbow resting
   on her crossed left arm while she processes, lean-and-tilt `listen`, small
   open-hand talk gestures
   while speaking, and idle stretches / look-arounds / fidgets every 1-3 minutes.
@@ -235,7 +240,8 @@ characters she re-targets her whole repertoire onto the new body mid-motion.
   headless against the real sample avatar and prints pose measurements
   (hand-to-chin distance, hand height over shoulder, wave swing width).
 - **The director** (`client/js/director.js`): a small state machine that decides
-  *what* she does — a gesture never interrupts one already playing, each gesture has
+  *what* she does — a gesture never interrupts one already playing (the on-demand
+  W wave is the one exception), each gesture has
   its own cooldown, and the whole thing is pure logic with unit tests
   (`node --test client/js/`).
 - **Emotion**: the hub's `ChatResult.emotion` tag sets her face for the length of the
@@ -387,6 +393,7 @@ Instead of a browser tab, she can live in a small borderless, transparent, alway
 |---|---|
 | Type to her | `/` or **Enter** — type, **Enter** sends, **Esc** gives up |
 | Push-to-talk | Hold **Space**, speak, release to send |
+| She waves at you | **W** (always works: it cuts in, never waits on the greeting cooldown) |
 | Next persona | **P** |
 | Hide her | **H** (the tray icon brings her back) |
 | Forget the chat | **Ctrl+Shift+Backspace**, press again within 3 s to confirm |
@@ -408,7 +415,8 @@ dofile(os.getenv("HOME") .. "/Development/riko_project/desktop/hyprland/riko.lua
 source = ~/Development/riko_project/desktop/hyprland/riko.conf
 ```
 
-Window size, bubble time and the in-window shortcuts themselves live under `desktop:` in `character_config.yaml`.
+Window size, bubble time, the app-start greeting (`greet_on_start`) and the
+in-window shortcuts themselves live under `desktop:` in `character_config.yaml`.
 
 To start her with the session, copy `desktop/riko.desktop` to `~/.config/autostart/` (or launch `bin/riko-desktop` from your compositor's autostart). Outside Hyprland she still appears, but floating/sizing is left to your window manager, and true transparency needs a compositor.
 
