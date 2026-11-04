@@ -1,0 +1,192 @@
+[
+  {
+    "name": "plain reply passes through",
+    "input": "Hey senpai, nothing to clean here.",
+    "expect": "Hey senpai, nothing to clean here."
+  },
+  {
+    "name": "bare https url dropped",
+    "input": "Found one! https://i.imgur.com/cat.gif",
+    "expect": "Found one!"
+  },
+  {
+    "name": "url mid sentence dropped",
+    "input": "The docs live at https://docs.godotengine.org/en/latest/ by the way.",
+    "expect": "The docs live at by the way."
+  },
+  {
+    "name": "www url dropped",
+    "input": "Check www.example.com for it, senpai.",
+    "expect": "Check for it, senpai."
+  },
+  {
+    "name": "markdown link keeps label",
+    "input": "Sure, the [Godot docs](https://docs.godotengine.org) cover that.",
+    "expect": "Sure, the Godot docs cover that."
+  },
+  {
+    "name": "markdown image dropped",
+    "input": "Look ![funny cat](https://x/y.gif) isn't that cute",
+    "expect": "Look isn't that cute"
+  },
+  {
+    "name": "gif url in details para not spoken",
+    "input": "Ha! That one got me.\n\n![cat](https://x/a.gif)\nhttps://x/a.gif",
+    "expect": "Ha! That one got me."
+  },
+  {
+    "name": "first paragraph only",
+    "input": "It's on your screen now!\n\nSources:\n- [one](https://a.example)\n- [two](https://b.example)",
+    "expect": "It's on your screen now!"
+  },
+  {
+    "name": "url-only reply fallback",
+    "input": "https://docs.godotengine.org",
+    "expect": "I put the link on screen."
+  },
+  {
+    "name": "url-only first para fallback",
+    "input": "https://x.com/gif\n\nThat's the one I found, senpai.",
+    "expect": "I put the link on screen."
+  },
+  {
+    "name": "emoji only reply no audio",
+    "input": "😂😂",
+    "expect": ""
+  },
+  {
+    "name": "whitespace reply no audio",
+    "input": "   \n\t ",
+    "expect": ""
+  },
+  {
+    "name": "numeric citations dropped",
+    "input": "Godot is free and open source [1], made in Argentina [2, 3].",
+    "expect": "Godot is free and open source, made in Argentina."
+  },
+  {
+    "name": "footnote style citation",
+    "input": "Vulkan support landed [^4] last release.",
+    "expect": "Vulkan support landed last release."
+  },
+  {
+    "name": "parenthetical citation",
+    "input": "GDScript is Python-like (1).",
+    "expect": "GDScript is Python-like."
+  },
+  {
+    "name": "source attribution dropped",
+    "input": "It runs on many platforms (source: Wikipedia).",
+    "expect": "It runs on many platforms."
+  },
+  {
+    "name": "inline code dropped",
+    "input": "Run `uv sync` first, then `uv run desktop.py`.",
+    "expect": "Run first, then."
+  },
+  {
+    "name": "fenced code dropped",
+    "input": "Here's how:\n\n```python\nimport godot\nprint('hi')\n```\n",
+    "expect": "Here's how:"
+  },
+  {
+    "name": "unclosed fence marker gone",
+    "input": "```python\nimport godot",
+    "expect": "import godot"
+  },
+  {
+    "name": "emphasis markers gone",
+    "input": "That was **really** good, *senpai*, ~cool~ _nice_.",
+    "expect": "That was really good, senpai, ~cool~ nice."
+  },
+  {
+    "name": "heading markers gone",
+    "input": "## Setup\nInstall it, then run it.",
+    "expect": "Setup Install it, then run it."
+  },
+  {
+    "name": "bullet markers gone",
+    "input": "Bring:\n- milk\n* eggs\n+ bread",
+    "expect": "Bring: milk eggs bread"
+  },
+  {
+    "name": "blockquote marker gone",
+    "input": "> to be, or not to be",
+    "expect": "to be, or not to be"
+  },
+  {
+    "name": "horizontal rule gone",
+    "input": "Done!\n\n---\n\nhttps://x.com",
+    "expect": "Done!"
+  },
+  {
+    "name": "emoji dropped mid text",
+    "input": "Nice work 🎉 you did it ❤️!",
+    "expect": "Nice work you did it!"
+  },
+  {
+    "name": "flag emoji dropped",
+    "input": "Great 🇯🕹 job",
+    "expect": "Great job"
+  },
+  {
+    "name": "chinese kept",
+    "input": "你好，せんぱい！",
+    "expect": "你好，せんぱい！"
+  },
+  {
+    "name": "multi-line first para joined",
+    "input": "Two lines that\nwrap without a blank line\n\nbut this part stays on screen.",
+    "expect": "Two lines that wrap without a blank line"
+  },
+  {
+    "name": "no url no blank line keeps all",
+    "input": "I found three: [cats](https://x/1), [dogs](https://x/2) and [birds](https://x/3). All on screen!",
+    "expect": "I found three: cats, dogs and birds. All on screen!"
+  },
+  {
+    "name": "idempotent clean text",
+    "input": "Hey senpai, nothing to clean here.",
+    "expect": "Hey senpai, nothing to clean here."
+  },
+  {
+    "name": "angle url dropped",
+    "input": "Link is <https://x.example/y> for you.",
+    "expect": "Link is for you."
+  },
+  {
+    "name": "url with trailing punctuation",
+    "input": "Try godotengine.org. No — try https://godotengine.org!",
+    "expect": "Try godotengine.org. No — try!"
+  },
+  {
+    "name": "empty brackets tidied",
+    "input": "See (  ) for more.",
+    "expect": "See for more."
+  },
+  {
+    "name": "table row pipes kept",
+    "input": "Name | Version\nRiko | 1.0",
+    "expect": "Name | Version Riko | 1.0"
+  },
+  {
+    "name": "prose parentheses kept",
+    "input": "The engine (the big one, Godot 4) runs fine, senpai.",
+    "expect": "The engine (the big one, Godot 4) runs fine, senpai."
+  },
+  {
+    "name": "wave-ish bracket not eaten mid-sentence",
+    "input": "I typed [wave] and my hand moved.",
+    "expect": "I typed [wave] and my hand moved."
+  },
+  {
+    "name": "url trailing comma stays prose",
+    "input": "Look https://x.example/y.gif, cute!",
+    "expect": "Look, cute!"
+  },
+  {
+    "name": "url in parens leaves no empty pair",
+    "input": "See (https://x.example) for more.",
+    "expect": "See for more."
+  }
+]

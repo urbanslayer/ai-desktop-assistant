@@ -178,15 +178,21 @@ class Session:
         # actions (docs/BODY.md §3) may be absent from older hubs too: [] then.
         self._speak(result["reply"], audio_url=result.get("audio_url"),
                     emotion=result.get("emotion") or "neutral",
-                    actions=result.get("actions") or [])
+                    actions=result.get("actions") or [],
+                    speech=result.get("speech"))
 
-    def _speak(self, answer, audio_url=None, emotion="neutral", actions=None):
+    def _speak(self, answer, audio_url=None, emotion="neutral", actions=None,
+               speech=None):
+        """Bubble + voice for one reply. The bubble always shows the full
+        `answer`; the voice gets the hub's cleaned `speech` (ChatResult.speech)
+        or, on an older hub, our own cleaned copy (riko/tts.py → riko/speech.py)."""
         persona = hub_client.active_persona() or {}
         print(f"{persona.get('name', 'Riko')}: {answer}")
         if self.cfg["tts"] == "hub":
             wav = self._hub_audio(audio_url)
         else:
-            wav = tts.speak(answer, self.cfg, voice=persona.get("tts_voice") or None)
+            wav = tts.speak(answer, self.cfg, voice=persona.get("tts_voice") or None,
+                            speech=speech)
         viewer.emit("status", state="speaking")
         viewer.play(wav, answer, emotion=emotion, actions=actions or [])
 

@@ -20,6 +20,7 @@ import soundfile as sf
 
 from riko import hub_client
 from riko.config import ROOT, need_key
+from riko.speech import speech_text
 
 VOICE_FILE = ROOT / "client" / "audio" / "riko.wav"  # inside client/ so the avatar page can load it
 
@@ -71,22 +72,30 @@ def check(cfg):
     print(f"[setup] GPT-SoVITS is running at {cfg['sovits']['url']}")
 
 
-def speak(text, cfg, voice=None):
+def speak(text, cfg, voice=None, speech=None):
     """Make her say `text` on THIS PC's own TTS. Returns the path of the WAV
     file, or None with tts: none / tts: hub (hub audio comes from the chat
     result instead — see from_hub_audio).
 
     `voice` overrides the configured voice (the active persona's tts_voice);
     only the openai backend has named voices, others keep their own sample/id.
+
+    `speech` is the hub's cleaned spoken text for this reply (ChatResult
+    .speech, docs/API.md). Either way the TTS never sees raw markdown or URLs:
+    without `speech` we apply riko/speech.py, the mirror of the hub's rules,
+    so the local voices say exactly what the hub voice would.
     """
     if cfg["tts"] in ("none", "hub") or not text.strip():
         return None
+    spoken = (speech or "").strip() or speech_text(text)
+    if not spoken:
+        return None
     if cfg["tts"] == "fish":
-        audio = _fish(text, cfg["fish"])
+        audio = _fish(spoken, cfg["fish"])
     elif cfg["tts"] == "openai":
-        audio = _openai(text, cfg["openai_tts"], voice=voice)
+        audio = _openai(spoken, cfg["openai_tts"], voice=voice)
     else:
-        audio = _sovits(text, cfg["sovits"])
+        audio = _sovits(spoken, cfg["sovits"])
     return _write(audio, cfg["tts"])
 
 
