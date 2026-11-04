@@ -105,18 +105,20 @@ function allowed(url) {
 }
 
 async function toTab(tabId, msg) {
+  let firstError = null;
   try {
     return await browser.tabs.sendMessage(tabId, msg);
   } catch (e) {
-    // fresh page (or page loaded before the extension started): inject and retry
-    try {
-      await browser.scripting.executeScript({ target: { tabId }, files:
-        ["lib/risk.js", "lib/snapshot.js", "content.js"] });
-    } catch (injectError) {
-      throw new Error(`no access to that tab (check the site permission in the options page): ${injectError.message}`);
-    }
-    return browser.tabs.sendMessage(tabId, msg);
+    firstError = e;
   }
+  // fresh page (or page loaded before the extension started): inject and retry
+  try {
+    await browser.scripting.executeScript({ target: { tabId }, files:
+      ["lib/risk.js", "lib/snapshot.js", "content.js"] });
+  } catch (injectError) {
+    throw new Error(`no access to that tab (check the site permission in the options page): ${firstError.message} / inject: ${injectError.message}`);
+  }
+  return browser.tabs.sendMessage(tabId, msg);
 }
 
 const banner = (tabId, on) => browser.tabs.sendMessage(tabId, { cmd: "banner", on }).catch(() => {});

@@ -61,8 +61,8 @@ def main():
     page_port = free_port()
     page_dir = Path(tempfile.mkdtemp(prefix="riko-testpage-"))
     (page_dir / "index.html").write_text(PAGE)
-    handler = type("H", (http.server.SimpleHTTPRequestHandler,),
-                   {"directory": str(page_dir), "log_message": lambda *a: None})
+    import functools
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(page_dir))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", page_port), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     page_url = f"http://127.0.0.1:{page_port}/index.html"
@@ -109,12 +109,18 @@ def main():
         assert opened.get("ok") is True, "browser_open failed"
 
         snap = None
+        resp = {}
         deadline = time.time() + 30
         while time.time() < deadline:
-            snap = bridge.call("read", {})
-            if snap.get("elements"):
+            resp = bridge.call("read", {})
+            snap = resp.get("result") if isinstance(resp.get("result"), dict) else resp
+            if (snap or {}).get("elements") or resp.get("ok") is False:
                 break
             time.sleep(1.0)  # page/content script may still be settling
+        print("browser_read raw ->", json.dumps(resp, ensure_ascii=False)[:400])
+        if not snap or "title" not in snap:
+            print("FAIL: browser_read did not return a snapshot")
+            return 1
         print("browser_read ->", json.dumps({k: snap[k] for k in ("title", "url")}, ensure_ascii=False),
               "| text:", snap["text"][:60].replace("\n", " "),
               "| elements:", [(e["n"], e["tag"], e.get("text")) for e in snap["elements"]])
