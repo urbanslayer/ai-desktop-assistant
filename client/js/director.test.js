@@ -336,13 +336,60 @@ test('greeting waves honour the 25 s cooldown and never stack', () => {
   d.tick(3.0);   // wave finished
   assert.ok(!names(d.heard(10, 'hello??')).includes('wave'), 'cooldown blocks after the gesture');
   assert.ok(names(d.heard(26, 'hello again')).includes('wave'), 'cooldown expired');
-  // requestWave is the same social wave: respects cooldown, no double-stack
+});
+
+// ── on-demand waves: the W shortcut / riko-ctl (owner bug 2026-11:
+// "Hitting W doesn't make her wave" — the 25 s greeting cooldown silently
+//  swallowed every W right after the startup wave or any greeting wave) ──
+test('requestWave always waves: no cooldown wait, body-free', () => {
+  const d = new Director({ random: seq(0.5) });
+  assert.ok(names(d.requestWave(0)).includes('wave'));
+  d.tick(3);  // first wave finished; it armed the 25 s cooldown
+  const acts = d.requestWave(4);  // mid-cooldown: W must wave anyway
+  assert.ok(names(acts).includes('wave'), 'cooldown must never swallow an on-demand wave');
+  const expr = acts.find((a) => a.type === 'expression');
+  assert.ok(expr && expr.name === 'happy' && expr.value > 0.5, 'the wave keeps its happy face');
+});
+
+test('requestWave preempts a running one-shot (idle/talk/emotion gesture)', () => {
+  const d = new Director({ random: seq(0.5) });
+  d.status(0, 'idle');
+  assert.deepEqual(names(d.say(1, { emotion: 'happy' })), ['nod']);  // nod one-shot 1..2.8
+  const acts = d.requestWave(1.5);
+  assert.deepEqual(acts.slice(0, 2).map((a) => a.type + ':' + a.name),
+                   ['gesture_stop:nod', 'gesture:wave'], 'blend out the nod, wave right now');
+  assert.equal(d.gesture.name, 'wave');
+  assert.equal(d.pending, null, 'nothing queues behind the forced wave');
+});
+
+test('requestWave preempts a status loop and replaces a queued wave', () => {
+  const d = new Director({ random: seq(0.5) });
+  d.status(0, 'thinking');  // think loop running
+  const acts = d.requestWave(1);
+  assert.deepEqual(acts.map((a) => a.type + ':' + a.name).slice(0, 2),
+                   ['gesture_stop:think', 'gesture:wave']);
+  assert.equal(d.gesture.name, 'wave');
+  // pressing W while waving drops a queued wave echo instead of stacking
   const d2 = new Director({ random: seq(0.5) });
-  assert.ok(names(d2.requestWave(0)).includes('wave'));
-  assert.deepEqual(d2.requestWave(1), [], 'no stacking while the wave runs');
-  d2.tick(3);
-  assert.deepEqual(d2.requestWave(10), [], 'cooldown applies to requestWave too');
-  assert.ok(names(d2.requestWave(26)).includes('wave'));
+  d2.start(0);        // wave one-shot until 2.4
+  d2.persona(0.5);    // persona wave -> pending (one-shots never interrupt)
+  assert.equal(d2.pending.name, 'wave');
+  assert.deepEqual(d2.requestWave(1), [], 'already waving: nothing to add');
+  assert.equal(d2.pending, null, 'the queued wave echo is dropped (no double wave)');
+  assert.deepEqual(names(d2.tick(3)).filter((n) => n === 'wave'), [], 'and it never replays');
+});
+
+test('requestWave skips only while a wave is already playing, and still marks activity', () => {
+  const d = new Director({ random: seq(0.5) });
+  assert.ok(names(d.requestWave(0)).includes('wave'));
+  const ends = d.gesture.endsAt;
+  assert.deepEqual(d.requestWave(1), [], 'no restack mid-wave');
+  assert.equal(d.gesture.endsAt, ends, 'the running wave keeps its end time');
+  assert.deepEqual(d.requestWave(2), []);
+  d.tick(3);  // wave over
+  assert.ok(names(d.requestWave(3.5)).includes('wave'), 'free again -> waves again');
+  // a forced cooldown-free wave still arms the cooldown for SOCIAL waves
+  assert.ok(!names(d.heard(4, 'hi')).includes('wave'), 'heard greetings still keep the cooldown');
 });
 
 test('requestWave marks activity so the return-wave logic stands down', () => {

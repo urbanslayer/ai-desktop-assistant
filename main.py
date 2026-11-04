@@ -37,6 +37,7 @@ def main():
     viewer.start(cfg)
     hub_client.start_state_poller()  # notice persona switches made on other clients
     session = Session(cfg, source="terminal")
+    session.greet_on_start()  # she says hello once when the page is ready (desktop.greet_on_start)
     viewer.on_say(session.submit_text)  # the avatar page's input box feeds this too
     active = hub_client.active_persona() or {}
     print(f"\n=== Riko  |  hub: {hub.url}  |  persona: {active.get('name', '?')}"

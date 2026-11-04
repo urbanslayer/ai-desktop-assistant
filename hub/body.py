@@ -55,15 +55,16 @@ ACTION_VERBS = {
 MAX_ACTIONS = 3
 MAX_APPEARANCE_CHARS = 1000
 
-# The prompt block (docs/BODY.md §2), ~110 tokens with a full action list.
+# The prompt block (docs/BODY.md §2), ~115 tokens with a full action list.
 PROMPT_TEMPLATE = (
     "You have a 3D body: you stand on the user's desktop and they can see "
-    "you. You can move by putting action tags anywhere in your reply, e.g. "
-    "[wave], [think], [nod]. Available actions: {names}. When the user asks "
-    "you to do one, do it (and you may say a few words about it). Otherwise "
+    "you. Your body moves ONLY through action tags: write tags like [wave], "
+    "[think], [nod] anywhere in your reply; prose like *waves* moves "
+    "nothing. Available actions: {names}. When the user asks you to do one, "
+    "you MUST include its tag or you stay frozen, e.g. \"wave at me\" -> "
+    "\"[wave] Hey senpai!\" (you may say a few words about it). Otherwise "
     "use them sparingly and naturally, like a person gesturing while "
-    "talking; usually zero or one per reply. Never describe actions in "
-    "prose like *waves*; use the tags."
+    "talking; usually zero or one per reply."
 )
 
 
@@ -75,6 +76,129 @@ def normalize_action_name(raw) -> str:
 def body_prompt(actions: list[str]) -> str:
     """The embodiment prompt block naming the current body set."""
     return PROMPT_TEMPLATE.format(names=", ".join(actions))
+
+
+# ── asked-for requests (docs/BODY.md §3 fallback) ────────────────────────────
+#
+# Whether the model emits action tags is stochastic (worse at high
+# temperature), so "wave at me!" can answer in prose with actions []. The hub
+# therefore keeps a *conservative* request matcher over the same verb table:
+# when the USER explicitly asks her body for an action of the current body
+# set and the reply didn't carry the tag, the server adds it anyway
+# (apply_asked) and hints the model (request_hint). The matcher only fires on
+# imperative/request forms addressed to her — never on mentions like "I waved
+# at my friend", "what do you think?", "wave function" or "don't wave".
+_ASK = r"(?:(?:can|could|will|would|shall)\s+you\s+|please\s+|pls\s+)?"
+_BOUND = r"(?:^|[.!?:;,]\s+|\n)"          # start of utterance / new clause
+_TRAIL = r"(?![\w-])"                     # no suffix: waved, waves, nodding
+
+# Bare verb must END the sentence (`wave!`, `can you wave?`) or take an
+# explicit complement — a following word ("wave function") is not a request.
+_END = r"(?=[.!?:,;]|\s*$)"
+
+_REQUEST_PATTERNS: dict[str, list[str]] = {
+    "wave": [
+        _BOUND + _ASK + r"wave" + _TRAIL + r"(?:\s+(?:at|to|toward|towards)\s+me"
+        r"|\s+(?:hello|hi|bye|goodbye|back|twice|now|for\s+me|your\s+hand)"
+        r"|" + _END + r")",
+        r"\bgive\s+(?:me|us)\s+a\s+wave\b", r"\bdo\s+(?:a|another)\s+wave\b",
+    ],
+    "nod": [
+        _BOUND + _ASK + r"nod" + _TRAIL + r"(?:\s+(?:for\s+me|yes|twice|now"
+        r"|your\s+head)|" + _END + r")",
+    ],
+    "shake_head": [
+        _BOUND + _ASK + r"shake\s+(?:your|ur)\s+head" + _TRAIL,
+    ],
+    # `think` only in an explicit pose/demo request — never "what do you
+    # think?" / "I think so".
+    "think": [
+        _BOUND + r"show\s+(?:me\s+)?(?:how\s+you|your)\s+think(?:ing)?\b",
+        _BOUND + _ASK + r"strike\s+a\s+thinking\s+pose" + _TRAIL,
+        r"\bthinking\s+pose\b",
+    ],
+    "stretch": [
+        _BOUND + _ASK + r"stretch" + _TRAIL + r"(?!\s+marks)"
+        + r"(?:\s+(?:for\s+me|a\s+bit|now)|" + _END + r")",
+        r"\bdo\s+a\s+stretch\b",
+    ],
+    "look_around": [
+        _BOUND + _ASK + r"look\s+around" + _TRAIL,
+        r"\b(?:take\s+a\s+look|have\s+a\s+look)\s+around\b",
+    ],
+    "laugh": [
+        _BOUND + _ASK + r"laugh" + _TRAIL + r"(?:\s+(?:for\s+me|a\s+bit|now)"
+        + r"|" + _END + r")",
+    ],
+    "pout": [
+        _BOUND + _ASK + r"pout" + _TRAIL + r"(?:\s+(?:for\s+me|a\s+bit|now)"
+        + r"|" + _END + r")",
+    ],
+    "hair_touch": [
+        _BOUND + _ASK + r"touch\s+(?:your|ur)\s+hair" + _TRAIL,
+        _BOUND + _ASK + r"fix\s+(?:your|ur)\s+hair" + _TRAIL,
+    ],
+    "fidget": [
+        _BOUND + _ASK + r"fidget" + _TRAIL + r"(?:\s+(?:for\s+me|a\s+bit|now)"
+        + r"|" + _END + r")",
+    ],
+}
+
+_REQUEST_RES: dict[str, re.Pattern] = {
+    name: re.compile("|".join(pats), re.IGNORECASE)
+    for name, pats in _REQUEST_PATTERNS.items()
+}
+
+
+def detect_action_request(text: str, body_actions: list[str] | None = None) -> str | None:
+    """Canonical action the user explicitly asked her body to do, else None.
+
+    Conservative: only imperative/request forms addressed to her count (see
+    _REQUEST_PATTERNS). When `body_actions` is given the request must be in
+    that body set (a request for a gesture nobody can play is not a request).
+    With several requests, the first verb in GESTURE_VOCAB order wins.
+    """
+    raw = str(text or "")
+    allowed = ({normalize_action_name(a) for a in body_actions}
+               if body_actions is not None else None)
+    for name in GESTURE_VOCAB:
+        pat = _REQUEST_RES.get(name)
+        if pat is None or (allowed is not None and name not in allowed):
+            continue
+        if pat.search(raw):
+            return name
+    return None
+
+
+def request_hint(action: str) -> str:
+    """One-line prompt nudge appended when the user just asked for `action`."""
+    return (f"The user just asked you to {action}: include [{action}] in "
+            "your reply.")
+
+
+def apply_asked(user_text: str, actions: list[dict],
+                body_actions: list[str]) -> list[dict]:
+    """The asked-for fallback (docs/BODY.md §3).
+
+    `user_text` is the final user message, `actions` the parsed reply list.
+    If the user explicitly asked for an action of the body set:
+    * the model's own matching tag gets `asked: true` (clients force-play it,
+      bypassing cooldowns — docs/BODY.md §5);
+    * a reply that lacks it gains `{"name": ..., "at": 0.0, "asked": true}`
+      at the front (start of the reply), within the MAX_ACTIONS cap.
+    The flag is additive: other action objects keep their shape, and turns
+    with no recognized request are returned untouched.
+    """
+    name = detect_action_request(user_text, body_actions)
+    if not name:
+        return actions
+    for a in actions:
+        if a.get("name") == name:
+            a["asked"] = True
+            return actions
+    if len(actions) >= MAX_ACTIONS:
+        return actions
+    return [{"name": name, "at": 0.0, "asked": True}] + actions
 
 
 def appearance_prompt(appearance: str) -> str:

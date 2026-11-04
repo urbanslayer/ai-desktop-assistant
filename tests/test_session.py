@@ -225,3 +225,57 @@ def test_hub_error_emits_error_event(turn_env):
     assert any(e["type"] == "error" for e in events)
     # and the worker survives: the turn ends with the idle status
     assert any(e["type"] == "status" and e["state"] == "idle" for e in events)
+
+
+# ── app-start greeting (owner request 2026-11: "when she loads, she should
+#    say her greeting as well") ─────────────────────────────────────────────
+def test_greet_on_start_speaks_the_persona_greeting_once(turn_env):
+    cfg, url, fake_hub = turn_env
+    cfg["tts"] = "hub"  # her greeting voice is the hub's greeting audio
+    s = session.Session(cfg, source="desktop")
+    s.greet_on_start()  # what desktop.py / main.py do at startup
+
+    events = collect_events(url, [], {"say"})
+    say = next(e for e in events if e["type"] == "say")
+    assert say["text"] == "Riko here. Miss me, senpai?"
+    assert say["emotion"] == "happy", "the app-start hello should light her face up"
+    # the voice clip rode along with the say event; tell the page-side player
+    # it ended so the worker's viewer.play does not sit on its timeout
+    requests.post(f"{url}/done", timeout=5)
+
+    # fetched the greeting audio from the hub exactly once, versioned
+    greeting_audio = [p for p in fake_hub.audio_requests if "greeting/audio" in str(p)]
+    assert greeting_audio == ["/api/personas/riko/greeting/audio?v=1"]
+
+    # the hello is NOT chat: the hub history stays empty
+    history = requests.get(f"{fake_hub.url}/api/history", timeout=5,
+                           headers={"Authorization": f"Bearer {HUB_KEY}"}).json()["messages"]
+    assert history == []
+
+    # and a second call never re-greets (reconnects / repeated startup calls)
+    s.greet_on_start()
+
+    # a state poller re-announcing the SAME persona must not greet again
+    hub_client.start_state_poller(interval=0.1)
+    time.sleep(1.0)
+    drain = []
+    for _ in range(6):
+        drain += requests.get(f"{url}/next", timeout=5).json()["events"]
+        time.sleep(0.05)
+    assert not [e for e in drain if e["type"] == "say"], f"poller re-greeted: {drain}"
+    assert [p for p in fake_hub.audio_requests if "greeting/audio" in str(p)] == greeting_audio
+
+
+def test_greet_on_start_can_be_switched_off(turn_env):
+    cfg, url, fake_hub = turn_env
+    cfg["tts"] = "hub"
+    cfg["desktop"]["greet_on_start"] = False
+    s = session.Session(cfg, source="desktop")
+    s.greet_on_start()
+    time.sleep(0.5)  # the page has been polling /next since the fixture
+    drain = []
+    for _ in range(6):
+        drain += requests.get(f"{url}/next", timeout=5).json()["events"]
+        time.sleep(0.05)
+    assert not [e for e in drain if e["type"] == "say"], f"she greeted despite greet_on_start: false -> {drain}"
+    assert fake_hub.audio_requests == []  # no voice work at all
