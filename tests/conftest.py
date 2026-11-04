@@ -6,8 +6,10 @@ use, so these tests pass with or without the real hub/ package.
 """
 import io
 import json
+import os
 import re
 import socket
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -15,6 +17,43 @@ import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+
+# ── Owner-state isolation (must run before any riko import) ──
+# The desktop app persists runtime state next to the owner's config
+# (~/.config/riko/listen_mode.json, roam_x.json, the client id + browser
+# token, the avatar cache). Without this, tests read the OWNER's choices:
+# an 'always' listening mode made every Session build a real AlwaysListener
+# on the live mic (thousands of sounddevice callbacks, PortAudio teardown
+# segfaults the whole pytest run). Point every override at one throwaway
+# dir; per-test monkeypatches still win. RIKO_* uses setdefault so CI can
+# pin its own values; the state dir itself is absolute, so HOME is safe.
+_TEST_STATE_ROOT = tempfile.mkdtemp(prefix="riko-test-state-")
+os.environ.setdefault("RIKO_APP_STATE_DIR", os.path.join(_TEST_STATE_ROOT, "appstate"))
+os.environ.setdefault("RIKO_ROAM_STATE", os.path.join(_TEST_STATE_ROOT, "roam_x.json"))
+os.environ.setdefault("RIKO_CONFIG_DIR", os.path.join(_TEST_STATE_ROOT, "config"))
+os.environ.setdefault("RIKO_AVATAR_CACHE", os.path.join(_TEST_STATE_ROOT, "avatars"))
+# Belt and braces: anything resolving XDG_CONFIG_HOME/riko also lands in
+# the throwaway dir instead of the owner's ~/.config/riko.
+os.environ.setdefault("XDG_CONFIG_HOME", os.path.join(_TEST_STATE_ROOT, "xdg"))
+
+# ── No real audio devices ────────────────────────────────────
+# Same reason: a real PortAudio stream in a test process races pytest's
+# teardown and aborts it (exit 139/134 after 'passed'). Tests inject their
+# fake (tests/test_listen_mode monkeypatches riko.asr.sd), so anything
+# still reaching the sounddevice module is a bug — fail loudly, not loudly
+# in a few seconds' worth of deprecation warnings.
+try:
+    import sounddevice as _sounddevice
+except ImportError:  # headless CI without the wheel: nothing to guard
+    pass
+else:
+
+    def _no_real_audio(*args, **kwargs):
+        raise RuntimeError("tests must not open real audio devices: "
+                           "inject a fake sd module (monkeypatch.setattr(asr, 'sd', fake))")
+
+    for _fn in ("InputStream", "OutputStream", "play", "rec", "record"):
+        setattr(_sounddevice, _fn, _no_real_audio)
 
 HUB_KEY = "test-hub-key"
 CHAT_REPLY = "[{name}] you said: {text}"
