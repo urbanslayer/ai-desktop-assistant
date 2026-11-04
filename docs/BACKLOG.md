@@ -26,27 +26,43 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
      the primary signal.
    - Needs from the owner, when this starts: the tailnet (Headscale or tailscale.com?), whether eve or
      another box advertises the `192.0.2.0/24` route, and target Android version / device.
-2. **Calling other models** (OpenAI, Claude, Gemini, OpenRouter): docs/TOOLS.md §C. **Plan only; do not
+2. **Music: Spotify and Tidal** (owner request). She can play music on request ("play some lo-fi on
+   Spotify"), with a small "now playing" popup by her showing the track, artist, cover art and
+   source (Spotify/Tidal, which device), plus play/pause/skip. Later, the Android app streams too.
+   Constraints to verify against current terms when this starts:
+   - **Spotify:** playback control through the Web API needs **Spotify Premium**, and the Web API only
+     controls a Spotify Connect device; it doesn't stream audio itself. Desktop options:
+     (a) the **Web Playback SDK** inside her page, which makes her window a Connect device (needs Widevine
+     DRM, which QtWebEngine lacks by default, so a risk);
+     (b) control the official Spotify desktop app as a Connect device (simplest, no audio in-app);
+     (c) a local Connect receiver such as librespot/spotifyd (unofficial, a ToS grey area).
+     Android: the **Spotify App Remote SDK** drives the installed Spotify app.
+   - **Tidal:** the official Tidal developer platform / player SDKs (Web and Android), which need
+     developer access approval; otherwise control via Tidal Connect.
+   - Shape: hub tools (`music_play(query, service?)`, `music_control(pause|resume|next|prev|volume)`,
+     `now_playing()`) with OAuth tokens stored server-side (write-only, refresh handled by the hub);
+     the desktop shows the popup from a `now_playing` event; she ducks or pauses music while she speaks.
+3. **Calling other models** (OpenAI, Claude, Gemini, OpenRouter): docs/TOOLS.md §C. **Plan only; do not
    implement until the owner says go.**
-3. **Optional: Riko as Home Assistant's conversation agent** for HA's own voice devices (Voice PE, phone
+4. **Optional: Riko as Home Assistant's conversation agent** for HA's own voice devices (Voice PE, phone
    app). Offered, not chosen. Would need an OpenAI-compatible chat endpoint on the hub.
-4. **Optional: "only when I say her name"** filter for always-listen mode.
+5. **Optional: "only when I say her name"** filter for always-listen mode.
 
 ## Quick wins
 
-5. **Works offline**: bundle three.js, three-vrm and three-vrm-animation under `client/vendor/`
+6. **Works offline**: bundle three.js, three-vrm and three-vrm-animation under `client/vendor/`
    (pinned versions, licence files) instead of loading them from the jsdelivr CDN.
-6. **Hub backups**: nightly copy of `~/AI/Docker/riko-hub/data` (and `breeze-tts/data/voices`, the ASR
+7. **Hub backups**: nightly copy of `~/AI/Docker/riko-hub/data` (and `breeze-tts/data/voices`, the ASR
    model is re-downloadable) to the owner's Duplicati on Nemu, or a simple dated tarball with rotation. Owner to
    confirm the target.
 
 ## Owner's steps
 
-7. Fill in each persona's **Appearance** on the hub web page.
-8. Push / open a PR: everything is on the local branch `feat/local-desktop`, nothing is pushed yet.
+8. Fill in each persona's **Appearance** on the hub web page.
+9. Push / open a PR: everything is on the local branch `feat/local-desktop`, nothing is pushed yet.
 
 ## Loose ends
 
-9. The status pill text during tool use is a stopgap: give the page a first-class `status(text=…)`.
-10. The thinking-pose fingers only curl on rigs that have weighted finger bones (the sample avatar doesn't).
-11. Test-run warnings (MCP SDK ping deprecation, FastAPI `on_event`); silence or migrate.
+10. The status pill text during tool use is a stopgap: give the page a first-class `status(text=…)`.
+11. The thinking-pose fingers only curl on rigs that have weighted finger bones (the sample avatar doesn't).
+12. Test-run warnings (MCP SDK ping deprecation, FastAPI `on_event`); silence or migrate.
