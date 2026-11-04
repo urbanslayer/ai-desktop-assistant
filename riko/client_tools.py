@@ -84,6 +84,55 @@ POLL_WAIT = 25.0                   # long-poll cadence, seconds
 TOOL_NAME_OK = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CLIENT_ID_OK = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# ── Body capabilities (docs/BODY.md §1) ──────────────────────
+# The desktop's built-in gesture vocabulary. The avatar page reports its real
+# library (built-ins + .vrma drop-ins) over POST /control/body-capabilities
+# and we re-register with that; until it does, we register this default list.
+# `talk_*` stay out: they are internal sprinkles, not things you can ask for.
+DEFAULT_BODY_ACTIONS = ["wave", "think", "nod", "shake_head", "look_around",
+                        "stretch", "fidget", "hair_touch", "laugh", "pout",
+                        "listen"]
+DEFAULT_BODY_EXPRESSIONS = ["happy", "angry", "sad", "relaxed", "surprised"]
+
+BODY_NAME_OK = re.compile(r"^[a-z0-9_-]{1,64}$")  # same grammar as the hub's
+
+
+def _clean_body(raw):
+    """Normalise a reported body object into {actions, expressions} of bare
+    lowercase names (docs/BODY.md §1); anything unusable is dropped."""
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for key in ("actions", "expressions"):
+        names = []
+        for item in (raw.get(key) or []):
+            name = re.sub(r"\s+", "_", str(item or "").strip().lower())
+            if not BODY_NAME_OK.match(name) or name in names:
+                continue
+            names.append(name)
+        out[key] = names
+    return out
+
+
+_current_body = {"actions": list(DEFAULT_BODY_ACTIONS),
+                 "expressions": list(DEFAULT_BODY_EXPRESSIONS)}
+
+
+def note_body(body):
+    """Remember what this desktop can physically do right now."""
+    global _current_body
+    _current_body = {"actions": list(body.get("actions") or []),
+                     "expressions": list(body.get("expressions") or [])}
+
+
+def current_body_actions():
+    """Gesture names this desktop can play right now (for greeting actions)."""
+    return list(_current_body["actions"])
+
+
+def _reset_body():
+    note_body({"actions": DEFAULT_BODY_ACTIONS,
+               "expressions": DEFAULT_BODY_EXPRESSIONS})
+
 
 class ToolError(Exception):
     """The tool ran but failed: reported to the hub as {ok: false, error}."""
@@ -516,7 +565,7 @@ class ClientRuntime:
     def __init__(self, hub, tools, executors, client_id=None, name=None,
                  kind="desktop", platform_name=None, on_approval=None,
                  on_event=None, approval_timeout=DEFAULT_APPROVAL_TIMEOUT,
-                 heartbeat_interval=None, poll_wait=POLL_WAIT):
+                 heartbeat_interval=None, poll_wait=POLL_WAIT, body=None):
         self.hub = hub
         self.client_id = str(client_id or "").strip()
         if not CLIENT_ID_OK.match(self.client_id):
@@ -525,6 +574,11 @@ class ClientRuntime:
         self.kind = kind
         self.platform_name = platform_name or sys.platform
         self.tools = [t for t in tools if TOOL_NAME_OK.match(t.get("name", ""))]
+        # Body capabilities (docs/BODY.md §1): until the avatar page reports
+        # its real library, register the built-in gesture list.
+        self.body = _clean_body(body) if body is not None else {
+            "actions": list(DEFAULT_BODY_ACTIONS),
+            "expressions": list(DEFAULT_BODY_EXPRESSIONS)}
         self.executors = dict(executors)
         self.on_approval = on_approval
         self.on_event = on_event
@@ -567,14 +621,35 @@ class ClientRuntime:
     def _register(self):
         out = self.hub.client_register(
             self.client_id, name=self.name, kind=self.kind,
-            platform=self.platform_name, tools=self.tools)
+            platform=self.platform_name, tools=self.tools, body=self.body)
         if self._heartbeat_override is None:
             hb = out.get("heartbeat_s") or out.get("heartbeat_seconds") or 30
             self._heartbeat_s = min(30.0, max(5.0, float(hb)))
         self._registered.set()
+        note_body(self.body)
         print(f"[client] registered on the hub as {self.client_id} "
-              f"({len(self.tools)} tools)")
+              f"({len(self.tools)} tools, body: {len(self.body['actions'])} actions)")
         return out
+
+    def set_body(self, raw):
+        """The avatar page reports the gesture library it can actually play
+        (built-ins + .vrma drop-ins; docs/BODY.md §1/§5). Re-register with the
+        hub when it changed; a hub that is down just gets it next re-register.
+        """
+        new = _clean_body(raw)
+        if new == self.body:
+            return {"ok": True, "changed": False, "actions": list(self.body["actions"])}
+        self.body = new
+        note_body(new)
+        print(f"[client] body updated: {', '.join(new['actions']) or '(no actions)'}")
+        if self._registered.is_set():
+            try:
+                self._register()
+            except hub_client.HubError as e:
+                print(f"[client] the body changed but the hub refused a re-register: {e}")
+                return {"ok": False, "changed": True, "error": str(e),
+                        "actions": list(new["actions"])}
+        return {"ok": True, "changed": True, "actions": list(new["actions"])}
 
     # ── threads ──────────────────────────────────────────────
     def _poll_loop(self):

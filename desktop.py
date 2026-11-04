@@ -333,6 +333,12 @@ def main():
             except hub_client.HubError as e:
                 return {"ok": False, "error": str(e)}
             return {"ok": True, "imported": n}
+        elif cmd == "body-capabilities":
+            # the avatar page reports the gesture library it can play right
+            # now (built-ins + .vrma drop-ins, docs/BODY.md §1/§5)
+            if runtime is None:
+                return {"ok": False, "error": "client tools are off (desktop.client.enabled: false)"}
+            return runtime.set_body(args)
         elif cmd in PAGE_CMDS:  # type / hide-input / toggle / show / hide / quit / wave
             bridge.command.emit(cmd)
         else:

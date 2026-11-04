@@ -6,7 +6,10 @@
 //          performance.now()/1000, tests pass whatever they like):
 //   start(now)                    the page finished loading
 //   status(now, state)            listening / hearing / thinking / speaking / idle
-//   say(now, {emotion, seconds, text})  a spoken line (emotion/text may be absent)
+//   say(now, {emotion, seconds, text, actions})
+//                                 a spoken line (emotion/text/actions may be
+//                                 absent; actions = [{name, at}] reply
+//                                 gestures, docs/BODY.md §5)
 //   heard(now, text)              the user's words arrived (text optional)
 //   requestWave(now)              the W shortcut / riko-ctl wave: wave on demand
 //   persona(now, info)              the persona (and body) changed; info = {id, avatar_version}
@@ -80,6 +83,42 @@ export const REPLY_GREETING_RE = /^(?:["'“”\s*.,!~—-]|\p{Extended_Pictogra
 const PRIO_EMOTION = 1, PRIO_IDLE = 2, PRIO_TALK = 3, PRIO_RETURN = 4, PRIO_PERSONA = 5;
 const PRIO_GREET = PRIO_PERSONA;  // a greeting wave may swap a running loop
 
+// ── Body actions (docs/BODY.md §5) ────────────────────────────
+// Your words that make a reply's action *asked for* (it then plays like the
+// W shortcut: cooldowns bypassed, one-shots preempted). Mirrors the hub's
+// verb table (hub/body.py ACTION_VERBS + GESTURE_VOCAB) so [wave] tags and
+// "wave at me" agree on the canonical name.
+export const ACTION_REQUESTS = [
+  [/\bwaves?\b|\bwaving\b/i, 'wave'],
+  [/\bnods?\b|\bnodding\b/i, 'nod'],
+  [/\bshak(e|es|ing)\b[^.!?]{0,24}\bhead\b/i, 'shake_head'],
+  [/\bshook\b[^.!?]{0,24}\bhead\b/i, 'shake_head'],
+  [/\bthink(s|ing)?\b|\bthought about\b/i, 'think'],
+  [/\bstretches?\b|\bstretching\b/i, 'stretch'],
+  [/\blooks?\b[^.!?]{0,16}\baround\b/i, 'look_around'],
+  [/\blaughs?\b|\blaughing\b|\blaughter\b/i, 'laugh'],
+  [/\bpouts?\b|\bpouting\b/i, 'pout'],
+  [/\btouch(es|ing)?\b[^.!?]{0,16}\bhair\b/i, 'hair_touch'],
+  [/\bfidgets?\b|\bfidgeting\b/i, 'fidget'],
+];
+
+/** `Shake-Head` / `shake head` -> `shake_head` (same normalisation as the hub). */
+export function normalizeAction(raw) {
+  return String(raw ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+/** Which canonical actions the user's own words name (docs/BODY.md §5). */
+export function askedForActions(text) {
+  const out = new Set();
+  const s = String(text || '');
+  for (const [re, name] of ACTION_REQUESTS) if (re.test(s)) out.add(name);
+  return out;
+}
+
+const SPEECH_CHARS_PER_S = 14;   // clip-less estimate: ~14 spoken chars per second
+const ACTION_QUEUE_S = 3;        // a natural action waits at most this long for the body
+const LOOP_ACTION_HOLD = 6;      // a loop that came from a reply stops after this long
+
 export class Director {
   constructor({ random = Math.random } = {}) {
     this.random = random;
@@ -94,6 +133,24 @@ export class Director {
     this.nextTalkAt = Infinity;
     this.lastTalk = null;
     this._personaKey = null;      // last persona id+version the page was told about
+    this.gestures = GESTURES;   // the playable library; library() adds VRMA drop-ins
+    this.scheduled = [];        // reply actions: {name, at, forced} / {stop, at}
+    this.lastUserText = '';     // your words this turn (asked-for detection)
+  }
+
+  /**
+   * Teach the director extra gestures the page can play — .vrma drop-ins
+   * (docs/BODY.md §1): {name: {loop, duration}}. Names already in the pose
+   * library keep their built-in timing; unknown ones become playable.
+   */
+  library(extra = {}) {
+    const next = { ...this.gestures };
+    for (const [name, g] of Object.entries(extra || {})) {
+      if (!g || !Number.isFinite(Number(g.duration)) || Number(g.duration) <= 0) continue;
+      if (next[name]) continue;  // built-ins own their own timing
+      next[name] = { loop: !!g.loop, duration: Number(g.duration) };
+    }
+    this.gestures = next;
   }
 
   // ── inputs ──────────────────────────────────────────────────
@@ -115,11 +172,14 @@ export class Director {
     if (key) this._personaKey = key;
     this.lastActivity = now;
     this.returnWave = false;
+    this.scheduled = [];      // the old persona's pending reply actions are stale
+    this.lastUserText = '';
     return this.#play('wave', now, { priority: PRIO_PERSONA, noCooldown: true });
   }
 
   heard(now, text = '') {
     const acts = this.#activity(now);
+    this.lastUserText = text ? String(text) : '';
     if (text && GREETING_RE.test(String(text))) acts.push(...this.#greetingWave(now));
     return acts;
   }
@@ -216,11 +276,19 @@ export class Director {
     return acts;
   }
 
-  say(now, { emotion = 'neutral', seconds = 0, text = '' } = {}) {
+  say(now, { emotion = 'neutral', seconds = 0, text = '', actions = [] } = {}) {
     const acts = [];
     this.lastActivity = now;
+    // Reply actions from the hub (docs/BODY.md §5): schedule each at
+    // `at * speech duration` — the clip length, or ~14 chars/s from the text.
+    // One of them being `wave` suppresses the greeting-text wave below, so a
+    // reply never carries two waves.
+    const list = Array.isArray(actions) ? actions : [];
+    const replyWave = list.some((a) => a && normalizeAction(a.name) === 'wave');
     // a reply that opens with a greeting waves along with it (cooldown applies)
-    if (text && REPLY_GREETING_RE.test(String(text))) acts.push(...this.#greetingWave(now));
+    if (text && !replyWave && REPLY_GREETING_RE.test(String(text))) {
+      acts.push(...this.#greetingWave(now));
+    }
     const map = EMOTION_EXPRESSIONS[emotion] || EMOTION_EXPRESSIONS.neutral;
     this.expression = map.expression
       ? { name: map.expression, until: now + Math.max(seconds, 0) + 3,
@@ -234,6 +302,25 @@ export class Director {
     if (emotion === 'thinking' && this.state !== 'thinking') {
       acts.push(...this.#play('think', now, { priority: PRIO_EMOTION, noCooldown: true }));
     }
+    // schedule this reply's body actions
+    const speech = seconds > 0 ? Number(seconds)
+      : String(text || '').length / SPEECH_CHARS_PER_S;
+    const asked = askedForActions(this.lastUserText);
+    this.lastUserText = '';  // asked-for only ever applies to the turn it answered
+    for (const a of list) {
+      const name = normalizeAction(a && a.name);
+      if (!name) continue;
+      if (!this.gestures[name]) {
+        console.warn(`[director] unknown action '${name}' — ignored`);
+        continue;
+      }
+      const frac = Number.isFinite(a.at) ? Math.min(Math.max(a.at, 0), 1) : 0;
+      // asked-for: the hub's flag (docs/BODY.md §3, additive) wins; without
+      // it the director decides from your own words (the mirrored verb table).
+      this.scheduled.push({ name, at: now + frac * speech,
+                            forced: a.asked === true || asked.has(name) });
+    }
+    if (this.scheduled.length) acts.push(...this.#drainScheduled(now));
     return acts;
   }
 
@@ -245,6 +332,8 @@ export class Director {
       this.gesture = null;  // anything queued behind it gets its turn (see below)
       if (this.pendingIdle) { this.pendingIdle = false; this.nextIdleAt = now + this._idleGap(); }
     }
+    // reply body actions due right now (docs/BODY.md §5)
+    if (this.scheduled.length) acts.push(...this.#drainScheduled(now));
     // a pending one-shot may go as soon as the body is free (or when it can
     // preempt a loop)
     this.#prunePending();
@@ -268,7 +357,7 @@ export class Director {
         const pick = choices[Math.floor(this.random() * choices.length)];
         this.lastTalk = pick;
         acts.push(...this.#play(pick, now, { priority: PRIO_TALK }));
-        this.nextTalkAt = now + GESTURES[pick].duration + 3 + this.random() * 4;
+        this.nextTalkAt = now + this.gestures[pick].duration + 3 + this.random() * 4;
       } else {
         this.nextTalkAt = now + 2;  // all on cooldown; check again shortly
       }
@@ -300,12 +389,74 @@ export class Director {
     return acts;
   }
 
+  /**
+   * Fire every reply action whose time has come. `forced` (the user asked
+   * for it) cuts in front of everything; natural ones stay polite and a
+   * loop a reply started gets a stop timer so it never runs forever.
+   */
+  #drainScheduled(now) {
+    const acts = [];
+    const due = this.scheduled.filter((s) => now >= s.at);
+    if (!due.length) return acts;
+    this.scheduled = this.scheduled.filter((s) => now < s.at);
+    for (const s of due.sort((a, b) => a.at - b.at)) {
+      if (s.stop) {  // scheduled stop for a loop gesture a reply started
+        if (this.gesture?.name === s.stop && this.gesture.loop) {
+          acts.push({ type: 'gesture_stop', name: s.stop });
+          this.gesture = null;
+        }
+        continue;
+      }
+      if (!this.gestures[s.name]) continue;  // library changed under us
+      if (s.forced) {
+        acts.push(...this.#forceAction(s.name, now));
+      } else {
+        acts.push(...this.#play(s.name, now, { priority: PRIO_TALK,
+                                               queueFor: ACTION_QUEUE_S }));
+      }
+      // a loop that came from a reply plays it, then stands down
+      if (acts.some((a) => a.type === 'gesture' && a.name === s.name)
+          && this.gesture?.name === s.name && this.gesture.loop) {
+        this.scheduled.push({ stop: s.name, at: now + LOOP_ACTION_HOLD });
+      }
+    }
+    return acts;
+  }
+
+  /**
+   * An *asked-for* action (docs/BODY.md §5): always plays — cooldowns are
+   * bypassed and running one-shots (and loops) are preempted. The only
+   * skip is the same gesture already moving.
+   */
+  #forceAction(name, now) {
+    const g = this.gestures[name];
+    if (!g) return [];
+    if (this.gesture?.name === name) return [];  // she is already doing it
+    const acts = [];
+    if (this.gesture) {
+      acts.push({ type: 'gesture_stop', name: this.gesture.name });
+      this.gesture = null;
+    }
+    this.pending = null;
+    this.gesture = { name, loop: g.loop, endsAt: now + g.duration };
+    this.cooldowns[name] = now + (COOLDOWNS[name] || 0);
+    acts.push({ type: 'gesture', name, loop: g.loop, duration: g.duration });
+    if (name === 'wave') {  // waves keep the happy face
+      const hold = g.duration + 1.5;
+      this.expression = { name: 'happy', until: now + hold, tilt: false, away: false };
+      acts.push({ type: 'expression', name: 'happy', value: 0.8, hold,
+                  tilt: false, away: false });
+    }
+    return acts;
+  }
+
   #ready(name, now) {
     return (this.cooldowns[name] || 0) <= now;
   }
 
-  #play(name, now, { priority = 1, noCooldown = false, allowPending = false } = {}) {
-    const g = GESTURES[name];
+  #play(name, now, { priority = 1, noCooldown = false, allowPending = false,
+                     queueFor = null } = {}) {
+    const g = this.gestures[name];
     if (!g) return [];
     if (!noCooldown && !this.#ready(name, now)) return [];
     const busyOneShot = this.gesture && !this.gesture.loop;
@@ -315,7 +466,9 @@ export class Director {
       || (busyLoop && name === this.gesture.name);         // ...nor does the same loop restart
     if (blocked) {
       if (allowPending || (this.pending && this.pending.priority >= priority)) return [];
-      this.pending = { name, priority, noCooldown, expiresAt: now + (g.loop ? 30 : 6) };
+      // reply actions wait only a few seconds; everything else keeps the old windows
+      const wait = queueFor != null ? queueFor : (g.loop ? 30 : 6);
+      this.pending = { name, priority, noCooldown, expiresAt: now + wait };
       return [];
     }
     // free slot, or we replace the running loop (status loops and priority >= 5)

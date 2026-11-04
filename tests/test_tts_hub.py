@@ -23,7 +23,8 @@ def hub_turn_env(monkeypatch, fake_hub, tmp_path):
     monkeypatch.setattr(tts, "VOICE_FILE", tmp_path / "riko.wav")
     played = []
     monkeypatch.setattr(viewer, "play",
-                        lambda wav, text=None, emotion="neutral": played.append((wav, text)))
+                        lambda wav, text=None, emotion="neutral", actions=None:
+                        played.append((wav, text)))
     hub_client.connect(cfg)
     return cfg, fake_hub, played
 

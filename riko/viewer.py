@@ -216,22 +216,25 @@ def start(cfg):
     return server
 
 
-def play(wav_path, text=None, emotion="neutral"):
+def play(wav_path, text=None, emotion="neutral", actions=None):
     """Show her line and play her voice on the avatar page (or the speakers if no page is open).
 
     wav_path may be None (tts: none): then only the speech bubble shows. Returns when she is done.
     emotion is forwarded to the page (the director turns it into a face + gesture);
     old hubs may not send one, hence the default.
+    actions is the ChatResult's body-action list (docs/BODY.md §5): [{name, at}]
+    scheduled by the page's director against her speech; absent/None = [].
     """
     emotion = emotion or "neutral"
+    actions = actions or []
     if wav_path is None:
         if text:
-            emit("say", text=text, emotion=emotion)
+            emit("say", text=text, emotion=emotion, actions=actions)
         return
     duration = sf.info(wav_path).duration
     if page_open():
         if text:
-            emit("say", text=text, seconds=duration, emotion=emotion)
+            emit("say", text=text, seconds=duration, emotion=emotion, actions=actions)
         _finished.clear()
         _clips.put(f"audio/{wav_path.name}?v={time.time()}")  # ?v= so the browser never replays the old clip
         if not _finished.wait(timeout=duration + 10):

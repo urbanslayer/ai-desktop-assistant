@@ -354,3 +354,133 @@ test('requestWave marks activity so the return-wave logic stands down', () => {
   const acts = d.tick(600 + 8);   // 10 min later
   assert.ok(acts.some((a) => a.name === 'wave' || a.type === 'gesture'), 'return wave still fires when idle');
 });
+
+
+// ── reply body actions (docs/BODY.md §5) ────────────────────
+
+test('reply actions are scheduled at fractions of the speech duration', () => {
+  const d = new Director({ random: seq() });
+  d.status(0, 'speaking');
+  const acts = d.say(1, { emotion: 'neutral', seconds: 4, text: 'ok!',
+                          actions: [{ name: 'wave', at: 0 }, { name: 'think', at: 0.6 }] });
+  assert.deepEqual(names(acts), ['wave']);   // at=0 fires with the reply
+  const due = d.tick(3.4);                   // wave (2.4 s) ends right at 1+2.4
+  assert.deepEqual(names(due), ['think']);   // 0.6 * 4 s = 2.4 s after the say
+  assert.equal(due.find((a) => a.type === 'gesture_stop')?.name, 'wave');
+});
+
+test('without an audio clip, speech length is estimated at ~14 chars/s', () => {
+  const d = new Director({ random: seq() });
+  d.state = 'speaking';
+  d.say(0, { text: 'x'.repeat(28), actions: [{ name: 'nod', at: 0.75 }] });
+  assert.equal(d.scheduled.length, 1);       // 28 chars / 14 = 2 s of speech
+  assert.deepEqual(names(d.tick(1.4)), []);  // due at 1.5
+  assert.deepEqual(names(d.tick(1.6)), ['nod']);
+});
+
+test('asked-for actions bypass cooldown and preempt a running loop', () => {
+  const d = new Director({ random: seq() });
+  d.status(0, 'thinking');                   // think loop running
+  d.cooldowns.wave = 10;                     // wave is on cooldown
+  d.heard(0.5, 'wave for me');               // your words name the verb
+  const acts = d.say(1, { seconds: 2, actions: [{ name: 'wave', at: 0 }] });
+  assert.deepEqual(acts.filter((a) => a.type !== 'expression').map((a) => a.type + ':' + a.name),
+                   ['gesture_stop:think', 'gesture:wave']);
+  assert.equal(d.gesture.name, 'wave');
+  assert.ok(acts.some((a) => a.type === 'expression' && a.name === 'happy'),
+            'a wave keeps the happy face');
+});
+
+test("the hub's asked flag forces an action without any user text", () => {
+  const d = new Director({ random: seq() });
+  d.status(0, 'thinking');                   // think loop running
+  d.cooldowns.nod = 99;                      // deep in cooldown
+  const acts = d.say(1, { seconds: 2, actions: [{ name: 'nod', at: 0, asked: true }] });
+  assert.deepEqual(names(acts), ['nod']);    // forced: cooldown bypassed, loop cut
+  assert.equal(d.gesture.name, 'nod');
+  // ...and the SAME action without the flag is just polite: cooldown drops it
+  const d2 = new Director({ random: seq() });
+  d2.cooldowns.nod = 99;
+  assert.deepEqual(names(d2.say(0, { seconds: 2, text: 'ok',
+                                     actions: [{ name: 'nod', at: 0 }] })), []);
+});
+
+test('an asked-for gesture already playing is not restarted', () => {
+  const d = new Director({ random: seq() });
+  d.status(0, 'thinking');
+  d.heard(0.5, 'nod for me');
+  const acts = d.say(0.6, { seconds: 2, actions: [{ name: 'think', at: 0 }] });
+  // think is playing and was not asked for -> it stays; nothing restarts
+  assert.deepEqual(acts.filter((a) => a.type !== 'expression'), []);
+  assert.equal(d.gesture.name, 'think');
+});
+
+test('natural actions wait at most 3 s for the body, then give up', () => {
+  const d = new Director({ random: seq() });
+  d.start(0);                                                 // wave 0..2.4
+  d.say(0.5, { seconds: 1, actions: [{ name: 'nod', at: 0 }] });  // due at 0.5, body busy
+  assert.equal(d.pending.name, 'nod');
+  assert.equal(d.pending.expiresAt, 3.5);                     // the 3 s window
+  assert.deepEqual(names(d.tick(3.6)), []);                   // expired unplayed
+  const d2 = new Director({ random: seq() });
+  d2.start(0);
+  d2.say(0.5, { seconds: 1, actions: [{ name: 'nod', at: 0 }] });
+  assert.ok(names(d2.tick(2.5)).includes('nod'), 'body frees at 2.4 -> nod goes');
+});
+
+test('a reply carrying a wave does not also greeting-wave', () => {
+  const d = new Director({ random: seq() });
+  const acts = d.say(0, { text: 'hey there!', seconds: 3,
+                          actions: [{ name: 'wave', at: 0.5 }] });
+  assert.equal(acts.filter((a) => a.type === 'gesture' && a.name === 'wave').length, 0);
+  assert.deepEqual(names(d.tick(1.5)), ['wave']);             // exactly one wave
+  const d2 = new Director({ random: seq() });
+  assert.ok(names(d2.say(0, { text: 'hi!', seconds: 2 })).includes('wave'),
+            'a greeting reply WITHOUT wave actions still waves');
+});
+
+test('unknown action names are noted and ignored', () => {
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    const d = new Director({ random: seq() });
+    const acts = d.say(0, { seconds: 2, actions: [{ name: 'cartwheel', at: 0 }] });
+    assert.deepEqual(names(acts), []);
+    assert.equal(d.scheduled.length, 0);
+  } finally {
+    console.warn = orig;
+  }
+  assert.match(warns[0] ?? '', /unknown action/i);
+});
+
+test('a loop that came from a reply plays it, then stands down', () => {
+  const d = new Director({ random: seq() });
+  const acts = d.say(0, { seconds: 2, actions: [{ name: 'listen', at: 0 }] });
+  assert.ok(names(acts).includes('listen'));
+  assert.equal(d.gesture.loop, true);
+  const stop = d.tick(6.1);  // LOOP_ACTION_HOLD = 6 s
+  assert.deepEqual(stop.filter((a) => a.type === 'gesture_stop').map((a) => a.name), ['listen']);
+  assert.equal(d.gesture, null);
+});
+
+test('drop-in gestures taught via library() are playable', () => {
+  const d = new Director({ random: seq() });
+  d.library({ curtsy: { loop: false, duration: 2 } });
+  const acts = d.say(0, { seconds: 1, actions: [{ name: 'curtsy', at: 0, asked: true }] });
+  assert.deepEqual(names(acts), ['curtsy']);
+});
+
+test('a persona switch drops stale reply actions', () => {
+  const d = new Director({ random: seq() });
+  d.say(0, { seconds: 4, actions: [{ name: 'nod', at: 0.9 }] });  // due at 3.6
+  d.persona(1, { id: 'p2', avatar_version: 7 });
+  assert.equal(d.scheduled.length, 0);
+  assert.ok(!names(d.tick(3.7)).includes('nod'));
+});
+
+test('action names normalize like the hub\'s', () => {
+  const d = new Director({ random: seq() });
+  const acts = d.say(0, { seconds: 1, actions: [{ name: 'Shake-Head', at: 0 }] });
+  assert.deepEqual(names(acts), ['shake_head']);
+});

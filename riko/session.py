@@ -13,7 +13,7 @@ the VRM when the persona changes — by keyword, riko-ctl or another client.
 import queue
 import threading
 
-from riko import asr, hub_client, tts, viewer
+from riko import asr, client_tools, hub_client, tts, viewer
 
 
 class Session:
@@ -111,7 +111,11 @@ class Session:
         if kind == "greet":
             viewer.emit("status", state="thinking")
             greeting = payload.get("greeting") or f"{payload['name']} here."
-            self._speak(greeting, audio_url=self._greeting_audio_url(payload), emotion="happy")
+            # switch greetings earn a wave when this body can wave (docs/BODY.md §3)
+            greet_actions = ([{"name": "wave", "at": 0}]
+                             if "wave" in client_tools.current_body_actions() else [])
+            self._speak(greeting, audio_url=self._greeting_audio_url(payload),
+                        emotion="happy", actions=greet_actions)
             return
         if kind == "audio":
             viewer.emit("status", state="hearing")
@@ -133,10 +137,12 @@ class Session:
         # tts: hub — the hub already made (or will make) the audio; audio_url
         # is null when TTS is off or this persona's voice is, so: bubble only.
         # emotion may be absent from older hubs: the viewer treats that as neutral.
+        # actions (docs/BODY.md §3) may be absent from older hubs too: [] then.
         self._speak(result["reply"], audio_url=result.get("audio_url"),
-                    emotion=result.get("emotion") or "neutral")
+                    emotion=result.get("emotion") or "neutral",
+                    actions=result.get("actions") or [])
 
-    def _speak(self, answer, audio_url=None, emotion="neutral"):
+    def _speak(self, answer, audio_url=None, emotion="neutral", actions=None):
         persona = hub_client.active_persona() or {}
         print(f"{persona.get('name', 'Riko')}: {answer}")
         if self.cfg["tts"] == "hub":
@@ -144,7 +150,7 @@ class Session:
         else:
             wav = tts.speak(answer, self.cfg, voice=persona.get("tts_voice") or None)
         viewer.emit("status", state="speaking")
-        viewer.play(wav, answer, emotion=emotion)
+        viewer.play(wav, answer, emotion=emotion, actions=actions or [])
 
     def _hub_audio(self, audio_url):
         """Fetch reply/greeting audio the hub made. None = speech bubble only;

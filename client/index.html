@@ -92,6 +92,11 @@
     // /measure?t=<sec> that many seconds after she woke up. Nothing else
     // changes; the harness is client/tools/capture_frames.py.
     const CAPTURE = new URLSearchParams(location.search).get('capture');
+    // Headless actions QA (?actionstiming=14): record every gesture start/stop
+    // transition (and a marker when a say event carrying actions arrives) into
+    // window.__actionTimeline, and POST it to /timeline that many seconds after
+    // wake. The harness is client/tools/actions_check.py.
+    const TIMING = Number(new URLSearchParams(location.search).get('actionstiming')) || 0;
     // QA hook (?force=think@0,wave@12): silence the director and play the named
     // built-in gesture(s) at the given seconds after she woke up, so poses can
     // be photographed and measured at exact times.
@@ -174,6 +179,25 @@
       }
     }
 
+    // ── Body capabilities (docs/BODY.md §1/§5) ──
+    // The page owns the real gesture library (built-in poses + .vrma drop-ins),
+    // so it teaches the director the drop-ins' timings and reports the whole
+    // list to the desktop (POST /control/body-capabilities), which registers
+    // it with the hub. Until this arrives, the desktop registers the built-in
+    // default list. A plain browser tab has no desktop to tell — POST is
+    // fire-and-forget; losing it just keeps the defaults on the hub.
+    const BODY_EXPRESSIONS = ['happy', 'angry', 'sad', 'relaxed', 'surprised'];
+    function reportBody() {
+      const actions = [...new Set([
+        ...Object.keys(GESTURES).filter((n) => !n.startsWith('talk_')),  // talk_* are internal
+        ...Object.keys(vrmas),
+      ])].sort();
+      fetch('/control/body-capabilities', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actions, expressions: BODY_EXPRESSIONS }),
+      }).catch(() => {});
+    }
+
     function attach(model) {
       if (vrm) {  // old persona: out of the scene, GPU memory freed
         motion.detach(vrm);
@@ -224,7 +248,11 @@
         controls.target.set(0, headY * 0.62, 0);
       }
       rebuildClips();
-      resumeLife();         // whatever the director had running, replay on this body
+      // reply actions may name .vrma gestures: teach the director their timings
+      director.library(Object.fromEntries(Object.entries(clips)
+        .map(([n, c]) => [n, { loop: !!c.loop, duration: c.clip.duration }])));
+      reportBody();           // tell the desktop what this body can do right now
+      resumeLife();           // whatever the director had running, replay on this body
     }
 
     // ── Camera: drag to rotate, right-drag to move her, scroll to zoom.
@@ -248,6 +276,10 @@
     function applyAction(a) {
       // one bad action must not kill the rest of this event batch
       try {
+        if (TIMING && (a.type === 'gesture' || a.type === 'gesture_stop')) {
+          (window.__actionTimeline = window.__actionTimeline || []).push(
+            { t: T(), type: a.type, name: a.name });
+        }
         if (a.type === 'gesture') {
           const c = clips[a.name];
           if (c) {  // a VRMA clip the owner dropped in takes over the body bones
@@ -585,8 +617,13 @@
         feed(director.status(T(), ev.state));
       } else if (ev.type === 'say') {
         flash(bubble, ev.text, (ev.seconds || 0) + BUBBLE_SECONDS);
+        if (TIMING && Array.isArray(ev.actions) && ev.actions.length) {
+          (window.__actionTimeline = window.__actionTimeline || []).push(
+            { t: T(), type: 'say', actions: ev.actions, seconds: ev.seconds || 0 });
+        }
         feed(director.say(T(), { emotion: ev.emotion || 'neutral',
-                                 seconds: ev.seconds || 0, text: ev.text || '' }));
+                                 seconds: ev.seconds || 0, text: ev.text || '',
+                                 actions: ev.actions || [] }));
       } else if (ev.type === 'heard') {
         flash(heard, ev.text, 6);
         feed(director.heard(T(), ev.text || ''));
@@ -636,6 +673,12 @@
       audioCtx.resume();
       if (DESKTOP) console.log(`Riko page ready, viewport ${innerWidth}x${innerHeight}`);
       setInterval(checkForVoice, DESKTOP ? 150 : 250);
+      if (TIMING) {
+        setTimeout(() => fetch('/timeline', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(window.__actionTimeline || []),
+        }).catch(() => {}), TIMING * 1000);
+      }
     }
     if (DESKTOP || CAPTURE) begin();  // capture mode: no click available in a headless run
     else {

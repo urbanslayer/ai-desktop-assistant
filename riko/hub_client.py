@@ -148,12 +148,19 @@ class HubClient:
         """GET /api/clients: who is online on the client-tool channel."""
         return self._json("GET", "/api/clients")
 
-    def client_register(self, client_id, name, kind="desktop", platform="", tools=()):
-        """Publish this app's tools; the model sees them as <kind>__<name>."""
-        body = {"name": name, "kind": kind, "tools": list(tools)}
+    def client_register(self, client_id, name, kind="desktop", platform="",
+                        tools=(), body=None):
+        """Publish this app's tools; the model sees them as <kind>__<name>.
+
+        `body` (docs/BODY.md §1) is an optional {actions: [...], expressions:
+        [...]} of gesture/expression names this client can play right now.
+        """
+        body_json = {"name": name, "kind": kind, "tools": list(tools)}
         if platform:
-            body["platform"] = platform
-        return self._json("POST", f"/api/clients/{client_id}/register", json=body)
+            body_json["platform"] = platform
+        if body is not None:
+            body_json["body"] = body
+        return self._json("POST", f"/api/clients/{client_id}/register", json=body_json)
 
     def client_heartbeat(self, client_id):
         return self._json("POST", f"/api/clients/{client_id}/heartbeat", timeout=10)
