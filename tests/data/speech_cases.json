@@ -282,7 +282,7 @@
   {
     "name": "domain in first para, url in details",
     "input": "Details: godotengine.org\n\nDocs at https://godotengine.org/docs",
-    "expect": "Details:"
+    "expect": "Details."
   },
   {
     "name": "version number kept",
@@ -358,5 +358,80 @@
     "name": "bare js file kept",
     "input": "app.js has a bug.",
     "expect": "app.js has a bug."
+  },
+  {
+    "name": "clause-end domain leaves no dangling comma",
+    "input": "Here it is again, senpai — the same link I already gave you, docs.godotengine.org.",
+    "expect": "Here it is again, senpai — the same link I already gave you."
+  },
+  {
+    "name": "trailing domain without punctuation",
+    "input": "I saw it on reddit.com",
+    "expect": "I saw it"
+  },
+  {
+    "name": "domain inside parentheses falls back",
+    "input": "(see docs.godotengine.org)",
+    "expect": "I put the link on screen."
+  },
+  {
+    "name": "email before comma clause kept",
+    "input": "email me at a@b.com, okay?",
+    "expect": "email me, okay?"
+  },
+  {
+    "name": "domain before bang",
+    "input": "visit docs.godotengine.org!",
+    "expect": "visit!"
+  },
+  {
+    "name": "domain before question mark",
+    "input": "did you see docs.godotengine.org?",
+    "expect": "did you see?"
+  },
+  {
+    "name": "trailing colon after domain becomes ending",
+    "input": "link: docs.godotengine.org",
+    "expect": "link."
+  },
+  {
+    "name": "trailing comma after domain becomes ending",
+    "input": "the link is example.com,",
+    "expect": "the link is."
+  },
+  {
+    "name": "dash dot seam after domain",
+    "input": "thanks again — docs.godotengine.org.",
+    "expect": "thanks again."
+  },
+  {
+    "name": "at dot seam after domain",
+    "input": "meet me at example.com.",
+    "expect": "meet me."
+  },
+  {
+    "name": "semicolon dot seam after domain",
+    "input": "hosted; example.com.",
+    "expect": "hosted."
+  },
+  {
+    "name": "doubled comma seam after domain",
+    "input": "the link, example.com , works fine",
+    "expect": "the link, works fine"
+  },
+  {
+    "name": "empty quotes after quoted domain",
+    "input": "I read \"docs.godotengine.org\" once",
+    "expect": "I read once"
+  },
+  {
+    "name": "space before closer parens after domain",
+    "input": "the site (docs.godotengine.org ) is great",
+    "expect": "the site is great"
+  },
+  {
+    "name": "dash space dot seam mid reply",
+    "input": "all set — docs.godotengine.org . enjoy",
+    "expect": "all set. enjoy"
   }
 ]

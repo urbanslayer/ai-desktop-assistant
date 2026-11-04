@@ -109,10 +109,10 @@ def test_greeting_audio_speaks_clean_text(tmp_path, fake_llm, fake_breeze):
     assert r.status_code == 201
     res = client.post("/api/chat", json={"text": "asuka"}).json()
     assert res["switched"] is True
-    assert res["speech"] == "Asuka here! Details:"  # cleaned greeting too
+    assert res["speech"] == "Asuka here! Details."  # cleaned greeting too
     got = client.get(res["audio_url"])
     assert got.status_code == 200
-    assert fake_breeze.speech_requests[-1]["input"] == "Asuka here! Details:"
+    assert fake_breeze.speech_requests[-1]["input"] == "Asuka here! Details."
     assert (tmp_path / "hubdata" / "audio"
             / f"greeting-asuka-v1-r{SPEECH_RULES_VERSION}.wav").exists()
 

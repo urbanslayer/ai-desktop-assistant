@@ -9,10 +9,9 @@ pins both halves to the same behaviour and a parity test fails if they drift.
 If you edit these rules: edit hub/speech.py the same way AND bump
 SPEECH_RULES_VERSION there (the hub's audio cache keys on it).
 """
-
 import re
 
-SPEECH_RULES_VERSION = 2
+SPEECH_RULES_VERSION = 3
 
 # Spoken when the first paragraph had words but nothing speakable survived
 # (it was links / citations only).
@@ -169,10 +168,24 @@ def clean_body(reply: str) -> str:
         # pointing at nothing ("Hosted at", "runs on.") must not be spoken.
         text = re.sub(r"[%s]\s*,\s*" % _DASH, lambda m: m.group(0)[0] + " ", text)
         text = re.sub(r"(?m)[ \t]+[%s]+[ \t]*(?=[,.;:!?])" % _DASH, "", text)
-        text = re.sub(r"(?m)[ \t]+[%s]+[ \t]*$" % _DASH, "", text)
+        text = re.sub(r"(?m)[ \t]+[%s]+[ \t]*$" % _DASH, ".", text)
         text = re.sub(r"([ \t][%s][ \t]*){2,}" % _DASH, " \u2014 ", text)
+        # a weak separator stranded right where the link was must yield to
+        # the clause end it now touches: "gave you, docs.x ." became
+        # "gave you,." and has to be spoken "gave you." (same for ";." ":."
+        # ".," and doubled commas); empty quotes/parens left by the removal
+        # ("", "(see )") go too.
+        text = re.sub(r"[,;:][ \t]*([.!?])", r"\1", text)
+        text = re.sub(r"([.!?])[ \t]*[,;:]+", r"\1", text)
+        text = re.sub(r",[ \t]*,", ",", text)
+        text = re.sub(r'["\u201c\u201d][ \t]*["\u201c\u201d]', "", text)
+        text = re.sub(r"[\[(][ \t]*(?:[^\s()\[\]]+[ \t]+){1,2}[\])][ \t]*",
+                      " ", text)
         text = re.sub(r"[ \t]+\b(?:at|on|from)\b[ \t]*(?=[,.;:!?\u2013\u2014]|\Z)",
                       "", text, flags=re.I)
+        # a line that now ENDS on a stranded separator gets a real ending:
+        # "the link is," -> "the link is.", "link:" -> "link."
+        text = re.sub(r"(?m)[ \t]*[,;:]+[ \t]*$", ".", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 

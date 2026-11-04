@@ -19,7 +19,10 @@ text keeps everything; the AUDIO gets this cleaned text instead:
     line: when the reply has a details/links section after one, only the first
     paragraph is spoken. If that first paragraph has nothing speakable left
     (it was all links), a short fallback line is spoken instead — a reply
-    with words never becomes empty audio.
+    with words never becomes empty audio,
+  * seams left by link-shaped removals are tidied: "gave you, x.org ." is
+    spoken "gave you." (never ",." ";." ":." "— ." or a trailing ","/":"),
+    and "( )", '""', a stranded dash or a dangling "at/on/from" go away.
 
 `riko/speech.py` is the client-side mirror (the hub deploys standalone and the
 client must clean identically for tts: openai/sovits/fish). The two files are
@@ -31,7 +34,7 @@ a spoken URL in them) are regenerated.
 """
 import re
 
-SPEECH_RULES_VERSION = 2
+SPEECH_RULES_VERSION = 3
 
 # Spoken when the first paragraph had words but nothing speakable survived
 # (it was links / citations only).
@@ -188,10 +191,24 @@ def clean_body(reply: str) -> str:
         # pointing at nothing ("Hosted at", "runs on.") must not be spoken.
         text = re.sub(r"[%s]\s*,\s*" % _DASH, lambda m: m.group(0)[0] + " ", text)
         text = re.sub(r"(?m)[ \t]+[%s]+[ \t]*(?=[,.;:!?])" % _DASH, "", text)
-        text = re.sub(r"(?m)[ \t]+[%s]+[ \t]*$" % _DASH, "", text)
+        text = re.sub(r"(?m)[ \t]+[%s]+[ \t]*$" % _DASH, ".", text)
         text = re.sub(r"([ \t][%s][ \t]*){2,}" % _DASH, " \u2014 ", text)
+        # a weak separator stranded right where the link was must yield to
+        # the clause end it now touches: "gave you, docs.x ." became
+        # "gave you,." and has to be spoken "gave you." (same for ";." ":."
+        # ".," and doubled commas); empty quotes/parens left by the removal
+        # ("", "(see )") go too.
+        text = re.sub(r"[,;:][ \t]*([.!?])", r"\1", text)
+        text = re.sub(r"([.!?])[ \t]*[,;:]+", r"\1", text)
+        text = re.sub(r",[ \t]*,", ",", text)
+        text = re.sub(r'["\u201c\u201d][ \t]*["\u201c\u201d]', "", text)
+        text = re.sub(r"[\[(][ \t]*(?:[^\s()\[\]]+[ \t]+){1,2}[\])][ \t]*",
+                      " ", text)
         text = re.sub(r"[ \t]+\b(?:at|on|from)\b[ \t]*(?=[,.;:!?\u2013\u2014]|\Z)",
                       "", text, flags=re.I)
+        # a line that now ENDS on a stranded separator gets a real ending:
+        # "the link is," -> "the link is.", "link:" -> "link."
+        text = re.sub(r"(?m)[ \t]*[,;:]+[ \t]*$", ".", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
