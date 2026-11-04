@@ -144,6 +144,12 @@ def test_upsert_dedup_and_update(tmp_path):
     s.db.commit()
     f5, upd5 = s.upsert_fact("my cat is called miso", scope="user")
     assert upd5 and f5["pinned"]
+    # cross-scope dedup (reviewer fix): a persona note that repeats a user
+    # fact (same wording — the model's paraphrases vary too much for fuzzy
+    # matching, but the identical case is common) merges into the user fact
+    f6, upd6 = s.upsert_fact("My cat is called Miso", scope="persona:riko",
+                             dedup_scopes=["user"])
+    assert upd6 and f6["id"] == f1["id"] and f6["scope"] == "user"
     s.close()
 
 

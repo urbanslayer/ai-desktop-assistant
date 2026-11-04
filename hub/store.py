@@ -495,21 +495,31 @@ class Store:
         return self.get_fact(new_id) or {}
 
     def upsert_fact(self, text: str, scope: str = "user", pinned: bool = False,
-                    source_message_id: int | None = None):
+                    source_message_id: int | None = None,
+                    dedup_scopes: list[str] | None = None):
         """remember-tool semantics: near-identical text in the same scope
         updates the existing fact instead of duplicating it. Returns
-        (fact, updated_existing)."""
+        (fact, updated_existing). dedup_scopes (optional) extends the
+        duplicate search to those scopes (e.g. a persona note that is really
+        a user fact is merged into the user scope instead of saved twice)."""
         text = _memory.clamp_fact_text(text)
         norm = _memory.normalize_text(text)
+        # dedup_scopes are checked FIRST: when a wording matches both a user
+        # fact and a private note, the shared user fact wins (the tool's merge
+        # intent) instead of silently updating the private note.
+        scopes_to_check = [s for s in (dedup_scopes or []) if s != scope] + [scope]
         with self._lock:
             existing = None
             keep_pinned = False
-            for row in self.db.execute(
-                    "SELECT id, text, pinned FROM facts WHERE scope=? ORDER BY id",
-                    (scope,)):
-                if _memory.similar(norm, _memory.normalize_text(row["text"])) >= 0.92:
-                    existing = row["id"]
-                    keep_pinned = bool(row["pinned"])
+            for check in scopes_to_check:
+                for row in self.db.execute(
+                        "SELECT id, text, pinned, scope FROM facts WHERE scope=? ORDER BY id",
+                        (check,)):
+                    if _memory.similar(norm, _memory.normalize_text(row["text"])) >= 0.92:
+                        existing = row["id"]
+                        keep_pinned = bool(row["pinned"])
+                        break
+                if existing is not None:
                     break
             updated = existing is not None
             if existing is not None:

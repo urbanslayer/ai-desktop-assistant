@@ -69,8 +69,13 @@ def build_memory_specs(store, events, persona_id: str, writes: list,
         if scope not in ("user", "persona"):
             raise RuntimeError("tool_error:scope must be 'user' or 'persona'")
         full_scope = scope if scope == "user" else f"persona:{persona_id}"
+        # A persona note that duplicates a user fact is merged into the user
+        # scope instead of being saved twice (reviewer fix: the model tends to
+        # call remember twice with different scopes for one statement).
+        dedup = ["user"] if full_scope != "user" else None
         fact, updated = store.upsert_fact(raw, scope=full_scope,
-                                          pinned=bool(args.get("pinned")))
+                                          pinned=bool(args.get("pinned")),
+                                          dedup_scopes=dedup)
         note(fact.get("id"), "updated" if updated else "added")
         writes.append({"id": fact["id"], "text": fact["text"]})
         return json.dumps({"id": fact["id"], "scope": fact["scope"],
