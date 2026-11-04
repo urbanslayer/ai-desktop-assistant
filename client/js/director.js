@@ -29,7 +29,10 @@
 //   - wave on app start, on persona switch, when she comes back from
 //     10+ minutes of doing nothing, on your greetings/goodbyes (heard or
 //     typed text), when her reply starts with a greeting, and on demand
-//     (W shortcut / riko-ctl wave) — greetings honour the 25 s cooldown;
+//     (W shortcut / riko-ctl wave); greeting waves honour the 25 s
+//     cooldown, an ON-DEMAND wave always plays (it bypasses the cooldown
+//     and blends out anything else running; only an already-playing wave
+//     makes it skip);
 //   - think loops while status is thinking, listen loops while listening;
 //   - talk gestures sprinkled through long answers;
 //   - stretch / look_around / fidget / hair_touch while idle every 1–3 min;
@@ -124,20 +127,44 @@ export class Director {
     return acts;
   }
 
-  /** The W shortcut / riko-ctl wave: wave on demand, same cooldown as greetings. */
+  /**
+   * The W shortcut / riko-ctl wave: an ON-DEMAND wave. It always plays right
+   * away — the greeting cooldown never swallows it, and it blends out
+   * whatever else is running (idle/talk/emotion one-shots and status loops
+   * included). The only skip is a wave already playing, so mashing W never
+   * restacks. (Social waves — greetings heard / greeting replies — keep the
+   * calm #greetingWave rules.)
+   */
   requestWave(now) {
     this.lastActivity = now;
-    return this.#greetingWave(now);
+    if (this.gesture?.name === 'wave') {
+      // already waving: answer the press by dropping any queued wave echo,
+      // so she waves once now, not twice in a row
+      if (this.pending?.name === 'wave') this.pending = null;
+      return [];
+    }
+    const acts = [];
+    if (this.gesture) {  // blend out the running one-shot or loop
+      acts.push({ type: 'gesture_stop', name: this.gesture.name });
+      this.gesture = null;
+    }
+    this.pending = null;  // our wave beats anything queued behind it
+    acts.push(...this.#play('wave', now, { priority: PRIO_GREET, noCooldown: true }));
+    return this.#happyFace(acts, now);
   }
 
   /**
-   * A social wave (greeting heard / greeting reply / on demand): respects the
-   * 25 s cooldown, never stacks on a wave already running or queued, and
-   * carries a happy face (the pose file adds the head tilt).
+   * A social wave (greeting heard / greeting reply): respects the 25 s
+   * cooldown, never stacks on a wave already running or queued, and carries
+   * a happy face (the pose file adds the head tilt).
    */
   #greetingWave(now) {
     if (this.gesture?.name === 'wave' || this.pending?.name === 'wave') return [];
-    const acts = this.#play('wave', now, { priority: PRIO_GREET });
+    return this.#happyFace(this.#play('wave', now, { priority: PRIO_GREET }), now);
+  }
+
+  /** The smile that rides along with any wave. */
+  #happyFace(acts, now) {
     for (const a of acts) {
       if (a.type === 'gesture' && a.name === 'wave') {
         const hold = a.duration + 1.5;

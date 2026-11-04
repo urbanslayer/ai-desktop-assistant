@@ -289,6 +289,45 @@
     }
     feed(director.start(T()));
 
+    // ── keyboard QA hook (?wavetest=1, with ?desktop=1): press the W shortcut
+    //    for real at fixed seconds after she woke up — during the greeting
+    //    cooldown and during a forced idle gesture — and POST the director's
+    //    answer to /wavetest so the harness (client/tools/wave_check.py) can
+    //    assert she actually waves. Anchored to wake, not page load.
+    if (new URLSearchParams(location.search).get('wavetest')) {
+      const wokeAt = T();
+      const report = [];
+      const snap = () => (director.gesture
+        ? { name: director.gesture.name, endsAt: director.gesture.endsAt } : null);
+      const pressW = (label, delayMs) => {
+        setTimeout(() => {
+          const before = snap();
+          const act0 = director.lastActivity;
+          dispatchEvent(new KeyboardEvent('keydown', { key: 'w', bubbles: true }));
+          const entry = { label, t: +(T() - wokeAt).toFixed(2), before,
+                          handlerRan: director.lastActivity !== act0,
+                          afterNow: snap(),
+                          pendingNow: director.pending ? director.pending.name : null };
+          report.push(entry);
+          // 600 ms later the frame loop has run: that is what she is really doing
+          setTimeout(() => {
+            entry.after = snap();
+            entry.pending = director.pending ? director.pending.name : null;
+          }, 600);
+        }, delayMs);
+      };
+      pressW('after-startup-wave', 3500);   // startup wave over (2.4 s), inside the 25 s cooldown
+      pressW('already-waving-again', 4200); // while the wave above should still run
+      setTimeout(() => { director.nextIdleAt = T(); }, 7500);  // force an idle gesture now
+      pressW('during-idle-gesture', 8200);  // W must cut in front of the idle one-shot
+      setTimeout(async () => {
+        try {
+          await fetch('/wavetest', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(report) });
+        } catch { /* harness gone */ }
+      }, 9200);
+    }
+
     // ── visual QA capture: PNGs (and pose metrics) at fixed seconds after wake ──
     window.rikoCapture = () => renderer.domElement.toDataURL('image/png');
     // Pose metrics against the REAL rig, written for ANY VRM (0.x or 1.0;
