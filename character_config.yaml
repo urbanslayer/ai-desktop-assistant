@@ -115,6 +115,9 @@ desktop:
     min_speech_ms: 200        # keep talking this long before it counts as speech
     silence_ms: 800           # this much quiet ends the utterance
     max_seconds: 30           # cap: an utterance longer than this is cut and sent
+    echo_tail_ms: 200         # deaf window after her own voice ends (echo guard);
+                              # the mic stays live and pre-rolls through it, so
+                              # words said during it still reach the next clip
 
   # Roam: strip (docs/WALK_MEMORY.md "W"). "off" = the small window always
   # (old behaviour). "strip" = a full-width see-through band at the BOTTOM

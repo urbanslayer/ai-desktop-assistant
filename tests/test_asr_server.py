@@ -115,6 +115,35 @@ def test_remote_transcription_end_to_end(asr_url, monkeypatch):
         assert any(expected in w for w in words), f"{expected!r} missing from {text!r}"
 
 
+def test_verbose_json_carries_confidence_segments(asr_url, monkeypatch):
+    """The verbose_json the client requests for VAD clips must carry the
+    per-segment fields the noise filter weighs (no_speech_prob, avg_logprob,
+    compression_ratio) — the evidence that replaced the phrase blocklist."""
+    monkeypatch.setenv("TEST_ASR_KEY", API_KEY)
+    hdr = {"Authorization": "Bear" + f"er {API_KEY}"}
+    r = requests.post(f"{asr_url}/v1/audio/transcriptions",
+                      files={"file": ("you.wav", SAMPLE.read_bytes())},
+                      data={"model": "whisper-1", "language": "en",
+                            "response_format": "verbose_json"},
+                      headers=hdr, timeout=60)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["text"].strip(), body
+    assert body["segments"], "no segments in verbose_json"
+    for seg in body["segments"]:
+        for field in ("no_speech_prob", "avg_logprob", "compression_ratio"):
+            assert isinstance(seg.get(field), (int, float)), f"{field} missing in {seg}"
+    # the exact path the always-listen turn takes
+    from riko import asr
+    cfg = cfg_remote(asr_url)
+    asr._remote = None
+    asr.check(cfg, fatal=True)
+    text, evidence = asr.transcribe_verbose(SAMPLE.read_bytes(), cfg)
+    assert text.strip() and evidence and evidence["segments"]
+    assert asr.vad_noise_reason(
+        text, evidence, {"voiced_seconds": 2.0, "mean_prob": 0.9}) is None
+
+
 def test_remote_transcription_without_setup_gives_a_clear_error(monkeypatch):
     from riko import asr
     monkeypatch.setattr(asr, "_remote", None)

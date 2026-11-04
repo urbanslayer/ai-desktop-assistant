@@ -8,8 +8,8 @@ asr: groq   -> Groq's online Whisper
 """
 import io
 import os
-import re
 import threading
+from collections import deque
 
 import numpy as np
 import sounddevice as sd
@@ -117,17 +117,27 @@ def record():
 
 class AlwaysListener:
     """Hands-free ears: one continuous 16 kHz mono stream, cut into utterances
-    by the VAD in riko/vad.py. Each finished segment goes to on_segment(wav)
-    — the SAME path push-to-talk uses (submit_audio -> transcribe -> turn),
-    tagged source='vad' so the turn can tell VAD noise from a deliberate clip.
+    by the VAD in riko/vad.py. Each finished segment goes to
+    on_segment(wav, stats) — the SAME path push-to-talk uses
+    (submit_audio -> transcribe -> turn), tagged source='vad' so the turn can
+    tell VAD noise from a deliberate clip. stats carries the Silero evidence
+    the noise filter weighs: seconds / voiced_seconds / mean_prob.
 
     Deliberately silent to the UI: the point of always mode is that there is
     no listening indicator, so this never emits a 'listening' status.
-    pause()/resume() drop frames and reset the segmenter (she is speaking, or
-    a turn is thinking); suspend()/release() hand the mic device itself to
-    the push-to-talk Recorder while Space is held. A device error mid-stream
-    retries with backoff; start() raises so the caller can fall back to
-    push-to-talk. Thread-safe: everything runs on one reader thread.
+    pause()/resume() ignore frames and forget the half-built segment (she is
+    speaking, or a turn is thinking); the mic stream STAYS OPEN the whole
+    time and every frame still goes through the VAD, so its recurrent state
+    never goes stale across the pause. Between tail() (her voice really
+    ended) and resume() the frames are kept in a short rolling pre-roll: the
+    next segment can back-date into them and the syllables you said during
+    the echo tail are not lost. Frames captured while she was still audible
+    (before tail()) are never fed into a segment. suspend()/release() hand
+    the mic device itself to the push-to-talk Recorder while Space is held.
+    A device error mid-stream retries with backoff; start() raises so the
+    caller can fall back to push-to-talk. Thread-safe: everything the reader
+    mutates runs on one reader thread; the cross-thread setters only touch
+    events and the tail ring.
     """
 
     def __init__(self, on_segment, cfg=None, sd_module=None, vad=None,
@@ -141,12 +151,17 @@ class AlwaysListener:
         self._stream = None
         self._thread = None
         self._stop = threading.Event()
-        self._pause = threading.Event()      # frames dropped, stream stays open
+        self._pause = threading.Event()      # frames ignored, stream stays open
         self._suspend = threading.Event()    # device handed to the Recorder
         self._resume = threading.Event()     # released / resumed, loop wakes up
         self._retry_delay = retry_delay
         self._retry_max = retry_max
         self._lock = threading.Lock()
+        # rolling audio captured while paused; (frame, kept) — kept=True only
+        # after tail(), i.e. only once her own voice is really over.
+        self._tail_ring: deque = deque(maxlen=max(1, vad_mod.frame_count(self._cfg["pre_roll_ms"])))
+        self._tail_kept = False
+        self._seed: list | None = None       # tail frames for the reader to prime
 
     @property
     def running(self):
@@ -207,10 +222,29 @@ class AlwaysListener:
             thread.join(timeout=3)
 
     def pause(self):
-        """Drop frames and forget the half-built segment (she is speaking)."""
+        """Ignore frames and forget the half-built segment (she is speaking).
+        The stream stays open and the VAD keeps seeing every frame."""
         self._pause.set()
+        with self._lock:
+            self._tail_ring.clear()
+            self._tail_kept = False
+        self._seed = None  # a new hold cancels any unclaimed tail pre-roll
+
+    def tail(self):
+        """Her voice really just ended (the page said so). Audio from here on
+        is echo-era, not her: resume() may pre-roll the next segment back
+        into it so the first syllables of your reply are not lost."""
+        with self._lock:
+            self._tail_kept = True
 
     def resume(self):
+        # Hand the tail frames to the reader thread; it primes the segmenter
+        # before the next push so pre-roll can cross the pause boundary.
+        with self._lock:
+            seed = [f for f, keep in self._tail_ring if keep]
+            self._tail_ring.clear()
+            self._tail_kept = False
+        self._seed = seed or None
         self._pause.clear()
 
     def suspend(self):
@@ -246,11 +280,21 @@ class AlwaysListener:
                     continue
                 delay = min(delay * 2, self._retry_max)
                 continue
+            # Every frame feeds the VAD, even while paused: Silero is
+            # recurrent, and keeping it warm across her turn is exactly what
+            # lets the first frames after resume read true speech at once.
+            prob = float(self._vad(frame))
             if self._pause.is_set() or self._suspend.is_set():
+                if self._pause.is_set():  # rolling echo-era audio, not her voice
+                    with self._lock:
+                        self._tail_ring.append((np.asarray(frame).reshape(-1),
+                                                self._tail_kept))
                 self._segmenter.reset()
                 continue
-            end = self._segmenter.push(np.asarray(frame).reshape(-1),
-                                       float(self._vad(frame)))
+            if self._seed:
+                self._segmenter.prime(self._seed)
+                self._seed = None
+            end = self._segmenter.push(np.asarray(frame).reshape(-1), prob)
             if end is None:
                 continue
             if end.audio is None:
@@ -260,8 +304,10 @@ class AlwaysListener:
             wav = io.BytesIO()
             sf.write(wav, end.audio, SAMPLE_RATE, format="WAV")
             print(f"[asr] always-listen: caught {end.seconds:.1f}s")
+            stats = {"seconds": end.seconds, "voiced_seconds": end.voiced_seconds,
+                     "mean_prob": end.mean_prob}
             try:
-                self.on_segment(wav.getvalue())
+                self.on_segment(wav.getvalue(), stats)
             except Exception as e:  # a segment must not kill the reader
                 print(f"[asr] always-listen: segment dropped ({type(e).__name__}: {e})")
 
@@ -279,44 +325,99 @@ class AlwaysListener:
             pass
 
 
-# Whisper's favourites when it hears nothing: classic word-hallucinations on
-# short noise segments. Compared case-insensitively, without surrounding
-# punctuation; the subtitles-by pattern catches the credit-line family.
-NOISE_TEXTS = {
-    "thank you", "thanks", "thank you!", "thanks for watching", "thanks for watching!",
-    "thank you for watching", "you", "bye", "bye bye", "bye.", "goodbye",
-    "yes", "so", "okay", "ok", "hmm", "oh", "the end", "please subscribe",
-    "you. ", "mm hm", "mhm", "aha", "ooh", "wow",
-}
-_SUBS_LINE = re.compile(r"subt?itles? (?:by|readings? by)|captioned? (?:by|in)", re.I)
-NOISE_HALLUCINATION_MAX_SECONDS = 1.5  # only short segments are "noise"
+# ── what counts as "Whisper invented that" ───────────────────
+# No phrase blocklist: "Thank you." is a real sentence a person says. A VAD
+# segment is only dropped when the evidence says nobody spoke:
+#  - Whisper's own per-segment verdicts (verbose_json): every segment looks
+#    like non-speech, or a segment has the rambly-repetition shape, or
+#  - Silero never truly believed the voiced frames (their mean probability
+#    hovers at the open threshold — TV noise, not a voice).
+# Without Whisper metrics (an ASR server too old for verbose_json fields)
+# Silero alone has to vouch for the clip, so it demands stronger proof.
+NO_SPEECH_PROB_MAX = 0.6         # above: Whisper thinks there is no speech in it
+AVG_LOGPROB_MIN = -1.0           # below: Whisper was guessing at the words
+COMPRESSION_RATIO_MAX = 2.4      # above: repetitive filler, the hallucination shape
+SILERO_MIN_MEAN_PROB = 0.6       # with Whisper metrics: drop below this
+SILERO_FALLBACK_MIN_MEAN_PROB = 0.7  # without metrics: demand a confident voice
+FALLBACK_MIN_VOICED_SECONDS = 0.4    # ... over at least this much real speech
 
 
-def hallucination_reason(text, wav_bytes, noise_phrases=True):
-    """Why this transcript is probably Whisper inventing words: a reason str,
-    or None when the text looks real. Empty/punctuation-only always count;
-    the classic word-hallucinations only on short (< ~1.5 s) segments.
-
-    noise_phrases=False skips the classic-phrase/subtitles blocklist: a
-    deliberate push-to-talk "Thank you." is a real sentence, not a hallucination.
-    Only VAD segments (TV noise) should ever drop those."""
+def _empty_reason(text):
     t = (text or "").strip()
     if not t:
         return "no words"
     if not any(c.isalnum() for c in t):
         return "punctuation only"
-    if not noise_phrases:
-        return None
-    seconds = 0.0
-    try:
-        seconds = sf.info(io.BytesIO(wav_bytes)).duration
-    except Exception:
-        pass
-    if seconds < NOISE_HALLUCINATION_MAX_SECONDS:
-        core = t.lower().strip(" \t.!?~*-–—…")
-        if core in NOISE_TEXTS or _SUBS_LINE.search(t):
-            return f"noise phrase on a {seconds:.1f}s clip"
     return None
+
+
+def hallucination_reason(text, wav_bytes=None, noise_phrases=True):
+    """Why this transcript is nothing: a reason str, or None when there are
+    words. Empty / punctuation-only transcripts always count.
+
+    The classic Whisper phrase blocklist ("Thank you.", "Thanks for
+    watching!") is GONE: it ate real thanks said to her. VAD segments are
+    judged by evidence instead — see vad_noise_reason. wav_bytes and
+    noise_phrases are accepted but unused (old call sites)."""
+    return _empty_reason(text)
+
+
+def vad_noise_reason(text, evidence, vad_stats=None):
+    """Drop this VAD segment (reason str) or accept it (None), on evidence:
+
+    evidence = {"segments": [{"no_speech_prob", "avg_logprob",
+              "compression_ratio"}, ...]} from Whisper itself (verbose_json),
+    or None/{} when the backend has no such fields. vad_stats = the Silero
+    numbers the segmenter measured: voiced_seconds / mean_prob (mean over
+    the voiced frames).
+
+    With Whisper metrics they decide: a segment is noise only when Whisper
+    calls ALL of its segments non-speech (no_speech_prob high AND avg_logprob
+    low), or one has the repetitive-filler shape (compression_ratio high), or
+    Silero never believed the voice. Anything else passes — including a real
+    'Thank you.' / 'Bye.'. Without metrics, accept only when Silero vouches:
+    >= 0.4 s of voiced audio with mean probability >= 0.7."""
+    reason = _empty_reason(text)
+    if reason:
+        return reason
+    st = vad_stats or {}
+    try:
+        voiced = float(st.get("voiced_seconds") or 0.0)
+        mean_p = float(st.get("mean_prob") or 0.0)
+    except (TypeError, ValueError):
+        voiced = mean_p = 0.0
+    segs = [s for s in ((evidence or {}).get("segments") or []) if isinstance(s, dict)]
+    if segs:
+        if all(float(s.get("no_speech_prob") or 0.0) > NO_SPEECH_PROB_MAX
+               and float(s.get("avg_logprob") or 0.0) < AVG_LOGPROB_MIN
+               for s in segs):
+            return "whisper says non-speech"
+        if any(float(s.get("compression_ratio") or 0.0) > COMPRESSION_RATIO_MAX
+               for s in segs):
+            return "rambly repetition (compression ratio)"
+        if mean_p and mean_p < SILERO_MIN_MEAN_PROB:
+            return f"weak silero evidence (mean prob {mean_p:.2f})"
+        return None
+    # No Whisper metrics: trust Silero alone, but strictly.
+    if voiced >= FALLBACK_MIN_VOICED_SECONDS and mean_p >= SILERO_FALLBACK_MIN_MEAN_PROB:
+        return None
+    return (f"no whisper metrics; weak silero evidence "
+            f"({voiced:.2f}s voiced @ mean prob {mean_p:.2f})")
+
+
+def _segments_evidence(segs) -> dict:
+    """Normalise whisper-SDK / verbose_json segment objects into plain dicts
+    of the three fields vad_noise_reason weighs."""
+    out = []
+    for s in segs:
+        get = s.get if isinstance(s, dict) else (lambda k, d=None: getattr(s, k, d))
+        entry = {"no_speech_prob": get("no_speech_prob"),
+                 "avg_logprob": get("avg_logprob"),
+                 "compression_ratio": get("compression_ratio")}
+        if any(v is None for v in entry.values()):
+            continue
+        out.append({k: float(v) for k, v in entry.items()})
+    return {"segments": out}
 
 
 def transcribe(wav_bytes, cfg):
@@ -338,6 +439,52 @@ def transcribe(wav_bytes, cfg):
         segments, _ = _whisper.transcribe(io.BytesIO(wav_bytes))
         text = "".join(s.text for s in segments)  # each segment already starts with a space
     return text.strip()
+
+
+def transcribe_verbose(wav_bytes, cfg):
+    """transcribe() for VAD segments: (text, evidence) where evidence is
+    {"segments": [{"no_speech_prob", "avg_logprob", "compression_ratio"},...]}
+    — Whisper's own confidence about what it just wrote — or None when the
+    backend has no verbose_json fields (an ASR server from before segments
+    were added; the caller then falls back to the Silero-only rule)."""
+    mode = cfg["asr"]
+    try:
+        if mode == "local":
+            if _whisper is None:
+                raise RuntimeError("local ASR was never loaded: call asr.check(cfg) first")
+            segments, _ = _whisper.transcribe(io.BytesIO(wav_bytes))
+            text, segs = [], []
+            for s in segments:  # the generator must be drained inside no lock here
+                text.append(s.text)
+                segs.append(s)
+            return "".join(text).strip(), _segments_evidence(segs)
+        if mode == "groq":
+            client = OpenAI(api_key=os.getenv("GROQ_API_KEY"),
+                            base_url="https://api.groq.com/openai/v1")
+            model, extra = GROQ_MODEL, {}
+        else:
+            if _remote is None:
+                raise RuntimeError("remote ASR was never set up: call asr.check(cfg) first")
+            client, r = _remote, cfg["remote_asr"]
+            model = r.get("model", "whisper-1")
+            extra = {"language": r["language"]} if r.get("language") else {}
+        resp = client.audio.transcriptions.create(
+            model=model, file=("you.wav", wav_bytes),
+            response_format="verbose_json", **extra)
+        text = (getattr(resp, "text", "") or "").strip()
+        raw = getattr(resp, "segments", None)
+        if raw is None:  # old server: verbose_json without segments
+            return text, None
+        evidence = _segments_evidence(raw)
+        if not evidence["segments"]:
+            return text, None  # a real transcription with no usable segments
+        return text, evidence
+    except Exception as e:
+        # Any failure of the verbose call: plain transcription is still fine,
+        # the caller just judges the clip on Silero evidence alone.
+        print(f"[asr] verbose_json unavailable ({type(e).__name__}: {e}); "
+              "using the plain response")
+        return transcribe(wav_bytes, cfg), None
 
 
 if __name__ == "__main__":

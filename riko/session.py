@@ -17,7 +17,8 @@ from typing import Callable, Optional
 
 from riko import appstate, asr, client_tools, hub_client, tts, viewer
 
-SPEECH_TAIL = 0.4  # VAD stays paused this long after her voice ends (echo guard)
+ECHO_TAIL_MS_DEFAULT = 200  # VAD stays paused this long after her voice ends
+                            # (echo guard); override: desktop.always_listen.echo_tail_ms
 LISTEN_MODES = ("push_to_talk", "always")
 
 
@@ -41,6 +42,7 @@ class Session:
         self._vad = None             # asr.AlwaysListener while always mode runs
         self._vad_holds = 0          # >0 = VAD paused (thinking/speaking/Space held)
         self._vad_lock = threading.Lock()
+        self._spoke_last_turn = False  # worker-only: did the last turn make sound?
         if self.listen_mode == "always" and self.source == "desktop":
             if not self._vad_start():
                 self.listen_mode = "push_to_talk"
@@ -52,13 +54,23 @@ class Session:
     def _vad_cfg(self):
         return dict((self.cfg.get("desktop") or {}).get("always_listen") or {})
 
+    def _echo_tail_seconds(self):
+        """Echo guard after her voice ends, from desktop.always_listen.echo_tail_ms."""
+        try:
+            ms = float(self._vad_cfg().get("echo_tail_ms", ECHO_TAIL_MS_DEFAULT))
+        except (TypeError, ValueError):
+            ms = float(ECHO_TAIL_MS_DEFAULT)
+        return min(max(ms, 0.0), 2000.0) / 1000.0
+
     def _vad_start(self):
         """Open the continuous mic stream. False = broken mic (caller falls back)."""
         if self._vad is None:
             try:
-                # VAD-originated clips: no 'hearing' pill, noise-blocklist on.
+                # VAD-originated clips carry the Silero stats the noise
+                # filter weighs (no pill, evidence filter — see _turn).
                 self._vad = asr.AlwaysListener(
-                    lambda wav: self.submit_audio(wav, source="vad"),
+                    lambda wav, stats=None: self.submit_audio(
+                        wav, source="vad", vad_stats=stats),
                     cfg=self._vad_cfg())
             except Exception as e:  # even constructing can fail (no numpy/sounddevice)
                 print(f"[listen] always-listen can't start: {e} — staying with push-to-talk")
@@ -166,13 +178,15 @@ class Session:
         viewer.emit("heard", text=text)
         self._turns.put(("text", text))
 
-    def submit_audio(self, wav_bytes, source="ptt"):
+    def submit_audio(self, wav_bytes, source="ptt", vad_stats=None):
         """Queue a recorded clip. source='ptt' = a deliberate recording (Space,
-        Enter in the terminal); source='vad' = an always-mode segment. The turn
-        behaves differently: VAD segments show no 'hearing' pill and earn the
-        hallucination-phrase blocklist; PTT clips show it and keep real short
-        'Thank you.'s."""
-        self._turns.put(("audio", (wav_bytes, source)))
+        Enter in the terminal); source='vad' = an always-mode segment, with
+        vad_stats = the Silero numbers the segmenter measured (seconds,
+        voiced_seconds, mean_prob). The turn behaves differently: VAD segments
+        show no 'hearing' pill and are judged on Whisper+Silero evidence
+        (real short 'Thank you.'s pass); PTT clips show it and only drop on
+        an empty transcript."""
+        self._turns.put(("audio", (wav_bytes, source, vad_stats)))
 
     def switch_persona(self, name):
         """Switch by id, name or keyword — raises HubError (404) if nothing matches.
@@ -242,22 +256,29 @@ class Session:
     def _worker(self):
         while True:
             kind, payload = self._turns.get()
-            # She must not hear herself: the VAD drops frames and forgets any
-            # half-built segment for the whole turn — thinking AND speaking
-            # (viewer.play returns when the page says the clip ended) — plus a
-            # short echo tail after her voice stops.
+            # She must not hear herself: the VAD ignores frames and forgets
+            # any half-built segment for the whole turn — thinking AND
+            # speaking (viewer.play returns when the page says the clip
+            # ended) — plus a short echo tail after her voice stops.
             self._vad_hold(True)
+            self._spoke_last_turn = False
             try:
                 self._turn(kind, payload)
             except Exception as e:  # one bad turn should not end the chat
                 print(f"[error] {type(e).__name__}: {e}")
                 viewer.emit("error", text=f"{type(e).__name__}: {e}")
             finally:
+                # The ears come back the moment the echo settles — and only
+                # for the echo: a turn that made no sound (ignored noise,
+                # tts: none) resumes instantly. Everything else (idle status,
+                # bookkeeping) waits behind the resume: every ms here is time
+                # she cannot hear you.
+                if self._vad is not None:
+                    if self._spoke_last_turn:
+                        time.sleep(self._echo_tail_seconds())
+                    self._vad_hold(False)
                 if self._turns.empty() and not self.recorder.recording:
                     viewer.emit("status", state="idle")
-                if self._vad is not None:
-                    time.sleep(SPEECH_TAIL)
-                self._vad_hold(False)
 
     def _turn(self, kind, payload):
         if kind == "greet":
@@ -270,15 +291,21 @@ class Session:
                         emotion="happy", actions=greet_actions)
             return
         if kind == "audio":
-            wav, source = payload
+            wav, source, vad_stats = payload
             if source == "ptt":
                 # deliberate recording: the pill is honest feedback. VAD
-                # segments show nothing until the hallucination filter has
+                # segments show nothing until the evidence filter has
                 # spoken — TV noise must not flash 'hmm?'.
                 viewer.emit("status", state="hearing")
-            text = asr.transcribe(wav, self.cfg)
-            reason = asr.hallucination_reason(text, wav, noise_phrases=(source != "ptt"))
-            if reason:  # Whisper inventing words on non-speech: drop the turn
+                text = asr.transcribe(wav, self.cfg)
+                reason = asr.hallucination_reason(text)
+            else:
+                # VAD segment: ask for Whisper's own confidence metrics too;
+                # the clip is only dropped when the evidence says nobody
+                # spoke — a real "Thank you." passes.
+                text, evidence = asr.transcribe_verbose(wav, self.cfg)
+                reason = asr.vad_noise_reason(text, evidence, vad_stats)
+            if reason:  # nobody actually spoke: drop the turn
                 print(f"[asr] ignored: {text.strip()!r} ({reason})")
                 if not text.strip() and source == "ptt":
                     print("(heard nothing, try again)")
@@ -316,7 +343,12 @@ class Session:
             wav = tts.speak(answer, self.cfg, voice=persona.get("tts_voice") or None,
                             speech=speech)
         viewer.emit("status", state="speaking")
+        self._spoke_last_turn = wav is not None
         viewer.play(wav, answer, emotion=emotion, actions=actions or [])
+        if self._vad is not None and wav is not None:
+            # Her voice is really over NOW (the page reported it): audio from
+            # here on is echo-era and may pre-roll the next VAD segment.
+            self._vad.tail()
 
     def _hub_audio(self, audio_url):
         """Fetch reply/greeting audio the hub made. None = speech bubble only;

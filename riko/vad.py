@@ -153,11 +153,16 @@ def make_vad():
 @dataclass
 class SegmentEnd:
     """One finished utterance. audio=None means it was dropped (not enough
-    real speech in it — a cough blip or a door)."""
+    real speech in it — a cough blip or a door).
+
+    mean_prob is the mean detector probability over the VOICED frames only
+    (silence would only dilute it): real speech reads ~0.9 on Silero, TV
+    noise hovers near the threshold. 0.0 when nothing was voiced."""
 
     audio: np.ndarray | None
     seconds: float
     voiced_seconds: float
+    mean_prob: float = 0.0
 
 
 class Segmenter:
@@ -186,10 +191,21 @@ class Segmenter:
         self._buf: list[np.ndarray] = []            # frames of the open segment
         self._pending = 0                           # voiced frames before start
         self._pending_ring: deque = deque()         # their audio (start point)
+        self._pending_probs: deque = deque()        # their probs (mean later)
         self._voiced = 0
+        self._voiced_prob = 0.0                     # sum of voiced probs
         self._silence = 0
         self._active = False
         self._preroll_frames = 0
+
+    def prime(self, frames) -> None:
+        """Seed the idle ring with audio recorded while the VAD was paused
+        (but AFTER her voice had ended — see AlwaysListener.tail()). Echo-era
+        audio is fair game: it lets the next segment's pre-roll reach back
+        across the resume so the first syllables you said during the echo
+        tail are not lost. Must be called between pushes."""
+        for frame in frames:
+            self._ring.append(frame)
 
     def push(self, frame: np.ndarray, prob: float) -> SegmentEnd | None:
         voiced = prob > self.threshold
@@ -198,8 +214,10 @@ class Segmenter:
             if voiced:
                 self._pending += 1
                 self._pending_ring.append(frame)
+                self._pending_probs.append(prob)
                 while len(self._pending_ring) > self.need_speech:
                     self._pending_ring.popleft()
+                    self._pending_probs.popleft()
                 if self._pending >= self.need_speech:
                     # speech confirmed: open the segment, back-dated by pre_roll
                     back = self._pending_ring  # oldest-first, the speech frames
@@ -215,18 +233,22 @@ class Segmenter:
                     self._preroll_frames = len(self._buf) - overlap
                     self._active = True
                     self._voiced = overlap
+                    self._voiced_prob = sum(self._pending_probs)
                     self._silence = 0
                     self._pending = 0
                     self._pending_ring.clear()
+                    self._pending_probs.clear()
                     self._ring.clear()
             else:
                 self._pending = 0
                 self._pending_ring.clear()
+                self._pending_probs.clear()
             return None
 
         self._buf.append(frame)
         if voiced:
             self._voiced += 1
+            self._voiced_prob += prob
             self._silence = 0
         else:
             self._silence += 1
@@ -238,6 +260,7 @@ class Segmenter:
         audio = np.concatenate(self._buf) if self._buf else np.zeros(0, np.float32)
         voiced_s = self._voiced * FRAME_MS / 1000.0
         total_s = len(audio) / SAMPLE_RATE
+        mean_p = self._voiced_prob / self._voiced if self._voiced else 0.0
         dropped = self._voiced < self.min_voiced
         self.reset()
-        return SegmentEnd(None if dropped else audio, total_s, voiced_s)
+        return SegmentEnd(None if dropped else audio, total_s, voiced_s, mean_p)

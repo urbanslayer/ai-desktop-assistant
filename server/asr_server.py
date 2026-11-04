@@ -117,13 +117,24 @@ def build_app(model_name, device, compute_type, model_dir=None):
                 beam_size=5,
                 vad_filter=True,  # skips silence, so a long press with little speech stays fast
             )
-            text = "".join(s.text for s in segments).strip()
+            # the generator materialises lazily: drain it inside the lock
+            seg_list = list(segments)
+        text = "".join(s.text for s in seg_list).strip()
         print(f"[asr-server] {info.duration:.1f}s audio -> {len(text)} chars "
               f"in {time.monotonic() - started:.2f}s ({info.language})", flush=True)
         if response_format == "text":
             return PlainTextResponse(text)
         if response_format == "verbose_json":
-            return {"text": text, "language": info.language, "duration": info.duration}
+            # OpenAI's verbose shape. The per-segment confidence fields are
+            # what Riko's client uses to tell a real "Thank you." from
+            # Whisper inventing words on a noise clip — keep them.
+            return {"text": text, "language": info.language, "duration": info.duration,
+                    "segments": [{"id": i, "start": s.start, "end": s.end, "text": s.text,
+                                  "temperature": float(s.temperature),
+                                  "avg_logprob": float(s.avg_logprob),
+                                  "compression_ratio": float(s.compression_ratio),
+                                  "no_speech_prob": float(s.no_speech_prob)}
+                                 for i, s in enumerate(seg_list)]}
         return {"text": text}
 
     return app
