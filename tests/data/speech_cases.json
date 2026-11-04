@@ -157,7 +157,7 @@
   {
     "name": "url with trailing punctuation",
     "input": "Try godotengine.org. No — try https://godotengine.org!",
-    "expect": "Try godotengine.org. No — try!"
+    "expect": "Try. No — try!"
   },
   {
     "name": "empty brackets tidied",
@@ -188,5 +188,175 @@
     "name": "url in parens leaves no empty pair",
     "input": "See (https://x.example) for more.",
     "expect": "See for more."
+  },
+  {
+    "name": "bare website name dropped after dash",
+    "input": "Here you go, senpai — docs.godotengine.org, the official Godot docs.",
+    "expect": "Here you go, senpai — the official Godot docs."
+  },
+  {
+    "name": "bare domain mid sentence dropped",
+    "input": "I checked github.com and it works.",
+    "expect": "I checked and it works."
+  },
+  {
+    "name": "domain with path dropped",
+    "input": "See godotengine.org/docs/manual, it's great.",
+    "expect": "See, it's great."
+  },
+  {
+    "name": "domain with port and path dropped",
+    "input": "Check example.com:8080/status first.",
+    "expect": "Check first."
+  },
+  {
+    "name": "domain with query dropped",
+    "input": "I opened riko.app/settings?tab=voice, neat.",
+    "expect": "I opened, neat."
+  },
+  {
+    "name": "multi-dot unknown tld dropped",
+    "input": "ping api.foo.bar twice",
+    "expect": "ping twice"
+  },
+  {
+    "name": "unknown tld with port dropped, dangling on goes",
+    "input": "The hub runs on eve.local:8080.",
+    "expect": "The hub runs."
+  },
+  {
+    "name": "cc tld chain dropped",
+    "input": "Visit bbc.co.uk for news.",
+    "expect": "Visit for news."
+  },
+  {
+    "name": "uppercase domain dropped",
+    "input": "GOOGLE.COM is down",
+    "expect": "is down"
+  },
+  {
+    "name": "dangling at dropped with domain",
+    "input": "Hosted at example.com",
+    "expect": "Hosted"
+  },
+  {
+    "name": "dangling from dropped with domain",
+    "input": "Copied from archlinux.org.",
+    "expect": "Copied."
+  },
+  {
+    "name": "email dropped",
+    "input": "Email riko@example.com to reach me.",
+    "expect": "Email to reach me."
+  },
+  {
+    "name": "mailto email dropped",
+    "input": "Contact mailto:riko@example.com anytime.",
+    "expect": "Contact anytime."
+  },
+  {
+    "name": "email after at leaves no dangling prep",
+    "input": "Reach me at riko@example.com, senpai!",
+    "expect": "Reach me, senpai!"
+  },
+  {
+    "name": "email mid sentence dropped",
+    "input": "Emailed senpai@riko.dev already.",
+    "expect": "Emailed already."
+  },
+  {
+    "name": "domain-only reply fallback",
+    "input": "reddit.com",
+    "expect": "I put the link on screen."
+  },
+  {
+    "name": "email-only reply fallback",
+    "input": "senpai@riko.dev",
+    "expect": "I put the link on screen."
+  },
+  {
+    "name": "domain path keeps sentence period",
+    "input": "Read example.com/docs. It helps.",
+    "expect": "Read. It helps."
+  },
+  {
+    "name": "domain in first para, url in details",
+    "input": "Details: godotengine.org\n\nDocs at https://godotengine.org/docs",
+    "expect": "Details:"
+  },
+  {
+    "name": "version number kept",
+    "input": "Godot 3.10.2 released.",
+    "expect": "Godot 3.10.2 released."
+  },
+  {
+    "name": "v-prefix version kept",
+    "input": "Try v4.2.1 instead.",
+    "expect": "Try v4.2.1 instead."
+  },
+  {
+    "name": "file names kept",
+    "input": "Edit config.yaml and main.py.",
+    "expect": "Edit config.yaml and main.py."
+  },
+  {
+    "name": "txt and png files kept",
+    "input": "Open notes.txt and image.png.",
+    "expect": "Open notes.txt and image.png."
+  },
+  {
+    "name": "decimals kept",
+    "input": "It's about 3.5 times, and pi is 3.14.",
+    "expect": "It's about 3.5 times, and pi is 3.14."
+  },
+  {
+    "name": "abbreviations kept",
+    "input": "That is e.g. i.e. usage.",
+    "expect": "That is e.g. i.e. usage."
+  },
+  {
+    "name": "dotted abbreviation kept",
+    "input": "U.S. news today.",
+    "expect": "U.S. news today."
+  },
+  {
+    "name": "tech js names kept",
+    "input": "I like Node.js, Vue.js and Next.js.",
+    "expect": "I like Node.js, Vue.js and Next.js."
+  },
+  {
+    "name": "asp.net socket.io and .net kept",
+    "input": "ASP.NET and Socket.IO rock, also the .NET runtime.",
+    "expect": "ASP.NET and Socket.IO rock, also the .NET runtime."
+  },
+  {
+    "name": "ip address kept",
+    "input": "ssh 192.0.2.51 works.",
+    "expect": "ssh 192.0.2.51 works."
+  },
+  {
+    "name": "file with port kept",
+    "input": "main.py:8000 serves it.",
+    "expect": "main.py:8000 serves it."
+  },
+  {
+    "name": "log and html files kept",
+    "input": "server.log and index.html are fine.",
+    "expect": "server.log and index.html are fine."
+  },
+  {
+    "name": "photo file kept",
+    "input": "photo.jpg is cute.",
+    "expect": "photo.jpg is cute."
+  },
+  {
+    "name": "docx file kept",
+    "input": "meeting notes.docx attached.",
+    "expect": "meeting notes.docx attached."
+  },
+  {
+    "name": "bare js file kept",
+    "input": "app.js has a bug.",
+    "expect": "app.js has a bug."
   }
 ]

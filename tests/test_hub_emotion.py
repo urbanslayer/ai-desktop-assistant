@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from hub import emotion as emo
 from hub.server import create_app
+from hub.speech import SPEECH_RULES_VERSION
 from hub.store import Store
 from test_hub_brain import FakeHubLLM
 from test_hub_voice import FakeBreeze
@@ -165,7 +166,7 @@ def test_tts_style_gets_delivery_hint_and_cache_is_per_emotion(tmp_path, fake_ll
     # cache file is keyed with the emotion
     aid = res["audio_url"].split("/")[3]
     names = [p.name for p in (tmp_path / "hubdata" / "audio").iterdir()]
-    assert any(n == f"{aid}-v1-r1-teasing.wav" for n in names), names
+    assert any(n == f"{aid}-v1-r{SPEECH_RULES_VERSION}-teasing.wav" for n in names), names
     # a second request re-serves the cache (still one synthesis)
     assert client.get(res["audio_url"]).status_code == 200
     assert len(fake_breeze.speech_requests) == 1

@@ -82,7 +82,7 @@ def test_audio_cache_invalidated_by_rules_version(url_client, fake_breeze, tmp_p
     url_client.post("/api/chat", json={"text": "hi"})
     assert url_client.get("/api/messages/2/audio").status_code == 200
     assert len(fake_breeze.speech_requests) == 1
-    old = tmp_path / "hubdata" / "audio" / "2-v1-r1.wav"
+    old = tmp_path / "hubdata" / "audio" / f"2-v1-r{SPEECH_RULES_VERSION}.wav"
     assert old.exists()
     monkeypatch.setattr(speech_mod, "SPEECH_RULES_VERSION", SPEECH_RULES_VERSION + 1)
     assert url_client.get("/api/messages/2/audio").status_code == 200

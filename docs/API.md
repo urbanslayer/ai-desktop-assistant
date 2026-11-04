@@ -380,10 +380,14 @@ chat timeout generous (minutes, not seconds).
 
 `speech` is what she **says**; `reply` is what she **shows**. The hub
 synthesizes its audio from `speech`, not `reply`: URLs dropped (markdown
-links keep only their label), code blocks and inline code dropped, markdown
-furniture and emoji dropped, source citations like `[1]` dropped, and only
-the **first paragraph** — everything after the first blank line (the links
-and details section) stays on screen and is never spoken (docs/TOOLS.md A).
+links keep only their label), bare website names and email addresses dropped
+(`docs.godotengine.org`, `you@example.com` — while version numbers like
+`3.10.2`, file names like `config.yaml`, abbreviations like `e.g.`, and tech
+names like `Node.js`/`ASP.NET` stay), code blocks and inline code dropped,
+markdown furniture and emoji dropped, source citations like `[1]` dropped,
+and only the **first paragraph** — everything after the first blank line (the
+links and details section) stays on screen and is never spoken (docs/TOOLS.md
+A).
 A reply whose first paragraph was links only speaks a short fallback line
 ("I put the link on screen."). The rule set is versioned (the hub's audio
 cache keys on it); clients that run their own TTS (`tts: openai/sovits/fish`)
