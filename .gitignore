@@ -19,3 +19,4 @@ tts/data/*
 # node dev deps for client/js tests
 client/node_modules/
 client/package-lock.json
+dist/
