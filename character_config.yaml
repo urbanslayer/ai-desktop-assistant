@@ -92,6 +92,10 @@ desktop:
   width: 420           # window size in pixels; everything around her is see-through
   height: 680
   bubble_seconds: 8    # how long her speech bubble stays after she finishes
+  greet_on_start: true # when the app starts and the avatar page is ready she
+                       # says the active persona's greeting (bubble + her voice,
+                       # riding her startup wave). false = stay quiet until you
+                       # talk to her.
 
   # The client-tool channel (docs/API.md "client tools"): she registers this PC
   # with the hub and runs what the model asks — open_url, clipboard_read,

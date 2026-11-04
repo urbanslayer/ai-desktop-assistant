@@ -222,6 +222,7 @@ def main():
     # extension over a local token-authenticated WebSocket.
     runtime, browser = client_tools.start_desktop(cfg, hub_client.get())
     hub_client.start_state_poller()  # notice switches made from the web page or another PC
+    session.greet_on_start()  # she says hello once when the page is ready (desktop.greet_on_start)
     active = hub_client.active_persona() or {}
     print(f"\n=== Riko desktop  |  hub: {hub.url}  |  persona: {active.get('name', '?')}"
           f"  |  ears: {cfg['asr']}  |  voice: {cfg['tts']} ===")
