@@ -1,5 +1,8 @@
 """The director / gesture modules must stay syntactically valid and their
 behaviour tests must pass under `node --test client/js/` (pure logic, no DOM).
+motion.test.js additionally imports real three (devDependency in
+client/package.json, same version as the page's importmap) and drives 10
+simulated minutes through the animation loop to catch pose accumulation.
 Skipped when node is not installed.
 """
 import shutil

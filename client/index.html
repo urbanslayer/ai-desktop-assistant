@@ -267,13 +267,14 @@
       for (const s of String(CAPTURE).split(',').map(Number).filter((n) => n > 0)) {
         setTimeout(async () => {
           try {
+            await new Promise((r) => requestAnimationFrame(r));  // a rendered frame in the buffer
             const t = (performance.now() - wokeAt) / 1000;
             await fetch(`/capture?t=${t.toFixed(2)}`, {
               method: 'POST', headers: { 'Content-Type': 'text/plain' },
               body: window.rikoCapture(),
             });
           } catch { /* harness gone; whatever it captured is captured */ }
-        }, Math.max(0, s * 1000 - (performance.now() - wokeAt)));
+        }, s * 1000);
       }
     }
 

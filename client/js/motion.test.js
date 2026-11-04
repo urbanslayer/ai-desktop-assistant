@@ -105,8 +105,11 @@ if (THREE) {
 
     const motion = new AvatarMotion(THREE, { scene, camera });
     motion.attach(vrm);
-    const rest = motion._rest;
-    assert.ok(rest.has('head') && rest.has('neck'), 'attach() must snapshot the rest pose');
+    // snapshot the rest straight off the nodes (no motion.js internals), so
+    // the old accumulating build fails on the drift bounds themselves
+    const rest = new Map();
+    for (const [b, n] of motion._boneCache) rest.set(b, n.quaternion.clone());
+    assert.ok(rest.has('head') && rest.has('neck'), 'bones must exist');
 
     const director = new Director({ random: seq(0.5, 0.13, 0.87, 0.42, 0.61, 0.28, 0.77, 0.95) });
     const apply = (a) => {
@@ -217,11 +220,18 @@ if (THREE) {
       scene.add(vrm.scene);
       const motion = new AvatarMotion(THREE, { scene, camera });
       motion.attach(vrm);
+      // snapshot rest from the nodes themselves (no motion.js internals) so
+      // this test also provably catches the old per-frame `+=` accumulation
+      const rest = new Map();
+      for (const [b, n] of motion._boneCache) rest.set(b, n.quaternion.clone());
       const neck = motion._node('neck');
       for (let i = 0; i < 60 * 300; i++) motion.update(1 / 60);  // 5 minutes, no gestures
-      const e = offsetEuler(motion._rest.get('neck'), neck.quaternion);
-      assert.ok(Math.abs(e.y) < 0.4 && Math.abs(e.x) < 0.3 && Math.abs(e.z) < 0.15,
+      const e = offsetEuler(rest.get('neck'), neck.quaternion);
+      assert.ok(finite(e) && Math.abs(e.y) < 0.4 && Math.abs(e.x) < 0.3 && Math.abs(e.z) < 0.15,
         `neck accumulated to ${JSON.stringify(e)} after 5 idle minutes`);
+      const headE = offsetEuler(rest.get('head'), motion._node('head').quaternion);
+      assert.ok(finite(headE) && Math.max(Math.abs(headE.x), Math.abs(headE.y), Math.abs(headE.z)) < 0.4,
+        `head accumulated to ${JSON.stringify(headE)} after 5 idle minutes`);
       // eyes-then-head: look-away starts at the eyes, the head follows slowly
       const before = motion.__debug().followYaw;
       motion.lookAway(2.5);
