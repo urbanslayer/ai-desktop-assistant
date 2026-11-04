@@ -20,3 +20,4 @@ tts/data/*
 client/node_modules/
 client/package-lock.json
 dist/
+browser-ext/.amo-upload-uuid
