@@ -43,14 +43,14 @@ SCREEN_W, SCREEN_H = 1920, 1080
 # ── tiny xcb helpers (listener window + XTEST clicks) ────────────────────
 
 class Screen(ctypes.Structure):
-    _fields_ = [("depth", ctypes.c_uint8), ("pad1", ctypes.c_uint8),
-                ("root", ctypes.c_uint32), ("default_colormap", ctypes.c_uint32),
-                ("white_pixel", ctypes.c_uint32), ("black_pixel", ctypes.c_uint32),
-                ("current_input", ctypes.c_uint32), ("back_buffer", ctypes.c_uint32),
+    # xcb_screen_t (from xcb_get_setup roots), NOT the Xlib Screen:
+    # root, default_visual, widths, heights, depth/visual list…
+    _fields_ = [("root", ctypes.c_uint32), ("default_visual", ctypes.c_uint32),
                 ("width_in_pixels", ctypes.c_uint32), ("height_in_pixels", ctypes.c_uint32),
                 ("width_in_millimeters", ctypes.c_uint32),
                 ("height_in_millimeters", ctypes.c_uint32),
-                ("min_instmaps", ctypes.c_uint32), ("installed_maps_len", ctypes.c_uint32)]
+                ("root_depth", ctypes.c_uint8), ("backing_store", ctypes.c_uint8),
+                ("visuals_len", ctypes.c_uint8), ("pad1", ctypes.c_uint8)]
 
 
 class Iterator(ctypes.Structure):
@@ -78,8 +78,8 @@ class XConn:
                                           ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint16,
                                           ctypes.c_uint16, ctypes.c_uint32, ctypes.c_uint32,
                                           ctypes.c_void_p]
-        lib.xcb_change_window_attributes.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
-                                                     ctypes.c_uint32, ctypes.c_void_p]
+        lib.xcb_configure_window.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                             ctypes.c_uint32, ctypes.c_void_p]
         lib.xcb_map_window.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         lib.xcb_flush.argtypes = [ctypes.c_void_p]
         lib.xcb_generate_id.argtypes = [ctypes.c_void_p]
@@ -89,47 +89,173 @@ class XConn:
         self.conn = lib.xcb_connect(None, None)
         if not self.conn or lib.xcb_connection_has_error(self.conn):
             raise RuntimeError("xcb connect failed (is DISPLAY set to the nested XWayland?)")
+        # NOTE: the ctypes cast of xcb_setup roots below is UNRELIABLE on
+        # XWayland (wrong struct layout -> garbage root id; the first smoke
+        # silently made its listener a child of a nonexistent window). The
+        # real root comes from query_tree(strip_xid).parent once desktop.py
+        # has mapped the strip; screen.root is only a fallback.
         it = lib.xcb_setup_roots_iterator(lib.xcb_get_setup(self.conn))
         self.screen = ctypes.cast(it.data, ctypes.POINTER(Screen)).contents
+        self.root = self.screen.root
         # XTEST lives in its own lib, not libxcb
         self.xtest = ctypes.CDLL(ctypes.util.find_library("xcb-xtest") or "libxcb-xtest.so.0")
 
+    def query_tree(self, wid):
+        """(root, parent, children) per the X server."""
+        lib = self.lib
+        ct = ctypes
+
+        class Cookie(ct.Structure):
+            _fields_ = [("sequence", ct.c_uint32)]
+
+        class TreeReply(ct.Structure):
+            _fields_ = [("response_type", ct.c_uint8), ("pad", ct.c_uint8),
+                        ("sequence", ct.c_uint16), ("length", ct.c_uint32),
+                        ("root", ct.c_uint32), ("parent", ct.c_uint32),
+                        ("n_children", ct.c_uint32), ("n_properties", ct.c_uint32),
+                        ("format_", ct.c_uint8), ("pad2", ct.c_uint8 * 23)]
+
+        if not hasattr(lib, "_tree_proto"):
+            lib.xcb_query_tree.argtypes = [ct.c_void_p, ct.c_uint32]
+            lib.xcb_query_tree.restype = Cookie
+            lib.xcb_query_tree_reply.argtypes = [ct.c_void_p, Cookie, ct.c_void_p]
+            lib.xcb_query_tree_reply.restype = ct.c_void_p
+            lib._tree_proto = True
+        ptr = lib.xcb_query_tree_reply(self.conn, lib.xcb_query_tree(self.conn, wid), None)
+        if not ptr:
+            return None
+        r = ct.cast(ptr, ct.POINTER(TreeReply)).contents
+        kids = [int.from_bytes(ct.string_at(ptr + 32 + i * 4, 4), "little")
+                for i in range(r.n_children)]
+        return r.root, r.parent, kids
+
     def make_listener(self, x, y, w, h):
-        """Map an override-redirect window that reports its button presses."""
+        """Map an override-redirect window under the root (the "window below").
+
+        No event mask is selected: a pointer-less XWayland (nested sway with
+        WLR_LIBINPUT_NO_DEVICES) validates core EventMask button bits against
+        the core pointer's button count and answers BadValue — the window
+        would never exist if we asked for ButtonPress. Routing is asserted
+        through ptr_state() (QueryPointer's child), not delivered events.
+        """
         lib = self.lib
         wid = lib.xcb_generate_id(self.conn)
-        # value list for create_window: one (mask_bit, value) pair: OverrideRedirect
-        vals = (ctypes.c_uint32 * 1)(1)
+        vals = (ctypes.c_uint32 * 1)(1)   # XCB_CW_OVERRIDE_REDIRECT (1<<8) = True
         lib.xcb_create_window(self.conn, 0, ctypes.c_uint32(wid),
-                              ctypes.c_uint32(self.screen.root),
+                              ctypes.c_uint32(self.root),
                               ctypes.c_int16(x), ctypes.c_int16(y),
                               ctypes.c_uint16(w), ctypes.c_uint16(h),
-                              ctypes.c_uint16(0), 1, 0, 1 << 11, vals)
-        # XCB_EVENT_MASK_BUTTON_PRESS | BUTTON_RELEASE = 0x1004
-        lib.xcb_change_window_attributes(self.conn, ctypes.c_uint32(wid),
-                                         1 << 2, (ctypes.c_uint32 * 1)(0x1004))
+                              ctypes.c_uint16(0), 1, 0, 1 << 8, vals)
         lib.xcb_map_window(self.conn, ctypes.c_uint32(wid))
         lib.xcb_flush(self.conn)
         self.wid = wid
         return wid
 
-    def pump_clicks(self, seconds):
-        """Drain events for a while; return list of (root_x, root_y) presses."""
+    def stack_below(self, wid, sibling):
+        """Restack wid directly below sibling (mapped-after-strip must go down)."""
+        vals = (ctypes.c_uint32 * 2)(sibling, 1)   # sibling, stack_mode=Below
+        self.lib.xcb_configure_window(self.conn, ctypes.c_uint32(wid),
+                                      (1 << 5) | (1 << 6), vals)
+        self.lib.xcb_flush(self.conn)
+
+    def ptr_state(self):
+        """(root_x, root_y, child): the X server's own pick — which window a
+        click at the pointer WOULD hit. Honours shaped input regions, so it
+        proves click-through without needing delivered button events."""
         lib = self.lib
-        lib.xcb_poll_for_event.restype = ctypes.c_void_p
-        end = time.monotonic() + seconds
+        ct = ctypes
+
+        class PtrCookie(ct.Structure):
+            _fields_ = [("sequence", ct.c_uint32)]
+
+        class PtrReply(ct.Structure):
+            _fields_ = [("response_type", ct.c_uint8), ("same_screen", ct.c_uint8),
+                        ("sequence", ct.c_uint16), ("length", ct.c_uint32),
+                        ("root", ct.c_uint32), ("child", ct.c_uint32),
+                        ("root_x", ct.c_int16), ("root_y", ct.c_int16),
+                        ("child_x", ct.c_int16), ("child_y", ct.c_int16)]
+
+        if not hasattr(lib, "_ptr_proto"):
+            lib.xcb_query_pointer.argtypes = [ct.c_void_p, ct.c_uint32]
+            lib.xcb_query_pointer.restype = PtrCookie
+            lib.xcb_query_pointer_reply.argtypes = [ct.c_void_p, PtrCookie, ct.c_void_p]
+            lib.xcb_query_pointer_reply.restype = ct.c_void_p
+            lib._ptr_proto = True
+        ptr = lib.xcb_query_pointer_reply(self.conn, lib.xcb_query_pointer(self.conn, self.root), None)
+        if not ptr:
+            return None
+        r = ct.cast(ptr, ct.POINTER(PtrReply)).contents
+        return (r.root_x, r.root_y, r.child)
+
+    def input_rects(self, wid):
+        """The window's INPUT shape rectangles per the server (empty shape = None,
+        unshaped/full = [(0,0,w,h)])."""
+        import ctypes.util as cu
+        lib = self.lib
+        ct = ctypes
+        if not hasattr(self, "_shape"):
+            self._shape = ct.CDLL(cu.find_library("xcb-shape") or "libxcb-shape.so.0")
+
+        class Cookie(ct.Structure):
+            _fields_ = [("sequence", ct.c_uint32)]
+
+        class Rect(ct.Structure):
+            _fields_ = [("x", ct.c_int16), ("y", ct.c_int16),
+                        ("w", ct.c_uint16), ("h", ct.c_uint16)]
+
+        class GetRectReply(ct.Structure):
+            _fields_ = [("response_type", ct.c_uint8), ("pad", ct.c_uint8),
+                        ("sequence", ct.c_uint16), ("length", ct.c_uint32),
+                        ("n_rectangles", ct.c_uint32), ("format_", ct.c_uint8),
+                        ("pad2", ct.c_uint8 * 15)]
+        sh = self._shape
+        if not hasattr(sh, "_proto"):
+            sh.xcb_shape_query_version.argtypes = [ct.c_void_p, ct.c_uint8, ct.c_uint8]
+            sh.xcb_shape_query_version.restype = Cookie
+            sh.xcb_shape_query_version_reply.argtypes = [ct.c_void_p, Cookie, ct.c_void_p]
+            sh.xcb_shape_query_version_reply.restype = ct.c_void_p
+            sh.xcb_shape_get_rectangles.argtypes = [ct.c_void_p, ct.c_uint32, ct.c_uint8]
+            sh.xcb_shape_get_rectangles.restype = Cookie
+            sh.xcb_shape_get_rectangles_reply.argtypes = [ct.c_void_p, Cookie, ct.c_void_p]
+            sh.xcb_shape_get_rectangles_reply.restype = ct.c_void_p
+            sh._proto = True
+        sh.xcb_shape_query_version_reply(self.conn, sh.xcb_shape_query_version(self.conn, 1, 1), None)
+        p = sh.xcb_shape_get_rectangles_reply(self.conn,
+                                              sh.xcb_shape_get_rectangles(self.conn, wid, 2), None)
+        if not p:
+            return None
+        r = ct.cast(p, ct.POINTER(GetRectReply)).contents
+        return [(rr.x, rr.y, rr.w, rr.h) for rr in
+                (ct.cast(p + 32 + i * 8, ct.POINTER(Rect)).contents
+                 for i in range(r.n_rectangles))]
+
+    def warp(self, x, y):
+        """XTEST pointer warp. XWayland applies the emulated motion one event
+        late, so send it twice and let the sprite settle before querying."""
+        fake = self.xtest.xcb_test_fake_input
+        fake.argtypes = [ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint8,
+                         ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int16,
+                         ctypes.c_int16, ctypes.c_uint8]
+        for _ in range(2):
+            fake(self.conn, 6, 0, 0, self.root, x, y, 0)
+            self.lib.xcb_flush(self.conn)
+            time.sleep(0.08)
+        time.sleep(0.15)
+
+    def drain_errors(self):
+        """Non-blocking: pop queued X errors (they ride the event queue)."""
+        lib = self.lib
         out = []
-        while time.monotonic() < end:
+        while True:
             ev = lib.xcb_poll_for_event(self.conn)
-            if ev:
-                b = ctypes.string_at(ev, 40)
-                code = b[0] & 0x7F
-                if code == 4:  # ButtonPress
-                    rx = int.from_bytes(b[20:22], "little")
-                    ry = int.from_bytes(b[22:24], "little")
-                    out.append((rx, ry))
-            else:
-                time.sleep(0.02)
+            if not ev:
+                break
+            b = ctypes.string_at(ev, 32)
+            code = b[0] & 0x7F
+            if code == 0:   # XCB_ERROR
+                out.append(f"err={b[1]} bad={int.from_bytes(b[4:8], 'little'):#x}"
+                           f" minor={int.from_bytes(b[8:10], 'little')}"
+                           f" major={b[10]}")
         return out
 
     def get_geom(self, xid):
@@ -141,12 +267,15 @@ class XConn:
             _fields_ = [("sequence", ct.c_uint32)]
 
         class GeomReply(ct.Structure):
-            _fields_ = [("response_type", ct.c_uint8), ("pad", ct.c_uint8),
-                        ("sequence", ct.c_uint32), ("length", ct.c_uint32),
+            # wire: type, depth, seq(2), len(4), root(4), x(2), y(2), w(2), h(2)
+            # — the C reply has NO drawable field; the previous layout shifted
+            # everything by 4 (returned (1920,648,0,0) for a 0,432 1920x648 win)
+            _fields_ = [("response_type", ct.c_uint8), ("depth", ct.c_uint8),
+                        ("sequence", ct.c_uint16), ("length", ct.c_uint32),
                         ("root", ct.c_uint32), ("x", ct.c_int16), ("y", ct.c_int16),
                         ("width", ct.c_uint16), ("height", ct.c_uint16),
-                        ("border_width", ct.c_uint16), ("depth", ct.c_uint8),
-                        ("visual", ct.c_uint32)]  # pad3 + visual, generous tail
+                        ("border_width", ct.c_uint16), ("pad3", ct.c_uint8 * 2),
+                        ("visual", ct.c_uint32)]
 
         if not hasattr(lib, "_geom_proto"):
             lib.xcb_get_geometry.argtypes = [ct.c_void_p, ct.c_uint32]
@@ -163,19 +292,13 @@ class XConn:
 
     def click(self, x, y):
         """XTEST: warp to (x, y) then press+release button 1 (root coords)."""
-        lib = self.lib
+        self.warp(x, y)
         fake = self.xtest.xcb_test_fake_input
-        fake.argtypes = [ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint8,
-                         ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int16,
-                         ctypes.c_int16, ctypes.c_uint8]
-        fake(self.conn, 6, 0, 0, self.screen.root, x, y, 0)   # MotionNotify
-        lib.xcb_flush(self.conn)
+        fake(self.conn, 4, 1, 0, self.root, 0, 0, 0)   # ButtonPress
+        self.lib.xcb_flush(self.conn)
         time.sleep(0.08)
-        fake(self.conn, 4, 1, 0, self.screen.root, 0, 0, 0)   # ButtonPress
-        lib.xcb_flush(self.conn)
-        time.sleep(0.08)
-        fake(self.conn, 5, 1, 0, self.screen.root, 0, 0, 0)   # ButtonRelease
-        lib.xcb_flush(self.conn)
+        fake(self.conn, 5, 1, 0, self.root, 0, 0, 0)   # ButtonRelease
+        self.lib.xcb_flush(self.conn)
 
 
 # ── orchestration ─────────────────────────────────────────────────────────
@@ -294,11 +417,11 @@ desktop:
 """, encoding="utf-8")
 
         # ── the second (under-strip) client window: our X listener ──
+        # created AFTER desktop.py maps the strip: the listener's parent must
+        # be the real XWayland root (derived from the strip's window tree),
+        # and being mapped last it is explicitly restacked below the strip.
         strip_h = min(680, int(SCREEN_H * 0.6))
         strip_y = SCREEN_H - strip_h
-        listener = XConn()
-        listener.make_listener(40, strip_y + 40, 500, 600)
-        print(f"[smoke] listener window mapped at (40,{strip_y + 40}) 500x600", flush=True)
 
         # ── desktop.py under the nested compositor ──
         denv = dict(wenv, RIKO_CONFIG=str(cfg_yaml), RIKO_PORT="8137",
@@ -366,6 +489,20 @@ desktop:
             if mx:
                 strip_xid = int(mx[1], 16)
 
+        listener = XConn()
+        if strip_xid is not None:
+            tq = listener.query_tree(strip_xid)
+            if tq:
+                listener.root = tq[1] or tq[0]   # parent of a top-level OR window = real root
+        listener.make_listener(40, sy + 40, 500, 600)
+        if strip_xid is not None:
+            listener.stack_below(listener.wid, strip_xid)
+        errs = listener.drain_errors()
+        lg = listener.get_geom(listener.wid)
+        print(f"[smoke] listener {listener.wid:#x} at {lg} under root "
+              f"{listener.root:#x}, stacked below strip"
+              + (f", X errors: {errs}" if errs else ""), flush=True)
+
         riko_views = []
         for n in walk(tree):
             if strip_xid is not None and n.get("window") == strip_xid:
@@ -417,6 +554,9 @@ desktop:
             time.sleep(0.5)
         if not bw or bw >= SCREEN_W * 0.5:
             raise RuntimeError(f"bbox never settled to body size (last: {bx},{by} {bw}x{bh})")
+        results.append(("input mask narrowed to her body box (not full strip)",
+                        bw < SCREEN_W * 0.5 and bh <= sh,
+                        f"region {bx},{by} {bw}x{bh} of strip {sw}x{sh}"))
         body_pt = (sx + bx + bw // 2, sy + by + bh // 2)
         # empty point: inside the strip, inside the listener window, clear of bbox
         empty_pt = (40 + 160, sy + sh - 90)
@@ -424,23 +564,46 @@ desktop:
         print(f"[smoke] body point {body_pt} (bbox {bx},{by} {bw}x{bh}); "
               f"empty point {empty_pt}", flush=True)
 
-        listener.click(*empty_pt)
-        got_empty = listener.pump_clicks(1.2)
-        n_before = sum("[roam] forward pointerdown" in ln for ln in log_lines)
-        listener.click(*body_pt)
-        got_body = listener.pump_clicks(1.2)
-        time.sleep(0.6)
-        n_after = sum("[roam] forward pointerdown" in ln for ln in log_lines)
+        # ── click routing through the shaped mask ──
+        # A pointer-less XWayland rejects core ButtonPress event selection
+        # (the strip's own Qt uses XInput2, so only the page sees clicks), so
+        # the oracle is QueryPointer: the X server's own pick of the window a
+        # click at the pointer would hit — shaped input regions included.
+        # Ask the server directly what INPUT shape the strip carries: proof
+        # the XFixes region actually landed (not just that desktop.py logged it).
+        srv_rects = listener.input_rects(strip_xid)
+        print(f"[smoke] strip INPUT rects per server: {srv_rects}", flush=True)
+        results.append(("server-side INPUT shape equals the body box",
+                        srv_rects == [(bx, by, bw, bh)],
+                        f"server {srv_rects}, expected {[(bx, by, bw, bh)]}"))
+        listener.warp(*empty_pt)
+        st_e = listener.ptr_state()
+        listener.warp(*body_pt)
+        st_b = listener.ptr_state()
+        print(f"[smoke] pointer over empty {empty_pt} -> {st_e}; "
+              f"over body {body_pt} -> {st_b}", flush=True)
+        results.append(("click in EMPTY strip area goes to the window BELOW (click-through)",
+                        bool(st_e) and st_e[2] == listener.wid,
+                        f"server pick {st_e}, listener={listener.wid:#x}"))
+        results.append(("click ON HER BODY goes to the strip, not the window below",
+                        bool(st_b) and strip_xid is not None and st_b[2] == strip_xid,
+                        f"server pick {st_b}, strip={strip_xid:#x}" if strip_xid else f"server pick {st_b}"))
 
-        results.append(("click in EMPTY strip area reaches window BELOW (click-through)",
-                        any(abs(rx - empty_pt[0]) < 60 and abs(ry - empty_pt[1]) < 60
-                            for rx, ry in got_empty),
-                        f"listener got {got_empty}"))
-        results.append(("click on HER BODY reaches the page, not the window below",
-                        n_after > n_before and
-                        not any(abs(rx - body_pt[0]) < 60 and abs(ry - body_pt[1]) < 60
-                                for rx, ry in got_body),
-                        f"page pointerdown {n_before}->{n_after}, listener {got_body}"))
+        # …and prove it with real XTEST clicks: only the body point may
+        # produce a pointerdown on her page.
+        def page_clicks():
+            return sum("[page] pointerdown" in ln for ln in log_lines)
+        n0 = page_clicks()
+        listener.click(*empty_pt)
+        time.sleep(0.6)
+        n1 = page_clicks()
+        listener.click(*body_pt)
+        time.sleep(0.6)
+        n2 = page_clicks()
+        results.append(("real click on EMPTY point never reaches her page",
+                        n1 == n0, f"page pointerdown {n0}->{n1}"))
+        results.append(("real click on HER BODY reaches her page",
+                        n2 > n1, f"page pointerdown {n1}->{n2}"))
 
         shot2 = outdir / "sway-click-on-her.png"
         subprocess.run(["grim", str(shot2)], env=wenv, timeout=15)

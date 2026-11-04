@@ -162,8 +162,9 @@ class _XShape:
         # SHAPE/XFIXES live in their own libs on Linux, not in libxcb itself.
         # find_library only maps SONAMEs here, so try the soname. CDLL has no
         # symbol enumeration, so pull the exact symbols we call.
-        need = {"xcb-shape": ("xcb_shape_query_version",),
-                "xcb-xfixes": ("xcb_xfixes_create_region",
+        need = {"xcb-shape": ("xcb_shape_query_version", "xcb_shape_query_version_reply"),
+                "xcb-xfixes": ("xcb_xfixes_query_version", "xcb_xfixes_query_version_reply",
+                               "xcb_xfixes_create_region",
                                "xcb_xfixes_destroy_region",
                                "xcb_xfixes_set_window_shape_region",
                                "xcb_xfixes_get_cursor_image")}
@@ -201,9 +202,28 @@ class _XShape:
             self.display = None
             raise RuntimeError("xcb connect failed")
         print("[roam] xcb connected (XWayland)", flush=True)
-        # No extension-presence probe: xcb_get_extension_data blocks reading a
-        # reply here; XWayland always provides SHAPE + XFIXES, and the symbol
-        # check in __init__ plus the smoke test cover real failures.
+        # ENABLE SHAPE + XFIXES: libxcb keeps an extension's major opcode at 0
+        # until the client round-trips its version — requests sent before that
+        # are silent no-ops (the nested-sway smoke proved the shaped-input
+        # region never reached the server without this handshake).
+        class _Cookie(ctypes.Structure):
+            _fields_ = [("sequence", ctypes.c_uint32)]
+        for q, maj, min in (("xcb_shape_query_version", 1, 1),
+                            ("xcb_xfixes_query_version", 5, 0)):
+            try:
+                req = getattr(self.lib, q)
+            except AttributeError:
+                continue
+            req.argtypes = [ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint8]
+            req.restype = _Cookie
+            rep = getattr(self.lib, q + "_reply")
+            rep.argtypes = [ctypes.c_void_p, _Cookie, ctypes.POINTER(ctypes.c_void_p)]
+            rep.restype = ctypes.c_void_p
+            # Ask for the NEWEST version (the server clamps to its own): with
+            # XFIXES this is load-bearing — XFixesSetWindowShapeRegion arrived
+            # in 2.0, and a 1.x negotiation makes the server reject the set
+            # with BadValue (nested-sway smoke: mask silently stayed full).
+            rep(self.display, req(self.display, maj, min), None)   # round trip = enable
         self.shape = True
         self.fixes = True
 
@@ -269,6 +289,8 @@ class RoamController(QObject):
         self.xid = 0
         self.warned = ""
         self._printed = False
+        self._last_print = 0.0
+        self.filter: object = None  # keepalive ref: Qt does NOT own the filter object
         # strip size: full screen width, the configured window height (clamped
         # to 60% of the screen so a tall monitor keeps a visible "band" feel)
         scr = QGuiApplication.primaryScreen()
@@ -382,19 +404,28 @@ class RoamController(QObject):
         lib.xcb_flush(self.xcb.display)
 
     def apply_bbox(self):
-        """Shape the window's input region to her projected body (or nothing)."""
+        """Shape the window's input region to her projected body (or nothing).
+
+        Re-applied on EVERY page update, not just on change: Qt may rewrite
+        window shapes on its own map/expose cycles, and a single rejected or
+        lost request (e.g. during window transitions) must not leave a stale
+        full-window mask forever. One round trip at 10 Hz — negligible.
+        """
         if not (self.in_strip and self.backend == "xcb" and self.xcb and self.xcb.display):
             return
         rect = self._clipped_bbox()
-        if rect == self._sent:
-            return
+        changed = rect != self._sent
         self._sent = rect
-        if not self._printed:
-            self._printed = True
-            print(f"[roam] input region -> {rect}", flush=True)
         new = self.xcb.create_region([rect] if rect else [])
         self.xcb.set_input_region(self.xid, new)
         self.xcb.destroy_region(new)
+        # Rate-limited trace of every shaping change (≤ 1 line / 2 s): the first
+        # line proves the page is live, later lines prove the mask narrows to
+        # her body — the nested-sway smoke asserts on these.
+        if changed and (not self._printed or time.monotonic() - self._last_print >= 2.0):
+            self._printed = True
+            self._last_print = time.monotonic()
+            print(f"[roam] input region -> {rect}", flush=True)
 
     def _clear_region(self):
         self._sent = None
@@ -595,7 +626,8 @@ def main():
     bridge = Bridge()
     roamc = RoamController(win, cfg)
     win.roam_strip = False
-    app.installNativeEventFilter(_NativeFilter(roamc))
+    roamc.filter = _NativeFilter(roamc)   # RoamController keeps it alive: Qt does not own it
+    app.installNativeEventFilter(roamc.filter)
 
     def show_window():
         if roamc.enabled and not roamc.in_strip:
