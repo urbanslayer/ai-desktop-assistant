@@ -6,8 +6,9 @@
 //          performance.now()/1000, tests pass whatever they like):
 //   start(now)                    the page finished loading
 //   status(now, state)            listening / hearing / thinking / speaking / idle
-//   say(now, {emotion, seconds})  a spoken line (emotion from the hub, may be absent)
-//   heard(now)                    the user's words arrived
+//   say(now, {emotion, seconds, text})  a spoken line (emotion/text may be absent)
+//   heard(now, text)              the user's words arrived (text optional)
+//   requestWave(now)              the W shortcut / riko-ctl wave: wave on demand
 //   persona(now, info)              the persona (and body) changed; info = {id, avatar_version}
 //   error(now)                    something went wrong
 //   tick(now)                     every frame; runs timers (gesture end, cooldowns,
@@ -25,8 +26,10 @@
 //   - a running one-shot gesture is never interrupted (loops can be swapped
 //     or preempted by a high-priority gesture like the persona wave);
 //   - a cooldown per gesture;
-//   - wave on app start, on persona switch, and when she comes back from
-//     10+ minutes of doing nothing;
+//   - wave on app start, on persona switch, when she comes back from
+//     10+ minutes of doing nothing, on your greetings/goodbyes (heard or
+//     typed text), when her reply starts with a greeting, and on demand
+//     (W shortcut / riko-ctl wave) — greetings honour the 25 s cooldown;
 //   - think loops while status is thinking, listen loops while listening;
 //   - talk gestures sprinkled through long answers;
 //   - stretch / look_around / fidget / hair_touch while idle every 1–3 min;
@@ -64,9 +67,18 @@ export const COOLDOWNS = {
 
 export const RETURN_AFTER_IDLE = 600;  // 10 min of nothing -> she waves when you're back
 
+// Greetings and goodbyes in your words earn a wave back (word boundaries, so
+// "hi" never fires inside "this" and "later" never inside "calculator").
+export const GREETING_RE = /\b(hi|hello|hey|hiya|good morning|good afternoon|good evening|good night|goodnight|goodbye|good bye|bye|see you|see ya|see ya later|later)\b/i;
+
+// Her own reply waving back: only when it *opens* with a greeting (after any
+// punctuation/emoji), not when a greeting merely appears mid-sentence.
+export const REPLY_GREETING_RE = /^(?:["'“”\s*.,!~—-]|\p{Extended_Pictographic})*(?:hi|hello|hey|hiya|good (?:morning|afternoon|evening|night)|goodnight|goodbye|good bye|bye|see you|see ya)\b/iu;
+
 // Pending one-shot priorities: higher wins the single pending slot, and >=5
 // may also preempt a *loop* (never a one-shot).
 const PRIO_EMOTION = 1, PRIO_IDLE = 2, PRIO_TALK = 3, PRIO_RETURN = 4, PRIO_PERSONA = 5;
+const PRIO_GREET = PRIO_PERSONA;  // a greeting wave may swap a running loop
 
 export class Director {
   constructor({ random = Math.random } = {}) {
@@ -106,8 +118,33 @@ export class Director {
     return this.#play('wave', now, { priority: PRIO_PERSONA, noCooldown: true });
   }
 
-  heard(now) {
+  heard(now, text = '') {
     const acts = this.#activity(now);
+    if (text && GREETING_RE.test(String(text))) acts.push(...this.#greetingWave(now));
+    return acts;
+  }
+
+  /** The W shortcut / riko-ctl wave: wave on demand, same cooldown as greetings. */
+  requestWave(now) {
+    this.lastActivity = now;
+    return this.#greetingWave(now);
+  }
+
+  /**
+   * A social wave (greeting heard / greeting reply / on demand): respects the
+   * 25 s cooldown, never stacks on a wave already running or queued, and
+   * carries a happy face (the pose file adds the head tilt).
+   */
+  #greetingWave(now) {
+    if (this.gesture?.name === 'wave' || this.pending?.name === 'wave') return [];
+    const acts = this.#play('wave', now, { priority: PRIO_GREET });
+    for (const a of acts) {
+      if (a.type === 'gesture' && a.name === 'wave') {
+        const hold = a.duration + 1.5;
+        this.expression = { name: 'happy', until: now + hold, tilt: false, away: false };
+        acts.push({ type: 'expression', name: 'happy', value: 0.8, hold, tilt: false, away: false });
+      }
+    }
     return acts;
   }
 
@@ -179,9 +216,11 @@ export class Director {
     return acts;
   }
 
-  say(now, { emotion = 'neutral', seconds = 0 } = {}) {
+  say(now, { emotion = 'neutral', seconds = 0, text = '' } = {}) {
     const acts = [];
     this.lastActivity = now;
+    // a reply that opens with a greeting waves along with it (cooldown applies)
+    if (text && REPLY_GREETING_RE.test(String(text))) acts.push(...this.#greetingWave(now));
     const map = EMOTION_EXPRESSIONS[emotion] || EMOTION_EXPRESSIONS.neutral;
     this.expression = map.expression
       ? { name: map.expression, until: now + Math.max(seconds, 0) + 3,

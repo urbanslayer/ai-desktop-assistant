@@ -9,6 +9,7 @@ a compositor keybind or a script, without focusing her first.
     riko-ctl talk-start   start recording   (bind to key press)
     riko-ctl talk-stop    stop and send     (bind to key release)
     riko-ctl toggle       show / hide her   (also: show, hide)
+    riko-ctl wave         she waves at you  (W in her window also works)
     riko-ctl forget       clear the chat history (on the hub, for this persona)
     riko-ctl personas     list personas and which one is active
     riko-ctl persona NAME switch who she is (id, name or keyword; case doesn't matter)
@@ -34,7 +35,7 @@ URL = os.environ.get("RIKO_URL", "http://127.0.0.1:8080")
 APP_ID = "riko"
 COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide", "forget",
             "personas", "persona", "persona-next", "quit", "status",
-            "approve", "deny", "browser-status", "browser-token"}
+            "approve", "deny", "browser-status", "browser-token", "wave"}
 
 
 def focus_window():

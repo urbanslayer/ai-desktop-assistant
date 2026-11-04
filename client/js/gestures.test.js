@@ -66,14 +66,27 @@ test('gesture table has the set ROUNDS.md asks for', () => {
   assert.equal(GESTURES.wave.loop, false);
 });
 
-test('wave forearm oscillator swings and eases in/out', () => {
+test('wave wrist + arm oscillators swing and ease in/out', () => {
   const s0 = sampleGesture('wave', 0.4);
-  const s = [];
-  for (let t = 0.55; t <= 2.05; t += 0.05) s.push(sampleGesture('wave', t).rightLowerArm[1]);
-  const spread = Math.max(...s) - Math.min(...s);
-  assert.ok(spread > 0.4, `forearm should swing, got ${spread}`);
+  const hand = [], arm = [];
+  for (let t = 0.55; t <= 2.05; t += 0.05) {
+    const s = sampleGesture('wave', t);
+    hand.push(s.rightHand[2]);
+    arm.push(s.rightUpperArm[2]);
+  }
+  const handSpread = Math.max(...hand) - Math.min(...hand);
+  const armSpread = Math.max(...arm) - Math.min(...arm);
+  assert.ok(handSpread > 0.5, `wrist should flap, got ${handSpread}`);
+  assert.ok(armSpread > 0.3, `arm should rock, got ${armSpread}`);
+  // 2-3 cycles over the ~1.55 s window (1.5 Hz): count wrist reversals
+  let reversals = 0;
+  for (let i = 1; i < hand.length - 1; i++) {
+    if ((hand[i] - hand[i - 1]) * (hand[i + 1] - hand[i]) < 0) reversals++;
+  }
+  assert.ok(reversals >= 3, `expected several wrist reversals, got ${reversals}`);
   // near the window edges the wobble is eased out
-  assert.ok(Math.abs(sampleGesture('wave', 0.56).rightLowerArm[1] - s0.rightLowerArm[1]) < 0.05);
+  assert.ok(Math.abs(sampleGesture('wave', 0.56).rightHand[2] - s0.rightHand[2]) < 0.05);
+  assert.ok(Math.abs(sampleGesture('wave', 0.56).rightUpperArm[2] - s0.rightUpperArm[2]) < 0.05);
 });
 
 test('mirrorPose flips upperArm z for VRM 0.x only', () => {

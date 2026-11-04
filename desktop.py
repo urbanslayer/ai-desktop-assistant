@@ -7,6 +7,7 @@ key, which belongs to your window manager). Configure them under
 desktop.shortcuts in character_config.yaml; defaults:
     Enter or /               type to her (Enter sends, Esc closes)
     Space (hold)             talk, release to send (push-to-talk, your local mic)
+    W                        she waves at you
     P                        next persona
     H                        hide her (the tray icon brings her back)
     Ctrl+Shift+Backspace     forget the chat (press again within 3 s to confirm)
@@ -38,7 +39,12 @@ from riko import asr, client_tools, hub_client, shortcuts, tts, viewer
 from riko.config import load_config
 from riko.session import Session
 
-APP_ID = "riko"  # Wayland app_id / X11 class; window rules match on this
+APP_ID = "riko"  # Wayland app_id / X11 class; window rules match on these
+
+# Commands that need the Qt thread (they poke the page or the window). 'wave'
+# asks the page's director for a social wave (same one the W shortcut fires).
+PAGE_CMDS = {"type", "hide-input", "toggle", "show", "hide", "quit", "wave"}
+WAVE_JS = "window.riko && riko.requestWave && riko.requestWave()"
 
 
 class Bridge(QObject):
@@ -251,6 +257,8 @@ def main():
             win.js("window.riko && riko.openInput()")
         elif cmd == "hide-input":
             win.js("window.riko && riko.closeInput()")
+        elif cmd == "wave":
+            win.js(WAVE_JS)
         elif cmd in ("toggle", "show", "hide"):
             {"toggle": toggle_window, "show": show_window, "hide": win.hide}[cmd]()
         elif cmd == "quit":
@@ -325,7 +333,7 @@ def main():
             except hub_client.HubError as e:
                 return {"ok": False, "error": str(e)}
             return {"ok": True, "imported": n}
-        elif cmd in ("type", "hide-input", "toggle", "show", "hide", "quit"):
+        elif cmd in PAGE_CMDS:  # type / hide-input / toggle / show / hide / quit / wave
             bridge.command.emit(cmd)
         else:
             return {"ok": False, "error": f"unknown command {cmd!r}"}

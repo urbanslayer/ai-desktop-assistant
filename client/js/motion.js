@@ -472,6 +472,11 @@ export class AvatarMotion {
       gp -= 0.25 * EASE(remain);
     }
     if (this.gesture && this.gesture.name === 'look_around') { gy *= 2.2; gp *= 2.2; }
+    if (this.gesture && this.gesture.name === 'think') {
+      // the thinker looks up and off to her right (the hand side) while the
+      // knuckles rest under the chin
+      gy -= 0.3; gp += 0.22;
+    }
 
     // rotate the base point around her head by the gaze offsets
     const dir = new T.Vector3().subVectors(base, headPos);

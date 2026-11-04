@@ -232,3 +232,22 @@ def test_index_page_is_served(base_url):
     r = requests.get(base_url + "/", timeout=5)
     assert r.status_code == 200
     assert "html" in r.headers["Content-Type"].lower()
+
+
+def test_heard_and_say_events_carry_their_text(base_url):
+    # the director watches these payloads to spot greetings (2026-11 owner ask),
+    # so the text must survive the trip through the event queue untouched
+    viewer.emit("heard", text="Good morning, Riko!")
+    viewer.emit("say", text="Hi there, senpai!", emotion="happy")
+    events = drain(base_url)
+    heard = next(e for e in events if e["type"] == "heard")
+    say = next(e for e in events if e["type"] == "say")
+    assert heard == {"type": "heard", "text": "Good morning, Riko!"}
+    assert say["text"] == "Hi there, senpai!" and say["emotion"] == "happy"
+
+
+def test_wave_is_a_page_control_command():
+    # riko-ctl wave / desktop W shortcut route through desktop.py's bridge
+    import desktop
+    assert "wave" in desktop.PAGE_CMDS
+    assert "requestWave" in desktop.WAVE_JS

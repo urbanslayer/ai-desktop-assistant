@@ -28,6 +28,7 @@ import re
 DEFAULTS = {
     "type": ("Enter", "/"),               # open the text box
     "talk": ("Space",),                   # hold to talk, release to send
+    "wave": ("W",),                       # she waves at you
     "persona_next": ("P",),               # next persona
     "hide": ("H",),                       # hide her (tray icon brings her back)
     "forget": ("Ctrl+Shift+Backspace",),  # forget the chat (press twice to confirm)

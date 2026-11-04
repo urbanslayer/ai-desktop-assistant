@@ -221,12 +221,19 @@ characters she re-targets her whole repertoire onto the new body mid-motion.
 - **Lip sync** (`client/js/gestures.js` + the WebAudio analyser): the voice clip's
   band energies pick a vowel shape — `aa / ih / ee / oh / ou` — with fast attack and
   softer release, so she mouths words instead of flapping.
-- **Gestures**: wave (hello, persona switch, after 10+ minutes apart), hand-to-chin
-  `think` while she processes, lean-and-tilt `listen`, small open-hand talk gestures
+- **Gestures**: wave — unmistakable raised-hand side-to-side — on app start, a
+  persona switch, after 10+ minutes apart, whenever you greet or leave her
+  (hi/bye/good morning/…), when her own reply opens with a greeting, and on
+  demand (`W` or `riko-ctl wave`); hand-to-chin `think` with the elbow resting
+  on her crossed left arm while she processes, lean-and-tilt `listen`, small
+  open-hand talk gestures
   while speaking, and idle stretches / look-arounds / fidgets every 1-3 minutes.
   Cheap one-shots — nod, head shake, laugh, pout — punctuate her emotions. They are
   keyframed bone poses (probed against the shipped avatar), eased in and out with
   slerps from an arms-down rest, never the T-pose.
+  `python3 client/tools/capture_frames.py think|wave <dir> <times>` renders them
+  headless against the real sample avatar and prints pose measurements
+  (hand-to-chin distance, hand height over shoulder, wave swing width).
 - **The director** (`client/js/director.js`): a small state machine that decides
   *what* she does — a gesture never interrupts one already playing, each gesture has
   its own cooldown, and the whole thing is pure logic with unit tests

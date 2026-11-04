@@ -293,3 +293,64 @@ test('persona events for the same id + avatar_version do not re-wave', () => {
   assert.deepEqual(names(d.persona(20)), ['wave']);
 });
 
+
+// ── greeting / goodbye waves (owner request 2026-11) ─────────────
+test('heard greeting waves back with a happy face', () => {
+  const d = new Director({ random: seq(0.5) });
+  for (const text of ['hi there', 'Hello!', 'hey riko', 'good morning', 'good night 🌙',
+                      'goodbye for now', 'bye!', 'see you later', 'good bye mom']) {
+    const d2 = new Director({ random: seq(0.5) });
+    const acts = d2.heard(0, text);
+    assert.ok(names(acts).includes('wave'), `expected a wave for "${text}"`);
+    const expr = acts.find((a) => a.type === 'expression');
+    assert.ok(expr && expr.name === 'happy' && expr.value > 0.5, `happy face with the wave for "${text}"`);
+  }
+});
+
+test('non-greetings never earn a greeting wave (word boundaries)', () => {
+  const d = new Director({ random: seq(0.5) });
+  for (const text of ['this is a test', 'the ship sailed', 'calculate 3 times 4',
+                      'I am never too shy about anything', 'the elephant waved', '']) {
+    const d2 = new Director({ random: seq(0.5) });
+    const acts = d2.heard(0, text);
+    assert.ok(!names(acts).includes('wave'), `"${text}" must not wave`);
+  }
+});
+
+test('a reply that OPENS with a greeting waves; a greeting mid-sentence does not', () => {
+  const d2 = new Director({ random: seq(0.5) });
+  const acts = d2.say(0, { emotion: 'happy', text: 'Hi! I missed you!' });
+  assert.ok(names(acts).includes('wave'), 'opening greeting should wave');
+  const d3 = new Director({ random: seq(0.5) });
+  const a3 = d3.say(0, { text: 'I was just thinking that hello is a weird word.' });
+  assert.ok(!names(a3).includes('wave'), 'mid-sentence greeting must not wave');
+  const d4 = new Director({ random: seq(0.5) });
+  assert.ok(names(d4.say(0, { text: '"Good evening!" she said' })).includes('wave'),
+    'leading quotes before a greeting still wave');
+});
+
+test('greeting waves honour the 25 s cooldown and never stack', () => {
+  const d = new Director({ random: seq(0.5) });
+  assert.ok(names(d.heard(0, 'hello')).includes('wave'));
+  assert.ok(!names(d.heard(1, 'hi again')).includes('wave'), 'no stacking mid-wave');
+  d.tick(3.0);   // wave finished
+  assert.ok(!names(d.heard(10, 'hello??')).includes('wave'), 'cooldown blocks after the gesture');
+  assert.ok(names(d.heard(26, 'hello again')).includes('wave'), 'cooldown expired');
+  // requestWave is the same social wave: respects cooldown, no double-stack
+  const d2 = new Director({ random: seq(0.5) });
+  assert.ok(names(d2.requestWave(0)).includes('wave'));
+  assert.deepEqual(d2.requestWave(1), [], 'no stacking while the wave runs');
+  d2.tick(3);
+  assert.deepEqual(d2.requestWave(10), [], 'cooldown applies to requestWave too');
+  assert.ok(names(d2.requestWave(26)).includes('wave'));
+});
+
+test('requestWave marks activity so the return-wave logic stands down', () => {
+  const d = new Director({ random: seq(0.5) });
+  d.status(0, 'idle');
+  d.requestWave(5);
+  d.tick(6);  // wave done by 5 + 2.4? no: still running at 6; finish it
+  d.tick(8);
+  const acts = d.tick(600 + 8);   // 10 min later
+  assert.ok(acts.some((a) => a.name === 'wave' || a.type === 'gesture'), 'return wave still fires when idle');
+});

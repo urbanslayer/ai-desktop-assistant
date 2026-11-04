@@ -80,16 +80,21 @@
     import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
     import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from '@pixiv/three-vrm-animation';
     import { Director } from './js/director.js';
-    import { vowelWeights } from './js/gestures.js';
+    import { GESTURES, vowelWeights, sampleGesture, mirrorPose } from './js/gestures.js';
     import { AvatarMotion } from './js/motion.js';
 
     // desktop.py opens this page with ?desktop=1: see-through background, no click-to-start,
     // and the whole body in frame. In a normal browser it looks like it always did.
     const DESKTOP = new URLSearchParams(location.search).has('desktop');
     // Headless visual QA hook (?capture=2,10,30): POST a PNG of the canvas to
-    // /capture?t=<sec> that many seconds after she woke up. Nothing else
-    // changes; see tests / the capture harness in $TMPDIR/riko-anim-frames.
+    // /capture?t=<sec> and the pose metrics (window.rikoMeasure) to
+    // /measure?t=<sec> that many seconds after she woke up. Nothing else
+    // changes; the harness is client/tools/capture_frames.py.
     const CAPTURE = new URLSearchParams(location.search).get('capture');
+    // QA hook (?force=think@0,wave@12): silence the director and play the named
+    // built-in gesture(s) at the given seconds after she woke up, so poses can
+    // be photographed and measured at exact times.
+    const FORCE = new URLSearchParams(location.search).get('force');
     if (DESKTOP) {
       // Both elements paint a white background by default; on HTML it is not covered
       // by the body rule, and Qt would happily show that white as an opaque box.
@@ -243,7 +248,8 @@
         console.warn('gesture action failed', a && a.type, a && a.name, e);
       }
     }
-    const feed = (actions) => { if (vrm) for (const a of actions) applyAction(a); };
+    // In ?force= mode the director is silenced: only the forced gestures move her.
+    const feed = (actions) => { if (FORCE || !vrm) return; for (const a of actions) applyAction(a); };
     // re-issue whatever was running after a persona swap (new bones, new clips)
     function resumeLife() {
       const g = director.gesture;
@@ -260,18 +266,99 @@
     }
     feed(director.start(T()));
 
-    // ── visual QA capture: PNGs at fixed seconds after she woke up ──
+    // ── visual QA capture: PNGs (and pose metrics) at fixed seconds after wake ──
     window.rikoCapture = () => renderer.domElement.toDataURL('image/png');
+    // Pose metrics against the REAL rig. The chin point is defined here and
+    // used by client/tools/capture_frames.py acceptance checks:
+    //   anchor = head-bone world position + head-local (0, -0.08, +0.04)
+    //   chin   = midpoint(head, anchor)   (~8 cm below the head origin, forward)
+    // dist(hand, chin) and dist(leftHand, rightLowerArm-origin = right elbow)
+    // are the think checks; wave reads handY - shoulderY and the lateral x of
+    // the right hand across the oscillation; z vs chest.z flags a limb sunk
+    // into the torso (the character faces +z in this page).
+    window.rikoMeasure = () => {
+      if (!vrm) return null;
+      const names = ['hips', 'spine', 'chest', 'upperChest', 'neck', 'head',
+                     'leftShoulder', 'rightShoulder', 'leftUpperArm', 'rightUpperArm',
+                     'leftLowerArm', 'rightLowerArm', 'leftHand', 'rightHand'];
+      const bones = {};
+      for (const n of names) {
+        const b = vrm.humanoid.getNormalizedBoneNode(n);
+        bones[n] = b ? b.getWorldPosition(new THREE.Vector3()).toArray() : null;
+      }
+      const h = bones.head;
+      if (!h) return { bones, chin: null, metrics: null };
+      const hq = vrm.humanoid.getNormalizedBoneNode('head')
+        .getWorldQuaternion(new THREE.Quaternion());
+      const off = new THREE.Vector3(0, -0.08, 0.04).applyQuaternion(hq);
+      const chin = [h[0] + off.x / 2, h[1] + off.y / 2, h[2] + off.z / 2];
+      const d = (a, b) => (a && b ? Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) : null);
+      return {
+        t: performance.now() / 1000, bones, chin,
+        metrics: {
+          handToChin: d(bones.rightHand, chin),
+          leftHandToRightElbow: d(bones.leftHand, bones.rightLowerArm),
+          handAboveShoulderY: bones.rightHand[1] - bones.rightShoulder[1],
+          handAboveHeadY: bones.rightHand[1] - bones.head[1],
+          handZ_vs_chestZ: bones.rightHand[2] - bones.chest[2],
+          elbowZ_vs_chestZ: bones.rightLowerArm[2] - bones.chest[2],
+          handX: bones.rightHand[0],
+          ...(window.__waveTrack && Number.isFinite(window.__waveTrack.min) ? {
+            waveLateralSwing: window.__waveTrack.max - window.__waveTrack.min,
+            wavePeakAboveShoulderY: window.__waveTrack.peakY,
+          } : {}),
+        },
+      };
+    };
+    // calibration helper: slap a gesture's pose onto the bones right now
+    window.rikoPreview = (name, t) => {
+      if (!vrm) return;
+      const pose = mirrorPose(sampleGesture(name, t), motion.vrm1);
+      motion._applyPose(pose, 1, Object.keys(pose));
+    };
+    if (FORCE) {
+      for (const item of String(FORCE).split(',')) {
+        const [name, at = '0'] = item.trim().split('@');
+        if (!GESTURES[name]) continue;
+        setTimeout(() => motion.playGesture(name), Math.max(0, Number(at) || 0) * 1000);
+      }
+      // Per-frame tracker for the wave acceptance numbers (a 4-frame
+      // snapshot cadence would miss the oscillation extremes):
+      // lateral x swing of the right hand + peak height over the shoulder.
+      window.__waveTrack = { min: Infinity, max: -Infinity, peakY: -Infinity };
+      const _vp = new THREE.Vector3(), _vs = new THREE.Vector3();
+      const trackWave = () => {
+        const g = motion.gesture;
+        // only inside the oscillation window (after the blend-in) so the
+        // reported swing width is the wave itself, not the arm going up
+        if (g && g.name === 'wave' && g.t > 0.5 && vrm) {
+          const hb = vrm.humanoid.getNormalizedBoneNode('rightHand');
+          const sb = vrm.humanoid.getNormalizedBoneNode('rightShoulder');
+          if (hb && sb) {
+            const p = hb.getWorldPosition(_vp), s = sb.getWorldPosition(_vs);
+            const w = window.__waveTrack;
+            w.min = Math.min(w.min, p.x); w.max = Math.max(w.max, p.x);
+            w.peakY = Math.max(w.peakY, p.y - s.y);
+          }
+        }
+        requestAnimationFrame(trackWave);
+      };
+      requestAnimationFrame(trackWave);
+    }
     if (CAPTURE) {
       const wokeAt = performance.now();
       for (const s of String(CAPTURE).split(',').map(Number).filter((n) => n > 0)) {
         setTimeout(async () => {
           try {
             await new Promise((r) => requestAnimationFrame(r));  // a rendered frame in the buffer
-            const t = (performance.now() - wokeAt) / 1000;
-            await fetch(`/capture?t=${t.toFixed(2)}`, {
+            const t = ((performance.now() - wokeAt) / 1000).toFixed(2);
+            await fetch(`/capture?t=${t}`, {
               method: 'POST', headers: { 'Content-Type': 'text/plain' },
               body: window.rikoCapture(),
+            });
+            await fetch(`/measure?t=${t}`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(window.rikoMeasure()),
             });
           } catch { /* harness gone; whatever it captured is captured */ }
         }, s * 1000);
@@ -336,6 +423,8 @@
     const control = (cmd) => fetch(`/control/${cmd}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
     }).catch(() => {});
+    // The W shortcut / riko-ctl 'wave': ask the director for a social wave.
+    function requestWave() { feed(director.requestWave(T())); }
     function openInput() {
       input.classList.add('show');
       input.focus();
@@ -404,6 +493,7 @@
       e.preventDefault();
       if (action === 'type') openInput();
       else if (action === 'talk') { talkHeld = true; control('talk-start'); }
+      else if (action === 'wave') requestWave();
       else if (action === 'persona_next') control('persona-next');
       else if (action === 'hide') control('hide');
       else if (action === 'quit') control('quit');
@@ -430,7 +520,8 @@
       control(ok ? 'approve' : 'deny');
     }
 
-    window.riko = { openInput, closeInput, motion, director };  // desktop.py calls these; motion/director are for debugging and the smoke test
+    window.riko = { openInput, closeInput, requestWave, motion, director,
+                    measure: () => window.rikoMeasure() };  // desktop.py calls these; motion/director/measure are for debugging, riko-ctl wave and the smoke test
 
     // ── Ask Python for her next line and UI events, tell it when a clip is done ──
     voice.onended = voice.onerror = () => fetch('/done', { method: 'POST' });
@@ -441,10 +532,11 @@
         feed(director.status(T(), ev.state));
       } else if (ev.type === 'say') {
         flash(bubble, ev.text, (ev.seconds || 0) + BUBBLE_SECONDS);
-        feed(director.say(T(), { emotion: ev.emotion || 'neutral', seconds: ev.seconds || 0 }));
+        feed(director.say(T(), { emotion: ev.emotion || 'neutral',
+                                 seconds: ev.seconds || 0, text: ev.text || '' }));
       } else if (ev.type === 'heard') {
         flash(heard, ev.text, 6);
-        feed(director.heard(T()));
+        feed(director.heard(T(), ev.text || ''));
       } else if (ev.type === 'error') {
         flash(bubble, ev.text, 6, 'error');
         feed(director.error(T()));

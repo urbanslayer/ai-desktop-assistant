@@ -26,38 +26,87 @@ export const POSE_BONES = [
   'hips', 'spine', 'chest', 'upperChest', 'neck',
   'leftShoulder', 'leftUpperArm', 'leftLowerArm', 'leftHand',
   'rightShoulder', 'rightUpperArm', 'rightLowerArm', 'rightHand',
+  // right-hand fingers (the think pose curls them onto the chin; rigs
+  // without finger bones just keep an open hand, nothing else breaks)
+  'rightThumbProximal',
+  'rightIndexProximal', 'rightIndexIntermediate',
+  'rightMiddleProximal', 'rightMiddleIntermediate',
+  'rightRingProximal', 'rightRingIntermediate',
+  'rightLittleProximal', 'rightLittleIntermediate',
 ];
 
 const REST_L_UPPER = -1.3;
 const REST_R_UPPER = 1.3;
 
-// name -> { loop, duration (s), keys: [{t, bones}], osc?: {bone, axis, base, amp, freq, from, until} }
+/** Curled right hand (hand-on-chin): proximal + intermediate joints bent,
+ *  thumb resting on the jaw. `c` scales the curl (finger taps vary it). */
+function curlRightHand(c = 1) {
+  const bend = (v) => [0, v * c, 0];
+  return {
+    rightThumbProximal: bend(0.55),
+    rightIndexProximal: bend(0.95), rightIndexIntermediate: bend(1.05),
+    rightMiddleProximal: bend(1.0), rightMiddleIntermediate: bend(1.1),
+    rightRingProximal: bend(0.95), rightRingIntermediate: bend(1.0),
+    rightLittleProximal: bend(0.85), rightLittleIntermediate: bend(0.9),
+  };
+}
+
+// name -> { loop, duration (s), keys: [{t, bones}], osc?: {bone, axis, base, amp, freq, from, until} | osc[] }
 // axis index into the [x,y,z] triplets below.
 export const GESTURES = {
-  // Greeting: right arm up beside the head, forearm swinging side to side.
+  // Greeting: right arm up beside the head with the hand above it, palm to
+  // the camera, wrist flapping while the arm rocks side to side (hand
+  // travels > 0.06 m laterally, > 0.15 m above the shoulder). Measured
+  // against sample_avatar.vrm: hand ~0.23 m above the shoulder at rest of
+  // the osc, ~0.13 m above the head bone.
   wave: {
     loop: false, duration: 2.4,
     keys: [
       { t: 0.0, bones: {} },
-      { t: 0.45, bones: { rightUpperArm: [-0.15, 0, -0.45], rightLowerArm: [0, 1.35, 0],
-                          rightHand: [0, 0, -0.25], neck: [0, 0, 0.06] } },
-      { t: 1.9, bones: { rightUpperArm: [-0.15, 0, -0.45], rightLowerArm: [0, 1.35, 0],
-                         rightHand: [0, 0, -0.25], neck: [0, 0, 0.06] } },
+      { t: 0.45, bones: { rightUpperArm: [-0.25, 0, -1.0], rightLowerArm: [0, 1.5, 0],
+                          rightHand: [0.35, 0, 0], neck: [0.05, 0, 0.1] } },
+      { t: 1.9, bones: { rightUpperArm: [-0.25, 0, -1.0], rightLowerArm: [0, 1.5, 0],
+                         rightHand: [0.35, 0, 0], neck: [0.05, 0, 0.1] } },
       { t: 2.4, bones: {} },
     ],
-    osc: { bone: 'rightLowerArm', axis: 1, base: 1.35, amp: 0.4, freq: 1.8, from: 0.55, until: 2.05 },
+    osc: [
+      { bone: 'rightHand', axis: 2, base: 0.35, amp: 0.6, freq: 1.5, from: 0.5, until: 2.05 },
+      { bone: 'rightUpperArm', axis: 2, base: -1.0, amp: 0.32, freq: 1.5, from: 0.5, until: 2.05 },
+    ],
   },
 
-  // Hand to chin, weight shifting, until the reply arrives (director loops it).
+  // Classic thinker, measured on sample_avatar.vrm: right elbow tucked low
+  // at her side in front of the ribs, resting on the left hand which lies
+  // palm-up across the waist; forearm angled up so the curled right hand
+  // touches the chin (hand bone within 0.06 m of the chin anchor, left hand
+  // within 0.06 m of the right elbow, nothing behind the chest plane). The
+  // hand is held the whole loop (entry/exit handled by the gesture blend);
+  // the pose breathes through a finger half-tap and a head micro-tilt at
+  // mid-loop. motion.js biases the gaze up-and-aside while this loops.
   think: {
     loop: true, duration: 4.0,
     keys: [
-      { t: 0.0, bones: { leftUpperArm: [-0.25, 0, -1.75], leftLowerArm: [0, -2.2, 0],
-                         leftHand: [0.2, 0, 0], neck: [0.1, 0, 0.05], spine: [0.02, 0, 0] } },
-      { t: 2.0, bones: { leftUpperArm: [-0.3, 0, -1.75], leftLowerArm: [0, -2.3, 0],
-                         leftHand: [0.25, 0, 0], neck: [0.14, 0, -0.04], spine: [0.03, 0, 0.02] } },
-      { t: 4.0, bones: { leftUpperArm: [-0.25, 0, -1.75], leftLowerArm: [0, -2.2, 0],
-                         leftHand: [0.2, 0, 0], neck: [0.1, 0, 0.05], spine: [0.02, 0, 0] } },
+      { t: 0.0, bones: {
+          rightUpperArm: [-1.2, 0.49, 1.8], rightLowerArm: [0.53, 2.47, -0.06],
+          rightShoulder: [-0.12, -0.45, 0.09], rightHand: [1.26, 0.16, 1.21],
+          ...curlRightHand(1),
+          leftUpperArm: [-0.22, -0.19, -1.6], leftLowerArm: [0.2, -1.76, -0.2],
+          leftShoulder: [-0.11, -0.28, 0],
+          neck: [0.05, -0.08, 0.12], spine: [0.02, 0, 0] } },
+      { t: 2.0, bones: {
+          rightUpperArm: [-1.2, 0.49, 1.8], rightLowerArm: [0.53, 2.47, -0.06],
+          rightShoulder: [-0.12, -0.45, 0.09], rightHand: [1.26, 0.16, 1.21],
+          ...curlRightHand(0.7),   // slow finger half-tap
+          leftUpperArm: [-0.22, -0.19, -1.6], leftLowerArm: [0.2, -1.76, -0.2],
+          leftShoulder: [-0.11, -0.28, 0],
+          neck: [0.07, -0.1, 0.14], spine: [0.03, 0, 0.01] } },  // head micro-tilt
+      { t: 4.0, bones: {
+          rightUpperArm: [-1.2, 0.49, 1.8], rightLowerArm: [0.53, 2.47, -0.06],
+          rightShoulder: [-0.12, -0.45, 0.09], rightHand: [1.26, 0.16, 1.21],
+          ...curlRightHand(1),
+          leftUpperArm: [-0.22, -0.19, -1.6], leftLowerArm: [0.2, -1.76, -0.2],
+          leftShoulder: [-0.11, -0.28, 0],
+          neck: [0.05, -0.08, 0.12], spine: [0.02, 0, 0] } },
     ],
   },
 
@@ -245,20 +294,22 @@ export function samplePose(name, t) {
 }
 
 /**
- * Like samplePose but with the gesture's oscillator folded in (the wave's
- * forearm swing). `t` is the same time as for samplePose.
+ * Like samplePose but with the gesture's oscillator(s) folded in (the wave's
+ * wrist flap + arm rock). `osc` may be one oscillator or an array of them.
+ * `t` is the same time as for samplePose.
  */
 export function sampleGesture(name, t) {
   const pose = samplePose(name, t);
   const g = GESTURES[name];
   if (!g || !g.osc) return pose;
-  const o = g.osc;
-  if (t < o.from || t > o.until) return pose;
-  // ease the wobble in and out over its window so it never snaps
-  const edge = clamp(Math.min(t - o.from, o.until - t) / 0.25, 0, 1);
-  const wob = Math.sin((t - o.from) * o.freq * Math.PI * 2) * o.amp * smoothstep(edge);
-  const rot = pose[o.bone] || (pose[o.bone] = [0, 0, 0]);
-  rot[o.axis] += wob;
+  for (const o of (Array.isArray(g.osc) ? g.osc : [g.osc])) {
+    if (t < o.from || t > o.until) continue;
+    // ease the wobble in and out over its window so it never snaps
+    const edge = clamp(Math.min(t - o.from, o.until - t) / 0.25, 0, 1);
+    const wob = Math.sin((t - o.from) * o.freq * Math.PI * 2) * o.amp * smoothstep(edge);
+    const rot = pose[o.bone] || (pose[o.bone] = [0, 0, 0]);
+    rot[o.axis] += wob;
+  }
   return pose;
 }
 

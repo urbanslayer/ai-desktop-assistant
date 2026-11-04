@@ -116,6 +116,7 @@ desktop:
   shortcuts:
     type: ["Enter", "/"]            # open the text box
     talk: "Space"                   # hold to talk, release to send
+    wave: "W"                       # she waves at you
     persona_next: "P"               # switch to the next persona
     hide: "H"                       # hide her (the tray icon brings her back)
     forget: "Ctrl+Shift+Backspace"  # forget the chat (press again within 3 s to confirm)
