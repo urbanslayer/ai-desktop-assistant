@@ -8,6 +8,7 @@
  */
 (function (root) {
   "use strict";
+  if (root.RikoSnapshot) return;  // idempotent: scripting.executeScript may re-run us
 
   const MAX_TEXT = 8000;        // readable text cap per read
   const MAX_ELEMENTS = 120;     // interactive elements per read

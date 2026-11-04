@@ -7,6 +7,7 @@
  */
 (function (root) {
   "use strict";
+  if (root.RikoRisk) return;  // idempotent: scripting.executeScript may re-run us
 
   // Words that mean "this click has consequences outside the page".
   const DANGER_WORDS = [

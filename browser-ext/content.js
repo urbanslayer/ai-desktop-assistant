@@ -12,6 +12,17 @@
 "use strict";
 
 (() => {
+  // Idempotency guard. The background's toTab() may scripting.executeScript us
+  // onto a page whose *declared* content script is already present (just slow
+  // to register), and a re-injection would otherwise stack a second
+  // runtime.onMessage listener -> double clicks, doubled typed text, double
+  // form submits. Declared scripts and executeScript share the same isolated
+  // world per tab, so this flag is visible to both. A re-injection is a no-op
+  // and the first injection's closure (idSeq included) keeps owning the page,
+  // so data-riko-id numbering stays stable.
+  if (window.__rikoContent) return;
+  window.__rikoContent = true;
+
   const BANNER_ID = "riko-helper-banner";
   const ID_ATTR = "data-riko-id";
   let idSeq = 0;

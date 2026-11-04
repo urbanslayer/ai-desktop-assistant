@@ -106,37 +106,63 @@ function allowed(url) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Firefox rejects tabs.sendMessage with "Could not establish connection.
+// Receiving end does not exist." when no content-script listener is registered
+// in the tab yet. That error class PROVES the command never ran in the page,
+// so re-sending it is safe (no double clicks). "Message manager closed" is the
+// frame-is-not-ready sibling (fresh tab; Firefox 157 sometimes answers this
+// before the content script even exists) — also pre-dispatch, also safe.
+// Anything else (restricted page, missing site permission) will not be fixed
+// by injecting, so it must not be retried or injected on.
+const NO_RECEIVING_END = /receiving end does not exist|could not establish connection/i;
+const PRE_DISPATCH_RETRYABLE = /message manager closed/i;
+
 async function toTab(tabId, msg) {
-  let firstError = null;
+  let lastError = null;
+  const errText = () => String((lastError && lastError.message) || lastError);
+  const retryable = () =>
+    NO_RECEIVING_END.test(errText()) || PRE_DISPATCH_RETRYABLE.test(errText());
+  const fail = () => new Error(`no access to that tab (site permission?): ${errText()}`);
+  const attempt = async () => {
+    try {
+      return { res: await browser.tabs.sendMessage(tabId, msg) };
+    } catch (e) {
+      lastError = e;
+      return null;
+    }
+  };
+  // poll for the content script instead of sleeping blind: on Firefox 157 a
+  // fresh tab's declared content script sometimes registers late
+  const poll = async (budgetMs) => {
+    const deadline = Date.now() + budgetMs;
+    for (;;) {
+      const r = await attempt();
+      if (r) return { done: true, res: r.res };
+      if (!retryable()) return { done: false, err: fail() };
+      if (Date.now() >= deadline) return { done: false };
+      await sleep(250);
+    }
+  };
+
+  let out = await poll(2500);
+  if (out.done) return out.res;
+  if (out.err) throw out.err;
+
+  if (!NO_RECEIVING_END.test(errText())) throw fail();  // not an injectable state
+  // page loaded before the extension existed: inject ONCE per call. risk.js,
+  // snapshot.js and content.js are idempotent (window-scoped guards), so
+  // racing a slow-but-present declared content script still leaves exactly
+  // one onMessage listener and stable data-riko-id numbering.
   try {
-    return await browser.tabs.sendMessage(tabId, msg);
+    await browser.scripting.executeScript({ target: { tabId },
+      files: ["lib/risk.js", "lib/snapshot.js", "content.js"] });
   } catch (e) {
-    firstError = e;
-    // a page that loaded seconds ago may still be registering its content script
-    await sleep(400);
-    try {
-      return await browser.tabs.sendMessage(tabId, msg);
-    } catch (e2) {
-      firstError = e2;
-    }
+    lastError = e;
+    throw fail();
   }
-  // fresh page (or page loaded before the extension started): inject and retry
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      await browser.scripting.executeScript({ target: { tabId }, files:
-        ["lib/risk.js", "lib/snapshot.js", "content.js"] });
-      break;
-    } catch (injectError) {
-      firstError = injectError;
-      await sleep(500); // host permission propagation can lag tab creation
-    }
-  }
-  await sleep(200); // let the injected script finish wiring its listener
-  try {
-    return await browser.tabs.sendMessage(tabId, msg);
-  } catch (finalError) {
-    throw new Error(`no access to that tab (site permission?): ${firstError && firstError.message} / ${finalError.message}`);
-  }
+  out = await poll(2000);
+  if (out.done) return out.res;
+  throw out.err || fail();
 }
 
 const banner = (tabId, on) => browser.tabs.sendMessage(tabId, { cmd: "banner", on }).catch(() => {});
