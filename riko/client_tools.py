@@ -41,14 +41,22 @@ from riko import hub_client
 
 DEFAULT_BROWSER_PORT = 8766
 
-# Quiet host page for the extension's WebSocket (served at /link). The real
-# work is done by the extension's link_relay.js content script; this page
-# only prints the link state the relay broadcasts via postMessage.
+# Identity the extension probes for (GET /hello) before it spends a tab on
+# the link; keep in sync with pyproject.toml's version when the app ships one.
+CLIENT_NAME = "riko-desktop"
+CLIENT_VERSION = "1.0.0"
+
+# Friendly status page for the extension's WebSocket tab (served at /link).
+# The real work is done by the extension's link_relay.js content script; this
+# page only shows whether Riko is online and reassures the owner that the
+# relay reconnects by itself. When the desktop is DOWN we can't serve this at
+# all — that case is handled extension-side (no tab opens until /hello
+# answers), so this page never becomes a raw browser error page by design.
 LINK_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Riko Helper link</title>
+<title>Riko link</title>
 <style>
  body { font: 13.5px/1.6 system-ui, sans-serif; background: #14101c;
         color: #cfc6e4; display: flex; align-items: center;
@@ -60,18 +68,20 @@ LINK_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <main>
-  <h1>Riko Helper &lt;-&gt; Riko desktop</h1>
-  <p>Keep this tab open; it carries Riko's link to your Firefox.
-     Closing it just reconnects in a moment. Pause her anytime from the
-     toolbar icon.</p>
-  <div id="s">connecting…</div>
+  <h1>Riko link</h1>
+  <p>This tab keeps Riko's browser helper connected. Keep it open.
+     Closing it is fine — it reopens by itself after a minute.</p>
+  <div id="s">Riko is connecting…</div>
+  <p id="rc">If Riko goes offline this tab waits and reconnects
+     automatically; you don't have to do anything.</p>
 </main>
 <script>
  addEventListener("message", (e) => {
    const d = e.data;
    if (d && d.source === "riko-link")
      document.getElementById("s").textContent =
-       {up: "linked", down: "reconnecting…", reject: "token rejected"}[d.state] || d.state;
+       {up: "Riko is online", down: "Riko is offline — reconnecting…",
+        reject: "token rejected (fix it in the extension options)"}[d.state] || d.state;
  });
 </script>
 </body>
@@ -386,7 +396,10 @@ class BrowserBridge:
     The same port also answers GET /riko-pair with the token over plain HTTP,
     so the extension can auto-pair without the owner pasting anything (only
     localhost can reach the socket; the token still keeps *other* local
-    processes from posing as the extension after the handshake).
+    processes from posing as the extension after the handshake). GET /hello
+    (no auth, CORS *) is the extension's reachability probe: it opens the
+    /link tab only after this answers with our identity, and GET /link hosts
+    the tab itself (see LINK_PAGE).
     """
 
     def __init__(self, token, host="127.0.0.1", port=DEFAULT_BROWSER_PORT):
@@ -434,14 +447,28 @@ class BrowserBridge:
                 # dead socket for the WebSocket upgrade — handshake vanishes.
                 ("Connection", "close"),
             ]), self.token.encode())
+        if path == "/hello":
+            # Reachability probe for the extension (no auth, cross-origin):
+            # background.js only spends a tab on /link once this answers with
+            # our identity. CORS * so the moz-extension background page can
+            # read it; Connection close for the same dead-socket reason as
+            # /riko-pair above.
+            return Response(200, "OK", Headers([
+                ("Content-Type", "application/json"),
+                ("Access-Control-Allow-Origin", "*"),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ]), json.dumps({"ok": True, "name": CLIENT_NAME,
+                            "version": CLIENT_VERSION}).encode())
         if path == "/link":
             # The Riko Helper extension keeps its WebSocket inside a tab on
             # this page: an http:// origin (unlike the extension's own secure
             # context, where Firefox 157 force-upgrades ws:// to wss:// and
             # never falls back). link_relay.js (content script) does the work;
-            # this page is just a quiet host with a status line.
+            # this page is a quiet host with a friendly status line.
             return Response(200, "OK", Headers([
                 ("Content-Type", "text/html; charset=utf-8"),
+                ("Access-Control-Allow-Origin", "*"),
                 ("Cache-Control", "no-store"),
                 ("Connection", "close"),
             ]), LINK_PAGE.encode())

@@ -370,15 +370,37 @@ def test_start_desktop_disabled(fake_hub, hub_connected, tmp_path, monkeypatch):
 
 def test_link_page_is_served(bridge):
     """GET /link hosts the extension's WebSocket tab (http origin, so Firefox
-    doesn't force-upgrade its ws:// to wss://). GET /riko-pair hands out the
-    token for auto-pairing."""
+    doesn't force-upgrade its ws:// to wss://) as a friendly status page.
+    GET /riko-pair hands out the token for auto-pairing."""
     import urllib.request
     with urllib.request.urlopen(f"http://127.0.0.1:{bridge.port}/link", timeout=5) as r:
         body = r.read().decode()
         assert r.headers["Content-Type"].startswith("text/html")
-    assert "Riko Helper" in body and "riko-link" in body
+        assert r.headers["Access-Control-Allow-Origin"] == "*"
+    assert "<title>Riko link</title>" in body
+    assert "keeps Riko's browser helper connected" in body
+    assert "Riko is online" in body and "reconnects" in body
+    assert "riko-link" in body           # the relay's postMessage source
     with urllib.request.urlopen(f"http://127.0.0.1:{bridge.port}/riko-pair", timeout=5) as r:
         assert r.read().decode() == "tok"
+
+
+def test_hello_probe_is_open_json_cors(bridge):
+    """GET /hello is the extension's reachability probe: no auth, JSON
+    identity, CORS * so the moz-extension background page can read it. A
+    plain urllib request carries no Authorization header — nothing to auth
+    with. The WebSocket handshake still works on the same port afterwards."""
+    import urllib.request
+    from websockets.sync.client import connect
+    with urllib.request.urlopen(f"http://127.0.0.1:{bridge.port}/hello", timeout=5) as r:
+        assert r.headers["Access-Control-Allow-Origin"] == "*"
+        assert r.headers["Content-Type"].startswith("application/json")
+        body = json.loads(r.read())
+    assert body == {"ok": True, "name": "riko-desktop",
+                    "version": client_tools.CLIENT_VERSION}
+    with connect(f"ws://127.0.0.1:{bridge.port}") as ws:     # handshake intact
+        ws.send(json.dumps({"type": "hello", "token": "tok", "name": "Probe Check"}))
+        assert json.loads(ws.recv()).get("type") == "hello_ok"
 
 
 # ── body capabilities (docs/BODY.md §1/§5) ───────────────────────────
