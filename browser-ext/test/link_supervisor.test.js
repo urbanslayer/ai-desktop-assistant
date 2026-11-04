@@ -72,6 +72,7 @@ function supervisor({ online = false, storage = {}, tabs = [] } = {}) {
              "const sleep = (ms) => new Promise((r) => { globalThis.__advance(ms); setTimeout(r, 0); });"),
     context);
   context.__advance = (ms) => { now += ms; };
+  context.__eval = (expr) => vm.runInContext(expr, context);
   const tick = async (n = 8) => {
     for (let i = 0; i < n; i += 1) await new Promise((r) => setTimeout(r, 0));
   };

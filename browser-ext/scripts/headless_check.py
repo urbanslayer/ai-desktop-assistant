@@ -3,25 +3,28 @@
 
     uv run python browser-ext/scripts/headless_check.py
 
-Starts a local test page + a stub HTTP server on the default bridge port that
-answers 404 to /hello (the desktop is DOWN), then runs Firefox itself —
-headless, TEMPORARY profile (never yours), extension temporarily installed by
-web-ext. Phase 1 proves the probe gate: within the first seconds after
-startup the extension must NOT open its link tab (no GET /link) while
-/hello refuses us; only probes are allowed. Phase 2 kills the stub, starts
-the real desktop side (riko.client_tools.BrowserBridge) on the same port, and
-waits for the supervisor's probe to succeed: the link tab
-(http://127.0.0.1:8766/link, served by the bridge) opens by itself and the
-tab's content script link_relay.js brings the WebSocket up (the tab's origin
-is http — see the wss-upgrade note in background.js). Then we drive
+Starts a local test page + a stub HTTP server on a SCRATCH port that answers
+404 to /hello (the desktop is DOWN), then runs Firefox itself — headless,
+TEMPORARY profile (never yours), extension temporarily installed by
+web-ext. The scratch port + token are seeded straight into the profile's
+extension storage file (legacy JSONFile backend, pinned via
+ExtensionStorageIDB.enabled=false), so the check never shares the default
+8766 with a live Riko desktop or the owner's running Firefox helper.
+Phase 1 proves the probe gate: within the first seconds after startup the
+extension must NOT open its link tab (no GET /link on the scratch port)
+while /hello refuses us; only probes are allowed. Phase 2 kills the stub,
+starts the real desktop side (riko.client_tools.BrowserBridge) on the same
+scratch port, and waits for the supervisor's probe to succeed: the link tab
+(http://127.0.0.1:<port>/link, served by the bridge) opens by itself and
+the tab's content script link_relay.js brings the WebSocket up (the tab's
+origin is http — see the wss-upgrade note in background.js). Then we drive
 browser_open + browser_read, one click that must come back as
 needs_confirmation (the "Buy now" danger upgrade), and one plain click.
 
-Everything on the port is OUR process: stub first, bridge after; nothing on
-the machine besides our PIDs is touched.
+Everything on the scratch port is OUR process: stub first, bridge after;
+nothing on the machine besides our PIDs is touched.
 
-Exits 0 on success, 1 on any failure, 3 if firefox/web-ext are missing or
-the default port is busy (desktop running).
+Exits 0 on success, 1 on any failure, 3 if firefox/web-ext are missing.
 """
 import functools
 import http.server
@@ -87,9 +90,10 @@ def main():
         print("SKIP: firefox and/or npx not found")
         return 3
 
-    # The extension dials its default port and auto-pairs via GET /riko-pair,
-    # so this check must own the default port.
-    ws_port = 8766
+    # Own scratch port: the fresh profile is pointed at it through the
+    # options page's auto-save query, so a live desktop on 8766 or another
+    # Firefox's helper can never join (or fake) this check.
+    ws_port = free_port()
     page_port = free_port()
     page_dir = Path(tempfile.mkdtemp(prefix="riko-testpage-"))
     (page_dir / "index.html").write_text(PAGE)
@@ -99,21 +103,26 @@ def main():
     page_url = f"http://127.0.0.1:{page_port}/index.html"
 
     profile = Path(tempfile.mkdtemp(prefix="riko-headless-profile-"))
+    # Seeding storage.local: Firefox 151 no longer reads webextensions.*
+    # prefs (managed storage moved to native manifests / policies), so we
+    # pin the legacy JSONFile storage backend and pre-create the extension's
+    # storage file ourselves. --keep-profile-changes below is REQUIRED:
+    # without it web-ext copies the profile and rewrites our files.
     (profile / "user.js").write_text(
         'user_pref("datareporting.policy.dataSubmissionEnabled", false);\n'
         'user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);\n'
-        'user_pref("dom.webnotifications.enabled", false);\n')
+        'user_pref("dom.webnotifications.enabled", false);\n'
+        'user_pref("extensions.webextensions.ExtensionStorageIDB.enabled", false);\n')
+    ext_store = profile / "browser-extension-data" / "riko-helper@riko.local"
+    ext_store.mkdir(parents=True)
+    (ext_store / "storage.js").write_text(json.dumps(
+        {"token": TOKEN, "port": ws_port}))
 
-    # desktop DOWN: our stub owns the port and refuses /hello
+    # desktop DOWN: our stub owns the scratch port and refuses /hello.
+    # The token/port ride the seeded storage file (see above), so this
+    # check never shares 8766 with a live desktop or the owner's helper.
     DownStub.hits = []
-    try:
-        stub = http.server.ThreadingHTTPServer(("127.0.0.1", ws_port), DownStub)
-    except OSError as e:
-        print(f"SKIP: can't bind {ws_port}: {e} (is the desktop running?)")
-        httpd.shutdown()
-        shutil.rmtree(profile, ignore_errors=True)
-        shutil.rmtree(page_dir, ignore_errors=True)
-        return 3
+    stub = http.server.ThreadingHTTPServer(("127.0.0.1", ws_port), DownStub)
     threading.Thread(target=stub.serve_forever, daemon=True).start()
 
     log_path = Path(os.environ.get("TMPDIR", "/tmp")) / "riko-web-ext.log"
@@ -121,7 +130,7 @@ def main():
     proc = subprocess.Popen(
         [npx, "--yes", "web-ext", "run", "--verbose", "--target", "firefox-desktop",
          "--firefox", firefox, "--firefox-profile", str(profile),
-         "--no-reload", "--args=-headless"],
+         "--keep-profile-changes", "--no-reload", "--args=-headless"],
         cwd=REPO / "browser-ext", stdout=log, stderr=subprocess.STDOUT)
 
     bridge = None
