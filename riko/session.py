@@ -56,7 +56,10 @@ class Session:
         """Open the continuous mic stream. False = broken mic (caller falls back)."""
         if self._vad is None:
             try:
-                self._vad = asr.AlwaysListener(self.submit_audio, cfg=self._vad_cfg())
+                # VAD-originated clips: no 'hearing' pill, noise-blocklist on.
+                self._vad = asr.AlwaysListener(
+                    lambda wav: self.submit_audio(wav, source="vad"),
+                    cfg=self._vad_cfg())
             except Exception as e:  # even constructing can fail (no numpy/sounddevice)
                 print(f"[listen] always-listen can't start: {e} — staying with push-to-talk")
                 return False
@@ -163,8 +166,13 @@ class Session:
         viewer.emit("heard", text=text)
         self._turns.put(("text", text))
 
-    def submit_audio(self, wav_bytes):
-        self._turns.put(("audio", wav_bytes))
+    def submit_audio(self, wav_bytes, source="ptt"):
+        """Queue a recorded clip. source='ptt' = a deliberate recording (Space,
+        Enter in the terminal); source='vad' = an always-mode segment. The turn
+        behaves differently: VAD segments show no 'hearing' pill and earn the
+        hallucination-phrase blocklist; PTT clips show it and keep real short
+        'Thank you.'s."""
+        self._turns.put(("audio", (wav_bytes, source)))
 
     def switch_persona(self, name):
         """Switch by id, name or keyword — raises HubError (404) if nothing matches.
@@ -220,7 +228,7 @@ class Session:
         if clip is None:
             viewer.emit("status", state="idle")
             return
-        self.submit_audio(clip)
+        self.submit_audio(clip, source="ptt")
 
     def talk_toggle(self):
         (self.talk_stop if self.recorder.recording else self.talk_start)()
@@ -262,12 +270,17 @@ class Session:
                         emotion="happy", actions=greet_actions)
             return
         if kind == "audio":
-            viewer.emit("status", state="hearing")
-            text = asr.transcribe(payload, self.cfg)
-            reason = asr.hallucination_reason(text, payload)
+            wav, source = payload
+            if source == "ptt":
+                # deliberate recording: the pill is honest feedback. VAD
+                # segments show nothing until the hallucination filter has
+                # spoken — TV noise must not flash 'hmm?'.
+                viewer.emit("status", state="hearing")
+            text = asr.transcribe(wav, self.cfg)
+            reason = asr.hallucination_reason(text, wav, noise_phrases=(source != "ptt"))
             if reason:  # Whisper inventing words on non-speech: drop the turn
                 print(f"[asr] ignored: {text.strip()!r} ({reason})")
-                if not text.strip() and self.listen_mode == "push_to_talk":
+                if not text.strip() and source == "ptt":
                     print("(heard nothing, try again)")
                     viewer.emit("error", text="(heard nothing, try again)")
                 return

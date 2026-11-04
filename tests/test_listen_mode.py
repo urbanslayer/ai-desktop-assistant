@@ -332,6 +332,12 @@ def test_hallucination_filter():
         assert asr.hallucination_reason(phrase, short), phrase
     assert asr.hallucination_reason("Thank you.", long) is None  # a real "thank you" can be long
     assert asr.hallucination_reason("hello there senpai", short) is None
+    # push-to-talk (noise_phrases=False): the deliberate-clip rule — a spoken
+    # "Thank you." passes, but silence/punctuation-only still drop.
+    assert asr.hallucination_reason("Thank you.", short, noise_phrases=False) is None
+    assert asr.hallucination_reason("subtitles by Person", short, noise_phrases=False) is None
+    assert asr.hallucination_reason("", short, noise_phrases=False)
+    assert asr.hallucination_reason("...!?..", short, noise_phrases=False)
 
 
 # ── appstate persistence ─────────────────────────────────────
@@ -415,6 +421,7 @@ def test_always_mode_no_listening_pill(listen_env):
     statuses = [e["state"] for e in events if e["type"] == "status"]
     assert "thinking" in statuses
     assert "listening" not in statuses, f"always mode must not show the pill: {statuses}"
+    assert "hearing" not in statuses, f"VAD segments must not flash 'hmm?': {statuses}"
     s.close()
 
 
@@ -479,6 +486,79 @@ def test_short_noise_reply_is_not_heard_as_words(listen_env, monkeypatch):
     # if the filter failed, a say would arrive; wait for it, then assert silence
     events = drain(url, want={"say"}, seconds=3.0)
     assert [e["type"] for e in events if e["type"] == "heard"] == []
+    s.close()
+
+
+def test_vad_noise_phrase_emits_no_status_at_all(listen_env, monkeypatch):
+    """The 'hmm?' fix: an ignored VAD segment must not even flash a pill —
+    no hearing, no thinking, no error; at most the worker's idle reset, so
+    the page can never be left on a stale state."""
+    cfg, url, made, _, _ = listen_env
+    cfg["desktop"] = dict(cfg["desktop"], listen_mode="always")
+    monkeypatch.setattr(asr, "transcribe", lambda wav, cfg=None: "Thank you.")
+    s = session.Session(cfg, source="desktop")
+    made[0].feed(wav_bytes(0.5, SR))  # ~1 s: the blocklist would normally eat this
+    events = drain(url, seconds=1.5)
+    types = [e["type"] for e in events]
+    assert "heard" not in types and "say" not in types and "error" not in types, types
+    statuses = [e["state"] for e in events if e["type"] == "status"]
+    assert set(statuses) <= {"idle"}, f"ignored VAD segment leaked status: {statuses}"
+    s.close()
+
+
+def test_ptt_thank_you_goes_through(listen_env, monkeypatch):
+    """A deliberate push-to-talk 'Thank you.' is real speech: the noise-phrase
+    blocklist belongs to VAD segments only."""
+    cfg, url, made, heard, _ = listen_env
+    monkeypatch.setattr(asr, "transcribe", lambda wav, cfg=None: "Thank you.")
+    s = session.Session(cfg, source="desktop")  # push-to-talk
+    s.submit_audio(wav_bytes(0.5, SR))  # the very clip the VAD path would drop
+    events = drain(url, want={"say"}, seconds=6)
+    heard_ev = [e for e in events if e["type"] == "heard"]
+    assert heard_ev and heard_ev[0]["text"] == "Thank you.", events
+    assert any(e["type"] == "say" for e in events), events  # she answered it
+    s.close()
+
+
+def test_ptt_turn_still_shows_the_hearing_pill(listen_env):
+    cfg, url, made, _, _ = listen_env
+    s = session.Session(cfg, source="desktop")
+    s.submit_audio(wav_bytes(1.2, SR))
+    events = drain(url, want={"say"}, seconds=6)
+    statuses = [e["state"] for e in events if e["type"] == "status"]
+    assert "hearing" in statuses and "thinking" in statuses, statuses
+    s.close()
+
+
+def test_vad_real_text_no_hearing_but_heard_and_thinking(listen_env):
+    """A VAD segment that passes the filter: no 'hmm?' beforehand, but the
+    normal heard -> thinking -> say flow still plays."""
+    cfg, url, made, _, _ = listen_env
+    cfg["desktop"] = dict(cfg["desktop"], listen_mode="always")
+    s = session.Session(cfg, source="desktop")
+    made[0].feed(wav_bytes(1.2, SR))
+    events = drain(url, want={"say"}, seconds=6)
+    statuses = [e["state"] for e in events if e["type"] == "status"]
+    assert "hearing" not in statuses, statuses
+    assert "thinking" in statuses, statuses
+    assert any(e["type"] == "heard" for e in events), events
+    s.close()
+
+
+def test_heard_nothing_hint_is_ptt_only(listen_env, monkeypatch):
+    """Empty transcripts drop in BOTH sources, but only the deliberate
+    push-to-talk clip earns '(heard nothing, try again)' — even in always
+    mode, where Space-held PTT rides the same submit_audio path."""
+    cfg, url, made, _, _ = listen_env
+    cfg["desktop"] = dict(cfg["desktop"], listen_mode="always")
+    monkeypatch.setattr(asr, "transcribe", lambda wav, cfg=None: "")
+    s = session.Session(cfg, source="desktop")
+    made[0].feed(wav_bytes(0.5, SR))  # VAD silence: dropped, no hint
+    s.submit_audio(wav_bytes(0.5, SR))  # PTT silence: asks again
+    events = drain(url, want={"error"}, seconds=6)
+    errors = [e for e in events if e["type"] == "error"]
+    assert len(errors) == 1 and "try again" in errors[0]["text"], events
+    assert [e for e in events if e["type"] == "heard"] == []
     s.close()
 
 

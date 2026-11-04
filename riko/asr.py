@@ -118,7 +118,8 @@ def record():
 class AlwaysListener:
     """Hands-free ears: one continuous 16 kHz mono stream, cut into utterances
     by the VAD in riko/vad.py. Each finished segment goes to on_segment(wav)
-    — the SAME path push-to-talk uses (submit_audio -> transcribe -> turn).
+    — the SAME path push-to-talk uses (submit_audio -> transcribe -> turn),
+    tagged source='vad' so the turn can tell VAD noise from a deliberate clip.
 
     Deliberately silent to the UI: the point of always mode is that there is
     no listening indicator, so this never emits a 'listening' status.
@@ -291,15 +292,21 @@ _SUBS_LINE = re.compile(r"subt?itles? (?:by|readings? by)|captioned? (?:by|in)",
 NOISE_HALLUCINATION_MAX_SECONDS = 1.5  # only short segments are "noise"
 
 
-def hallucination_reason(text, wav_bytes):
+def hallucination_reason(text, wav_bytes, noise_phrases=True):
     """Why this transcript is probably Whisper inventing words: a reason str,
     or None when the text looks real. Empty/punctuation-only always count;
-    the classic word-hallucinations only on short (< ~1.5 s) segments."""
+    the classic word-hallucinations only on short (< ~1.5 s) segments.
+
+    noise_phrases=False skips the classic-phrase/subtitles blocklist: a
+    deliberate push-to-talk "Thank you." is a real sentence, not a hallucination.
+    Only VAD segments (TV noise) should ever drop those."""
     t = (text or "").strip()
     if not t:
         return "no words"
     if not any(c.isalnum() for c in t):
         return "punctuation only"
+    if not noise_phrases:
+        return None
     seconds = 0.0
     try:
         seconds = sf.info(io.BytesIO(wav_bytes)).duration
