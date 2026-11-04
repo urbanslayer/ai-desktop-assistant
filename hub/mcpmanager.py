@@ -40,6 +40,59 @@ BACKOFF_MAX_S = 60.0
 WATCHDOG_S = 2.0                 # ping cadence once ready (detect a dead server)
 PING_TIMEOUT_S = 10.0
 DEFAULT_CALL_TIMEOUT_S = 60
+MAX_PROMPT_CHARS_PER_SERVER = 1500   # MCP Prompts -> system prompt caps
+MAX_PROMPT_TOTAL_CHARS = 3000
+
+# ${NAME} secret placeholders in server env/header VALUES (docs/API.md
+# "MCP servers"): expanded from the hub process environment at connect time,
+# never stored, logged or returned expanded. Only strict env-var names count;
+# anything else stays literal text.
+ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+ENV_PLACEHOLDER_AT = re.compile(r"\$\{[A-Z][A-Z0-9_]{0,63}\}")  # match(v, i) anchors at i
+
+HA_SPEECH_HINT = ("Home Assistant: when you talk to the owner about devices, "
+                  "speak device names naturally ('the kitchen light'), never "
+                  "entity ids like light.kitchen.")
+
+
+class MissingEnvError(RuntimeError):
+    """A ${NAME} placeholder in an env/header value names a variable that is
+    not set in the hub process environment. Message = 'missing env NAME' —
+    the NAME only, never a value."""
+
+
+def expand_env_placeholders(value: str) -> str:
+    """Expand ${NAME} in one env/header value from os.environ.
+    Unknown-name formats stay literal; a valid name that is not set raises
+    MissingEnvError (which carries the NAME, never a value)."""
+    def repl(m):
+        name = m.group(1)
+        if not ENV_NAME_RE.match(name):
+            return m.group(0)  # not an env-var name: literal text
+        got = os.environ.get(name)
+        if got is None:
+            raise MissingEnvError(f"missing env {name}")
+        return got
+    return ENV_PLACEHOLDER_RE.sub(repl, str(value))
+
+
+def expand_env_map(mapping: dict | None) -> dict[str, str]:
+    return {str(k): expand_env_placeholders(v) for k, v in (mapping or {}).items()}
+
+
+def is_env_template(value) -> bool:
+    """True when the value is pure literal text plus ${NAME} placeholders —
+    i.e. the secret itself lives in the hub environment, so the stored text
+    is safe to show on the API/page instead of the masked bool."""
+    v = str(value or "")
+    found, i = False, v.find("$")
+    while i != -1:
+        m = ENV_PLACEHOLDER_AT.match(v, i)
+        if not m:
+            return False
+        found, i = True, v.find("$", m.end())
+    return found
 
 # ── lazy SDK import ──────────────────────────────────────────────────────
 _SDK: dict | None = None
@@ -143,6 +196,12 @@ def validate_servers(raw_servers, previous: list | None) -> list[dict]:
                                      "never or null")
                 perms[str(tname)[:80]] = str(perm)
             srv["tool_permissions"] = perms
+        dp = raw.get("default_permission")
+        if dp is not None and str(dp) != "":
+            if str(dp) not in PERM_VALUES:
+                raise ValueError(f"server '{name}' default_permission must be "
+                                 "always, ask, never or null")
+            srv["default_permission"] = str(dp)
         if "timeout" in raw:
             try:
                 num = int(raw["timeout"])
@@ -157,12 +216,15 @@ def validate_servers(raw_servers, previous: list | None) -> list[dict]:
 
 def public_servers(servers: list[dict]) -> list[dict]:
     """GET shape: env/header VALUES are write-only — keys are listed with a
-    `true`/`false` "is set" flag instead of the value."""
+    `true`/`false` "is set" flag instead of the value. A value that is pure
+    literal text + ${NAME} placeholders (is_env_template) is not a secret
+    (the secret lives in the hub environment), so its raw text is shown."""
     out = []
     for s in servers:
         pub = {k: v for k, v in s.items() if k not in ("env", "headers")}
-        pub["env"] = {k: bool(v) for k, v in (s.get("env") or {}).items()}
-        pub["headers"] = {k: bool(v) for k, v in (s.get("headers") or {}).items()}
+        for key in ("env", "headers"):
+            pub[key] = {k: (v if is_env_template(v) else bool(v))
+                        for k, v in (s.get(key) or {}).items()}
         out.append(pub)
     return out
 
@@ -212,9 +274,61 @@ def _cfg_hash(srv: dict) -> str:
     return hashlib.sha256(json.dumps(srv, sort_keys=True).encode()).hexdigest()
 
 
+HA_TOOL_VERBS = {
+    # keys are the tool name WITHOUT the domain prefix (real HA names are
+    # e.g. intent__HassTurnOn, light__HassLightSet, assist_satellite__HassBroadcast)
+    "HassTurnOn": "turning on",
+    "HassTurnOff": "turning off",
+    "HassLightSet": "setting the light",
+    "HassClimateSetTemperature": "setting the temperature of",
+    "HassSetPosition": "setting the position of",
+    "HassStopMoving": "stopping",
+    "HassCancelAllTimers": "cancelling the timers of",
+    "HassMediaPause": "pausing",
+    "HassMediaUnpause": "resuming",
+    "HassMediaStop": "stopping",
+    "HassMediaNext": "skipping ahead on",
+    "HassMediaPrevious": "going back on",
+    "HassSetVolume": "setting the volume of",
+}
+
+
+def ha_base_tool(tool: str) -> str:
+    """Real HA names its MCP tools '<domain>__<Name>'; match the bare name."""
+    return str(tool).rsplit("__", 1)[-1]
+
+
+def is_ha_tool(server: str, tool: str) -> bool:
+    base = ha_base_tool(tool)
+    return (server == "homeassistant" or base.startswith("Hass")
+            or base == "GetLiveContext")
+
+
+def progress_label(server: str, tool: str, args: dict) -> str:
+    """Readable tool-progress label. Home Assistant's assist tools get a
+    plain-English phrase built from their args ('turning on Kitchen light');
+    everything else falls back to 'using <server>: <tool>'."""
+    if is_ha_tool(server, tool):
+        base = ha_base_tool(tool)
+        args = args if isinstance(args, dict) else {}
+        name = str(args.get("name") or "").strip()
+        area = str(args.get("area") or "").strip()
+        target = name or (f"the {area}" if area else "")
+        if base == "GetLiveContext":
+            return "checking the house"
+        if base == "HassBroadcast":
+            spot = name or area   # 'announcing to upstairs', not 'to the upstairs'
+            return ("announcing" + (f" to {spot}" if spot else ""))[:100]
+        verb = HA_TOOL_VERBS.get(base, "")
+        if verb and target:
+            return f"{verb} {target}"[:100]
+        return "using Home Assistant"
+    return f"using {server}: {tool}"
+
+
 class _Runtime:
-    __slots__ = ("cfg", "cfg_hash", "state", "error", "tools", "last_ok",
-                 "task", "stop", "attempt", "client", "lock")
+    __slots__ = ("cfg", "cfg_hash", "state", "error", "tools", "prompt_text",
+                 "last_ok", "task", "stop", "attempt", "client", "lock")
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -222,6 +336,7 @@ class _Runtime:
         self.state = "disabled" if not cfg.get("enabled") else "starting"
         self.error = ""
         self.tools: list[dict] = []
+        self.prompt_text = ""       # MCP Prompts text (no-arg), capped
         self.last_ok = ""
         self.task: asyncio.Task | None = None
         self.stop: asyncio.Event | None = None
@@ -309,13 +424,16 @@ class MCPManager:
         if sdk is None:
             raise RuntimeError(UNAVAILABLE_MSG)
         cfg = rt.cfg
+        # ${NAME} placeholders expand from the hub process environment at
+        # connect time ONLY: the stored config, the API and the page keep
+        # the raw text, and the expanded value is never logged or returned.
         if cfg["transport"] == "stdio":
-            env = {**os.environ, **{str(k): str(v) for k, v in (cfg.get("env") or {}).items()}}
+            env = {**os.environ, **expand_env_map(cfg.get("env"))}
             server = sdk["StdioServerParameters"](command=cfg["command"],
                                                   args=list(cfg.get("args") or []),
                                                   env=env)
         else:
-            headers = {str(k): str(v) for k, v in (cfg.get("headers") or {}).items()} or None
+            headers = expand_env_map(cfg.get("headers")) or None
             http_client = sdk["create_mcp_http_client"](headers=headers) \
                 if headers else None
             server = sdk["streamable_http_client"](
@@ -360,6 +478,71 @@ class MCPManager:
             })
         rt.tools = tools
 
+    async def _refresh_prompts(self, rt: _Runtime) -> None:
+        """Fetch this server's no-argument MCP Prompts once per (re)connect;
+        their text rides the system prompt (prompt_notes). Servers without
+        prompt support answer with a method error — that just means no text.
+        Resources are NOT auto-read: live state tools cover that."""
+        rt.prompt_text = ""
+        try:
+            listing = await rt.client.list_prompts()
+        except Exception:
+            return
+        blocks: list[str] = []
+        for p in getattr(listing, "prompts", None) or []:
+            pname = str(getattr(p, "name", "") or "")
+            args = getattr(p, "arguments", None) or []
+            if not pname or any(getattr(a, "required", False) for a in args):
+                continue  # templated prompts need arguments we cannot supply
+            try:
+                got = await rt.client.get_prompt(pname)
+            except Exception:
+                continue
+            parts = []
+            for msg in getattr(got, "messages", None) or []:
+                content = getattr(msg, "content", None)
+                if getattr(content, "type", "") == "text":
+                    txt = str(getattr(content, "text", "") or "").strip()
+                    if txt:
+                        parts.append(txt)
+            if not parts:
+                continue
+            desc = str(getattr(got, "description", "") or
+                       getattr(p, "description", "") or "").strip()
+            head = f"[{pname}] {desc}".strip()
+            blocks.append((head + "\n" if head else "") + "\n".join(parts))
+        rt.prompt_text = "\n\n".join(blocks)[:MAX_PROMPT_CHARS_PER_SERVER]
+
+    def prompt_notes(self, offered_names: list[str] | None = None) -> str:
+        """The tools-block addendum: 'Instructions from <server>:' texts for
+        ready servers whose tools are on offer, plus the Home Assistant
+        speech hint. Capped per server at fetch time and in total here."""
+        offered = set(offered_names) if offered_names is not None else None
+        blocks: list[str] = []
+        used = 0
+        ha_offered = False
+        for name, rt in list(self._servers.items()):
+            if rt.state != "ready" or not rt.cfg.get("enabled"):
+                continue
+            avail = [t for t in rt.tools
+                     if offered is None or t["model_name"] in offered]
+            if not avail:
+                continue
+            if name == "homeassistant" or any(
+                    is_ha_tool(name, t["name"]) for t in avail):
+                ha_offered = True
+            if not rt.prompt_text:
+                continue
+            block = f"Instructions from {name}:\n{rt.prompt_text}"
+            room = MAX_PROMPT_TOTAL_CHARS - used - (2 if blocks else 0)
+            if room <= 0:
+                break
+            blocks.append(block[:room])
+            used += min(len(block), room) + (2 if len(blocks) > 1 else 0)
+        if ha_offered:
+            blocks.append(HA_SPEECH_HINT)
+        return "\n\n".join(blocks)
+
     async def _serve(self, name: str, rt: _Runtime) -> None:
         while not self._shutdown:
             stop = asyncio.Event()
@@ -369,6 +552,7 @@ class MCPManager:
                 async with client:
                     rt.client = client
                     await self._refresh_tools(rt)
+                    await self._refresh_prompts(rt)
                     rt.state, rt.error = "ready", ""
                     rt.last_ok, rt.attempt = now_iso(), 0
                     # hold: until stop, checking liveness with a ping
@@ -394,7 +578,10 @@ class MCPManager:
                 if self._shutdown:
                     break
                 rt.state = "error"
-                rt.error = f"{type(e).__name__}: {e}"[:300]
+                # MissingEnvError already reads 'missing env NAME' — names
+                # only, never a value (the class prefix would only hurt)
+                rt.error = (str(e) if isinstance(e, MissingEnvError)
+                            else f"{type(e).__name__}: {e}")[:300]
                 if self.events is not None:
                     try:
                         self.events.publish("mcp_server_error", server=name,
@@ -403,6 +590,7 @@ class MCPManager:
                         pass
             finally:
                 rt.client = None
+                rt.prompt_text = ""
             if self._shutdown or stop.is_set():
                 # a restart poke: reconnect right away, backoff reset
                 continue
@@ -461,8 +649,9 @@ class MCPManager:
                     parameters=t["input_schema"], source="mcp", risk=t["risk"],
                     run=run,
                     label=(lambda s=server, tl=t["name"]: lambda args:
-                           f"using {s}: {tl}")(),
+                           progress_label(s, tl, args))(),
                     permission_override=str(perms.get(t["name"], "")),
+                    permission_default=str(rt.cfg.get("default_permission") or ""),
                 ))
         return specs
 
@@ -480,7 +669,9 @@ class MCPManager:
                              "server": rt.cfg["name"],
                              "permission_override":
                                  str((rt.cfg.get("tool_permissions") or {})
-                                     .get(t["name"], ""))})
+                                     .get(t["name"], "")),
+                             "permission_default":
+                                 str(rt.cfg.get("default_permission") or "")})
         return rows
 
     def status(self, servers: list[dict]) -> list[dict]:

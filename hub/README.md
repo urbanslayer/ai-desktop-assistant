@@ -52,6 +52,7 @@ check hits `/api/health` every 30 s; `docker compose ps` shows the status.
 | `RIKO_LLM_BASE_URL` / `RIKO_LLM_API_KEY` / `RIKO_LLM_MODEL` | `""` / `""` / `auto` | OpenAI-compatible LLM defaults |
 | `RIKO_TTS_BASE_URL` / `RIKO_TTS_ENABLED` | `http://breeze-tts:8137` / `1` | Breeze-TTS-2; empty URL = voice off |
 | `RIKO_SEARXNG_URL` | empty (web_search off) | SearXNG backend for `web_search`, e.g. `http://192.0.2.101:8989` |
+| `RIKO_HA_URL` + `RIKO_HA_TOKEN` | empty (off) | built-in `homeassistant` MCP server: HA base URL + long-lived access token; both set enables `…/api/mcp/assist` (README "Home Assistant") |
 | `RIKO_ALLOW_PRIVATE_FETCH` | `0` | `1` lets `fetch_page` reach private/loopback IPs (SSRF guard off) |
 | `RIKO_HUB_DATA` / `RIKO_HUB_HOST` / `RIKO_HUB_PORT` (in-container) | `/data` / `0.0.0.0` / `8002` | baked into the image; compose pins them, see `.env.example` |
 

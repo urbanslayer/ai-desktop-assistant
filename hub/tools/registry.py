@@ -32,6 +32,10 @@ class ToolSpec:
     # explicit per-tool permission from the tool's own source (MCP servers
     # carry tool_permissions per server); wins over the settings map
     permission_override: str = ""
+    # soft per-source default (MCP server `default_permission`, e.g. the
+    # Home Assistant preset's "always"): loses to an explicit settings entry,
+    # beats the risk-based fallback
+    permission_default: str = ""
 
 
 def full_tool_name(kind: str, name: str) -> str:
@@ -45,10 +49,12 @@ def full_tool_name(kind: str, name: str) -> str:
 
 
 def permission_for(name: str, source: str, risk: str, permissions: dict,
-                   override: str = "") -> str:
+                   override: str = "", default: str = "") -> str:
     """Effective permission for a tool name under the saved permissions map.
     `override` (e.g. an MCP server's own tool_permissions entry) wins over
-    the map; both only apply when the value is a real permission."""
+    the map; both only apply when the value is a real permission. `default`
+    (e.g. an MCP server's default_permission) is the soft floor: it loses to
+    an explicit map entry but beats the risk-based fallback."""
     if override in PERMISSIONS:
         return override
     explicit = str((permissions or {}).get(name) or "")
@@ -56,6 +62,8 @@ def permission_for(name: str, source: str, risk: str, permissions: dict,
         return explicit
     if source == "hub":
         return "always"
+    if default in PERMISSIONS:
+        return default
     return "always" if risk == "read" else "ask"
 
 

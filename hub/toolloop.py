@@ -156,7 +156,8 @@ def execute_call(call: dict, by_name: dict, permissions: dict, cap: int,
 
     if spec is not None and error is None:
         perm = permission_for(spec.name, spec.source, spec.risk, permissions,
-                              getattr(spec, "permission_override", ""))
+                              getattr(spec, "permission_override", ""),
+                              getattr(spec, "permission_default", ""))
         label = _label_for(spec, args)
     # announce BEFORE running: long-poll watchers show in-flight tools
     events.publish("tool_started", call_id=call_id, tool=name, label=label)

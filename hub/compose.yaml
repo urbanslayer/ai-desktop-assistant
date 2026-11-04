@@ -29,6 +29,13 @@ services:
       # to private/loopback addresses (SSRF guard off; trusted LAN only).
       RIKO_SEARXNG_URL: "${RIKO_SEARXNG_URL:-}"
       RIKO_ALLOW_PRIVATE_FETCH: "${RIKO_ALLOW_PRIVATE_FETCH:-0}"
+      # Home Assistant (README "Home Assistant"): RIKO_HA_URL is the HA base
+      # URL, RIKO_HA_TOKEN the long-lived access token. Both set = the hub
+      # offers the built-in 'homeassistant' MCP server (…/api/mcp/assist).
+      # The token never enters the database: the server config only carries
+      # the ${RIKO_HA_TOKEN} placeholder, expanded at connect time.
+      RIKO_HA_URL: "${RIKO_HA_URL:-}"
+      RIKO_HA_TOKEN: "${RIKO_HA_TOKEN:-}"
     volumes:
       # hub.db + avatars live here on the host; back this folder up to move her brain
       - ./data:/data

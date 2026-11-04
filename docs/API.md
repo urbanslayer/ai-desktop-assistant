@@ -922,7 +922,8 @@ every configured server reports `state: "unavailable"` with error
 `"mcp package not installed"`.
 
 Server shape (in `settings.mcp.servers`; the whole list is replaced on every
-`PUT`, values of `env`/`headers` are **write-only**):
+`PUT`, values of `env`/`headers` are **write-only** — with one exception, the
+`${NAME}` placeholders below):
 
 ```json
 {"name": "time",                     // [a-z0-9_-]{1,32}, unique
@@ -932,25 +933,54 @@ Server shape (in `settings.mcp.servers`; the whole list is replaced on every
  "url": "http://127.0.0.1:8931/mcp", // http only (http/https)
  "headers": {"X-Key": "***"},   // http only; extra request headers
  "enabled": true,
+ "default_permission": "always",     // optional soft default for this server's
+                                     // tools: always|ask|never (empty = per
+                                     // tool risk); beaten by tool_permissions
+                                     // and the global tools.permissions map
  "tool_permissions": {"delete_file": "never"},     // per *server-side* tool name,
                                                    // always|ask|never; beats the
                                                    // global tools.permissions map
  "timeout": 60}                      // per-call seconds, ≥ 1
 ```
 
+**`${NAME}` placeholders in `env`/`headers` values** are secrets-by-
+reference: at connect time the hub expands `${NAME}` from its own process
+environment (names must match `^[A-Z][A-Z0-9_]{0,63}$`; anything else stays
+literal). A missing variable puts the server in
+`state: "error"` with `error: "missing env NAME"` — names only, never a
+value — and the rest of the hub keeps running. The expanded value is never
+stored, logged or returned: `GET /api/settings` keeps exactly what you saved.
+A value that is pure literal text + placeholders (e.g.
+`Bearer ${RIKO_HA_TOKEN}`) is **not masked** on reads, because the raw
+template holds no secret; a value with any real characters in it masks as
+the usual write-only bool. This is how the Home Assistant token stays in
+`~/AI/Docker/riko-hub/.env` and out of the database and the web page.
+
 How the tools join the loop:
 
 - Model-facing name is **`mcp_<server>__<tool>`** (sanitized to
-  `[A-Za-z0-9_-]{1,64}`), e.g. `mcp_time__get_current_time`.
+  `[A-Za-z0-9_-]{1,64}`), e.g. `mcp_time__get_current_time`. Home
+  Assistant's own domain prefixes survive: `intent__HassTurnOn` becomes
+  `mcp_homeassistant__intent__HassTurnOn`.
 - Risk comes from the server's tool annotations: `readOnlyHint` → `read`
-  (offered `always`), `destructiveHint` → `danger`, otherwise `act` (offered
-  `ask`). `tool_permissions` above overrides per tool; `never` hides the tool
-  entirely. `ask` approvals ride the same `__approval__` client channel as
-  client tools.
+  (offered `always`), `destructiveHint` → `danger`, otherwise `act`. The
+  permission ladder per tool: `tool_permissions` override → saved global
+  `tools.permissions` → the server's `default_permission` → risk default
+  (`always` for `read`, else `ask`). `never` hides the tool entirely. `ask`
+  approvals ride the same `__approval__` client channel as client tools.
+- **Prompts travel too**: on (re)connect the hub fetches each ready server's
+  MCP Prompts that need no arguments (`list_prompts`/`get_prompt`) and
+  appends them to the system prompt as `Instructions from <server>:` blocks
+  (≤ 1500 chars per server, ≤ 3000 total). Servers without prompt support,
+  or with only templated prompts, are silently skipped. Resources are not
+  auto-read — live-state tools cover that.
 - Calls appear in `/api/tools`, `/api/tools/log` (`source: "mcp"`) and the
-  events stream (`tool_started` with label `using <server>: <tool>`); results
-  are capped at `max_result_chars` and wrapped as untrusted like everything
-  else. `tools.enabled: false` turns MCP tools off too.
+  events stream (`tool_started` with label `using <server>: <tool>`, or a
+  readable phrase for Home Assistant tools, e.g. `turning on Kitchen light`
+  from `intent__HassTurnOn` args `name`/`area`, `checking the house` for
+  `GetLiveContext`); results are capped at `max_result_chars` and wrapped as
+  untrusted like everything else. `tools.enabled: false` turns MCP tools off
+  too.
 - Lifecycle: connecting happens on a dedicated MCP event loop; a dead or
   silent server is retried with exponential backoff, the tool list refreshes
   on (re)connect and on `notifications/tools/list_changed` when supported,
@@ -978,6 +1008,44 @@ answers `422` — a broken server never bricks chat. In Docker, stdio servers
 run **inside the hub container**: `uvx` and `npx` are installed there and
 their caches are writable under `/data` (see `hub/README.md`); an http server
 pointing at the host needs a host-reachable URL.
+
+### Built-in Home Assistant server (`RIKO_HA_URL` + `RIKO_HA_TOKEN`)
+
+When both `RIKO_HA_URL` and `RIKO_HA_TOKEN` are set in the hub's environment
+(the compose file passes them through from `~/AI/Docker/riko-hub/.env`) and
+nothing named `homeassistant` is saved in settings, the hub offers a
+built-in MCP server for Home Assistant's official **Model Context Protocol
+Server** integration:
+
+```json
+{"name": "homeassistant", "transport": "http", "enabled": true,
+ "url": "<RIKO_HA_URL>/api/mcp/assist",
+ "headers": {"Authorization": "Bearer ${RIKO_HA_TOKEN}"},
+ "default_permission": "always"}
+```
+
+- `/api/mcp/assist` is the integration's *Device control* endpoint: the same
+  tools HA Assist has (`intent__HassTurnOn`, `light__HassLightSet`,
+  `homeassistant__GetLiveContext`, …), restricted to the entities you
+  exposed under **Settings > Voice assistants > Expose**. The integration's
+  main endpoint `/api/mcp` exposes more; add it as a normal MCP server by
+  hand if you want it.
+- `default_permission: "always"` matches the owner's call: Riko is the
+  voice assistant and HA is the hands — whatever you exposed, she may use
+  without asking. Per-tool `tool_permissions` still wins, so you can pin
+  anything to `ask` or `never`.
+- Env-default semantics like every other settings block: the row shows
+  `mcp_source: {"servers": "env"}`, editing or disabling it on **Settings >
+  MCP** saves your version (source flips to `saved`), and
+  `POST /api/settings/reset {"mcp": true}` returns to the env default.
+- The Assist integration also publishes an MCP **Prompt** with Assist's
+  instructions; the hub picks it up automatically (see *Prompts travel too*
+  above), so Riko gets the same guidance Assist uses, plus a standing hint
+  to speak device names naturally, never entity ids.
+- The token never enters the database or the web page: the saved header is
+  the literal text `Bearer ${RIKO_HA_TOKEN}`; only the hub process, which
+  reads `RIKO_HA_TOKEN` from its own environment at connect time, ever sees
+  the value.
 
 ## Events long-poll
 

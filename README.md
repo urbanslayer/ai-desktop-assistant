@@ -50,6 +50,7 @@ Her head — personas, memory, which LLM to think with — is a small server cal
 | 🗣️ **Speaks** | Her voice lives on the **hub**: [Breeze-TTS-2](https://github.com/HoppouAI/Breeze-TTS-2.cpp) makes every persona sound different, designed from a text description or cloned from a short clip, all edited on the hub's web page. Clients just download the WAV — no TTS keys on your PC. (English and Chinese only; the weights and audio are non-commercial.) Prefer TTS on this PC? `tts: openai`, `sovits` or `fish` still work; `tts: none` shows a speech bubble instead. She never reads URLs or markdown aloud: the voice gets a cleaned *speech text* of the reply while links, code and details stay on screen. |
 | 💃 **Shows up** | A VRM avatar in your browser: she blinks, breathes, looks around, follows your pointer, lip-syncs actual vowel shapes, waves hello, thinks with a hand on her chin and wears her emotion — see [Her animation](#animation). Drag to spin her around, right-drag to move her, scroll to zoom. |
 | 🪟 **Lives on your desktop** | On Linux she can also run as a small borderless, transparent, always-on-top window, no browser involved: `uv run desktop.py` ([Desktop pet](#desktop-pet)). |
+| 🏠 **Controls your home** | Hook the hub up to [Home Assistant](#home-assistant) and she turns on lights, sets the thermostat and checks the house — through HA's official MCP integration, with only the entities you expose. |
 | 🎭 **Becomes anyone** | Multiple **personas** on the hub — personality, avatar, greeting and voice each. Switch from her web page, the tray menu, or `riko-ctl persona asuka`; she changes her whole body live, no reload. |
 | ✅ **Tells you what's missing** | Before she starts, a quick check catches a missing key, server or file and tells you how to fix it. |
 
@@ -309,6 +310,24 @@ llm:
 ```
 
 After the first start those settings live on the hub — edit them on its web page. `model: auto` means you can swap the model on the server without touching Riko. Reasoning models spend part of their budget thinking, so `max_tokens` should leave headroom (1024 is a safe default), and the clients wait up to 180 s per reply.
+
+<a id="home-assistant"></a>
+## 🏠 Home Assistant
+
+Riko can control your smart home through Home Assistant's official **Model Context Protocol Server** integration: she gets exactly the *Device control* toolset Assist has (`intent__HassTurnOn`, `light__HassLightSet`, `homeassistant__GetLiveContext`, …) over the integration's `/api/mcp/assist` endpoint, and only for the entities **you** expose. She is the voice assistant; Home Assistant is the hands — whatever you expose, she may use without asking (Settings > MCP on her page still lets you pin any tool to `ask` or `never`).
+
+1. **In Home Assistant**: Settings > Devices & services > Add integration > **Model Context Protocol Server**, configured with your Assist pipeline's LLM API. Then expose the devices she may touch: Settings > Voice assistants > **Expose**.
+2. **Create a long-lived access token**: your HA profile > Security > Long-lived access tokens. This is the only secret she needs.
+3. **On the hub machine** put both into `~/AI/Docker/riko-hub/.env` and restart:
+   ```bash
+   RIKO_HA_URL=https://homeassistant.example.com   # your HA base URL
+   RIKO_HA_TOKEN=ha_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+   ```bash
+   docker compose up -d
+   ```
+   With those two set, the hub offers a built-in `homeassistant` MCP server (Settings > MCP shows it with source *env*; edit or disable it there, reset returns it). The token itself never goes in the database, the web page or a chat — the saved header is just the text `Bearer ${RIKO_HA_TOKEN}`, expanded from the hub's environment at connect time. Set no token? MCP servers can reference any hub env var the same way: `${NAME}` in any header/env value.
+4. **Try her**: *"turn on the kitchen light"*, *"what's the temperature in the living room?"*. Progress reads like *"turning on Kitchen light"*, and she says device names out loud — never entity ids.
 
 <a id="remote-ears"></a>
 ## 👂 Remote ears

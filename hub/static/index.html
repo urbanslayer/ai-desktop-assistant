@@ -332,20 +332,30 @@
         stdio servers run inside the hub container (uvx and npx are installed there); http
         servers are streamable-HTTP URLs. Server rows save immediately — they do not wait
         for “Save settings”. env/header values are write-only: a blank value keeps the stored
-        one, deleting the line removes the key.</p>
+        one, deleting the line removes the key. A value of the form
+        <code>${NAME}</code> is not a secret: it expands from the hub's
+        environment at connect time (missing var → the server reports
+        “missing env NAME”), so such values show in plain text.</p>
       <table class="tbl" id="mtable" style="width:100%"><tbody></tbody></table>
       <div style="margin-top:8px; display:flex; gap:8px; align-items:center">
         <button class="btn small" id="mreload">Reload status</button>
         <span class="hint" id="merr"></span>
       </div>
 
-      <h3 style="margin-top:12px" id="mformtitle">Add server</h3>
+      <h3 style="margin-top:12px; display:flex; align-items:center; gap:10px">
+        <span id="mformtitle">Add server</span>
+        <button class="btn small" id="mha" title="Fill the form with the Home Assistant MCP server (/api/mcp/assist, Authorization: Bearer ${RIKO_HA_TOKEN})">Add Home Assistant</button>
+      </h3>
       <div class="row" style="max-width:640px">
         <div><label>Name ([a-z0-9_-], 1-32)</label><input id="mname" placeholder="time"></div>
         <div><label>Transport</label>
           <select id="mtransport"><option value="stdio">stdio (command)</option>
             <option value="http">http (streamable)</option></select></div>
         <div><label>Timeout s (1-600)</label><input id="mtimeout" type="number" min="1" max="600" placeholder="60"></div>
+        <div><label>Default permission</label>
+          <select id="mdefperm"><option value="">(per tool risk)</option>
+            <option value="always">always</option><option value="ask">ask</option>
+            <option value="never">never</option></select></div>
       </div>
       <label>Command (stdio) + args, space-separated</label>
       <input id="mcmd" placeholder="uvx mcp-server-time --local-timezone Australia/Sydney">
@@ -1068,10 +1078,11 @@ $("tlogreload").onclick = async () => {
 
 /* ── MCP servers panel (settings tab, docs/ROUNDS.md R2-M) ───────── */
 let mcpServers = [];    // GET /api/settings -> mcp.servers (env/header VALUES write-only)
+let mcpDefaults = [];   // GET /api/settings -> defaults.mcp.servers (env default: homeassistant)
 let mcpEditing = null;  // server name being edited (null = adding)
 
 function kvLines(obj, sep) {   // stored keys back into the textarea, values blank
-  return Object.keys(obj || {}).map((k) => k + sep + " " + (obj[k] === true ? "" : obj[k])).join("\n");
+  return Object.keys(obj || {}).map((k) => k + sep + " " + (typeof obj[k] === "boolean" ? "" : obj[k])).join("\n");
 }
 function lineKV(text, sep) {   // "KEY=value" / "Name: value" lines -> object
   const out = {};
@@ -1089,6 +1100,7 @@ async function loadMcp() {
   try {
     const s = await api("/api/settings");
     mcpServers = (s.mcp || {}).servers || [];
+    mcpDefaults = ((s.defaults || {}).mcp || {}).servers || [];
     const st = {};
     (await api("/api/mcp/status")).forEach((r) => { st[r.name] = r; });
     const ready = mcpServers.filter((sv) => (st[sv.name] || {}).state === "ready").length;
@@ -1137,6 +1149,7 @@ $("mtable").onclick = async (ev) => {
       $("mheaders").value = kvLines(sv.headers, ":");
       $("mperms").value = Object.entries(sv.tool_permissions || {})
         .map(([t, p]) => `${t} = ${p}`).join("\n");
+      $("mdefperm").value = sv.default_permission || "";
       $("mtimeout").value = sv.timeout == null ? "" : sv.timeout;
       $("menabled").checked = sv.enabled !== false;
       $("mname").scrollIntoView({ behavior: "smooth", block: "center" });
@@ -1180,6 +1193,7 @@ $("msave").onclick = async () => {
     if (!["always", "ask", "never"].includes(p)) { $("merr").textContent = `permission for '${t}' must be always, ask or never`; return; }
   }
   sv.tool_permissions = perms;
+  if ($("mdefperm").value) sv.default_permission = $("mdefperm").value;
   if ($("mtimeout").value) {
     const v = parseInt($("mtimeout").value, 10);
     if (!Number.isFinite(v) || v < 1 || v > 600) { $("merr").textContent = "timeout must be 1..600"; return; }
@@ -1200,7 +1214,29 @@ $("mcancel").onclick = () => {
   $("mcancel").hidden = true;
   $("mname").value = ""; $("mcmd").value = ""; $("murl").value = "";
   $("menv").value = ""; $("mheaders").value = ""; $("mperms").value = "";
-  $("mtimeout").value = ""; $("menabled").checked = true;
+  $("mdefperm").value = ""; $("mtimeout").value = ""; $("menabled").checked = true;
+};
+$("mha").onclick = () => {
+  // Helper: prefill the form with the Home Assistant MCP server (HA Settings
+  // > Devices & services > Add integration > "Model Context Protocol Server").
+  // The URL comes from the hub env default when RIKO_HA_URL is set; otherwise
+  // the owner types their HA base URL + /api/mcp/assist by hand.
+  const preset = mcpDefaults.find((d) => d.name === "homeassistant") || {};
+  $("merr").textContent = "";
+  $("mname").value = "homeassistant";
+  $("mtransport").value = "http";
+  $("mcmd").value = "";
+  $("murl").value = preset.url || "";
+  $("menv").value = "";
+  $("mheaders").value = "Authorization: Bearer ${RIKO_HA_TOKEN}";
+  $("mperms").value = "";
+  $("mdefperm").value = "always";
+  $("mtimeout").value = "";
+  $("menabled").checked = true;
+  $("mname").scrollIntoView({ behavior: "smooth", block: "center" });
+  $("merr").textContent = preset.url
+    ? "Home Assistant fields filled (token comes from the hub's RIKO_HA_TOKEN) — save below"
+    : "Home Assistant fields filled — set the URL and save; the token comes from the hub's RIKO_HA_TOKEN env";
 };
 
 /* ── chat test ────────────────────────────────────────────────────── */

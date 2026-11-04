@@ -94,8 +94,9 @@ TOOLS_DEFAULTS = {
     "permissions": {},        # tool name -> always | ask | never
 }
 
-# MCP settings defaults (docs/ROUNDS.md R2-M): no servers out of the box.
-MCP_DEFAULTS = {"servers": []}
+# MCP settings (docs/ROUNDS.md R2-M): no servers out of the box; the only
+# env default is the built-in Home Assistant server composed in main() from
+# RIKO_HA_URL + RIKO_HA_TOKEN (see create_app's mcp_defaults).
 
 # Long-term memory settings (docs/WALK_MEMORY.md M). No env defaults: the
 # block is exactly the built-in defaults plus what the owner saved.
@@ -143,13 +144,17 @@ def create_app(data_dir, api_key: str | None = None,
                llm_defaults: dict | None = None,
                tts_defaults: dict | None = None,
                tools_defaults: dict | None = None,
-               memory_defaults: dict | None = None) -> FastAPI:
+               memory_defaults: dict | None = None,
+               mcp_defaults: dict | None = None) -> FastAPI:
     """Build the hub app over `data_dir` (SQLite + avatars live there).
 
     api_key None/empty disables auth. llm_defaults fills any LLM settings
     field the user has not saved via PUT /api/settings (api_key included);
     saved values always win. tts_defaults / tools_defaults do the same for
-    the `tts` / `tools` settings objects (RIKO_TTS_* / RIKO_SEARXNG_URL)."""
+    the `tts` / `tools` settings objects (RIKO_TTS_* / RIKO_SEARXNG_URL).
+    mcp_defaults {"ha_url","ha_token"} (RIKO_HA_URL / RIKO_HA_TOKEN) offers
+    the built-in Home Assistant MCP server while no server named
+    'homeassistant' is saved (see mcp_servers)."""
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     avatars_dir = data_dir / "avatars"
@@ -172,6 +177,7 @@ def create_app(data_dir, api_key: str | None = None,
     tts_defaults = dict(tts_defaults or {})
     tools_defaults = dict(tools_defaults or {})
     memory_defaults = dict(memory_defaults or {})
+    mcp_defaults = dict(mcp_defaults or {})
     app = FastAPI(title="riko-hub", version=HUB_VERSION, docs_url=None, redoc_url=None)
     chat_lock = threading.Lock()  # one chat at a time; concurrent requests queue
     events = EventBus()           # GET /api events ring buffer (R1-B)
@@ -305,20 +311,41 @@ def create_app(data_dir, api_key: str | None = None,
         return merged
 
     # ── MCP settings + manager (docs/ROUNDS.md R2-M) ───────────────────
-    # settings `mcp.servers` has no env default: the list is exactly what
-    # the user saved. The manager owns one asyncio loop thread for all
-    # sessions; the hub boots fine without the mcp package (servers just
-    # report state "unavailable").
+    # settings `mcp.servers` env default: the built-in Home Assistant server
+    # when RIKO_HA_URL + RIKO_HA_TOKEN are set (mcp_defaults). The manager
+    # owns one asyncio loop thread for all sessions; the hub boots fine
+    # without the mcp package (servers just report state "unavailable").
     mcp_manager = MCPManager(events)
 
     def stored_mcp() -> dict:
         saved = store.get_json("mcp", {})
         return dict(saved) if isinstance(saved, dict) else {}
 
+    def ha_preset() -> dict | None:
+        """The built-in 'homeassistant' MCP server (HA's official Model
+        Context Protocol Server integration, /api/mcp/assist = the Assist
+        device-control toolset). Env-default semantics like the other
+        setting blocks: shown while nothing named 'homeassistant' is saved,
+        editable/disableable on the page, and reset returns to it. The
+        Authorization header keeps the ${RIKO_HA_TOKEN} placeholder — the
+        token itself stays in the hub environment, never in the database."""
+        url = str(mcp_defaults.get("ha_url") or "").strip().rstrip("/")
+        token = str(mcp_defaults.get("ha_token") or "").strip()
+        if not url or not token:
+            return None
+        return {"name": "homeassistant", "transport": "http", "enabled": True,
+                "url": url + "/api/mcp/assist",
+                "headers": {"Authorization": "Bearer ${RIKO_HA_TOKEN}"},
+                "default_permission": "always"}
+
     def mcp_servers() -> list[dict]:
         servers = stored_mcp().get("servers")
-        return [s for s in servers if isinstance(s, dict)] \
+        out = [s for s in servers if isinstance(s, dict)] \
             if isinstance(servers, list) else []
+        preset = ha_preset()
+        if preset and not any(s.get("name") == "homeassistant" for s in out):
+            out = out + [preset]
+        return out
 
     def settings_response() -> dict:
         saved = stored_llm()
@@ -333,6 +360,7 @@ def create_app(data_dir, api_key: str | None = None,
         tools_source = {k: ("saved" if k in saved_tools else "default")
                         for k in TOOLS_DEFAULTS}
         has_mcp = isinstance(stored_mcp().get("servers"), list)
+        preset = ha_preset()
         saved_memory = stored_memory()
         memory_source = {k: ("saved" if k in saved_memory else "default")
                          for k in MEMORY_DEFAULTS}
@@ -347,14 +375,15 @@ def create_app(data_dir, api_key: str | None = None,
                          "tts": default_tts(),
                          "tools": default_tools(),
                          "memory": default_memory(),
-                         "mcp": dict(MCP_DEFAULTS, servers=[]),
+                         "mcp": {"servers": public_mcp_servers([preset])
+                                 if preset else []},
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES)},
             "llm_source": source,
             "tts_source": tts_source,
             "tools_source": tools_source,
             "memory_source": memory_source,
-            "mcp_source": {k: ("saved" if has_mcp else "default")
-                           for k in MCP_DEFAULTS},
+            "mcp_source": {"servers": "saved" if has_mcp
+                           else ("env" if preset else "default")},
         }
 
     def persona_lookup() -> dict[str, str]:
@@ -827,10 +856,12 @@ def create_app(data_dir, api_key: str | None = None,
                         if permission_for(s.name, "client", s.risk, permissions) != "never":
                             specs.append(s)
                     # MCP tools (R2-M): mcp_<server>__<tool>, the manager's
-                    # per-server tool_permissions override beats the map
+                    # per-server tool_permissions override beats the map, the
+                    # per-server default_permission beats the risk fallback
                     for s in mcp_manager.tool_specs():
                         if permission_for(s.name, "mcp", s.risk, permissions,
-                                          s.permission_override) != "never":
+                                          s.permission_override,
+                                          s.permission_default) != "never":
                             specs.append(s)
                 offered_names = [s.name for s in specs if s.available]
 
@@ -867,6 +898,11 @@ def create_app(data_dir, api_key: str | None = None,
                         store.touch_facts([f["id"] for f in memory_facts])
                 if offered_names:
                     system += "\n\n" + tools_prompt(offered_names)
+                    # MCP Prompts (docs/API.md): server-provided
+                    # instructions (e.g. HA Assist's) + the HA speech hint
+                    mcp_notes = mcp_manager.prompt_notes(offered_names)
+                    if mcp_notes:
+                        system += "\n\n" + mcp_notes
 
                 max_history = int(settings.get("max_history") or 40)
                 history = store.recent_messages(pid, max_history)
@@ -1090,7 +1126,9 @@ def create_app(data_dir, api_key: str | None = None,
                 saved_mcp["servers"] = cleaned_servers
                 store.set_json("mcp", saved_mcp)
                 try:
-                    mcp_manager.sync(cleaned_servers)
+                    # sync the EFFECTIVE list: an env-defaulted Home Assistant
+                    # server stays when the saved list does not name one
+                    mcp_manager.sync(mcp_servers())
                 except Exception as e:  # never fail the save on the reconnect
                     events.publish("mcp_error", error=f"{type(e).__name__}: {e}"[:300])
         bump_state()
@@ -1505,7 +1543,9 @@ def create_app(data_dir, api_key: str | None = None,
             tools.append({**s,
                           "permission": permission_for(s["name"], "mcp", s["risk"],
                                                        permissions,
-                                                       s["permission_override"])})
+                                                       s["permission_override"],
+                                                       s.get("permission_default",
+                                                            ""))})
         return {"tools": tools, "settings": cfg, "defaults": default_tools(),
                 "status": tools_status_response(),
                 # online body set (docs/BODY.md §1): what she can do right now
@@ -1794,14 +1834,23 @@ def main():
         "allow_private_fetch": os.getenv("RIKO_ALLOW_PRIVATE_FETCH", "")
                                .strip().lower() in ("1", "true", "yes", "on"),
     }
+    # Home Assistant (docs/API.md "Home Assistant via MCP"): RIKO_HA_URL is
+    # the HA base URL, RIKO_HA_TOKEN the long-lived access token; both set =
+    # the built-in 'homeassistant' MCP server is offered. The token never
+    # enters the database — the server config only carries ${RIKO_HA_TOKEN}.
+    mcp_defaults = {
+        "ha_url": os.getenv("RIKO_HA_URL", ""),
+        "ha_token": os.getenv("RIKO_HA_TOKEN", ""),
+    }
     app = create_app(data_dir, api_key=os.getenv("RIKO_HUB_KEY") or None,
                      llm_defaults=llm_defaults, tts_defaults=tts_defaults,
-                     tools_defaults=tools_defaults)
+                     tools_defaults=tools_defaults, mcp_defaults=mcp_defaults)
     host = os.getenv("RIKO_HUB_HOST", "0.0.0.0")
     port = int(os.getenv("RIKO_HUB_PORT", "8002"))
     print(f"[hub] data={data_dir} llm={llm_defaults['base_url'] or '(not configured)'} "
           f"tts={tts_defaults['base_url'] or '(off)'} "
           f"searxng={tools_defaults['searxng_url'] or '(off)'} "
+          f"homeassistant={'on' if mcp_defaults['ha_url'] and mcp_defaults['ha_token'] else '(off)'} "
           f"mcp={'on' if mcp_available() else 'unavailable: mcp package not installed'}")
     uvicorn.run(app, host=host, port=port)
 
