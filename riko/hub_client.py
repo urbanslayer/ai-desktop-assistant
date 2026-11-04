@@ -22,10 +22,11 @@ import requests
 
 from riko.config import ROOT
 
-CHAT_TIMEOUT = 180     # reasoning models are slow
+CHAT_TIMEOUT = 300     # a turn may run tools for minutes (docs/API.md Tools)
 DEFAULT_TIMEOUT = 15
 AVATAR_TIMEOUT = 120   # a .vrm can be tens of MB
 AUDIO_TIMEOUT = 120    # the hub may still be synthesising when we ask
+LONGPOLL_TIMEOUT = 70  # GET /api/events or /clients/{id}/requests: wait + slack
 
 
 def avatar_cache_dir():
@@ -134,6 +135,45 @@ class HubClient:
         result = self._json("POST", "/api/history/import",
                             json={"persona": persona, "messages": messages, "replace": replace})
         return int(result.get("imported", 0))
+
+    # ── Events + the client-tool channel (docs/API.md, R1-B/R2-F) ──
+    def events(self, after=0, wait=25):
+        """Long-poll GET /api/events -> {events: [...], last}. Pass `last`
+        back as `next after`; an empty list just means 'nothing yet'."""
+        return self._json("GET", "/api/events",
+                          params={"after": after, "wait": wait},
+                          timeout=LONGPOLL_TIMEOUT)
+
+    def clients(self):
+        """GET /api/clients: who is online on the client-tool channel."""
+        return self._json("GET", "/api/clients")
+
+    def client_register(self, client_id, name, kind="desktop", platform="", tools=()):
+        """Publish this app's tools; the model sees them as <kind>__<name>."""
+        body = {"name": name, "kind": kind, "tools": list(tools)}
+        if platform:
+            body["platform"] = platform
+        return self._json("POST", f"/api/clients/{client_id}/register", json=body)
+
+    def client_heartbeat(self, client_id):
+        return self._json("POST", f"/api/clients/{client_id}/heartbeat", timeout=10)
+
+    def client_requests(self, client_id, wait=25):
+        """Long-poll for tool calls to run: {requests: [...], approval_timeout_s}."""
+        return self._json("GET", f"/api/clients/{client_id}/requests",
+                          params={"wait": wait}, timeout=LONGPOLL_TIMEOUT)
+
+    def client_result(self, client_id, request_id, ok=True, result=None,
+                      error="", approved=None):
+        body = {"request_id": request_id, "ok": bool(ok), "error": error or ""}
+        if result is not None:
+            body["result"] = result
+        if approved is not None:
+            body["approved"] = bool(approved)
+        return self._json("POST", f"/api/clients/{client_id}/results", json=body)
+
+    def client_unregister(self, client_id):
+        self._call("DELETE", f"/api/clients/{client_id}")
 
     # ── Voice (the hub makes the audio; docs/VOICE.md) ───────
     def tts_status(self):

@@ -34,7 +34,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from riko import asr, hub_client, shortcuts, tts, viewer
+from riko import asr, client_tools, hub_client, shortcuts, tts, viewer
 from riko.config import load_config
 from riko.session import Session
 
@@ -211,6 +211,10 @@ def main():
     tts.check(cfg)
     viewer.start(cfg)
     session = Session(cfg, source="desktop")
+    # Client-tool channel (docs/ROUNDS.md R2-F): register on the hub, run the
+    # tools it asks for, show approvals, and serve the Riko Helper Firefox
+    # extension over a local token-authenticated WebSocket.
+    runtime, browser = client_tools.start_desktop(cfg, hub_client.get())
     hub_client.start_state_poller()  # notice switches made from the web page or another PC
     active = hub_client.active_persona() or {}
     print(f"\n=== Riko desktop  |  hub: {hub.url}  |  persona: {active.get('name', '?')}"
@@ -295,6 +299,32 @@ def main():
             print("[ctl] input closed", flush=True)
         elif cmd == "status":
             return {"ok": True, "recording": session.recorder.recording, "visible": win.isVisible()}
+        elif cmd in ("approve", "deny"):
+            if runtime is None:
+                return {"ok": False, "error": "client tools are off (desktop.client.enabled: false)"}
+            return runtime.approve_hook() if cmd == "approve" else runtime.deny_hook()
+        elif cmd == "approval-pending":
+            return {"ok": True, "pending": runtime.pending_approval() if runtime else None}
+        elif cmd == "browser-status":
+            on = bool(browser and browser.connected())
+            return {"ok": True, "enabled": runtime is not None, "connected": on,
+                    "extension": browser.extension_name() if on else "",
+                    "ws_port": (d.get("client") or {}).get("browser_port",
+                                                           client_tools.DEFAULT_BROWSER_PORT)}
+        elif cmd == "browser-token":
+            return {"ok": True, "token": client_tools.browser_token(),
+                    "port": (d.get("client") or {}).get("browser_port",
+                                                        client_tools.DEFAULT_BROWSER_PORT),
+                    "connected": bool(browser and browser.connected())}
+        elif cmd == "history-import":
+            msgs = args.get("messages")
+            if not isinstance(msgs, list) or not msgs:
+                return {"ok": False, "error": 'history-import: send {"messages": [{"role","content"}, ...]}'}
+            try:
+                n = hub_client.get().import_history(msgs)
+            except hub_client.HubError as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "imported": n}
         elif cmd in ("type", "hide-input", "toggle", "show", "hide", "quit"):
             bridge.command.emit(cmd)
         else:
@@ -361,6 +391,26 @@ def main():
     tray.activated.connect(lambda reason: toggle_window() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
     if QSystemTrayIcon.isSystemTrayAvailable():
         tray.show()
+    # notify-send missing? the tool falls back to a tray bubble (and if there is
+    # no tray at all, to the terminal).
+    client_tools.set_notify_fallback(
+        lambda title, text: tray.showMessage(title, text, 8000)
+        if tray.isVisible() else print(f"[notify] {title}: {text}"))
+
+    def show_browser_token():  # the pairing token, shown in the tray as promised
+        if browser is None:
+            tray.showMessage("Riko", "browser tools are off (desktop.client.enabled: false)")
+            return
+        info = control("browser-token")
+        tray.showMessage("Riko — Firefox helper",
+                         f"token: {info['token']}\nport: {info['port']}\n"
+                         f"extension: {'connected' if info['connected'] else 'not connected'}",
+                         15000)
+
+    token_action = QAction("Show browser token", menu)
+    token_action.triggered.connect(show_browser_token)
+    menu.addAction(token_action)
+    tray.setContextMenu(menu)
 
     show_window()
     QTimer.singleShot(400, lambda: _hyprland_setup(int(d.get("width", 420)), int(d.get("height", 680)), ruled))
@@ -368,6 +418,8 @@ def main():
     code = app.exec()
     if session.recorder.recording:
         session.recorder.stop()
+    if runtime is not None:
+        runtime.stop()  # unregister from the hub's client channel
     print("Bye!")
     sys.exit(code)
 

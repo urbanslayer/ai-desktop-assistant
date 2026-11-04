@@ -18,6 +18,11 @@ dependencies = [
     "sounddevice",
     "soundfile",
     "uvicorn",
+    "websockets>=17.4",
+    # MCP client for hub local mode (docs/ROUNDS.md R2-M). Same constraint as
+    # hub/pyproject.toml; the hub imports it lazily, so local mode without it
+    # still boots — MCP just reports "unavailable".
+    "mcp",
 ]
 
 [dependency-groups]

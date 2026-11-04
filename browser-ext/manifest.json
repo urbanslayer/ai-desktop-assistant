@@ -1,0 +1,73 @@
+{
+  "manifest_version": 3,
+  "name": "Riko Helper",
+  "version": "0.1.0",
+  "description": "Lets Riko (the desktop avatar) read and drive this Firefox through the local Riko desktop app \u2014 with your approval for anything risky.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "riko-helper@riko.local",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "activeTab",
+    "alarms",
+    "local-network-access",
+    "localNetworkAccess"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "scripts": [
+      "lib/risk.js",
+      "lib/snapshot.js",
+      "background.js"
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>",
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": [
+        "lib/risk.js",
+        "lib/snapshot.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1/link*"
+      ],
+      "js": [
+        "link_relay.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Riko Helper \u2014 click to pause/resume her"
+  },
+  "options_ui": {
+    "page": "options.html"
+  },
+  "icons": {
+    "48": "icons/icon48.png",
+    "96": "icons/icon96.png"
+  }
+}
