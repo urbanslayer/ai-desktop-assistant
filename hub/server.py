@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -41,6 +42,8 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from .toolloop import run_turn
     from .tools.memory_tools import build_memory_specs
     from .tools.registry import build_hub_specs, hub_tool_info, permission_for, tools_prompt
+    from .tools import timers as _timers
+    from .scheduler import TimerScheduler, TimerPermanent
     from .store import Store, default_voice, now_iso
 except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     import body as _body  # type: ignore[no-redef]
@@ -60,6 +63,8 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     from tools.memory_tools import build_memory_specs  # type: ignore[no-redef]
     from tools.registry import (build_hub_specs, hub_tool_info,  # type: ignore[no-redef]
                                 permission_for, tools_prompt)
+    from tools import timers as _timers  # type: ignore[no-redef]
+    from scheduler import TimerScheduler, TimerPermanent  # type: ignore[no-redef]
     from store import Store, default_voice, now_iso  # type: ignore[no-redef]
 
 HUB_VERSION = "1"
@@ -158,7 +163,8 @@ def create_app(data_dir, api_key: str | None = None,
                tts_defaults: dict | None = None,
                tools_defaults: dict | None = None,
                memory_defaults: dict | None = None,
-               mcp_defaults: dict | None = None) -> FastAPI:
+               mcp_defaults: dict | None = None,
+               timers_defaults: dict | None = None) -> FastAPI:
     """Build the hub app over `data_dir` (SQLite + avatars live there).
 
     api_key None/empty disables auth. llm_defaults fills any LLM settings
@@ -191,10 +197,21 @@ def create_app(data_dir, api_key: str | None = None,
     tools_defaults = dict(tools_defaults or {})
     memory_defaults = dict(memory_defaults or {})
     mcp_defaults = dict(mcp_defaults or {})
+    timers_defaults = dict(timers_defaults or {})
     app = FastAPI(title="riko-hub", version=HUB_VERSION, docs_url=None, redoc_url=None)
-    chat_lock = threading.Lock()  # one chat at a time; concurrent requests queue
+    # one chat turn at a time PER PERSONA (docs/TIMERS.md H): a fired timer
+    # waits for its own persona's chat to free without blocking the others
+    chat_locks: dict[str, threading.Lock] = {}
+    chat_locks_guard = threading.Lock()
     events = EventBus()           # GET /api events ring buffer (R1-B)
     clients_hub = ClientHub(events)  # client-tool channel server side (R1-B)
+
+    def persona_lock_for(pid: str) -> threading.Lock:
+        with chat_locks_guard:
+            lock = chat_locks.get(pid)
+            if lock is None:
+                lock = chat_locks[pid] = threading.Lock()
+            return lock
 
     def bump_state() -> None:
         """Single choke point for state changes: version bump + event."""
@@ -360,6 +377,37 @@ def create_app(data_dir, api_key: str | None = None,
             out = out + [preset]
         return out
 
+    # ── timezone setting (docs/TIMERS.md H) — blank = server TZ ─────────
+    def stored_timezone() -> str:
+        """Saved IANA zone name, '' when unset (unset = server default)."""
+        return str(store.get_json("timezone", "") or "").strip()
+
+    def default_timezone() -> str:
+        return _timers.default_timezone_name()
+
+    def effective_timezone():
+        """ZoneInfo the hub speaks times in: saved → TZ env → UTC."""
+        return _timers.resolve_timezone(stored_timezone() or default_timezone())
+
+    def effective_timezone_name() -> str:
+        tz = effective_timezone()
+        if tz is not None:
+            return getattr(tz, "key", "") or str(tz)
+        return "UTC"
+
+    def due_at_local_from_utc_str(due_str: str) -> str:
+        """Render a stored due_at (UTC ISO) in the hub's configured zone."""
+        due = None
+        try:
+            due = datetime.strptime(str(due_str), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            try:
+                due = datetime.fromisoformat(str(due_str).replace("Z", "+00:00"))
+            except ValueError:
+                return str(due_str)
+        return _timers.to_local(due, effective_timezone())
+
     def settings_response() -> dict:
         saved = stored_llm()
         defaults = default_llm()
@@ -384,13 +432,16 @@ def create_app(data_dir, api_key: str | None = None,
             "memory": memory_settings(),
             "mcp": {"servers": public_mcp_servers(mcp_servers())},
             "switch_phrases": switch_phrases(),
+            "timezone": stored_timezone(),
+            "timezone_source": "saved" if stored_timezone() else "default",
             "defaults": {"llm": defaults_public,
                          "tts": default_tts(),
                          "tools": default_tools(),
                          "memory": default_memory(),
                          "mcp": {"servers": public_mcp_servers([preset])
                                  if preset else []},
-                         "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES)},
+                         "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES),
+                         "timezone": default_timezone()},
             "llm_source": source,
             "tts_source": tts_source,
             "tools_source": tools_source,
@@ -669,6 +720,8 @@ def create_app(data_dir, api_key: str | None = None,
             return err(409, "cannot delete the last persona")
         was_active = store.active() == persona_id
         message_ids = store.message_ids(persona_id)
+        # timers round: open timers die with the persona (docs/TIMERS.md)
+        doomed_timers = store.find_open_timers(persona_id)
         fact_ids = store.delete_persona(persona_id)
         (avatars_dir / f"{persona_id}.vrm").unlink(missing_ok=True)
         reference_path(persona_id).unlink(missing_ok=True)
@@ -677,6 +730,9 @@ def create_app(data_dir, api_key: str | None = None,
         # memory round: the persona's private notes died with it
         for fid in fact_ids:
             events.publish("memory_changed", id=fid, op="deleted")
+        # timers round: their open timers died with it too
+        for t in doomed_timers:
+            _publish_cancelled(t, "persona_deleted")
         if was_active:
             store.set_active(remaining[0])
         bump_state()
@@ -793,6 +849,296 @@ def create_app(data_dir, api_key: str | None = None,
             bump_state()
         return {"imported": len(messages)}
 
+    # ── timers (docs/TIMERS.md H) ───────────────────────────────────────
+    # The set-turn captures what the fire-turn must run with: merged LLM
+    # settings, memory settings, and the ids of the tools this turn offered.
+    # Timers speak the hub's configured timezone (saved `timezone` setting →
+    # TZ env → UTC).
+    def create_timer(persona_id: str, prompt: str, time_raw, label: str,
+                     cancel_on: list, snapshot: dict) -> dict:
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            raise ValueError("timer_error: 'prompt' is required")
+        if len(prompt) > 4000:
+            prompt = prompt[:4000]
+        if store.open_timer_count() >= _timers.MAX_PENDING_TIMERS:
+            raise ValueError(
+                f"timer_error: at most {_timers.MAX_PENDING_TIMERS} pending "
+                "timers — cancel one first")
+        tz = effective_timezone()
+        now_utc = datetime.now(timezone.utc)
+        due = _timers.parse_timer_time(time_raw, now_utc)
+        row = store.add_timer(persona_id=persona_id,
+                              label=(label or _timers.label_from_prompt(prompt))[:80],
+                              prompt=prompt,
+                              due_at=due.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                              cancel_on=cancel_on, captured=snapshot)
+        if row is None:
+            raise RuntimeError("timer_error: could not store the timer")
+        local = due if tz is None else due.astimezone(tz)
+        row["due_at_local"] = _timers.to_local(due, tz)
+        row["timezone"] = effective_timezone_name() if tz is not None else "UTC"
+        row["local_time"] = local.strftime("%Y-%m-%d %H:%M")
+        events.publish("timer_set", id=row["id"], label=row["label"],
+                       persona_id=row["persona_id"], due_at=row["due_at"],
+                       due_at_local=row["due_at_local"], cancel_on=row["cancel_on"])
+        bump_state()
+        return row
+
+    def _publish_cancelled(row: dict, reason: str) -> None:
+        events.publish("timer_cancelled", id=row["id"], label=row["label"],
+                       persona_id=row["persona_id"], reason=reason)
+
+    def cancel_timers_on_event(persona_id: str, event: str, reason: str) -> list:
+        """cancel_on hook: cancel this persona's open timers listening for
+        `event` (claimed-but-unfired rows count — the scheduler skips them
+        after it wins the persona lock)."""
+        rows = store.cancel_timer_rows(
+            [t["id"] for t in store.find_open_timers(persona_id, event)])
+        for row in rows:
+            _publish_cancelled(row, reason)
+        if rows:
+            bump_state()
+        return rows
+
+    def cancel_timer_for_persona(persona_id: str, tid, label: str) -> dict:
+        """cancel_timer tool + DELETE route core: id wins over label; label
+        matches exact (case-insensitive) first, then substring."""
+        rows = store.find_open_timers(persona_id)
+        if tid not in (None, ""):
+            try:
+                tid_i = int(tid)
+            except (TypeError, ValueError):
+                return {"error": "timer_error: id must be a number"}
+            row = next((r for r in rows if r["id"] == tid_i), None)
+            if row is None:
+                return {"error": f"timer_error: no open timer with id {tid_i}"}
+        else:
+            lab = (label or "").strip().lower()
+            matches = [r for r in rows if r["label"].lower() == lab] \
+                or [r for r in rows if lab and lab in r["label"].lower()]
+            if not matches:
+                return {"error": f"timer_error: no open timer labelled {label!r}"}
+            if len(matches) > 1:
+                return {"error": "timer_error: several open timers match that "
+                                 "label — cancel by id",
+                        "candidates": [{"id": m["id"], "label": m["label"]}
+                                       for m in matches]}
+            row = matches[0]
+        done = store.cancel_timer_rows([row["id"]])
+        for r in done:
+            _publish_cancelled(r, "tool")
+        if done:
+            bump_state()
+            return {"cancelled": row["id"], "label": row["label"]}
+        return {"error": f"timer_error: timer {row['id']} is no longer open"}
+
+    timers_api = {"create": create_timer, "cancel": cancel_timer_for_persona,
+                  "timezone": effective_timezone_name,
+                  "local": due_at_local_from_utc_str}
+
+    def fire_timer_turn(timer: dict) -> dict:
+        """Scheduler callback: run the timer prompt as a normal chat turn
+        (emotion, actions, speech, audio, memory and tools all apply), under
+        the persona lock the scheduler already holds."""
+        kind, *rest = run_chat_turn(timer["persona_id"], timer["prompt"],
+                                    "timer", True, False, timer=timer)
+        if kind == "err":
+            code, detail = rest
+            if code == 404:  # persona vanished — retrying cannot help
+                raise TimerPermanent(str(detail))
+            raise RuntimeError(f"HTTP {code}: {detail}")
+        data = rest[0]
+        return {"message_id": data["message_ids"][-1], "reply": data["reply"],
+                "speech": data["speech"], "emotion": data["emotion"],
+                "actions": data["actions"], "audio_url": data["audio_url"]}
+
+    def run_chat_turn(pid: str, text: str, source: str, speak: bool,
+                      voice_flag: bool, timer: dict | None = None):
+        """One normal chat turn for persona `pid` — the shared body of
+        POST /api/chat and of fired timers (docs/TIMERS.md: same path, so a
+        timer turn gets emotion, actions, speech, audio_url, memory and
+        tools). A timer turn runs with the SET-turn's captured settings and
+        tool ids and must not be cancelled by its own user message (the
+        cancel hook lives in post_chat, not here). Caller holds
+        persona_lock_for(pid). Returns ("ok", data) | ("err", code, detail).
+        """
+        persona = store.get_persona(pid)
+        if not persona:
+            return ("err", 404, f"no persona '{pid}'")
+        captured = (timer or {}).get("captured") or {}
+        settings = captured.get("settings") or llm_settings()
+        if not settings.get("base_url"):
+            return ("err", 503, "LLM not configured")
+
+        # offered tools: hub built-ins + online client tools, minus anything
+        # the permission table says `never` (docs/ROUNDS.md)
+        tools_cfg = tools_settings()
+        mem_cfg = captured.get("memory") or memory_settings()
+        memory_writes: list = []
+        specs: list = []
+        turn_tool_ids: list = []
+        timer_capture: dict = {"settings": settings, "memory": mem_cfg,
+                               "tool_ids": []}
+        if tools_cfg.get("enabled"):
+            permissions = tools_cfg.get("permissions") or {}
+            hub_specs = build_hub_specs(tools_cfg)
+            # memory round (docs/WALK_MEMORY.md M): remember/recall/
+            # forget_fact ride the tool loop, default permission always,
+            # and vanish when memory or tools are off
+            if mem_cfg.get("enabled"):
+                hub_specs += build_memory_specs(
+                    store, events, pid, memory_writes,
+                    auto_remember=bool(mem_cfg.get("auto_remember", True)))
+            # timers round (docs/TIMERS.md H): timer / list_timers /
+            # cancel_timer, same per-turn build as the memory tools.
+            # timer_capture is filled in once the turn's offered tool ids
+            # are known; a timer set during this turn stores it as `captured`.
+            hub_specs += _timers.build_timer_specs(store, pid, timers_api,
+                                                   lambda: timer_capture)
+            for s in hub_specs:
+                if permission_for(s.name, "hub", s.risk, permissions) != "never":
+                    specs.append(s)
+            for s in clients_hub.online_tool_specs():
+                if permission_for(s.name, "client", s.risk, permissions) != "never":
+                    specs.append(s)
+            # MCP tools (R2-M): mcp_<server>__<tool>, the manager's
+            # per-server tool_permissions override beats the map, the
+            # per-server default_permission beats the risk fallback
+            for s in mcp_manager.tool_specs():
+                if permission_for(s.name, "mcp", s.risk, permissions,
+                                  s.permission_override,
+                                  s.permission_default) != "never":
+                    specs.append(s)
+            if captured.get("tool_ids") is not None:
+                # fired timer: only the tools the set-turn had offered
+                allowed = set(captured["tool_ids"])
+                specs = [s for s in specs if s.name in allowed]
+        offered_names = [s.name for s in specs if s.available]
+        turn_tool_ids.extend(offered_names)
+        timer_capture["tool_ids"] = list(offered_names)
+
+        system = persona["system_prompt"]
+        if persona.get("emotes"):
+            system += "\n\n" + _emotion.PROMPT_RULE
+        # docs/BODY.md: the body block only when an embodied client is online
+        # AND the persona is embodied; the appearance line always (text-only
+        # chats can describe her too).
+        body_actions = clients_hub.body_actions()
+        if persona.get("embodied", True) and body_actions:
+            system += "\n\n" + _body.body_prompt(body_actions)
+            # one-line nudge when this very message asks for a gesture:
+            # cheap and raises tag compliance
+            asked_for = _body.detect_action_request(text, body_actions)
+            if asked_for:
+                system += "\n\n" + _body.request_hint(asked_for)
+        appearance = str(persona.get("appearance") or "").strip()
+        if appearance:
+            system += "\n\n" + _body.appearance_prompt(appearance)
+        if voice_flag:  # speech-recognised turn: never comment on misheard names
+            system += "\n\n" + voice_prompt(
+                [p["name"] for p in store.list_personas()])
+        # memory round: the "What you remember" block goes in even when the
+        # tool loop is off (facts stay useful as notes); the memory tools
+        # themselves only exist while tools are on.
+        memory_facts: list = []
+        if mem_cfg.get("enabled"):
+            ordered_facts = _memory.gather_facts(store, text, pid)
+            block, memory_facts = _memory.build_memory_block(
+                ordered_facts,
+                bool(mem_cfg.get("auto_remember", True)),
+                any(s.name == "remember" for s in specs),
+                int(mem_cfg.get("prompt_budget_tokens") or 600))
+            if block:
+                system += "\n\n" + block
+                store.touch_facts([f["id"] for f in memory_facts])
+        if offered_names:
+            # local-time line (docs/TIMERS.md): she speaks times in the
+            # hub's configured timezone, never in raw UTC
+            tz_now = datetime.now(effective_timezone() or timezone.utc)
+            system += "\n\n" + tools_prompt(
+                offered_names,
+                now_local=tz_now.strftime("%Y-%m-%d %H:%M"),
+                tz_name=effective_timezone_name(),
+                local_note=("" if timer is None else
+                            " A timer you set has just fired: its prompt is the "
+                            "next user message — act on it now (remind, check, "
+                            "answer); do not schedule it again unless asked"))
+            # MCP Prompts (docs/API.md): server-provided instructions
+            # (e.g. HA Assist's) + the HA speech hint
+            mcp_notes = mcp_manager.prompt_notes(offered_names)
+            if mcp_notes:
+                system += "\n\n" + mcp_notes
+
+        max_history = int(settings.get("max_history") or 40)
+        history = store.recent_messages(pid, max_history)
+        messages = ([{"role": "system", "content": system}]
+                    + [{"role": m["role"], "content": m["content"]} for m in history]
+                    + [{"role": "user", "content": text}])
+
+        events.publish("turn_started", persona=pid, source=source)
+        ctx = {"persona": pid, "events": events, "log": store.log_tool,
+               "status": tools_status, "clients": clients_hub,
+               "deadline": time.monotonic()
+                           + float(tools_cfg.get("max_seconds") or 120)}
+        try:
+            out = run_turn(brain, settings, tools_cfg, specs, messages, ctx)
+        except Exception as e:
+            return ("err", 502, f"{type(e).__name__}: {e}")
+
+        # the emotion tag never reaches the stored reply or the TTS
+        emotion, answer = _emotion.parse_emotion(out["text"])
+        # body actions are parsed from the FINAL reply only (the tool loop
+        # may have streamed several model turns)
+        answer, actions, ignored = _body.parse_actions(answer, body_actions)
+        if ignored:
+            log.info("ignored_actions persona=%s names=%s", pid, ",".join(ignored))
+        # docs/BODY.md §3 asked-for fallback: tag emission is stochastic
+        # (worse at high temperature), so an explicit request the reply
+        # forgot is added anyway; the model's own matching tag is just
+        # flagged. Only for embodied personas with a body that can play it
+        # (empty set otherwise).
+        actions = _body.apply_asked(
+            text, actions, body_actions if persona.get("embodied", True) else [])
+        tools_used = out["tools_used"]
+
+        timer_id = timer["id"] if timer else None
+        user_id = store.add_message(pid, "user", text, source, voice=voice_flag,
+                                    timer_id=timer_id)
+        # the spoken text is the cleaned reply (hub/speech.py): audio and any
+        # client-side TTS use it, the bubble keeps all of it.
+        spoken = _speech.speech_text(answer)
+        assistant_id = store.add_message(pid, "assistant", answer, source,
+                                         emotion=emotion, tools=tools_used,
+                                         actions=actions, speech=spoken,
+                                         memory_writes=memory_writes,
+                                         timer_id=timer_id)
+        bump_state()
+        # The chat never waits for audio: audio_url points at the audio route,
+        # which synthesises lazily (and caches on disk).
+        audio_url = None
+        if speak and tts_on() and (persona.get("voice") or {}).get("mode") != "off":
+            audio_url = f"/api/messages/{assistant_id}/audio"
+        finish = {"persona": pid, "message_id": assistant_id,
+                  "emotion": emotion, "actions": actions}
+        if timer:
+            # docs/TIMERS.md: a fired timer's turn_finished carries the FULL
+            # speak payload so clients can play it without another round-trip
+            finish.update(origin="timer", persona_id=pid,
+                          timer={"id": timer["id"], "label": timer["label"]},
+                          reply=answer, speech=spoken, audio_url=audio_url)
+        events.publish("turn_finished", **finish)
+        data = {"reply": answer, "persona": pid, "switched": False,
+                "emotion": emotion, "tools_used": tools_used,
+                "actions": actions, "speech": spoken,
+                "memory_writes": memory_writes,
+                "message_ids": [user_id, assistant_id],
+                "state_version": store.version(),
+                "audio_url": audio_url}
+        if timer:
+            data["timer"] = {"id": timer["id"], "label": timer["label"]}
+        return ("ok", data)
+
     @app.post("/api/chat")
     async def post_chat(request: Request):
         try:
@@ -810,176 +1156,105 @@ def create_app(data_dir, api_key: str | None = None,
         voice = bool(body.get("voice"))  # speech-recognised text (docs/API.md)
         norm = normalize_switch_text(text)
 
-        def turn():  # blocking section: store + LLM, one chat at a time
-            with chat_lock:
-                target = match_switch(norm)
-                if target:  # switch: activate, greet, store nothing
-                    if store.set_active(target):
-                        bump_state()
-                    persona = store.get_persona(target) or {}
-                    reply = persona.get("greeting") or f"{persona.get('name', target)} here."
-                    # docs/BODY.md: a switch greets with a wave when the
-                    # online body set can do it and the persona is embodied.
-                    greet_actions = (
-                        [{"name": "wave", "at": 0.0}]
-                        if persona.get("embodied", True)
-                        and "wave" in clients_hub.body_actions()
-                        else [])
-                    audio_url = None
-                    if speak and tts_on() and (persona.get("voice") or {}).get("mode") != "off":
-                        audio_url = (f"/api/personas/{target}/greeting/audio"
-                                     f"?v={persona.get('voice_version', 1)}")
-                    events.publish("turn_started", persona=target, source=source)
-                    events.publish("turn_finished", persona=target,
-                                   message_id=None, emotion=None,
-                                   actions=greet_actions)
-                    return ("ok", {"reply": reply, "persona": target, "switched": True,
-                                   "emotion": None, "tools_used": [], "actions": greet_actions,
-                                   "speech": _speech.speech_text(reply),
-                                   "message_ids": [], "state_version": store.version(),
-                                   "audio_url": audio_url})
-
-                pid = override or store.active()
-                persona = store.get_persona(pid)
-                if not persona:
-                    return ("err", 404, f"no persona '{pid}'")
-                settings = llm_settings()
-                if not settings.get("base_url"):
-                    return ("err", 503, "LLM not configured")
-
-                # offered tools: hub built-ins + online client tools, minus
-                # anything the permission table says `never` (docs/ROUNDS.md)
-                tools_cfg = tools_settings()
-                mem_cfg = memory_settings()
-                memory_writes: list = []
-                specs: list = []
-                if tools_cfg.get("enabled"):
-                    permissions = tools_cfg.get("permissions") or {}
-                    hub_specs = build_hub_specs(tools_cfg)
-                    # memory round (docs/WALK_MEMORY.md M): remember/recall/
-                    # forget_fact ride the tool loop, default permission
-                    # always, and vanish when memory or tools are off
-                    if mem_cfg.get("enabled"):
-                        hub_specs += build_memory_specs(
-                            store, events, pid, memory_writes,
-                            auto_remember=bool(mem_cfg.get("auto_remember", True)))
-                    for s in hub_specs:
-                        if permission_for(s.name, "hub", s.risk, permissions) != "never":
-                            specs.append(s)
-                    for s in clients_hub.online_tool_specs():
-                        if permission_for(s.name, "client", s.risk, permissions) != "never":
-                            specs.append(s)
-                    # MCP tools (R2-M): mcp_<server>__<tool>, the manager's
-                    # per-server tool_permissions override beats the map, the
-                    # per-server default_permission beats the risk fallback
-                    for s in mcp_manager.tool_specs():
-                        if permission_for(s.name, "mcp", s.risk, permissions,
-                                          s.permission_override,
-                                          s.permission_default) != "never":
-                            specs.append(s)
-                offered_names = [s.name for s in specs if s.available]
-
-                system = persona["system_prompt"]
-                if persona.get("emotes"):
-                    system += "\n\n" + _emotion.PROMPT_RULE
-                # docs/BODY.md: the body block only when an embodied client
-                # is online AND the persona is embodied; the appearance line
-                # always (text-only chats can describe her too).
-                body_actions = clients_hub.body_actions()
-                if persona.get("embodied", True) and body_actions:
-                    system += "\n\n" + _body.body_prompt(body_actions)
-                    # one-line nudge when this very message asks for a
-                    # gesture: cheap and raises tag compliance
-                    asked_for = _body.detect_action_request(text, body_actions)
-                    if asked_for:
-                        system += "\n\n" + _body.request_hint(asked_for)
-                appearance = str(persona.get("appearance") or "").strip()
-                if appearance:
-                    system += "\n\n" + _body.appearance_prompt(appearance)
-                if voice:  # speech-recognised turn: never comment on misheard names
-                    system += "\n\n" + voice_prompt(
-                        [p["name"] for p in store.list_personas()])
-                # memory round: the "What you remember" block goes in even
-                # when the tool loop is off (facts stay useful as notes); the
-                # memory tools themselves only exist while tools are on.
-                memory_facts: list = []
-                if mem_cfg.get("enabled"):
-                    ordered_facts = _memory.gather_facts(store, text, pid)
-                    block, memory_facts = _memory.build_memory_block(
-                        ordered_facts,
-                        bool(mem_cfg.get("auto_remember", True)),
-                        any(s.name == "remember" for s in specs),
-                        int(mem_cfg.get("prompt_budget_tokens") or 600))
-                    if block:
-                        system += "\n\n" + block
-                        store.touch_facts([f["id"] for f in memory_facts])
-                if offered_names:
-                    system += "\n\n" + tools_prompt(offered_names)
-                    # MCP Prompts (docs/API.md): server-provided
-                    # instructions (e.g. HA Assist's) + the HA speech hint
-                    mcp_notes = mcp_manager.prompt_notes(offered_names)
-                    if mcp_notes:
-                        system += "\n\n" + mcp_notes
-
-                max_history = int(settings.get("max_history") or 40)
-                history = store.recent_messages(pid, max_history)
-                messages = ([{"role": "system", "content": system}]
-                            + [{"role": m["role"], "content": m["content"]} for m in history]
-                            + [{"role": "user", "content": text}])
-
-                events.publish("turn_started", persona=pid, source=source)
-                ctx = {"persona": pid, "events": events, "log": store.log_tool,
-                       "status": tools_status, "clients": clients_hub,
-                       "deadline": time.monotonic()
-                                   + float(tools_cfg.get("max_seconds") or 120)}
-                try:
-                    out = run_turn(brain, settings, tools_cfg, specs, messages, ctx)
-                except Exception as e:
-                    return ("err", 502, f"{type(e).__name__}: {e}")
-
-                # the emotion tag never reaches the stored reply or the TTS
-                emotion, answer = _emotion.parse_emotion(out["text"])
-                # body actions are parsed from the FINAL reply only (the
-                # tool loop may have streamed several model turns)
-                answer, actions, ignored = _body.parse_actions(answer, body_actions)
-                if ignored:
-                    log.info("ignored_actions persona=%s names=%s", pid, ",".join(ignored))
-                # docs/BODY.md §3 asked-for fallback: tag emission is
-                # stochastic (worse at high temperature), so an explicit
-                # request the reply forgot is added anyway; the model's own
-                # matching tag is just flagged. Only for embodied personas
-                # with a body that can play it (empty set otherwise).
-                actions = _body.apply_asked(
-                    text, actions, body_actions if persona.get("embodied", True) else [])
-                tools_used = out["tools_used"]
-
-                user_id = store.add_message(pid, "user", text, source, voice=voice)
-                # the spoken text is the cleaned reply (hub/speech.py): audio
-                # and any client-side TTS use it, the bubble keeps all of it.
-                spoken = _speech.speech_text(answer)
-                assistant_id = store.add_message(pid, "assistant", answer, source,
-                                                 emotion=emotion, tools=tools_used,
-                                                 actions=actions, speech=spoken,
-                                                 memory_writes=memory_writes)
-                bump_state()
-                events.publish("turn_finished", persona=pid,
-                               message_id=assistant_id, emotion=emotion,
-                               actions=actions)
-                # The chat never waits for audio: audio_url points at the audio
-                # route, which synthesises lazily (and caches on disk).
+        def turn():  # blocking section: store + LLM, one turn per persona at a time
+            target = match_switch(norm)
+            if target:  # switch: activate, greet, store nothing
+                # the switch line is an owner message in the chat it was
+                # typed into — cancel_on chat.user_message timers honour it
+                old_active = store.active()
+                if old_active and old_active != target:
+                    cancel_timers_on_event(old_active, "chat.user_message",
+                                           "user_message")
+                if store.set_active(target):
+                    bump_state()
+                persona = store.get_persona(target) or {}
+                reply = persona.get("greeting") or f"{persona.get('name', target)} here."
+                # docs/BODY.md: a switch greets with a wave when the online
+                # body set can do it and the persona is embodied.
+                greet_actions = (
+                    [{"name": "wave", "at": 0.0}]
+                    if persona.get("embodied", True)
+                    and "wave" in clients_hub.body_actions()
+                    else [])
                 audio_url = None
                 if speak and tts_on() and (persona.get("voice") or {}).get("mode") != "off":
-                    audio_url = f"/api/messages/{assistant_id}/audio"
-                return ("ok", {"reply": answer, "persona": pid, "switched": False,
-                               "emotion": emotion, "tools_used": tools_used,
-                               "actions": actions, "speech": spoken,
-                               "memory_writes": memory_writes,
-                               "message_ids": [user_id, assistant_id],
-                               "state_version": store.version(),
+                    audio_url = (f"/api/personas/{target}/greeting/audio"
+                                 f"?v={persona.get('voice_version', 1)}")
+                events.publish("turn_started", persona=target, source=source)
+                events.publish("turn_finished", persona=target,
+                               message_id=None, emotion=None,
+                               actions=greet_actions)
+                return ("ok", {"reply": reply, "persona": target, "switched": True,
+                               "emotion": None, "tools_used": [], "actions": greet_actions,
+                               "speech": _speech.speech_text(reply),
+                               "message_ids": [], "state_version": store.version(),
                                "audio_url": audio_url})
+
+            pid = override or store.active()
+            if not store.persona_exists(pid):
+                return ("err", 404, f"no persona '{pid}'")
+            # docs/TIMERS.md cancel hook: an owner message in this persona's
+            # chat cancels their timers that asked to die on chat.user_message
+            # (inside the lock, so it also catches timers claimed but not yet
+            # run; a FIRED timer's own turn never runs this hook)
+            with persona_lock_for(pid):
+                cancel_timers_on_event(pid, "chat.user_message", "user_message")
+                return run_chat_turn(pid, text, source, speak, voice)
 
         kind, *rest = await run_in_threadpool(turn)
         return rest[0] if kind == "ok" else err(rest[0], rest[1])
+
+    # ── timer routes (docs/TIMERS.md H) ─────────────────────────────────
+    def timer_public(row: dict) -> dict:
+        """API view: no captured snapshot (its settings carry the api_key —
+        write-only, like GET /api/settings never returns it)."""
+        tz = effective_timezone()
+        out = {k: v for k, v in row.items() if k != "captured"}
+        out["timezone"] = effective_timezone_name()
+        try:
+            due = datetime.strptime(row["due_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
+            out["due_at_local"] = _timers.to_local(due, tz)
+        except ValueError:
+            out["due_at_local"] = row["due_at"]
+        return out
+
+    @app.get("/api/timers")
+    def get_timers(status: str = ""):
+        rows = store.list_timers()
+        if status:
+            rows = [r for r in rows if r["status"] == status]
+        return {"timers": [timer_public(r) for r in rows]}
+
+    @app.delete("/api/timers/{timer_id}")
+    def delete_timer(timer_id: int):
+        row = store.get_timer(timer_id)
+        if row is None:
+            return err(404, f"no timer {timer_id}")
+        done = store.cancel_timer_rows([timer_id])
+        if not done:
+            return err(409, f"timer {timer_id} is {row['status']}, not cancellable")
+        _publish_cancelled(done[0], "request")
+        bump_state()
+        return {"cancelled": timer_id, "label": row["label"]}
+
+    @app.post("/api/chat/read")
+    async def post_chat_read(request: Request):
+        """The client says the owner READ this persona's chat: cancels that
+        persona's timers whose cancel_on names chat.read (docs/TIMERS.md)."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        pid = str(body.get("persona_id") or "") or store.active()
+        if not store.persona_exists(pid):
+            return err(404, f"no persona '{pid}'")
+        rows = cancel_timers_on_event(pid, "chat.read", "chat_read")
+        return {"cancelled": [r["id"] for r in rows]}
+
+
 
     @app.get("/api/settings")
     def get_settings():
@@ -1148,6 +1423,17 @@ def create_app(data_dir, api_key: str | None = None,
                     mcp_manager.sync(mcp_servers())
                 except Exception as e:  # never fail the save on the reconnect
                     events.publish("mcp_error", error=f"{type(e).__name__}: {e}"[:300])
+        if "timezone" in body:
+            # docs/TIMERS.md H: the zone timer times and spoken times use.
+            # blank = unset → the server TZ (compose sets TZ).
+            tz_val = str(body["timezone"] or "").strip()
+            if not tz_val:
+                store.del_json("timezone")
+            elif not _timers.valid_timezone(tz_val):
+                return err(422, f"'{tz_val}' is not a valid IANA timezone "
+                                "(e.g. Europe/London)")
+            else:
+                store.set_json("timezone", tz_val)
         bump_state()
         return settings_response()
 
@@ -1176,11 +1462,13 @@ def create_app(data_dir, api_key: str | None = None,
             mcp_manager.sync(mcp_servers())
         if body.get("switch_phrases"):
             changed |= store.del_json("switch_phrases")
+        if body.get("timezone"):
+            changed |= store.del_json("timezone")
         if not (body.get("llm") or body.get("tts") or body.get("tools")
                 or body.get("memory") or body.get("mcp")
-                or body.get("switch_phrases")):
-            return err(422, 'set "llm", "tts", "tools", "memory", "mcp" '
-                            'and/or "switch_phrases" to true')
+                or body.get("switch_phrases") or body.get("timezone")):
+            return err(422, 'set "llm", "tts", "tools", "memory", "mcp", '
+                            '"switch_phrases" and/or "timezone" to true')
         if changed:
             bump_state()
         return settings_response()
@@ -1826,9 +2114,31 @@ def create_app(data_dir, api_key: str | None = None,
         events.publish("mcp_error", error=f"startup sync failed: "
                                           f"{type(e).__name__}: {e}"[:300])
 
+    # ── timer scheduler (docs/TIMERS.md H) ──────────────────────────────
+    # Daemon thread, claims due timers every poll_s and fires them as chat
+    # turns under the persona lock (never-interrupt). start() first resets
+    # firing->pending: a timer claimed right before a crash fires late.
+    timer_poll_s = max(1.0, float(timers_defaults.get("poll_s", 1.0)))
+    timer_retry_s = max(1.0, float(timers_defaults.get("retry_delay_s", 30.0)))
+    timer_scheduler = TimerScheduler(store, events, fire_timer_turn,
+                                     persona_lock_for,
+                                     poll_s=timer_poll_s,
+                                     retry_delay_s=timer_retry_s)
+    app.state.timer_scheduler = timer_scheduler
+    # The thread only runs for a real hub (main() passes poll_s explicitly) —
+    # test apps built via create_app() drive scheduler.tick() directly, so
+    # per-test daemon threads never pile up. A test that wants the live loop
+    # passes timers_defaults={"poll_s": ...} or {"start": True}.
+    if timers_defaults.get("start") or timers_defaults.get("poll_s") is not None:
+        timer_scheduler.start()
+
     @app.on_event("shutdown")
     async def _mcp_shutdown():
         await run_in_threadpool(mcp_manager.shutdown)
+
+    @app.on_event("shutdown")
+    async def _timers_shutdown():
+        timer_scheduler.stop()
 
     return app
 
@@ -1862,7 +2172,8 @@ def main():
     }
     app = create_app(data_dir, api_key=os.getenv("RIKO_HUB_KEY") or None,
                      llm_defaults=llm_defaults, tts_defaults=tts_defaults,
-                     tools_defaults=tools_defaults, mcp_defaults=mcp_defaults)
+                     tools_defaults=tools_defaults, mcp_defaults=mcp_defaults,
+                     timers_defaults={"poll_s": os.getenv("RIKO_TIMER_POLL_S", "1")})
     host = os.getenv("RIKO_HUB_HOST", "0.0.0.0")
     port = int(os.getenv("RIKO_HUB_PORT", "8002"))
     print(f"[hub] data={data_dir} llm={llm_defaults['base_url'] or '(not configured)'} "

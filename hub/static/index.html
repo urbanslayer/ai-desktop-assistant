@@ -106,6 +106,7 @@
     <button data-tab="personas" class="on">Personas</button>
     <button data-tab="history">History</button>
     <button data-tab="memory">Memory</button>
+    <button data-tab="timers">Timers</button>
     <button data-tab="settings">Settings</button>
     <button data-tab="chat">Chat test</button>
   </nav>
@@ -237,6 +238,22 @@
     </div>
   </section>
 
+  <!-- ──────────────────────────── timers ── -->
+  <section id="tab-timers" hidden>
+    <div class="card">
+      <h2>Timers <span class="chip" id="tcount"></span></h2>
+      <div class="row" style="align-items:end">
+        <div><label>&nbsp;</label><button class="btn" id="treloadtimers">Reload</button></div>
+      </div>
+      <div id="tlist" style="margin-top:10px"></div>
+      <p class="hint">One-shot timers she scheduled with the <b>timer</b> tool — just ask in
+        Chat ("remind me in 20 seconds to check the oven"). A fired timer arrives as a normal
+        reply marked with ⏰. cancel_on timers also die when you message her or open the chat.
+        The hub speaks times in its configured timezone (Settings → Timezone / TZ env).</p>
+      <div class="err" id="terr"></div>
+    </div>
+  </section>
+
   <!-- ──────────────────────────── settings ── -->
   <section id="tab-settings" hidden>
     <div class="card">
@@ -266,6 +283,11 @@
       <textarea id="sphrases" placeholder="switch to, change to, become, persona, talk to, i want to talk to"></textarea>
       <p class="hint">A whole chat message like “&lt;phrase&gt; &lt;persona keyword&gt;” switches persona.
         Blanking this list restores the server defaults — keywords and names always switch on their own.</p>
+
+      <h2 style="margin-top:14px">Timezone <span class="src" id="stzsrc"></span></h2>
+      <input id="stimezone" placeholder="Europe/London">
+      <p class="hint">Timer due times and every spoken time use this zone. Blank = the server's
+        own zone (the hub container's TZ). Timers round (docs/TIMERS.md).</p>
 
       <h2 style="margin-top:14px">TTS — hub voice</h2>
       <label><input type="checkbox" id="sttsenabled" style="width:auto; vertical-align:middle">
@@ -437,6 +459,7 @@ function show(tab) {
   document.querySelectorAll("main section").forEach((s) => { s.hidden = s.id !== "tab-" + tab; });
   if (tab === "history") loadHistory();
   if (tab === "memory") loadMemory();
+  if (tab === "timers") loadTimers();
   if (tab === "chat") eventsLoop();  // restart if it died (key set later, hub was down)
 }
 
@@ -454,6 +477,7 @@ async function poll() {
       $("cpersona").textContent = state.active.name;
       if (!$("tab-history").hidden && $("hauto").checked) loadHistory();
       if (!$("tab-memory").hidden) loadMemory();
+      if (!$("tab-timers").hidden) loadTimers();
     }
   } catch (e) {
     $("status").textContent = e.message.startsWith("401") ? "key needed" : "hub unreachable";
@@ -725,9 +749,12 @@ async function loadHistory() {
       (m.role === "user" && m.voice ? " · 🎤 speech-recognised" : "") +
       (m.tools_used && m.tools_used.length ? ` · tools: ${esc(m.tools_used.map((t) => t.tool).join(", "))}` : "") +
       (m.memory_writes && m.memory_writes.length ? ` · 🧠 ${esc(m.memory_writes.map((w) => w.text).join("; ").slice(0, 80))}` : "") +
+      (m.timer_id ? ` · ⏰ timer #${m.timer_id}` : "") +   // docs/TIMERS.md H chip
       `</div></div>`
     ).join("") || `<p class="hint">no history yet</p>`;
     $("htx").scrollTop = $("htx").scrollHeight;
+    // opening the chat disarms timers waiting on it (docs/TIMERS.md H)
+    api("/api/chat/read", { method: "POST", json: { persona_id: pid } }).catch(() => {});
   } catch (e) { $("herr").textContent = e.message; }
 }
 $("hclear").onclick = async () => {
@@ -840,7 +867,7 @@ $("mimport").onchange = async () => {
 };
 
 /* ── settings ─────────────────────────────────────────────────────── */
-const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "sttsbase", "sttstimeout",
+const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "stimezone", "sttsbase", "sttstimeout",
                      "stoolsteps", "stoolsecs", "stoolchars", "stsearxng", "smembudget"];
 let settingsSnap = null;    // field values as loaded — the diff base for Save
 let permSnap = {};          // saved per-tool permission overrides ("" = default)
@@ -896,6 +923,12 @@ async function loadSettings() {
     $("smembudget").value = mem.prompt_budget_tokens == null ? "" : mem.prompt_budget_tokens;
     const memsrc = s.memory_source || {};
     $("smemsrc").textContent = Object.values(memsrc).includes("saved") ? "· saved overrides" : "· defaults";
+    // Timezone (docs/TIMERS.md): show the SAVED value only (blank = fall back
+    // to the server zone, shown as the placeholder), so the diff snapshot is
+    // honest and an untouched field never re-saves the default.
+    $("stimezone").value = s.timezone_source === "saved" ? (s.timezone || "") : "";
+    $("stimezone").placeholder = ((s.defaults || {}).timezone || "UTC");
+    $("stzsrc").textContent = s.timezone_source === "saved" ? "· saved" : "· using server zone";
     loadTools();
     loadMcp();
     $("apikey").value = "";
@@ -963,6 +996,7 @@ $("ssave").onclick = async () => {
   if (changed("sphrases"))
     body.switch_phrases = now.sphrases.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
   // (an emptied list sends [] → the server resets the default phrases)
+  if (changed("stimezone")) body.timezone = now.stimezone;  // blank → server zone again
   const tts = {};
   if (changed("sttsbase")) tts.base_url = now.sttsbase;    // blank → server default again
   if (changed("sttsenabled")) tts.enabled = now.sttsenabled === "1";
@@ -1018,10 +1052,10 @@ $("skeyclear").onclick = async () => {
   } catch (e) { setSerr(e.message); }
 };
 $("sreset").onclick = async () => {
-  if (!confirm("Drop the saved LLM settings, TTS settings, tools settings, memory settings, MCP servers and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* / RIKO_SEARXNG_URL env) apply?")) return;
+  if (!confirm("Drop the saved LLM settings, TTS settings, tools settings, memory settings, MCP servers, timezone and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* / RIKO_SEARXNG_URL / TZ env) apply?")) return;
   setSerr("");
   try {
-    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, tools: true, memory: true, mcp: true, switch_phrases: true } });
+    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, tools: true, memory: true, mcp: true, timezone: true, switch_phrases: true } });
     setSerr("reset to server defaults ✔", true);
     await loadSettings(); await poll();
     await reportLlmState();
@@ -1303,7 +1337,19 @@ async function eventsLoop() {
   evRunning = false;
 }
 function applyEvent(e) {
+  if (e.type === "timer_set" || e.type === "timer_cancelled" ||
+      e.type === "timer_fired" || e.type === "timer_retry" || e.type === "timer_failed") {
+    if (!$("tab-timers").hidden) loadTimers();   // docs/TIMERS.md H live list
+  }
   if ($("tab-chat").hidden) return;
+  if (e.type === "turn_finished" && e.origin === "timer") {
+    // a timer fired while this page was watching: her proactive reply
+    addChat("ai", e.persona, "⏰ " + e.reply, e.emotion, e.actions);
+    if (e.audio_url) playInto($("ctx"), e.audio_url)
+      .catch(() => { /* voice optional mid-conversation */ });
+    $("ctx").scrollTop = $("ctx").scrollHeight;
+    return;
+  }
   if (e.type === "tool_started") {
     const d = document.createElement("div");
     d.className = "hint"; d.id = "tc-" + e.call_id;
@@ -1314,6 +1360,45 @@ function applyEvent(e) {
     if (el) el.textContent += e.ok ? ` ✔ ${e.ms} ms` : ` ✗ failed (${e.ms} ms)`;
   }
 }
+
+/* ── timers (docs/TIMERS.md H) ─────────────────────────────────────── */
+async function loadTimers() {
+  try {
+    const r = await api("/api/timers");
+    const names = {};
+    ((state && state.personas) || []).forEach((p) => { names[p.id] = p.name; });
+    const open = r.timers.filter((t) => t.status === "pending" || t.status === "firing");
+    $("tcount").textContent = open.length ? open.length + " open" : "";
+    $("terr").textContent = "";
+    $("tlist").innerHTML = r.timers.map((t) => {
+      const isOpen = t.status === "pending" || t.status === "firing";
+      return `<div class="msg ${isOpen ? "ai" : "user"}">⏰ <b>${esc(t.label || t.prompt.slice(0, 40))}</b>` +
+        ` <span class="chip">${esc(names[t.persona_id] || t.persona_id)}</span>` +
+        ` <span class="chip">${esc(t.status)}</span>` +
+        (isOpen ? ` <span class="cdown" data-due="${esc(t.due_at)}"></span>` : "") +
+        `<div class="meta">#${t.id} · due ${esc(t.due_at_local || t.due_at)}` +
+        (t.cancel_on && t.cancel_on.length ? ` · cancels on: ${esc(t.cancel_on.join(", "))}` : "") +
+        ` · ${esc(t.prompt.slice(0, 80))}` +
+        (t.error ? ` · ✗ ${esc(t.error)}` : "") + `</div>` +
+        (isOpen ? `<button class="btn small danger tcancel" data-id="${t.id}">Cancel</button>` : "") +
+        `</div>`;
+    }).join("") || `<p class="hint">no timers yet — ask her to remind you of something in Chat</p>`;
+    $("tlist").querySelectorAll(".tcancel").forEach((b) => b.onclick = async () => {
+      try { await api(`/api/timers/${b.dataset.id}`, { method: "DELETE" }); await poll(); loadTimers(); }
+      catch (e) { $("terr").textContent = e.message; }
+    });
+    tickCountdowns();
+  } catch (e) { $("terr").textContent = e.message; }
+}
+function tickCountdowns() {
+  document.querySelectorAll(".cdown").forEach((el) => {
+    const ms = new Date(el.dataset.due).getTime() - Date.now();
+    el.textContent = ms > 0 ? `due in ${Math.ceil(ms / 1000)} s`
+                            : "due now — waiting for the chat to be free";
+  });
+}
+$("treloadtimers").onclick = loadTimers;
+setInterval(() => { if (!$("tab-timers").hidden) tickCountdowns(); }, 1000);
 
 /* ── boot ─────────────────────────────────────────────────────────── */
 $("keysave").onclick = () => setKey($("hubtoken").value.trim());

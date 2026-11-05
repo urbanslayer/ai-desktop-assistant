@@ -17,7 +17,7 @@ try:  # package import (repo root) vs standalone (`python server.py` in hub/)
 except (ImportError, SystemError):  # standalone: hub/ is on sys.path
     import memory as _memory  # type: ignore[no-redef]
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Voice migration for personas written before the voice round (docs/VOICE.md):
 # a bland design-mode voice with a random seed, so they keep talking after the
@@ -111,6 +111,32 @@ END;
 CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE OF text ON facts BEGIN
   UPDATE facts_fts SET text = new.text WHERE rowid = new.id;
 END;
+"""
+
+# docs/TIMERS.md H — one-shot timers. `due_at` is UTC ISO (now_iso format);
+# `cancel_on` a JSON array of cancel events; `captured` the settings/tool_ids
+# snapshot the set-turn took (the fire turn runs with those, not the settings
+# of the moment). `status`: pending | firing | fired | cancelled | failed.
+# `firing` = the scheduler claimed it and is waiting for the persona lock
+# (never-interrupt); a restart resets firing -> pending so it fires late.
+_SCHEMA_V8 = """
+CREATE TABLE IF NOT EXISTS timers(
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  persona_id        TEXT NOT NULL,
+  label             TEXT NOT NULL DEFAULT '',
+  prompt            TEXT NOT NULL,
+  due_at            TEXT NOT NULL,
+  cancel_on         TEXT NOT NULL DEFAULT '[]',
+  captured          TEXT NOT NULL DEFAULT '{}',
+  status            TEXT NOT NULL DEFAULT 'pending',
+  created_at        TEXT NOT NULL,
+  fired_at          TEXT,
+  result_message_id INTEGER,
+  error             TEXT NOT NULL DEFAULT '',
+  retry_count       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_timers_due ON timers(status, due_at);
+CREATE INDEX IF NOT EXISTS idx_timers_persona ON timers(persona_id, status);
 """
 
 
@@ -220,6 +246,13 @@ class Store:
             cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
             if "voice" not in cols:
                 self.db.execute("ALTER TABLE messages ADD COLUMN voice INTEGER NOT NULL DEFAULT 0")
+        if version < 8:  # timers round (docs/TIMERS.md H)
+            self.db.executescript(_SCHEMA_V8)
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+            if "timer_id" not in cols:
+                # both messages of a fired timer's turn carry the timer id
+                # (⏰ chip on the web page / history)
+                self.db.execute("ALTER TABLE messages ADD COLUMN timer_id INTEGER")
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.commit()
 
@@ -347,9 +380,9 @@ class Store:
         return self.get_persona(pid)
 
     def delete_persona(self, pid: str) -> list[int]:
-        """Delete a persona, its messages and its private notes. Returns the
-        ids of the persona:<pid> facts that went away (memory round, so the
-        server can emit memory_changed for each)."""
+        """Delete a persona, its messages, its private notes and its timers.
+        Returns the ids of the persona:<pid> facts that went away (memory
+        round, so the server can emit memory_changed for each)."""
         with self._lock:
             scope = f"persona:{pid}"
             ids = [r["id"] for r in self.db.execute(
@@ -357,6 +390,7 @@ class Store:
             self.db.execute("DELETE FROM facts WHERE scope=?", (scope,))
             self.db.execute("DELETE FROM personas WHERE id=?", (pid,))
             self.db.execute("DELETE FROM messages WHERE persona=?", (pid,))
+            self.db.execute("DELETE FROM timers WHERE persona_id=?", (pid,))
             self.db.commit()
             return ids
 
@@ -385,7 +419,8 @@ class Store:
     def add_message(self, persona: str, role: str, content: str, source: str,
                     emotion: str | None = None, tools: list | None = None,
                     actions: list | None = None, speech: str = "",
-                    memory_writes: list | None = None, voice: bool = False) -> int:
+                    memory_writes: list | None = None, voice: bool = False,
+                    timer_id: int | None = None) -> int:
         """`emotion` only makes sense on assistant messages (docs/ROUNDS.md:
         null for user messages). `tools` is the compact tools_used list
         [{tool, label}] stored on the assistant reply. `actions` is the
@@ -394,17 +429,18 @@ class Store:
         `memory_writes` is [{id, text}] — facts this reply saved via the
         remember tool (docs/WALK_MEMORY.md M, the 🧠 chip). `voice` marks a
         user message that came from speech recognition (docs/API.md chat
-        `voice` field; the 🎤 chip)."""
+        `voice` field; the 🎤 chip). `timer_id` marks both messages of a
+        fired timer's turn (docs/TIMERS.md H, the ⏰ chip)."""
         with self._lock:
             cur = self.db.execute(
                 "INSERT INTO messages(persona,role,content,source,created_at,emotion,"
-                "tools,actions,speech,memory_writes,voice) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "tools,actions,speech,memory_writes,voice,timer_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (persona, role, content, source, now_iso(), emotion,
                  json.dumps(tools) if tools else "",
                  json.dumps(actions) if actions else "",
                  str(speech or ""),
                  json.dumps(memory_writes) if memory_writes else "",
-                 1 if voice else 0))
+                 1 if voice else 0, timer_id))
             self.db.commit()
             assert cur.lastrowid is not None
             return cur.lastrowid
@@ -460,6 +496,7 @@ class Store:
                 "actions": actions, "speech": speech,
                 "memory_writes": mem_writes,
                 "voice": bool(row["voice"]) if "voice" in row.keys() else False,
+                "timer_id": (row["timer_id"] if "timer_id" in row.keys() else None),
                 "created_at": row["created_at"]}
 
     def clear_messages(self, persona: str) -> int:
@@ -479,6 +516,152 @@ class Store:
         with self._lock:
             row = self.db.execute("SELECT MAX(id) AS m FROM messages").fetchone()
         return row["m"] or 0
+
+    # ── one-shot timers (docs/TIMERS.md H) ──────────────────────────────
+    @staticmethod
+    def _timer_dict(row) -> dict:
+        def _json(raw, fallback):
+            try:
+                return json.loads(raw) if raw else fallback
+            except ValueError:
+                return fallback
+        return {"id": row["id"], "persona_id": row["persona_id"],
+                "label": row["label"], "prompt": row["prompt"],
+                "due_at": row["due_at"],
+                "cancel_on": _json(row["cancel_on"], []),
+                "captured": _json(row["captured"], {}),
+                "status": row["status"], "created_at": row["created_at"],
+                "fired_at": row["fired_at"],
+                "result_message_id": row["result_message_id"],
+                "error": row["error"], "retry_count": row["retry_count"]}
+
+    def add_timer(self, persona_id: str, label: str, prompt: str,
+                  due_at: str, cancel_on: list, captured: dict) -> dict | None:
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT INTO timers(persona_id,label,prompt,due_at,cancel_on,"
+                "captured,status,created_at) VALUES(?,?,?,?,?,?,'pending',?)",
+                (persona_id, label, prompt, due_at, json.dumps(cancel_on or []),
+                 json.dumps(captured or {}), now_iso()))
+            self.db.commit()
+            tid = cur.lastrowid
+        return self.get_timer(tid) if tid is not None else None
+
+    def get_timer(self, timer_id: int) -> dict | None:
+        with self._lock:
+            row = self.db.execute("SELECT * FROM timers WHERE id=?",
+                                  (timer_id,)).fetchone()
+        return self._timer_dict(row) if row else None
+
+    def list_timers(self, persona_id: str | None = None,
+                    limit: int = 200) -> list[dict]:
+        """Open (pending/firing) rows first, soonest due first; the closed
+        ones after, newest first (the web Timers list shows the whole story)."""
+        where, args = ("WHERE persona_id=?", [persona_id]) if persona_id else ("", [])
+        with self._lock:
+            rows = self.db.execute(
+                f"SELECT * FROM timers {where} ORDER BY "
+                "(status IN ('pending','firing')) DESC, "
+                "CASE WHEN status IN ('pending','firing') THEN due_at ELSE '' END ASC, "
+                "CASE WHEN status IN ('pending','firing') THEN 0 ELSE id END DESC "
+                "LIMIT ?", args + [limit]).fetchall()
+        return [self._timer_dict(r) for r in rows]
+
+    def open_timer_count(self, persona_id: str | None = None) -> int:
+        """pending + firing (the ones a fire/retry could still consume)."""
+        with self._lock:
+            if persona_id:
+                row = self.db.execute(
+                    "SELECT COUNT(*) AS n FROM timers WHERE persona_id=? "
+                    "AND status IN ('pending','firing')", (persona_id,)).fetchone()
+            else:
+                row = self.db.execute(
+                    "SELECT COUNT(*) AS n FROM timers "
+                    "WHERE status IN ('pending','firing')").fetchone()
+        return row["n"]
+
+    def claim_due_timers(self, now_iso_str: str, limit: int = 10) -> list[dict]:
+        """Atomically move up to `limit` due pending rows to 'firing' and
+        return them. due_at and now_iso_str share the now_iso format, so the
+        string comparison is the time comparison."""
+        with self._lock:
+            ids = [r["id"] for r in self.db.execute(
+                "SELECT id FROM timers WHERE status='pending' AND due_at<=? "
+                "ORDER BY due_at LIMIT ?", (now_iso_str, limit)).fetchall()]
+            if not ids:
+                return []
+            marks = ",".join("?" * len(ids))
+            self.db.execute(
+                f"UPDATE timers SET status='firing' WHERE id IN ({marks}) "
+                "AND status='pending'", ids)
+            self.db.commit()
+            rows = self.db.execute(
+                f"SELECT * FROM timers WHERE id IN ({marks}) AND status='firing'",
+                ids).fetchall()
+        return [self._timer_dict(r) for r in rows]
+
+    def reset_firing_timers(self) -> list[dict]:
+        """Startup recovery: rows a dead scheduler claimed but never fired
+        go back to pending (they fire late — late beats never)."""
+        with self._lock:
+            ids = [r["id"] for r in self.db.execute(
+                "SELECT id FROM timers WHERE status='firing'").fetchall()]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                self.db.execute(
+                    f"UPDATE timers SET status='pending' WHERE id IN ({marks})", ids)
+                self.db.commit()
+        return [t for t in (self.get_timer(i) for i in ids) if t]
+
+    def finish_timer(self, timer_id: int, status: str,
+                     result_message_id: int | None = None,
+                     error: str = "") -> dict | None:
+        """Mark the terminal states: fired / failed."""
+        with self._lock:
+            self.db.execute(
+                "UPDATE timers SET status=?, fired_at=?, result_message_id=?, error=? "
+                "WHERE id=?",
+                (status, now_iso(), result_message_id, error[:400], timer_id))
+            self.db.commit()
+        return self.get_timer(timer_id)
+
+    def retry_timer(self, timer_id: int, due_at: str, error: str) -> dict | None:
+        """The one allowed retry: back to pending, due again in due_at."""
+        with self._lock:
+            self.db.execute(
+                "UPDATE timers SET status='pending', due_at=?, retry_count=retry_count+1, "
+                "error=? WHERE id=?", (due_at, error[:400], timer_id))
+            self.db.commit()
+        return self.get_timer(timer_id)
+
+    def find_open_timers(self, persona_id: str,
+                         event: str | None = None) -> list[dict]:
+        """pending/firing rows of a persona, optionally those listening for
+        a cancel_on event (cancel_on is a small JSON array — filtered in
+        Python, not SQL)."""
+        rows = [t for t in self.list_timers(persona_id=persona_id, limit=1000)
+                if t["status"] in ("pending", "firing")]
+        if event is not None:
+            rows = [t for t in rows if event in t["cancel_on"]]
+        return rows
+
+    def cancel_timer_rows(self, timer_ids: list[int]) -> list[dict]:
+        """Cancel the given ids while still cancellable (pending/firing);
+        returns the rows that actually became 'cancelled'."""
+        out = []
+        with self._lock:
+            for tid in timer_ids:
+                cur = self.db.execute(
+                    "UPDATE timers SET status='cancelled', fired_at=? "
+                    "WHERE id=? AND status IN ('pending','firing')",
+                    (now_iso(), tid))
+                if cur.rowcount:
+                    row = self.db.execute("SELECT * FROM timers WHERE id=?",
+                                          (tid,)).fetchone()
+                    if row:
+                        out.append(self._timer_dict(row))
+            self.db.commit()
+        return out
 
     # ── long-term memory facts (docs/WALK_MEMORY.md M) ─────────────────
     # scope: "user" (shared across personas) or "persona:<id>" (private note)

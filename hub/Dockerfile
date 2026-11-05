@@ -20,7 +20,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # `uvx mcp-server-*` family. Tool caches live under /data so the uvx/npm
 # downloads survive restarts and work for the non-root hub user.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # deps first, so code edits don't bust the install layer (root's uv cache is

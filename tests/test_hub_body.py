@@ -175,7 +175,7 @@ def test_old_v3_db_migrates_with_body_columns(tmp_path):
     p = st2.get_persona("keep")
     assert p["appearance"] == "" and p["embodied"] is True  # defaults per contract
     assert st2.recent_messages("keep", 10)[0]["actions"] == []
-    assert st2.db.execute("PRAGMA user_version").fetchone()[0] == 7  # v5 speech, v6 memory, v7 voice
+    assert st2.db.execute("PRAGMA user_version").fetchone()[0] == 8  # v5 speech, v6 memory, v7 voice, v8 timers
     st2.close()
 
 

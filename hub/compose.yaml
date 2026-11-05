@@ -3,6 +3,9 @@ services:
   hub:
     build: ./
     image: riko-hub
+    # owner's wall-clock zone for timers + spoken times (docs/TIMERS.md H);
+    # the settings page `timezone` field overrides this per deployment
+    TZ: "${TZ:-Europe/London}"
     ports:
       - "${RIKO_HUB_PORT:-8002}:8002"
     environment:
@@ -36,6 +39,8 @@ services:
       # the ${RIKO_HA_TOKEN} placeholder, expanded at connect time.
       RIKO_HA_URL: "${RIKO_HA_URL:-}"
       RIKO_HA_TOKEN: "${RIKO_HA_TOKEN:-}"
+      # timer scheduler poll interval in seconds (docs/TIMERS.md H, floor 1)
+      RIKO_TIMER_POLL_S: "${RIKO_TIMER_POLL_S:-1}"
     volumes:
       # hub.db + avatars live here on the host; back this folder up to move her brain
       - ./data:/data

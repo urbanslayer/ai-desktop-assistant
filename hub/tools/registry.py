@@ -84,6 +84,20 @@ HUB_TOOL_DESCRIPTIONS = {
                "[{id, text, scope, pinned}]."),
     "forget_fact": ("Delete a fact from long-term memory, by id or by its "
                     "exact text when it clearly matches one fact."),
+    "timer": ("Schedule ONE future chat turn for this persona (a reminder, a "
+              "check-in). time: relative (\"20 seconds\", \"+10s\", \"5m\", "
+              "\"1h\", \"2d\", \"in 10 minutes\") or RFC 3339 WITH a timezone "
+              "(\"2026-11-05T14:30:00+00:00\") — a bare local time is refused. "
+              "prompt: what to do when it fires (write it so future-you knows "
+              "what the user asked). cancel_on: events that cancel it — "
+              "[\"chat.user_message\"] = any new owner message cancels it, "
+              "[\"chat.read\"] = opening the chat cancels it. Max 30 days "
+              "ahead, max 50 pending timers. Confirm the fire time in the "
+              "user's local timezone (the result carries due_at_local)."),
+    "list_timers": ("List this persona's open timers "
+                    "[{id, label, status, due_at, due_at_local, cancel_on}]."),
+    "cancel_timer": ("Cancel one pending timer by id or label "
+                     "(check list_timers first if unsure which it means)."),
 }
 
 
@@ -139,9 +153,19 @@ def openai_tools(specs: list[ToolSpec]) -> list[dict]:
             for s in specs]
 
 
-def tools_prompt(spec_names: list[str]) -> str:
-    """System-prompt block appended while tools are on (docs/ROUNDS.md)."""
+def tools_prompt(spec_names: list[str], now_local: str = "",
+                 tz_name: str = "", local_note: str = "") -> str:
+    """System-prompt block appended while tools are on (docs/ROUNDS.md).
+    `now_local`/`tz_name` (timers round H) add the owner's local-time line —
+    the model must speak times in the hub's configured timezone, never in
+    raw UTC."""
     now = now_iso_static()
+    local = ""
+    if now_local:
+        local = (f" The owner's local time is {now_local}"
+                 + (f" ({tz_name})" if tz_name else "")
+                 + "; always speak times and dates in that timezone, never in "
+                   "UTC" + (local_note or "") + ".")
     return (
         "Tools: you can call these tools — " + ", ".join(spec_names) + ". "
         "Use them instead of guessing when you need facts you do not have. "
@@ -153,7 +177,7 @@ def tools_prompt(spec_names: list[str]) -> str:
         "blank line is spoken in full, so write it as prose. In what you "
         "say out loud, never write a URL or website address; name the site "
         "instead (\"the Godot docs\"). "
-        f"Current date/time: {now} (UTC)."
+        f"Current date/time: {now} (UTC)." + local
     )
 
 
@@ -178,7 +202,9 @@ def hub_tool_info(tools_cfg: dict, permissions: dict) -> list[dict]:
                     "description": s.description,
                     "permission": permission_for(s.name, "hub", s.risk, permissions)})
     for name, risk in (("remember", "act"), ("recall", "read"),
-                       ("forget_fact", "act")):
+                       ("forget_fact", "act"),
+                       ("timer", "act"), ("list_timers", "read"),
+                       ("cancel_timer", "act")):
         out.append({"name": name, "display": name, "source": "hub",
                     "risk": risk, "available": True,
                     "description": HUB_TOOL_DESCRIPTIONS[name],

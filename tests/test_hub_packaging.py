@@ -132,6 +132,20 @@ def test_compose_env_interpolation_matches_key():
                 f"{key}: interpolates a different var ({value!r})"
 
 
+def test_compose_sets_the_owner_timezone_for_timers():
+    """docs/TIMERS.md H: timers and spoken times follow the owner's wall
+    clock — compose pins the container TZ (and the poll knob is forwarded)."""
+    svc = COMPOSE["services"]["hub"]
+    assert svc["TZ"] == "${TZ:-Europe/London}"
+    assert svc["environment"]["RIKO_TIMER_POLL_S"] == "${RIKO_TIMER_POLL_S:-1}"
+    env_example = (HUB / ".env.example").read_text(encoding="utf-8")
+    assert "TZ=Europe/London" in env_example
+    assert "RIKO_TIMER_POLL_S" in env_example
+    # zoneinfo needs tzdata inside python:3.12-slim for Europe/London to resolve
+    dockerfile = (HUB / "Dockerfile").read_text(encoding="utf-8")
+    assert "tzdata" in dockerfile
+
+
 def test_dockerfile_ships_every_module_server_imports():
     needed = _modules_server_needs()
     assert "clients" in needed and "tools" in needed  # the round-1 casualties

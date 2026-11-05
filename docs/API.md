@@ -109,6 +109,7 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
     {"id": 7, "text": "User's cat is called Miso"}
   ],
   "voice": false,                  // user messages: true when the text came from speech recognition
+  "timer_id": null,                // set on BOTH messages of a fired timer turn (docs/TIMERS.md)
   "created_at": "2026-11-03T18:00:00Z"
 }
 ```
@@ -214,8 +215,11 @@ transcript with `after=0`).
 | `POST /api/personas/{id}/voice/lock` | freeze designed voice: its take becomes the clone |
 | `GET /api/settings` | LLM + TTS + tools settings + defaults + per-field source (key never returned) |
 | `PUT /api/settings` | change settings (blank field = unset → default; `clear_api_key`) |
-| `POST /api/settings/reset` | drop saved LLM/TTS/tools/switch-phrase overrides → defaults |
+| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timezone/switch-phrase overrides → defaults |
 | `POST /api/settings/test` | model probe + breeze health → `{ok, model, tts}` |
+| `GET /api/timers` | one-shot timers (docs/TIMERS.md; `?status=` filter) |
+| `DELETE /api/timers/{id}` | cancel a pending/firing timer |
+| `POST /api/chat/read` | "owner read this persona's chat" → cancels `chat.read` timers |
 | `GET /` | web config page (no auth; asks for the key) |
 
 ### GET /api/health
@@ -466,6 +470,8 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
              "auto_remember": true},
   "switch_phrases": ["switch to", "change to", "become", "persona",
                      "talk to", "i want to talk to"],
+  "timezone": "",                                  // saved override, "" = server zone
+  "timezone_source": "default",                    // docs/TIMERS.md: timers + spoken times
   "defaults": {"llm": {"base_url": "http://192.0.2.51:8000/v1", "model": "auto",
                        "temperature": 0.8, "max_tokens": 4096, "max_history": 40,
                        "reasoning_effort": "", "extra_body": {}, "api_key_set": true},
@@ -477,7 +483,8 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                "mcp": {"servers": []},
                "memory": {"enabled": true, "prompt_budget_tokens": 600,
                           "auto_remember": true},
-               "switch_phrases": ["switch to", "..."]},
+               "switch_phrases": ["switch to", "..."],
+               "timezone": "Europe/London"},
   "llm_source": {"base_url": "saved", "model": "default", "api_key": "default",
                  "temperature": "default", "...": "...", "switch_phrases": "default"},
   "tts_source": {"base_url": "default", "enabled": "default", "...": "..."},
@@ -542,7 +549,7 @@ Semantics (made so a careless form save cannot break the hub):
   temperature/max_tokens/max_history, or non-object `extra_body`.
 
 `POST /api/settings/reset` with `{"llm": true, "tts": true, "tools": true,
-"memory": true, "mcp": true, "switch_phrases": true}` (each side optional,
+"memory": true, "mcp": true, "timezone": true, "switch_phrases": true}` (each side optional,
 `422` if none)
 drops the saved overrides so the defaults apply again. Returns the same body
 as `GET`.
@@ -640,6 +647,77 @@ assigned, persona scopes must exist, one bad entry rejects the whole import,
 curl -s -H "$AUTH" $HUB/api/memory | jq '.facts[] | [.id, .scope, .text]'
 curl -s -X DELETE -H "$AUTH" "$HUB/api/memory?scope=user&confirm=yes"
 ```
+
+## Timers (one-shot scheduled turns, docs/TIMERS.md)
+
+She schedules them by voice — the model calls the hub tools `timer(prompt,
+time, label?, cancel_on?)`, `list_timers()` and `cancel_timer(id|label)` —
+and when a timer fires its `prompt` enters the same persona chat as a
+user-side message and she answers it, through the normal chat path (emotion,
+actions, speech, audio, memory and tools all apply). One-shot only.
+
+- **Times:** relative (`10s`, `+10s`, `5m`, `1h`, `2d`, `in 10 seconds`,
+  `5 minutes`) or RFC 3339 **with an explicit timezone** (a bare local time
+  is rejected, not guessed). The due time must be ≥ 1 s in the future and at
+  most 30 days ahead; the hub holds at most 50 pending timers.
+- **Never interrupts:** if a turn is generating for that persona when the
+  timer comes due it waits and fires once the chat is free.
+- **Survives restarts:** timers live in SQLite and resume on boot; one that
+  came due while the hub was down fires shortly after start.
+- **Captured at set time:** the fire turn runs with the LLM settings and the
+  tool set the setting turn had; the persona's system prompt is rebuilt live.
+- **Timezone:** timer times speak the hub's configured zone — the
+  `timezone` setting (Settings page; blank = server zone, the hub
+  container's `TZ`, `Europe/London` in compose).
+
+Cancel events (`cancel_on`): `chat.user_message` — the owner sends any
+message to that persona first; `chat.read` — the owner opens that persona's
+chat (web page, or the desktop window focused → `POST /api/chat/read`).
+
+### GET /api/timers
+
+```bash
+curl -s -H "$AUTH" "$HUB/api/timers"              # all recent timers
+curl -s -H "$AUTH" "$HUB/api/timers?status=pending"
+```
+
+```json
+{"timers": [{
+  "id": 3, "persona_id": "riko", "label": "tea",
+  "prompt": "tell the owner the tea is ready",
+  "due_at": "2026-11-05T12:30:00Z",
+  "due_at_local": "2026-11-05T12:30:00+00:00", "timezone": "Europe/London",
+  "cancel_on": ["chat.user_message"],
+  "status": "pending",                             // pending|firing|fired|cancelled|failed
+  "created_at": "2026-11-05T12:25:00Z",
+  "fired_at": null, "result_message_id": null, "error": null, "retry_count": 0
+}]}
+```
+
+Newest first, capped at the latest 200. `due_at` is always UTC;
+`due_at_local` renders it in the hub's effective timezone for display.
+`GET` never returns the captured settings (they contain the write-only API
+key). A fired turn's two messages carry `timer_id` — render ⏰ for them.
+
+### DELETE /api/timers/{id} → `{cancelled, label}`
+
+Cancels a `pending`/`firing` timer (`409` when already fired/cancelled,
+`404` when unknown). Publishes `timer_cancelled` with `reason: "request"`.
+`cancel_timer` from voice publishes the same event with `reason: "tool"`.
+
+### POST /api/chat/read → `{cancelled: [ids]}`
+
+```bash
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"persona_id":"riko"}' $HUB/api/chat/read
+```
+
+"The owner just read this persona's chat" — cancels that persona's open
+timers whose `cancel_on` names `chat.read`. `persona_id` optional (defaults
+to the active persona). The web page calls it whenever a persona's chat is
+rendered; the desktop calls it on window focus (throttled). Any ordinary
+`POST /api/chat` user message cancels `chat.user_message` timers the same
+way; the fired timer's own turn never self-cancels.
 
 ## Voice & audio (docs/VOICE.md)
 
@@ -1078,8 +1156,11 @@ curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 #   {"seq":15,"time":"…","type":"approval_needed","request_id":"…","client_id":"my-desktop","tool":"desktop__do_thing","summary":"do_thing {}"},
 #   {"seq":16,"time":"…","type":"turn_finished","persona":"riko","message_id":42,"emotion":"happy","actions":[{"name":"wave","at":0.0}]},
 #   {"seq":17,"time":"…","type":"memory_changed","id":7,"op":"added"},
-#   {"seq":18,"time":"…","type":"state_changed","version":18}
-# ],"last":18}
+#   {"seq":18,"time":"…","type":"timer_set","id":3,"label":"tea","persona_id":"riko","due_at":"2026-11-05T12:30:00Z","due_at_local":"2026-11-05T12:30:00+00:00","cancel_on":[]},
+#   {"seq":19,"time":"…","type":"timer_fired","id":3,"label":"tea","persona_id":"riko","message_id":42},
+#   {"seq":20,"time":"…","type":"turn_finished","persona":"riko","origin":"timer","persona_id":"riko","timer":{"id":3,"label":"tea"},"message_id":42,"reply":"Your tea is ready!","speech":"Your tea is ready!","emotion":"happy","actions":[],"audio_url":"/api/messages/42/audio"},
+#   {"seq":21,"time":"…","type":"state_changed","version":21}
+# ],"last":21}
 ```
 
 Loop: keep `last`, pass it back as `after`, `wait` ≤ 30 s (default 25). The
@@ -1094,7 +1175,16 @@ part of your state polling with this one connection. `memory_changed`
 (`{id, op}` with `op` = `added` / `updated` / `deleted`) fires whenever a
 fact is saved, edited or forgotten — by the memory tools, the routes, or a
 persona delete that took its private notes with it; refresh your memory view
-on it.
+on it. Timers (docs/TIMERS.md) publish `timer_set` /
+`timer_cancelled` / `timer_fired` (`{id, label, persona_id, …}`; cancelled
+also carries `reason`: `user_message`, `chat_read`, `tool`, `request`,
+`persona_deleted`), plus `timer_retry` / `timer_failed` when
+a fire turn hits the LLM once more before giving up. When the fire turn
+finishes, `turn_finished` carries the FULL speak payload so you can play
+the proactive reply without another round-trip: `origin: "timer"`,
+`persona_id`, `timer: {id, label}`, `reply`, `speech`, `emotion`, `actions`,
+`audio_url` (and the usual `persona`, `message_id`, `emotion`). Desktop
+clients: play origin-timer turns like normal replies; queue them if busy.
 
 ## Client tool channel (desktop / Android tools the model can call)
 
