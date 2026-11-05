@@ -105,6 +105,33 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
        - **Android:** use the official Spotify app as the Connect device (spotifyd has no Android build;
          a librespot Android port would be further unofficial work).
        - **Echos:** use their built-in Connect support. spotifyd isn't needed there.
+     - **Future: our own Android build of the spotifyd idea** (owner, 2026-11-05: "a copy that does work
+       on android"). Goal: the Riko Android app is itself a Spotify Connect device (plays audio in-app, no
+       official Spotify app needed). Starting points, checked 2026-11-05:
+       - **Rust route (preferred):** build the rust **librespot** crate (v0.8.0, actively maintained) for
+         Android with `cargo-ndk` as a small JNI library: the Connect receiver, Spotify login, and an audio
+         sink. librespot's built-in backends are desktop ones, so write an Android sink (Oboe/AAudio via
+         the `oboe` or `cpal` crate, which support Android). Ship it inside the app with a foreground media
+         service + MediaSession, so lock-screen/notification controls work, it survives backgrounding,
+         and audio focus ducks it under her voice. Benefit: the same code base as spotifyd/librespot on
+         desktop.
+       - **JVM route:** **librespot-java** (Apache-2.0, last push 2025-11, 422 stars) runs on the JVM, and
+         the old **devgianlu/librespot-android** wrapper (45 stars, last push 2023-01, no licence file)
+         shows it working on Android. It's simpler to integrate in a Kotlin app, but the JVM port lags the
+         Rust one on protocol changes, and the stale wrapper isn't a dependency to rely on (the missing
+         licence alone rules out copying it).
+       - **Fire OS 5 / API 22:** Oboe needs API 16+ (AAudio 26+, OpenSL ES fallback below), and cargo-ndk
+         can target API 21+. So an in-app Connect receiver is feasible on old Fire OS hardware, which an
+         installed Spotify app may not be. That's the real reason to do this rather than rely on the
+         official app.
+       - **Caveats:**
+         - It's unofficial (same ToS grey area as spotifyd) and needs Premium.
+         - Spotify periodically changes auth (e.g. login5/AP changes); upstream librespot follows them,
+           so pin to a released version and track upstream.
+         - It's GPL-free: librespot is MIT, so it can be embedded. Re-check at build time.
+       - **Order:** after the hub Spotify integration and the basic Android app exist. Prototype as a
+         standalone Android "Riko Speaker" app first, which is easier to test on an Echo Show / old Fire
+         device, then fold it into the main app.
    - **Tidal:** the official Tidal developer platform / player SDKs (Web and Android), which need
      developer access approval; otherwise control via Tidal Connect.
    - Shape: hub tools (`music_play(query, service?)`, `music_control(pause|resume|next|prev|volume)`,
