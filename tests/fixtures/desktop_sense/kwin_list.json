@@ -32,7 +32,7 @@
    "position": "0x0",
    "scale": 1,
    "focused": false,
-   "active_workspace": ""
+   "active_workspace": "1"
   },
   {
    "name": "DP-2",
@@ -41,7 +41,7 @@
    "position": "2560x0",
    "scale": 1,
    "focused": true,
-   "active_workspace": ""
+   "active_workspace": "2"
   }
  ],
  "focused": {

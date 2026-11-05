@@ -103,6 +103,7 @@ class HyprlandBackend:
                 continue        # scratchpad/special workspaces are not exposed
             mid = c.get("monitor")
             mon = mon_names.get(mid, "" if mid is None else str(mid))
+            fr = c.get("focusHistoryID")
             out.append({
                 "id": c.get("address", ""),
                 "app": c.get("class", ""),
@@ -110,6 +111,9 @@ class HyprlandBackend:
                 "workspace": ws_name,
                 "monitor": mon or str(mid),
                 "focused": c.get("address") == focused_addr,
+                # 0 = currently focused, larger = less recently focused
+                # (docs/DESKTOP_SENSE.md multi-window 'current tab')
+                "focus_recency": fr if isinstance(fr, int) else None,
                 "fullscreen": bool(c.get("fullscreen")),
                 "floating": bool(c.get("floating")),
                 "pid": c.get("pid"),
@@ -130,6 +134,7 @@ class HyprlandBackend:
             "workspace": (w.get("workspace") or {}).get("name", ""),
             "monitor": str(w.get("monitor", "")),
             "focused": True,
+            "focus_recency": 0,        # activewindow is history entry 0
             "fullscreen": bool(w.get("fullscreen")),
             "floating": bool((w.get("floating") or {}).get("state")
                              if isinstance(w.get("floating"), dict)
@@ -169,12 +174,18 @@ class HyprlandBackend:
             time.sleep(0.25)
         return best
 
-    def launch(self, argv, monitor=None, workspace=None, runner=None, env=None):
+    def launch(self, argv, monitor=None, workspace=None, runner=None, env=None,
+               follow=False):
         """`hyprctl dispatch exec <cmd>`; when a target monitor/workspace is
         asked for, move the new window afterwards (silent, no focus steal
-        unless we moved it at all)."""
+        unless we moved it at all). `follow=True` (open_app's follow flag)
+        switches to where the app lands: no `silent` in the workspace tag
+        and movetoworkspace instead of movetoworkspacesilent."""
         cmd = " ".join(str(a) for a in argv)          # hyprctl exec takes one string
-        ws_tag = f"[workspace {workspace} silent] " if workspace not in (None, "") else ""
+        ws_tag = ""
+        if workspace not in (None, ""):
+            ws_tag = (f"[workspace {workspace}] " if follow
+                      else f"[workspace {workspace} silent] ")
         before = {w["id"] for w in self.windows()}
         if not self.dispatch(f'exec "{ws_tag}{cmd}"', runner=runner):
             raise ToolError("hyprctl dispatch exec failed")
@@ -191,14 +202,34 @@ class HyprlandBackend:
                     raise ToolError(f"no such monitor: {monitor}")
                 target_ws = target_ws or str(m.get("active_workspace") or "")
             if target_ws:
-                if self.dispatch(f"movetoworkspacesilent {target_ws},address:{new_win['id']}",
+                mover = "movetoworkspace" if follow else "movetoworkspacesilent"
+                if self.dispatch(f"{mover} {target_ws},address:{new_win['id']}",
                                  runner=runner):
                     moved = {"workspace": target_ws}
                 else:
                     moved = {"note": "launched but could not move it to the screen"}
             if monitor and not moved.get("note"):
+                # keep that workspace ON the requested screen (owner:
+                # 'show workspace 2 on the left screen')
+                self.dispatch(f"moveworkspacetomonitor {target_ws} {monitor}",
+                              runner=runner)
                 moved["monitor"] = monitor
         return moved or {"launched": True}
+
+    def switch_workspace(self, workspace, monitor=None, runner=None) -> dict:
+        """Show a workspace/virtual desktop (number or name). With a
+        monitor: moveworkspacetomonitor first — that is the dispatch that
+        matches 'show workspace 2 on the left screen'."""
+        ref = str(workspace or "").strip()
+        if not ref:
+            raise ToolError("switch_workspace: give a workspace number or name")
+        if monitor:
+            if not self.dispatch(f"moveworkspacetomonitor {ref} {monitor}",
+                                 runner=runner):
+                raise ToolError("hyprctl moveworkspacetomonitor failed")
+        if not self.dispatch(f"workspace {ref}", runner=runner):
+            raise ToolError("hyprctl workspace switch failed")
+        return {"workspace": ref, "monitor": monitor or ""}
 
     def focus_window(self, ref: str) -> dict:
         ref = str(ref or "").strip()

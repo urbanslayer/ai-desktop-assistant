@@ -226,7 +226,13 @@ def _desktop_sense_line(spec_names) -> str:
         return ("You can see the owner's open windows, browser tabs and "
                 "screens, and open apps on a given screen, with the "
                 "desktop_* and browser_tabs tools; look before guessing, "
-                "and say which screen you used. ")
+                "and say which screen you used. There can be several "
+                "Firefox windows; when asked for the current/active tab, "
+                "give the most recently focused one first and mention the "
+                "others with their screen if more than one window is open. "
+                "You can switch workspaces/virtual desktops and open apps "
+                "on a given workspace or screen; you don't need keystrokes "
+                "for that. ")
     return ""
 
 

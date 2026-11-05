@@ -1317,12 +1317,22 @@ name is **`<kind>__<name>`** (double underscore), e.g. `desktop__open_url`.
 
 Desktop awareness (docs/DESKTOP_SENSE.md): while the tray checkbox "Let her
 see my desktop" is on, the desktop client also registers `desktop_windows`,
-`desktop_focused`, `desktop_monitors`, `desktop_apps`, `open_app` and
-`focus_window` — the two `act` tools carry `permission_default: "always"` in
+`desktop_focused`, `desktop_monitors`, `desktop_apps`, `open_app`,
+`switch_workspace` and
+`focus_window` — the three `act` tools carry `permission_default: "always"` in
 their registration (owner decision: no confirmation), which
 `permission_for` honours exactly like an MCP default (a user-set permission
 still wins). While awareness is off those tools are not registered at all.
-`browser_tabs` answers from the Riko Helper's `listTabs` method (falls back
+`switch_workspace(workspace, monitor?)` shows a workspace/virtual desktop
+(no keystrokes); `open_app` accepts `follow` (default true with `workspace`)
+to switch the view to where the app lands. `desktop_monitors` rows include
+the current workspace per monitor.
+`browser_tabs` returns `{windows, tabs}`: `windows` is one row per Firefox
+window (active tab, tab count, screen, focus rank — `windows[0]` is THE
+current tab, ordered by the compositor's focus recency, not Firefox's own
+order), from the Riko Helper's `activeTabs` method (0.1.3+); older
+extensions group `listTabs` by windowId. The flat `tabs` list comes from
+`listTabs` (falls back
 to the old `tabs` on an outdated extension and says "update the Riko Helper
 extension" when it knows neither); the focused-tab part of
 `desktop_focused` uses `activeTab`. Private/incognito tabs and denylisted

@@ -109,6 +109,10 @@ class SwayBackend:
                 "workspace": ws,
                 "monitor": output,
                 "focused": bool(node.get("focused")),
+                # sway's tree has no focus history: only the focused
+                # window has a known rank (0), the rest fall back to the
+                # extension's own order
+                "focus_recency": 0 if node.get("focused") else None,
                 "fullscreen": node.get("fullscreen_mode", 0) != 0,
                 "floating": node.get("type") == "floating_con"
                             or node.get("layout") == "floating",
@@ -123,7 +127,8 @@ class SwayBackend:
         return None
 
     # ── actions ────────────────────────────────────────────────
-    def launch(self, argv, monitor=None, workspace=None, runner=None, env=None):
+    def launch(self, argv, monitor=None, workspace=None, runner=None, env=None,
+               follow=False):
         before = {w["id"] for w in self.windows()}
         # sway's `exec` runs its argument through sh — our argv is already
         # sanitized (desktop Exec words, no model strings); quote defensively
@@ -157,7 +162,27 @@ class SwayBackend:
                     moved = {"monitor": monitor}
                 else:
                     moved = {"note": "launched but could not move it to the screen"}
+            if follow and moved.get("note") is None:
+                # 'switch there too': focusing the moved container brings
+                # its workspace/output into view
+                self._command(f'[con_id="{new_win["id"]}"] focus', runner=runner)
         return moved or {"launched": True}
+
+    def switch_workspace(self, workspace, monitor=None) -> dict:
+        """`swaymsg workspace <n|name>`; with a monitor, move that workspace
+        onto the output first so it shows there ('show workspace 2 on the
+        left screen')."""
+        ref = str(workspace or "").strip()
+        if not ref:
+            raise ToolError("switch_workspace: give a workspace number or name")
+        quoted = ref if ref.isdigit() else f'"{ref}"'
+        if monitor:
+            if not self._command(f'[workspace="{ref}"] '
+                                 f'move workspace to output {monitor}'):
+                raise ToolError("swaymsg move workspace to output failed")
+        if not self._command(f"workspace {quoted}"):
+            raise ToolError("swaymsg workspace switch failed")
+        return {"workspace": ref, "monitor": monitor or ""}
 
     def focus_window(self, ref: str) -> dict:
         ref_l = str(ref or "").strip().lower()

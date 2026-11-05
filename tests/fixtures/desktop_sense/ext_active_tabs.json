@@ -1,0 +1,62 @@
+{
+ "ok": true,
+ "result": {
+  "focusedWindowId": 101,
+  "windows": [
+   {
+    "windowId": 101,
+    "focused": true,
+    "state": "normal",
+    "title": "Riko Hub",
+    "tabCount": 3,
+    "lastFocusedAt": 900,
+    "activeTab": {
+     "id": 11,
+     "windowId": 101,
+     "title": "Riko Hub",
+     "url": "http://127.0.0.1:8765/",
+     "active": true,
+     "pinned": false,
+     "audible": false,
+     "incognito": false
+    }
+   },
+   {
+    "windowId": 102,
+    "focused": false,
+    "state": "normal",
+    "title": "Godot",
+    "tabCount": 12,
+    "lastFocusedAt": 800,
+    "activeTab": {
+     "id": 21,
+     "windowId": 102,
+     "title": "Godot Docs — Godot Engine",
+     "url": "https://docs.godotengine.org/en/stable/",
+     "active": true,
+     "pinned": false,
+     "audible": false,
+     "incognito": false
+    }
+   },
+   {
+    "windowId": 103,
+    "focused": false,
+    "state": "private",
+    "title": "",
+    "tabCount": 1,
+    "lastFocusedAt": 700,
+    "activeTab": {
+     "id": 31,
+     "windowId": 103,
+     "title": "Search Results",
+     "url": "https://example.org/search",
+     "active": true,
+     "pinned": false,
+     "audible": false,
+     "incognito": true
+    }
+   }
+  ]
+ }
+}
