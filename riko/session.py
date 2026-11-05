@@ -10,6 +10,7 @@ Every step is reported to the avatar page as a UI event, so the desktop
 window can show "listening...", "thinking...", her speech bubble, and swap
 the VRM when the persona changes — by keyword, riko-ctl or another client.
 """
+import collections
 import queue
 import threading
 import time
@@ -43,6 +44,12 @@ class Session:
         self._vad_holds = 0          # >0 = VAD paused (thinking/speaking/Space held)
         self._vad_lock = threading.Lock()
         self._spoke_last_turn = False  # worker-only: did the last turn make sound?
+        # ── hub live events (docs/TIMERS.md D) ──────────────────────────
+        self.on_timer_notice: Optional[Callable[[str, str], None]] = None  # desktop.py: tray
+        self._events_stop = None     # stop Event of the events follower thread
+        self._timer_lock = threading.Lock()
+        self._timer_played = collections.deque(maxlen=512)   # message_ids already queued to speak
+        self._timer_noticed = collections.deque(maxlen=512)  # message_ids already sent to the tray
         if self.listen_mode == "always" and self.source == "desktop":
             if not self._vad_start():
                 self.listen_mode = "push_to_talk"
@@ -129,10 +136,12 @@ class Session:
                 self._vad.resume()
 
     def close(self):
-        """Release the mic on shutdown."""
+        """Release the mic and the events follower on shutdown."""
         if self._vad is not None:
             self._vad.close()
             self._vad = None
+        if self._events_stop is not None:
+            self._events_stop.set()
 
     # ── Ways in ──────────────────────────────────────────────
     def greet_on_start(self, page_timeout=120.0):
@@ -208,6 +217,64 @@ class Session:
         active_id = (hub_client.active_persona() or {}).get("id")
         nxt = listed[(ids.index(active_id) + 1) % len(listed)] if active_id in ids else listed[0]
         return self.switch_persona(nxt["id"])
+
+    # ── Hub live events (docs/TIMERS.md D) ───────────────────
+    def follow_hub_events(self, wait=25.0):
+        """Follow the hub's events long-poll so turns the HUB starts — fired
+        timers — reach her like any other reply (docs/TIMERS.md D). The
+        desktop app starts this in hub mode; idempotent. Timer replies queue
+        into the worker, so they wait behind whatever she is doing now and
+        ride the same VAD hold / echo tail as a normal turn."""
+        if self._events_stop is None:
+            self._events_stop = hub_client.start_events_follower(
+                self._on_hub_event, client=self.hub, wait=wait)
+
+    def _on_hub_event(self, kind, ev):
+        """One hub event (follower thread). Only timer traffic matters here:
+        every other turn was already played by the call that started it."""
+        if kind == "timer_fired":
+            self._timer_notice(ev)
+            return
+        if kind != "turn_finished" or ev.get("origin") != "timer":
+            return  # a normal turn (no origin) was spoken by its own /api/chat
+        if str(ev.get("persona_id") or ev.get("persona") or "") != self._active_id():
+            return  # another persona's timer: the tray line came from timer_fired
+        message_id = ev.get("message_id")
+        with self._timer_lock:
+            if message_id in self._timer_played:  # ring replay / double delivery
+                return
+            self._timer_played.append(message_id)
+        self._turns.put(("timer", dict(ev)))
+
+    def _timer_notice(self, ev):
+        """A timer fired for a NON-active persona: one tray line, no switch
+        ('⏰ <persona>: <label>'). Active-persona timers are spoken, not shown."""
+        persona_id = str(ev.get("persona_id") or "")
+        if not persona_id or persona_id == self._active_id():
+            return
+        message_id = ev.get("message_id")
+        with self._timer_lock:
+            if message_id in self._timer_noticed:
+                return
+            self._timer_noticed.append(message_id)
+        label = str(ev.get("label") or "").strip()
+        if self.on_timer_notice:
+            try:
+                self.on_timer_notice(self._persona_name(persona_id), label)
+            except Exception as e:
+                print(f"[timer] notice failed: {type(e).__name__}: {e}")
+
+    def _persona_name(self, persona_id):
+        active = hub_client.active_persona() or {}
+        if active.get("id") == persona_id:
+            return active.get("name") or persona_id
+        try:
+            for p in self.hub.personas():
+                if p.get("id") == persona_id:
+                    return p.get("name") or persona_id
+        except Exception:  # hub hiccup: the id still identifies her
+            pass
+        return persona_id
 
     def talk_start(self):
         if self.recorder.recording:
@@ -289,6 +356,20 @@ class Session:
                              if "wave" in client_tools.current_body_actions() else [])
             self._speak(greeting, audio_url=self._greeting_audio_url(payload),
                         emotion="happy", actions=greet_actions)
+            return
+        if kind == "timer":
+            # docs/TIMERS.md D: a fired timer's reply, started by the HUB. It
+            # plays exactly like a normal reply — bubble, hub voice from
+            # audio_url, emotion, actions — and because it lands on this
+            # worker it waits behind whatever she is doing now and rides the
+            # same VAD hold / echo tail as any other turn.
+            reply = str(payload.get("reply") or "").strip()
+            if not reply:
+                return
+            self._speak(reply, audio_url=payload.get("audio_url"),
+                        emotion=payload.get("emotion") or "neutral",
+                        actions=payload.get("actions") or [],
+                        speech=payload.get("speech"))
             return
         if kind == "audio":
             wav, source, vad_stats = payload

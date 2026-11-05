@@ -189,6 +189,18 @@ class HubClient:
     def client_unregister(self, client_id):
         self._call("DELETE", f"/api/clients/{client_id}")
 
+    def chat_read(self, persona_id):
+        """POST /api/chat/read (docs/TIMERS.md): the owner saw this persona's
+        chat, so the hub cancels that persona's chat.read timers. False on an
+        old hub without the route (404 — silently nothing happened)."""
+        try:
+            self._call("POST", "/api/chat/read", json={"persona_id": persona_id})
+            return True
+        except HubError as e:
+            if e.status == 404:  # old hub without timers: nothing to cancel
+                return False
+            raise
+
     # ── Voice (the hub makes the audio; docs/VOICE.md) ───────
     def tts_status(self):
         """GET /api/tts/status -> {enabled, reachable, base_url, voices}.
@@ -241,6 +253,7 @@ def _reset():
     _client = None
     _active = None
     _names_cache = None
+    _last_chat_read.clear()  # tests must not inherit another test's chat.read throttle
 
 
 def get():
@@ -338,6 +351,86 @@ def start_state_poller(client=None, interval=3.0):
             announce_persona(state)
 
     threading.Thread(target=loop, daemon=True, name="riko-hub-poll").start()
+
+
+def start_events_follower(on_event, client=None, wait=25.0, backoff_s=2.0,
+                          stop=None):
+    """Follow GET /api/events (docs/API.md) on a daemon thread.
+
+    One long-poll for every live-event consumer in the app (tool progress,
+    timer turns — docs/TIMERS.md D). The cursor is primed SYNCHRONOUSLY here
+    (one wait=0 poll) so nothing buffered before app start is ever replayed,
+    and every event fired after this call returns is guaranteed delivered.
+    A hub without the route answers 404: the follower never starts and the
+    returned stop Event is already set — old hubs simply have no live events.
+    A down hub retries every `backoff_s`. `on_event(kind, event)` runs on
+    the follower thread; exceptions there are printed, never fatal. Returns
+    the stop Event (set it to end the follower).
+    """
+    client = client or get()
+    stop = stop if stop is not None else threading.Event()
+    cursor = 0
+    try:  # prime: skip everything the hub buffered before we started
+        cursor = int(client.events(after=0, wait=0).get("last") or 0)
+    except HubError as e:
+        if getattr(e, "status", None) == 404:
+            stop.set()  # old hub, no events route: nothing to follow
+            return stop
+        # briefly-down hub at startup: the loop below retries with backoff
+
+    def loop():
+        nonlocal cursor
+        while not stop.is_set():
+            try:
+                out = client.events(after=cursor, wait=int(wait))
+            except HubError as e:
+                if getattr(e, "status", None) == 404:  # hub lost the route
+                    return
+                stop.wait(backoff_s)  # hub down/restarting: back off, keep up
+                continue
+            cursor = int(out.get("last") or cursor)
+            for ev in out.get("events") or []:
+                try:
+                    on_event(str(ev.get("type") or ""), ev)
+                except Exception as e:  # one bad handler must not kill the stream
+                    print(f"[events] handler: {type(e).__name__}: {e}")
+
+    threading.Thread(target=loop, daemon=True, name="riko-events").start()
+    return stop
+
+
+# docs/TIMERS.md D: POST /api/chat/read when the owner sees a persona's chat
+# (window shown/focused). At most once per 30 s per persona.
+CHAT_READ_THROTTLE_S = 30.0
+_last_chat_read = {}  # persona_id -> time.monotonic() of the last attempt
+
+
+def note_chat_read(persona_id=None, client=None, throttle_s=None):
+    """Tell the hub the owner looked at this persona's chat (docs/TIMERS.md):
+    the hub cancels that persona's chat.read timers. Called on window
+    show/focus. Never raises and never blocks: the POST runs on a daemon
+    thread, an old hub's 404 is ignored silently, and each persona is
+    reported at most once per `throttle_s` (default 30)."""
+    client = client or _client
+    if client is None:
+        return
+    if persona_id is None:
+        persona_id = (_active or {}).get("id")
+    if not persona_id:
+        return
+    limit = CHAT_READ_THROTTLE_S if throttle_s is None else float(throttle_s)
+    now = time.monotonic()
+    if now - _last_chat_read.get(persona_id, float("-inf")) < limit:
+        return
+    _last_chat_read[persona_id] = now  # count the ATTEMPT: a down hub must not stampede
+
+    def go():
+        try:
+            client.chat_read(persona_id)  # 404 (old hub) returns False inside
+        except HubError as e:
+            print(f"[hub] chat/read report failed: {e}")
+
+    threading.Thread(target=go, daemon=True, name="riko-chat-read").start()
 
 
 # ── Startup ───────────────────────────────────────────────────

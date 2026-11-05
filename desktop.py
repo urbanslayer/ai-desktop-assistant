@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Callable, Optional
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
@@ -74,6 +75,7 @@ class AvatarWindow(QWebEngineView):
         d = cfg.get("desktop") or {}
         self.input_open = False
         self._drag_target = None
+        self.on_focus: Optional[Callable[[], None]] = None  # chat.read report on focus (docs/TIMERS.md D)
 
         self.setWindowTitle("Riko")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
@@ -113,6 +115,16 @@ class AvatarWindow(QWebEngineView):
 
     def js(self, code):
         self.page().runJavaScript(code)
+
+    def changeEvent(self, event):
+        # docs/TIMERS.md D: seeing her chat is how chat.read timers cancel —
+        # report on focus (throttled inside hub_client.note_chat_read).
+        if event.type() == QEvent.Type.WindowActivate and self.on_focus:
+            try:
+                self.on_focus()
+            except Exception as e:  # a hub hiccup must not eat the event
+                print(f"[hub] on_focus: {type(e).__name__}: {e}")
+        super().changeEvent(event)
 
 
 def _tray_icon():
@@ -590,6 +602,7 @@ def main():
     # extension over a local token-authenticated WebSocket.
     runtime, browser = client_tools.start_desktop(cfg, hub_client.get())
     hub_client.start_state_poller()  # notice switches made from the web page or another PC
+    session.follow_hub_events()  # hub-fired timer replies reach her like normal turns (docs/TIMERS.md D)
     session.greet_on_start()  # she says hello once when the page is ready (desktop.greet_on_start)
     active = hub_client.active_persona() or {}
     print(f"\n=== Riko desktop  |  hub: {hub.url}  |  persona: {active.get('name', '?')}"
@@ -624,6 +637,7 @@ def main():
     d = cfg.get("desktop") or {}
     ruled = False if _roam_wanted else _hyprland_rule(int(d.get("width", 420)), int(d.get("height", 680)))
     win = AvatarWindow(cfg)
+    win.on_focus = hub_client.note_chat_read  # focus = her chat was seen (docs/TIMERS.md D)
     bridge = Bridge()
     roamc = RoamController(win, cfg)
     win.roam_strip = False
@@ -636,10 +650,12 @@ def main():
             if roamc.in_strip:
                 win.roam_strip = True
                 win.activateWindow()
+                hub_client.note_chat_read()  # the owner sees her chat (docs/TIMERS.md D)
                 return
         win.show()
         win.raise_()
         win.activateWindow()
+        hub_client.note_chat_read()  # the owner sees her chat (docs/TIMERS.md D)
 
     def toggle_window():
         win.hide() if win.isVisible() else show_window()
@@ -842,6 +858,17 @@ def main():
         tray.setToolTip("Riko — always listening (L switches back)")
     # keep the tray honest when the mode changes elsewhere (L key, riko-ctl)
     session.on_listen_mode = lambda mode: bridge.command.emit(f"listen-ui:{mode}")
+
+    # A timer that fired for ANOTHER persona: one quiet tray line, no switch
+    # (docs/TIMERS.md D). Active-persona timers are spoken, not shown here.
+    def timer_notice(persona_name, label):
+        line = f"⏰ {persona_name}: {label or 'timer'}"
+        if tray.isVisible():
+            tray.showMessage("Riko", line, 8000)
+        else:
+            print(f"[timer] {line}")
+    session.on_timer_notice = timer_notice
+
     tray.setContextMenu(menu)
     tray.activated.connect(lambda reason: toggle_window() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
     if QSystemTrayIcon.isSystemTrayAvailable():

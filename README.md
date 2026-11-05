@@ -47,6 +47,7 @@ Her head — personas, memory, which LLM to think with — is a small server cal
 | 👂 **Understands** | Speech to text with [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) on your own PC, on a second machine with a GPU (see [Remote ears](#remote-ears)), or [Groq](https://console.groq.com)'s fast online Whisper. |
 | 🧠 **Thinks** | Her brain is the **hub**: any OpenAI-compatible server (vLLM, llama.cpp, LM Studio, Ollama, OpenAI itself), reached over a small HTTP API the hub owns. |
 | 📝 **Remembers** | Chat history lives on the hub, not on your PC: browse it, edit it or wipe it from her web page. |
+| ⏰ **Comes back later** | "Remind me in 20 minutes to check the oven" sets a one-shot **timer** on the hub. When it fires she answers its prompt in the same chat, with the whole conversation as context — the desktop speaks it like a normal reply (⏰ chip on the web page). "Unless I get to it" works too: sending a message or opening that chat cancels it. Ask "what timers do I have?" or "cancel the tea timer" any time. |
 | 🗣️ **Speaks** | Her voice lives on the **hub**: [Breeze-TTS-2](https://github.com/HoppouAI/Breeze-TTS-2.cpp) makes every persona sound different, designed from a text description or cloned from a short clip, all edited on the hub's web page. Clients just download the WAV — no TTS keys on your PC. (English and Chinese only; the weights and audio are non-commercial.) Prefer TTS on this PC? `tts: openai`, `sovits` or `fish` still work; `tts: none` shows a speech bubble instead. She never reads URLs or markdown aloud: the voice gets a cleaned *speech text* of the reply while links, code and details stay on screen. |
 | 💃 **Shows up** | A VRM avatar in your browser: she blinks, breathes, looks around, follows your pointer, lip-syncs actual vowel shapes, waves hello, thinks with a hand on her chin and wears her emotion — see [Her animation](#animation). Drag to spin her around, right-drag to move her, scroll to zoom. |
 | 🪟 **Lives on your desktop** | On Linux she can also run as a small borderless, transparent, always-on-top window, no browser involved: `uv run desktop.py` ([Desktop pet](#desktop-pet)). |
@@ -310,6 +311,8 @@ llm:
 ```
 
 After the first start those settings live on the hub — edit them on its web page. `model: auto` means you can swap the model on the server without touching Riko. Reasoning models spend part of their budget thinking, so `max_tokens` should leave headroom (1024 is a safe default), and the clients wait up to 180 s per reply.
+
+The hub also runs her **timers** (see [docs/TIMERS.md](docs/TIMERS.md)): one-shot callbacks the model sets with a `timer` tool ("in 10 minutes", or an exact time). Fired turns go through the same chat path as anything you type, so they carry her voice, emotion and actions, and they never interrupt a turn in flight. Clients follow the hub's events stream to pick them up: the desktop speaks a fired reply for the persona it shows (another persona's timer is just a tray note), and tells the hub when you actually look at a chat, which cancels that persona's "unless I get to it" timers. Pending, fired and cancelled timers are listed on her web page, where you can cancel any of them.
 
 <a id="home-assistant"></a>
 ## 🏠 Home Assistant

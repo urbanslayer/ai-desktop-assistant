@@ -132,6 +132,9 @@ class FakeHub:
         self.speech = None            # when set, chat replies carry this ChatResult.speech
         self.register_count = 0       # how many register POSTs arrived
         self.last_auth = None         # Authorization header of the last API call
+        self.read_requests = []       # JSON body of every POST /api/chat/read (docs/TIMERS.md)
+        self.has_chat_read = True     # False -> an OLD hub: POST /api/chat/read is 404
+        self.has_events = True        # False -> an OLD hub: GET /api/events is 404
         # Client-tool channel (docs/API.md), server side, simplified:
         self.registered = {}          # client_id -> last register body
         self.heartbeats = []          # client_id of every heartbeat POST
@@ -230,6 +233,8 @@ class FakeHub:
                         return self._send({"detail": "persona voice is off"}, 409)
                     return self._audio()
                 if path == "/api/events":
+                    if not outer.has_events:
+                        return self._send({"detail": "Not Found"}, 404)  # old hub, no events
                     qp = self._query()
                     after = int(qp.get("after", ["0"])[0] or 0)
                     wait = min(float(qp.get("wait", ["0"])[0] or 0), 0.5)
@@ -272,6 +277,11 @@ class FakeHub:
                     return self._send(outer.state())
                 if self.path == "/api/chat":
                     return self._send(outer.chat(body))
+                if self.path == "/api/chat/read":
+                    if not outer.has_chat_read:
+                        return self._send({"detail": "Not Found"}, 404)  # old hub, no timers
+                    outer.read_requests.append(body)
+                    return self._send({"ok": True, "cancelled": []})
                 if self.path == "/api/tts":
                     outer.audio_requests.append(("tts", body.get("text", "")))
                     return self._audio()
