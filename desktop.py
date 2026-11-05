@@ -32,7 +32,7 @@ import time
 from typing import Callable, Optional
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
@@ -577,6 +577,69 @@ class _NativeFilter(QAbstractNativeEventFilter):
             return False, 0
 
 
+def build_persona_menu(parent_menu, session):
+    """The tray's Persona submenu (built by main(), split out so an offscreen
+    Qt test can drive it). Rebuilt every time it opens, so it tracks the hub
+    (keyword switches, the web page, another PC) without any polling here.
+
+    Two tray-only traps, both owner-reported bugs:
+    - ``triggered`` hands the action's ``checked`` bool to its slot, so the id
+      must be bound in a keyword arg of the lambda; a closure default arg like
+      ``def pick(pid=p['id'])`` silently receives True instead of the id
+      (the hub then 404s on persona 'True').
+    - checkable actions are only mutually exclusive inside a QActionGroup;
+      without one, several personas stay ticked at once. The group is
+      parented to the menu so it survives rebuilds (QAction's destructor
+      removes a deleted action from its group).
+    """
+    persona_menu = QMenu("Persona", parent_menu)
+    group = QActionGroup(persona_menu)
+    group.setExclusive(True)
+
+    def sync_checks():
+        """Re-tick from the hub's ACTUAL active persona: a switch may have
+        failed (hub down, 404), and Qt already moved the tick on click."""
+        active_id = (hub_client.active_persona() or {}).get("id")
+        for act in persona_menu.actions():
+            if act.isCheckable():
+                act.setChecked(act.data() == active_id)
+
+    def pick(pid):
+        if (hub_client.active_persona() or {}).get("id") == pid:
+            sync_checks()  # clicking the active persona is a no-op
+            return
+        try:
+            session.switch_persona(pid)
+        except hub_client.HubError as e:
+            print(f"[persona] {e}")
+        sync_checks()
+
+    def rebuild():
+        persona_menu.clear()
+        try:
+            listed = hub_client.get().personas()
+            active_id = (hub_client.active_persona() or {}).get("id")
+        except hub_client.HubError as e:
+            dead = QAction(f"hub unreachable: {e}", persona_menu)
+            dead.setEnabled(False)
+            persona_menu.addAction(dead)
+            return
+        for p in listed:
+            action = QAction(p["name"], persona_menu)
+            action.setCheckable(True)
+            action.setData(p["id"])
+            action.setChecked(p["id"] == active_id)
+            # _checked swallows the triggered(checked) bool; pid is keyword-bound
+            action.triggered.connect(lambda _checked=False, pid=p["id"]: pick(pid))
+            group.addAction(action)
+            persona_menu.addAction(action)
+
+    persona_menu.aboutToShow.connect(rebuild)
+    rebuild()
+    parent_menu.addMenu(persona_menu)
+    return persona_menu
+
+
 def main():
     parser = argparse.ArgumentParser(description="Riko as a floating desktop avatar.")
     parser.add_argument("--asr", choices=["remote", "local", "groq"], help="speech to text (overrides the config)")
@@ -804,33 +867,9 @@ def main():
 
     # Persona submenu: rebuilt every time it opens, so it tracks the hub
     # (keyword switches, the web page, another PC) without any polling here.
-    persona_menu = QMenu("Persona", menu)
-
-    def rebuild_persona_menu():
-        persona_menu.clear()
-        try:
-            listed = hub_client.get().personas()
-            active_id = (hub_client.active_persona() or {}).get("id")
-        except hub_client.HubError as e:
-            dead = QAction(f"hub unreachable: {e}", persona_menu)
-            dead.setEnabled(False)
-            persona_menu.addAction(dead)
-            return
-        for p in listed:
-            def pick(pid=p["id"], _=False):
-                try:
-                    session.switch_persona(pid)
-                except hub_client.HubError as e:
-                    print(f"[persona] {e}")
-            action = QAction(p["name"], persona_menu)
-            action.setCheckable(True)
-            action.setChecked(p["id"] == active_id)
-            action.triggered.connect(pick)
-            persona_menu.addAction(action)
-
-    persona_menu.aboutToShow.connect(rebuild_persona_menu)
-    rebuild_persona_menu()
-    menu.addMenu(persona_menu)
+    # Exclusive check marks + triggered(checked)-safe id binding: see
+    # build_persona_menu (owner bug: switching from the tray did nothing).
+    build_persona_menu(menu, session)
 
     # Always listen: hands-free VAD ears with no listening pill, vs today's
     # hold-Space push-to-talk. Checkable; the check + tooltip also follow
