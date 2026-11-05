@@ -37,6 +37,43 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
      (b) control the official Spotify desktop app as a Connect device (simplest, no audio in-app);
      (c) a local Connect receiver such as librespot/spotifyd (unofficial, a ToS grey area).
      Android: the **Spotify App Remote SDK** drives the installed Spotify app.
+   - **spotify-tui analysis** (owner pointer, 2026-11-05; github.com/Rigellute/spotify-tui):
+     - **How it works:** a Rust TUI that uses the official **Spotify Web API** through the user's own app
+       on the Spotify Developer Dashboard. It's set up with a client ID, a redirect URI
+       (`http://localhost:8888/callback`) and an OAuth consent screen, and that dashboard-app pattern is the
+       right one for us.
+     - **Its limits:**
+       - It is **control-only**: its README says the Web API "doesn't handle streaming itself". You need
+         the official Spotify client or spotifyd running as the device it plays on, and **Premium** to play.
+       - It is **unmaintained**: last release v0.25.0 in 2021-08, last push 2024-04, Rust. So don't embed
+         it; it isn't usable on Android anyway.
+       - The maintained successor, `aome510/spotify_player` (active, ~7k stars), embeds librespot for real
+         streaming. That makes it unofficial streaming, the ToS grey area noted above.
+     - **Plan derived from it:**
+       - **Hub-owned Spotify integration:** the owner creates one Developer Dashboard app. The hub does the
+         OAuth Authorization Code + PKCE flow (redirect to the hub's own `/api/spotify/callback`, reached
+         from the web page) and keeps the refresh token server-side, write-only. Hub tools:
+         search/play/queue/pause/skip/volume/now-playing/**list devices**/**transfer playback**.
+       - **Every client gets music control through the hub for free:** desktop, web page, Android.
+       - **Where the sound comes out = any Spotify Connect device:**
+         - the official Spotify app on the PC or phone;
+         - the hub can **transfer playback** to the owner's **Amazon Echo devices**. With Spotify linked in
+           the Alexa app, Echos appear as Spotify Connect devices ("play it on the kitchen Echo"), so no app
+           has to run on the Echo at all.
+       - **Android app:** control via the hub. For playing on the phone itself, start or hand off to the
+         official Spotify app (App Remote SDK, or a Connect transfer to the phone's own Spotify device).
+       - **Fire OS 5 (older Echo devices):**
+         - Fire OS 5 is Android 5.1 (API 22), found on screened Echos (Echo Show 1st/2nd gen, Echo Spot).
+         - Plain Echo speakers don't run Android apps.
+         - Stock screened Echos don't allow sideloading APKs, so "the Android app on an Echo" likely needs
+           a developer/rooted device. Treat it as stretch.
+         - The Connect-transfer route covers playback on every Echo regardless.
+         - If the Android app should still install on API 22, set `minSdk 22` from the start and check that
+           each dependency supports it (gomobile/libtailscale, the Spotify App Remote SDK, the audio/VAD libs).
+           Otherwise target API 26+.
+     - **Verify when this starts:** the Developer Dashboard's current development-mode rules (user cap,
+       Premium requirements for the app owner, quota/extension policy) and current Web API endpoint
+       availability. Spotify has tightened these over 2024–2026.
    - **Tidal:** the official Tidal developer platform / player SDKs (Web and Android), which need
      developer access approval; otherwise control via Tidal Connect.
    - Shape: hub tools (`music_play(query, service?)`, `music_control(pause|resume|next|prev|volume)`,
