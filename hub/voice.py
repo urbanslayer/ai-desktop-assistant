@@ -20,6 +20,17 @@ Status codes that matter: 404 unknown voice (never a silent fallback),
 
 Breeze speaks **English and Chinese only** and its weights/outputs are
 **non-commercial**. No authentication (LAN/VPN service only).
+
+**Text length: no input cap — do not chunk here.** Per Breeze-TTS-2.cpp
+v0.1.6 (`docs/server.md`, tag commit 87b4366): "There is no length limit on
+`text`" — the server splits long text **on sentence boundaries** itself
+(`split_chars`, server default `--split-chars 600`) and generates the pieces
+one at a time, each conditioned on the first so the voice does not change
+partway. Client-side chunking would be worse: our pieces would be generated
+independently and need silence padding between them. So `speech()` sends the
+whole utterance as ONE request; the hub's overall spoken-length cap lives in
+`hub/speech.py` (`MAX_SPOKEN_CHARS`), which keeps every request within a
+sane size regardless.
 """
 import io
 import time

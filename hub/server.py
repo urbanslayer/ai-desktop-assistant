@@ -73,7 +73,8 @@ GLTF_MAGIC = b"glTF"
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024          # reference clip upload cap
 REFERENCE_MIN_SECONDS = 3.0                     # breeze wants a usable clip
 REFERENCE_MAX_SECONDS = 30.0
-MAX_TTS_TEXT = 1000                             # POST /api/tts text cap
+MAX_TTS_TEXT = 5000                             # POST /api/tts raw-text cap
+# (what actually gets spoken is capped by speech.MAX_SPOKEN_CHARS)
 MAX_AUDIO_CACHE_BYTES = 500 * 1024 * 1024       # data/audio total cap, oldest evicted
 PREVIEW_LINE = "Hey senpai, this is how I sound right now. Not bad, right?"
 
@@ -1236,8 +1237,9 @@ def create_app(data_dir, api_key: str | None = None,
         emotion = message.get("emotion")
         # 'neutral' sounds like no hint at all: same cache file, no duplicate WAV
         suffix = "" if not emotion or emotion == "neutral" else f"-{emotion}"
-        # audio speaks the CLEANED text (no URLs/markdown, first paragraph —
-        # hub/speech.py); always recomputed so rule upgrades beat stale rows.
+        # audio speaks the CLEANED text (no URLs/markdown, every prose
+        # paragraph, details blocks dropped — hub/speech.py); always
+        # recomputed so rule upgrades beat stale rows.
         # -r<N> in the name is the rules version: old clips never survive it.
         return serve_cached_audio(
             f"{message_id}-v{persona['voice_version']}"

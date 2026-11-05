@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 import hub.speech as speech_mod
 from hub.server import create_app
-from hub.speech import LINK_FALLBACK, SPEECH_RULES_VERSION, speech_text
+from hub.speech import LINK_FALLBACK, MAX_SPOKEN_CHARS, SPEECH_RULES_VERSION, speech_text
 from test_hub_brain import FakeHubLLM
 from test_hub_voice import add_persona, fake_breeze, fake_llm, make_client
 
@@ -119,7 +119,7 @@ def test_greeting_audio_speaks_clean_text(tmp_path, fake_llm, fake_breeze):
 
 def test_tts_route_cleans_before_breeze(tmp_path, fake_llm, fake_breeze):
     client = make_client(tmp_path, llm=fake_llm, tts=fake_breeze)
-    r = client.post("/api/tts", json={"text": "Look https://x.example/y.gif, cute!\n\nmore"})
+    r = client.post("/api/tts", json={"text": "Look https://x.example/y.gif, cute!\n\nhttps://x.example/y.gif"})
     assert r.status_code == 200
     assert fake_breeze.speech_requests[-1]["input"] == "Look that website, cute!"
     # nothing speakable at all -> 422, never empty audio
@@ -159,3 +159,52 @@ def test_prompt_tells_her_not_to_read_urls(tmp_path, fake_llm):
     system = fake_llm.chat_requests[-1]["messages"][0]["content"]
     assert "never write a URL or website address" in system
     assert "name the site instead" in system
+    # the multi-paragraph rule: only the links/sources tail is shown-not-spoken
+    assert "put links and sources at the end, after a blank line" in system
+    assert "spoken in full" in system
+
+
+# ── the whole-reply fix: prose past paragraph one must be spoken ─────────────
+
+LONG_REPLY = (
+    "Sure — three things helped me there.\n\n"
+    "First, keep the reply in prose: the bubble keeps every paragraph.\n\n"
+    "Second, links belong at the end, after a blank line.\n\n"
+    "Sources:\n- [docs](https://docs.godotengine.org/x)\n- https://blog.example/post\n\n"
+    "Third, this last paragraph is spoken too, even after the links block."
+)
+
+SPOKEN_LONG = ("Sure — three things helped me there. "
+               "First, keep the reply in prose: the bubble keeps every paragraph. "
+               "Second, links belong at the end, after a blank line. "
+               "Third, this last paragraph is spoken too, even after the links block.")
+
+
+def test_whole_multi_paragraph_reply_is_spoken(tmp_path, fake_llm, fake_breeze):
+    """Owner bug: a long reply spoke only sentence or two — speech_text used
+    to cut at the first blank line. Every prose paragraph must reach breeze;
+    only the Sources block is dropped."""
+    fake_llm.reply = LONG_REPLY
+    client = make_client(tmp_path, llm=fake_llm, tts=fake_breeze)
+    res = client.post("/api/chat", json={"text": "explain it properly"}).json()
+    assert res["reply"] == LONG_REPLY          # display keeps everything
+    assert res["speech"] == SPOKEN_LONG
+    assert "http" not in res["speech"] and "Sources" not in res["speech"]
+    got = client.get(res["audio_url"])
+    assert got.status_code == 200
+    # ONE request: Breeze splits long text on sentence boundaries itself
+    # (hub/voice.py header, docs/server.md v0.1.6) — the hub must not chunk.
+    assert len(fake_breeze.speech_requests) == 1
+    assert fake_breeze.speech_requests[-1]["input"] == SPOKEN_LONG
+
+
+def test_spoken_text_is_capped_at_a_sentence_end(tmp_path, fake_llm, fake_breeze):
+    unit = "That is a perfectly fine sentence, senpai."
+    fake_llm.reply = "\n\n".join([" ".join([unit] * 12)] * 6)  # ~3000 chars
+    client = make_client(tmp_path, llm=fake_llm, tts=fake_breeze)
+    res = client.post("/api/chat", json={"text": "go on"}).json()
+    spoken = res["speech"]
+    assert 0 < len(spoken) <= MAX_SPOKEN_CHARS
+    assert spoken.endswith(unit)               # cut exactly at a sentence end
+    client.get(res["audio_url"])
+    assert fake_breeze.speech_requests[-1]["input"] == spoken

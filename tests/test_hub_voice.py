@@ -519,8 +519,10 @@ def test_preview_override_can_audition_off_voice_in_design(client, fake_breeze):
 # ── POST /api/tts ────────────────────────────────────────────────────────────
 
 def test_tts_route_length_limit_and_validation(client):
-    assert client.post("/api/tts", json={"text": "x" * 1000}).status_code == 200
-    too_long = client.post("/api/tts", json={"text": "x" * 1001})
+    # raw-text cap is 5000 (the SPOKEN text is capped shorter by
+    # speech.MAX_SPOKEN_CHARS); a wall of one word survives cleaning
+    assert client.post("/api/tts", json={"text": "x" * 5000}).status_code == 200
+    too_long = client.post("/api/tts", json={"text": "x" * 5001})
     assert too_long.status_code == 422
     assert client.post("/api/tts", json={"text": "  "}).status_code == 422
     assert client.post("/api/tts", json={"text": "hi", "persona": "ghost"}).status_code == 404
@@ -687,3 +689,25 @@ def test_old_db_gets_voice_defaults(tmp_path):
     assert isinstance(p["voice"]["seed"], int) and p["voice"]["seed"] > 0
     assert p["voice_version"] == 1
     assert client.get("/api/state").json()["version"] == 9  # migration keeps the state version
+
+
+# ── long text: one request, Breeze splits it itself ──────────────────────────
+
+def test_long_utterance_goes_to_breeze_in_one_request(fake_breeze):
+    """Breeze-TTS-2.cpp v0.1.6 has NO input length cap: the server splits
+    long text on sentence boundaries itself (split_chars, default 600) and
+    conditions each piece on the first so the voice holds (docs/server.md;
+    see the hub/voice.py header). The client must therefore send the whole
+    utterance in ONE request — chunking client-side would lose that voice
+    conditioning and pad silence between the pieces."""
+    from hub.voice import Breeze
+    breezy = Breeze({"base_url": fake_breeze.base_url})
+    text = "This sentence is long enough to matter, senpai. " * 55  # ~2600 chars
+    wav = breezy.speech(text, instructions="Bright and warm.")
+    assert len(fake_breeze.speech_requests) == 1
+    assert fake_breeze.speech_requests[-1]["input"] == text
+    # the reply is a proper WAV with real header lengths (breeze streams
+    # max-length placeholders; reencode_wav fixes them before anyone caches
+    # or plays the clip)
+    data, rate = sf.read(io.BytesIO(wav))
+    assert rate == 24000 and abs(len(data) / rate - CLIP_SECONDS) < 0.05

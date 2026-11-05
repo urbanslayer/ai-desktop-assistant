@@ -3,20 +3,27 @@
 riko/tts.py cleans text before THIS PC's TTS (openai / sovits / fish) so she
 sounds the same as with the hub's voice: in-sentence URLs, website names and
 emails become short site names ("Blender", "the Godot Engine docs", "their
-email address"), whole-line links and everything after the first blank line
-stay dropped, no markdown. The hub deploys standalone (its own Docker image),
-so this is a copy, not an import — tests/data/speech_cases.json pins both
-halves to the same behaviour and a parity test fails if they drift.
+email address"), every prose paragraph is spoken and only the details blocks
+(link lists, "Sources:" sections, tables, code) stay dropped, no markdown.
+The hub deploys standalone (its own Docker image), so this is a copy, not an
+import — tests/data/speech_cases.json pins both halves to the same behaviour
+and a parity test fails if they drift.
 
 If you edit these rules: edit hub/speech.py the same way AND bump
 SPEECH_RULES_VERSION there (the hub's audio cache keys on it).
 """
 import re
 
-SPEECH_RULES_VERSION = 4
+SPEECH_RULES_VERSION = 5
 
-# Spoken when the first paragraph had words but nothing speakable survived
-# (it was links / citations only).
+# Upper bound on what one reply says out loud; text past it is cut at the
+# last sentence end inside the cap (then at a word boundary). Documented in
+# docs/API.md; Breeze itself has no input cap and splits long text on
+# sentence boundaries server-side (hub/voice.py).
+MAX_SPOKEN_CHARS = 2500
+
+# Spoken when the reply had words but nothing speakable survived
+# (it was links / citations / tables only).
 LINK_FALLBACK = "I put the link on screen."
 DETAIL_FALLBACK = "I put the details on your screen."
 
@@ -82,6 +89,7 @@ _CITE = re.compile(
 _HEADING = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+")
 _QUOTE = re.compile(r"(?m)^[ \t]{0,3}>[ \t]?")
 _BULLET = re.compile(r"(?m)^[ \t]*[-*+\u2022\u00b7][ \t]+(?=\S)")
+_NUM_ITEM = re.compile(r"(?m)^[ \t]*\d{1,2}[.)][ \t]+(?=\S)")   # "1. x" -> "x"
 _RULE = re.compile(r"(?m)^[ \t]*(?:[-*_][ \t]*){3,}$")
 _BOLD = re.compile(r"(\*\*|__|~~)(?=\S)(.+?)(?<=\S)\1", re.S)   # **x** __x__ ~~x~~ -> x
 _STAR = re.compile(r"\*{1,3}")                                  # any leftover asterisks
@@ -140,6 +148,37 @@ _SITE_ACRONYMS = {"bbc", "cnn", "npr", "ibm", "nasa", "espn", "fbi", "cia",
 _SENT_END = ".!?\u2026"
 # Leading characters that never make text after a link "continue the sentence".
 _STRIP_FRONT = ")]}\\\"'\u201c\u201d\u2019\u2026\u2014\u2013,;:- \t"
+
+# ── details-block recognition (paragraphs that are shown, not spoken) ───────
+# A section opener: when the rest of its paragraph is links-only, the label
+# line cuts the paragraph ("Answer.\nSources:\n- https://a" speaks sentence 1).
+_SECTION_LABEL = re.compile(
+    r"(?i)^[ \t]{0,3}#{0,6}[ \t]*(?:sources?(?:[ \t]+and[ \t]+links?)?|links?"
+    r"|references?|citations?|attributions?|details?|see[ \t]+also"
+    r"|further[ \t]+reading|more[ \t]+(?:info(?:rmation)?|details?)"
+    r"|for[ \t]+more(?:[ \t]+(?:info(?:rmation)?|details?))?)\s*:?\s*$")
+# Words that introduce a link without being content ("Docs at X:", "link: X",
+# "watch it: X"). Consulted ONLY for a line that actually carried a
+# link-shaped token; a residue of at most _LINK_RESIDUE_WORDS of these words
+# leaves nothing of substance behind, so the line was a link line. Real
+# content words are never in here, and longer residues ("Link is X for you")
+# are sentences ABOUT the link, so they keep the in-sentence naming rules.
+_LINK_RESIDUE_WORDS = 3
+_LINK_INTRO = {
+    "a", "an", "the", "and", "or", "at", "on", "in", "to", "for", "from", "of",
+    "here", "is", "are", "it", "its", "this", "that", "these", "those",
+    "you", "your", "yours", "me", "my",
+    "link", "links", "url", "urls", "docs", "doc", "documentation", "page",
+    "pages", "site", "website", "address", "source", "sources", "reference",
+    "references", "source", "video", "videos", "photo", "photos", "picture",
+    "picture", "image", "images", "screenshot", "download", "downloads",
+    "official", "see", "read", "watch", "check", "try", "open", "visit",
+    "info", "information", "details", "detail", "via", "direct", "straight",
+}
+# Private-use sentinel wrapping markdown link LABELS in the details probe:
+# a label is not prose, so it must not rescue a link list from the cut.
+_L0 = "\ue000"
+_CAP_SENT = re.compile(r"[.!?\u3002\uff01\uff1f\u2026]+(?=[\s\"'\u201c\u201d\u2019)\]]|$)")
 
 
 def _split_tail(u: str):
@@ -257,13 +296,80 @@ def _collapse(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def clean_body(reply: str) -> str:
-    """All removal/replacement rules over the whole reply (paragraph split
-    comes after, so a URL-only paragraph still 'counts' as the first
-    paragraph)."""
-    text = str(reply or "")
+def _line_linkish(line: str) -> bool:
+    """True when a line is essentially JUST a link or a section opener:
+    a 'Sources:'-style heading, or after images/URLs/emails/domains/citations
+    are removed and list markers and markdown link LABELS are ignored, nothing
+    is left but punctuation or link-introduction words ('Docs at', 'link:').
+    Prose words ('hosted', 'cute', 'senpai') always rescue the line."""
+    if _SECTION_LABEL.match(line):
+        return True
+    had_link = False
+    l, n = _MD_IMAGE.subn(" ", line)
+    had_link = n > 0
+    l, n = _MD_LINK.subn(lambda m: _L0 + (m.group(1) or "") + _L0, l)
+    had_link = had_link or n > 0
+    for pat in (_ANGLE_URL, _URL, _EMAIL):
+        l, n = pat.subn(" ", l)
+        had_link = had_link or n > 0
+    def _dom(m):
+        nonlocal had_link
+        if _domain_survives(m):
+            return m.group(0)
+        had_link = True
+        return " "
+    l = _DOMAIN.sub(_dom, l)
+    if not had_link:
+        return False
+    l = _CITE.sub(" ", l)
+    l = _HEADING.sub("", l)
+    l = _QUOTE.sub("", l)
+    l = _BULLET.sub("", l)
+    l = _NUM_ITEM.sub("", l)
+    l = re.sub("%s[^\uE000]*%s" % (_L0, _L0), " ", l)  # drop link labels
+    l = re.sub(r"[^\w\s]", " ", l)
+    words = [w for w in l.lower().split() if not w.isdigit()]
+    return len(words) <= _LINK_RESIDUE_WORDS and all(w in _LINK_INTRO for w in words)
+
+
+def _is_details_block(para: str) -> bool:
+    """A paragraph that is on-screen material, not speech: empty, a markdown
+    table, or lines that are all links / link intros / section labels.
+    Prose lists ('- milk', '1. eggs') have content words and stay spoken."""
+    lines = [ln for ln in para.splitlines() if ln.strip()]
+    if not lines:
+        return True
+    pipes = sum(1 for ln in lines if "|" in ln)
+    if len(lines) >= 2 and pipes >= 2 and pipes * 2 >= len(lines):
+        return True  # markdown table
+    return all(_line_linkish(ln) for ln in lines)
+
+
+def _cut_section(para: str) -> str:
+    """Cut a paragraph at a 'Sources:'-style label line when everything under
+    the label is links ("Answer.\\nSources:\\n- https://a" -> "Answer.")."""
+    lines = para.split("\n")
+    for i, ln in enumerate(lines):
+        if _SECTION_LABEL.match(ln):
+            rest = [r for r in lines[i + 1:] if r.strip()]
+            if all(_line_linkish(r) for r in rest):
+                return "\n".join(lines[:i])
+            break
+    return para
+
+
+def _strip_blocks(text: str) -> str:
+    """Whole-block removals that must happen BEFORE the paragraph split:
+    code fences (their content may hold blank lines) and markdown images."""
     text = _FENCE.sub(" ", text)
     text = _FENCE_MARK.sub(" ", text)
+    text = _MD_IMAGE.sub(" ", text)
+    return text
+
+
+def clean_prose(text: str) -> str:
+    """All inline removal/replacement rules over one block of text."""
+    text = str(text or "")
     text = _INLINE_CODE.sub(" ", text)
     text = _MD_IMAGE.sub(" ", text)
     text = _MD_LINK.sub(lambda m: m.group(1), text)
@@ -277,6 +383,7 @@ def clean_body(reply: str) -> str:
     text = _HEADING.sub("", text)
     text = _QUOTE.sub("", text)
     text = _BULLET.sub("", text)
+    text = _NUM_ITEM.sub("", text)
     text = _RULE.sub("", text)
     text = _BOLD.sub(lambda m: m.group(2), text)
     text = _UNDER.sub(lambda m: m.group(1), text)
@@ -320,6 +427,25 @@ def clean_body(reply: str) -> str:
     return text
 
 
+def clean_body(reply: str) -> str:
+    """All removal/replacement rules over the whole reply (the details-block
+    split in speech_text comes after, so rule upgrades stay one code path)."""
+    return clean_prose(_strip_blocks(str(reply or "")))
+
+
+def _cap_spoken(text: str) -> str:
+    """Speak at most MAX_SPOKEN_CHARS, cutting at the last sentence end
+    inside the cap (word boundary if a lone sentence runs past it)."""
+    if len(text) <= MAX_SPOKEN_CHARS:
+        return text
+    head = text[:MAX_SPOKEN_CHARS]
+    ends = list(_CAP_SENT.finditer(head))
+    if ends:
+        return head[:ends[-1].end()].strip()
+    cut = head.rfind(" ")
+    return (head[:cut] if cut > MAX_SPOKEN_CHARS // 2 else head).rstrip()
+
+
 def contains_url(text: str) -> bool:
     """Anything the link-shaped fallback covers: URLs, emails, and bare
     domains the cleaner would actually remove (files/tech names don't count)."""
@@ -330,17 +456,34 @@ def contains_url(text: str) -> bool:
 
 
 def speech_text(reply: str) -> str:
-    """The words to hand TTS for this reply. '' only when the reply itself
+    """The words to hand TTS for this reply. EVERY prose paragraph is spoken
+    (docs/TOOLS.md A: links and details go after a blank line — they are the
+    part dropped, not everything after it). '' only when the reply itself
     had no words at all; a worded reply never returns ''."""
     text = str(reply or "")
     if not text.strip():
         return ""
-    cleaned = clean_body(text)
-    first = re.split(r"\n[ \t]*\n", cleaned, maxsplit=1)[0]
-    spoken = _collapse(first)
-    if spoken:
-        return spoken
-    # first paragraph survived as nothing speakable — say where the rest is
+    blocks = [(p, _is_details_block(p))
+              for p in re.split(r"\n[ \t]*\n", _strip_blocks(text)) if p.strip()]
+    parts = []
+    for i, (para, details) in enumerate(blocks):
+        if details:
+            continue
+        spoken = _collapse(clean_prose(_cut_section(para)))
+        if not spoken:
+            continue
+        # A paragraph ending on a dangling connector ("Here's how:") is a
+        # lead-in — give it a real spoken ending when what it introduced was
+        # dropped (code block, links) or nothing follows at all. When the
+        # NEXT paragraph is spoken prose the colon is a true pause: keep it.
+        follows = blocks[i + 1:]
+        if spoken[-1] in ",;:" and (not follows or follows[0][1]):
+            spoken = spoken[:-1] + "."
+        parts.append(spoken)
+    out = _cap_spoken(" ".join(parts))
+    if out:
+        return out
+    # every paragraph survived as nothing speakable — say where the rest is
     if _HAS_WORD.search(text):
         return LINK_FALLBACK if contains_url(text) else DETAIL_FALLBACK
     return ""

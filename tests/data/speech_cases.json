@@ -35,7 +35,7 @@
     "expect": "Ha! That one got me."
   },
   {
-    "name": "first paragraph only",
+    "name": "sources section after prose dropped",
     "input": "It's on your screen now!\n\nSources:\n- [one](https://a.example)\n- [two](https://b.example)",
     "expect": "It's on your screen now!"
   },
@@ -45,9 +45,9 @@
     "expect": "I put the link on screen."
   },
   {
-    "name": "url-only first para fallback",
+    "name": "url-only first para then prose spoken",
     "input": "https://x.com/gif\n\nThat's the one I found, senpai.",
-    "expect": "I put the link on screen."
+    "expect": "That's the one I found, senpai."
   },
   {
     "name": "emoji only reply no audio",
@@ -87,7 +87,7 @@
   {
     "name": "fenced code dropped",
     "input": "Here's how:\n\n```python\nimport godot\nprint('hi')\n```\n",
-    "expect": "Here's how:"
+    "expect": "Here's how."
   },
   {
     "name": "unclosed fence marker gone",
@@ -135,9 +135,9 @@
     "expect": "你好，せんぱい！"
   },
   {
-    "name": "multi-line first para joined",
+    "name": "second prose paragraph now spoken too",
     "input": "Two lines that\nwrap without a blank line\n\nbut this part stays on screen.",
-    "expect": "Two lines that wrap without a blank line"
+    "expect": "Two lines that wrap without a blank line but this part stays on screen."
   },
   {
     "name": "no url no blank line keeps all",
@@ -165,9 +165,9 @@
     "expect": "See for more."
   },
   {
-    "name": "table row pipes kept",
+    "name": "table-only reply detail fallback",
     "input": "Name | Version\nRiko | 1.0",
-    "expect": "Name | Version Riko | 1.0"
+    "expect": "I put the details on your screen."
   },
   {
     "name": "prose parentheses kept",
@@ -280,9 +280,9 @@
     "expect": "Read Example. It helps."
   },
   {
-    "name": "domain in first para, url in details",
+    "name": "all-link-material reply link fallback",
     "input": "Details: godotengine.org\n\nDocs at https://godotengine.org/docs",
-    "expect": "Details: Godot Engine"
+    "expect": "I put the link on screen."
   },
   {
     "name": "version number kept",
@@ -370,9 +370,9 @@
     "expect": "I saw it on Reddit"
   },
   {
-    "name": "domain inside parentheses named",
+    "name": "parenthetical see-domain-only link fallback",
     "input": "(see docs.godotengine.org)",
-    "expect": "(see the Godot Engine docs)"
+    "expect": "I put the link on screen."
   },
   {
     "name": "email before comma clause kept",
@@ -380,9 +380,9 @@
     "expect": "email me at their email address, okay?"
   },
   {
-    "name": "domain before bang",
+    "name": "bare visit-domain reply link fallback",
     "input": "visit docs.godotengine.org!",
-    "expect": "visit the Godot Engine docs!"
+    "expect": "I put the link on screen."
   },
   {
     "name": "domain before question mark",
@@ -390,14 +390,14 @@
     "expect": "did you see the Godot Engine docs?"
   },
   {
-    "name": "trailing colon before domain kept",
+    "name": "bare link-colon-domain reply link fallback",
     "input": "link: docs.godotengine.org",
-    "expect": "link: the Godot Engine docs"
+    "expect": "I put the link on screen."
   },
   {
-    "name": "trailing comma after domain becomes ending",
+    "name": "bare link-is-domain reply link fallback",
     "input": "the link is example.com,",
-    "expect": "the link is Example."
+    "expect": "I put the link on screen."
   },
   {
     "name": "dash dot seam after domain",
@@ -486,8 +486,8 @@
   },
   {
     "name": "docs hint on unknown compound site",
-    "input": "See docs.myapp.io for details.",
-    "expect": "See the My App docs for details."
+    "input": "See docs.myapp.io for details, senpai.",
+    "expect": "See the My App docs for details, senpai."
   },
   {
     "name": "unknown domain falls back to title-cased label",
@@ -510,9 +510,9 @@
     "expect": "It's cheaper on Amazon, senpai."
   },
   {
-    "name": "whole-line domain inside first para dropped",
+    "name": "later prose paragraph spoken now",
     "input": "Got it.\nblender.org\n\nDetails later.",
-    "expect": "Got it."
+    "expect": "Got it. Details later."
   },
   {
     "name": "url after sentence end stays dropped",
@@ -523,5 +523,75 @@
     "name": "email inside sentence with comma",
     "input": "Send feedback to hello@riko.dev, please.",
     "expect": "Send feedback to their email address, please."
+  },
+  {
+    "name": "four paragraphs all spoken",
+    "input": "Yes, three steps work here.\n\nFirst, update the config file.\n\nThen restart the app.\n\nFinally say the word and it glides.",
+    "expect": "Yes, three steps work here. First, update the config file. Then restart the app. Finally say the word and it glides."
+  },
+  {
+    "name": "trailing sources section dropped prose kept",
+    "input": "It shipped last Tuesday.\n\nThe docs cover the flags well.\n\nSources:\n- [blog](https://a.example/post)\n- [wiki](https://b.example/wiki)",
+    "expect": "It shipped last Tuesday. The docs cover the flags well."
+  },
+  {
+    "name": "prose bullet list spoken without markers",
+    "input": "Bring:\n- a flashlight\n- water\n- snacks",
+    "expect": "Bring: a flashlight water snacks"
+  },
+  {
+    "name": "numbered list markers gone",
+    "input": "Two steps, in order:\n\n1. plug it in\n2. press the button",
+    "expect": "Two steps, in order: plug it in press the button"
+  },
+  {
+    "name": "code block in middle keeps both sides",
+    "input": "First, check the settings.\n\n```python\nuv sync\n```\n\nThen start the app.",
+    "expect": "First, check the settings. Then start the app."
+  },
+  {
+    "name": "sources section in middle dropped",
+    "input": "Godot 4.3 came out.\n\nSources:\n- https://godotengine.org/article\n\nThe changelog is long.",
+    "expect": "Godot 4.3 came out. The changelog is long."
+  },
+  {
+    "name": "table dropped prose around it kept",
+    "input": "Here are the specs.\n\nName | Version\nRiko | 1.0\n\nHope it helps.",
+    "expect": "Here are the specs. Hope it helps."
+  },
+  {
+    "name": "markdown link label list dropped",
+    "input": "Yes, use these.\n\n[Godot docs](https://docs.godotengine.org)\n[Blender](https://blender.org)",
+    "expect": "Yes, use these."
+  },
+  {
+    "name": "link-only paragraph between prose skipped",
+    "input": "I found two things.\n\nhttps://x.example/a\n\nThe second one is better.",
+    "expect": "I found two things. The second one is better."
+  },
+  {
+    "name": "image-only paragraph dropped",
+    "input": "Look at this!\n\n![chart](https://x.example/c.png)\n\nTraffic is up.",
+    "expect": "Look at this! Traffic is up."
+  },
+  {
+    "name": "heading sources with links dropped",
+    "input": "Done, senpai.\n\n## Sources\n- https://a.example/1",
+    "expect": "Done, senpai."
+  },
+  {
+    "name": "numbered link list dropped",
+    "input": "The list is below.\n\n1. https://a.example\n2. https://b.example",
+    "expect": "The list is below."
+  },
+  {
+    "name": "trailing link line dropped after prose",
+    "input": "The file saved fine.\n\nhttps://eve.local:8080/preview",
+    "expect": "The file saved fine."
+  },
+  {
+    "name": "spoken reply capped at sentence end",
+    "input": "That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.",
+    "expect": "That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai."
   }
 ]

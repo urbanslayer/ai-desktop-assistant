@@ -409,11 +409,19 @@ links keep only their label), bare website names and email addresses dropped
 (`docs.godotengine.org`, `you@example.com` — while version numbers like
 `3.10.2`, file names like `config.yaml`, abbreviations like `e.g.`, and tech
 names like `Node.js`/`ASP.NET` stay), code blocks and inline code dropped,
-markdown furniture and emoji dropped, source citations like `[1]` dropped,
-and only the **first paragraph** — everything after the first blank line (the
-links and details section) stays on screen and is never spoken (docs/TOOLS.md
-A).
-A reply whose first paragraph was links only speaks a short fallback line
+markdown furniture and emoji dropped, source citations like `[1]` dropped.
+**Every prose paragraph is spoken** — a multi-paragraph answer is spoken in
+full, not just its first paragraph. What gets dropped instead are the
+details blocks, wherever they sit: paragraphs that are only links or link
+intros ("Docs at X:"), bullet/numbered lists of links, "Sources:"/"Links:"
+sections, markdown tables and images. Prose bullet lists ARE spoken (markers
+removed). The whole spoken text is capped at **2500 characters**, cut at a
+sentence end (Breeze splits long text itself on sentence boundaries —
+`split_chars`, default 600, docs/VOICE.md and `hub/voice.py` — so the hub
+sends one request; the cap is there because a wall of prose is not a spoken
+answer (docs/TOOLS.md A: links and sources go after a blank line, they are
+shown, not spoken).
+A reply whose paragraphs were all links/details speaks a short fallback line
 ("I put the link on screen."). The rule set is versioned (the hub's audio
 cache keys on it); clients that run their own TTS (`tts: openai/sovits/fish`)
 must speak `speech` — never `reply` — or apply the identical cleaner
@@ -669,10 +677,11 @@ Same, for the greeting (`?v=` informational). This is what a switch's
 
 One-shot WAV for a line that is not in any transcript (client-side
 narration): body `{"text": "…", "persona": optional id, "emotion": optional
-one of the emotion ids}`, ≤ **1000 characters** (`422`), never cached,
-`Content-Type: audio/wav`. The text goes through the same spoken-text
-cleaner as chat audio, so posting a raw reply (markdown and all) still
-speaks clean words; nothing speakable after cleaning → `422`. The `emotion`
+one of the emotion ids}`, ≤ **5000 characters** of raw text (`422`), never
+cached, `Content-Type: audio/wav`. The text goes through the same
+spoken-text cleaner as chat audio (including the 2500-character spoken cap),
+so posting a raw reply (markdown and all) still speaks clean words; nothing
+speakable after cleaning → `422`. The `emotion`
 only steers delivery (same hint as below); unknown emotion → `422`.
 
 ```bash
