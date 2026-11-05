@@ -311,12 +311,17 @@ class Session:
                     print("(heard nothing, try again)")
                     viewer.emit("error", text="(heard nothing, try again)")
                 return
+            # fix words Whisper misheard (Farina -> Furina): the corrected
+            # text is what the bubble shows and what the hub ever sees
+            text = asr.apply_corrections(text, self.cfg).strip()
             viewer.emit("heard", text=text)
         else:
             text = payload
         print(f"You:  {text}")
         viewer.emit("status", state="thinking")
-        result = self.hub.chat(text, source=self.source)
+        # voice=True (docs/API.md): this text came off a mic — the hub tells
+        # her never to comment on misheard names, and marks the 🎤 flag
+        result = self.hub.chat(text, source=self.source, voice=kind == "audio")
         # 'switch to asuka' and bare keywords come back as switched, with the
         # greeting as the reply; a persona change also reloads the avatar page.
         if result.get("switched") or result.get("persona") != self._active_id():

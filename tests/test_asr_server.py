@@ -115,6 +115,21 @@ def test_remote_transcription_end_to_end(asr_url, monkeypatch):
         assert any(expected in w for w in words), f"{expected!r} missing from {text!r}"
 
 
+def test_prompt_and_hotwords_round_trip_with_the_real_model(asr_url):
+    """The REAL faster-whisper behind the server: the `prompt` field must map
+    to initial_prompt and `hotwords` must be accepted without breaking a
+    transcription (the vocabulary bias must not backfire into a 500)."""
+    hdr = {"Authorization": "Bear" + f"er {API_KEY}"}
+    r = requests.post(f"{asr_url}/v1/audio/transcriptions",
+                      files={"file": ("you.wav", SAMPLE.read_bytes())},
+                      data={"model": "whisper-1", "language": "en",
+                            "prompt": "Riko, Furina, Asuka, senpai.",
+                            "hotwords": "Furina"},
+                      headers=hdr, timeout=120)
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json()["text"], str)
+
+
 def test_verbose_json_carries_confidence_segments(asr_url, monkeypatch):
     """The verbose_json the client requests for VAD clips must carry the
     per-segment fields the noise filter weighs (no_speech_prob, avg_logprob,

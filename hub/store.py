@@ -17,7 +17,7 @@ try:  # package import (repo root) vs standalone (`python server.py` in hub/)
 except (ImportError, SystemError):  # standalone: hub/ is on sys.path
     import memory as _memory  # type: ignore[no-redef]
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Voice migration for personas written before the voice round (docs/VOICE.md):
 # a bland design-mode voice with a random seed, so they keep talking after the
@@ -214,6 +214,12 @@ class Store:
                                 "SELECT id, text FROM facts")
         except sqlite3.OperationalError:
             self.fts_enabled = False
+        if version < 7:  # voice-turn round (docs/API.md POST /api/chat `voice`):
+            # a user message that came from speech recognition (🎤 on the
+            # web page; the prompt line about misheard names)
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+            if "voice" not in cols:
+                self.db.execute("ALTER TABLE messages ADD COLUMN voice INTEGER NOT NULL DEFAULT 0")
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.commit()
 
@@ -379,23 +385,26 @@ class Store:
     def add_message(self, persona: str, role: str, content: str, source: str,
                     emotion: str | None = None, tools: list | None = None,
                     actions: list | None = None, speech: str = "",
-                    memory_writes: list | None = None) -> int:
+                    memory_writes: list | None = None, voice: bool = False) -> int:
         """`emotion` only makes sense on assistant messages (docs/ROUNDS.md:
         null for user messages). `tools` is the compact tools_used list
         [{tool, label}] stored on the assistant reply. `actions` is the
         parsed body-action list [{name, at}] (docs/BODY.md). `speech` is the
         cleaned spoken text of the reply (hub/speech.py); '' on user rows.
         `memory_writes` is [{id, text}] — facts this reply saved via the
-        remember tool (docs/WALK_MEMORY.md M, the 🧠 chip)."""
+        remember tool (docs/WALK_MEMORY.md M, the 🧠 chip). `voice` marks a
+        user message that came from speech recognition (docs/API.md chat
+        `voice` field; the 🎤 chip)."""
         with self._lock:
             cur = self.db.execute(
                 "INSERT INTO messages(persona,role,content,source,created_at,emotion,"
-                "tools,actions,speech,memory_writes) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "tools,actions,speech,memory_writes,voice) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (persona, role, content, source, now_iso(), emotion,
                  json.dumps(tools) if tools else "",
                  json.dumps(actions) if actions else "",
                  str(speech or ""),
-                 json.dumps(memory_writes) if memory_writes else ""))
+                 json.dumps(memory_writes) if memory_writes else "",
+                 1 if voice else 0))
             self.db.commit()
             assert cur.lastrowid is not None
             return cur.lastrowid
@@ -450,6 +459,7 @@ class Store:
                 "emotion": row["emotion"], "tools_used": tools,
                 "actions": actions, "speech": speech,
                 "memory_writes": mem_writes,
+                "voice": bool(row["voice"]) if "voice" in row.keys() else False,
                 "created_at": row["created_at"]}
 
     def clear_messages(self, persona: str) -> int:

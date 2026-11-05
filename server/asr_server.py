@@ -17,12 +17,21 @@ Options (or the env vars in brackets):
 Endpoints:
     GET  /health
     GET  /v1/models
-    POST /v1/audio/transcriptions   (multipart: file, [model], [language], [prompt], [response_format], [temperature])
+    POST /v1/audio/transcriptions   (multipart: file, [model], [language], [prompt], [hotwords], [response_format], [temperature])
+
+`prompt` maps to Faster-Whisper's initial_prompt (its decoder context:
+spellings and style it should prefer, e.g. "Riko, Furina, senpai."), and
+`hotwords` to Faster-Whisper's hotwords parameter. In faster-whisper >= 1.1
+the two COMPOSE rather than compete: the prompt tokens go in first and the
+hotword tokens are appended after them, so sending both is fine and this
+server forwards both. (Servers on an older faster-whisper without a
+hotwords parameter just ignore the field, see build_app.)
 """
 import argparse
 import ctypes
 import glob
 import hmac
+import inspect
 import io
 import os
 import site
@@ -76,6 +85,13 @@ def build_app(model_name, device, compute_type, model_dir=None):
     whisper = WhisperModel(model_name, device=device, compute_type=compute_type,
                            download_root=model_dir)
     print(f"[asr-server] ready on {whisper.model.device}", flush=True)
+    # faster-whisper >= 1.1 has a `hotwords` parameter (its tokens are appended
+    # after the initial_prompt ones — the two compose, they are not exclusive).
+    # An older install gets the field accepted but ignored, per the docstring.
+    supports_hotwords = "hotwords" in inspect.signature(whisper.transcribe).parameters
+    if not supports_hotwords:
+        print("[asr-server] this faster-whisper has no 'hotwords' parameter; "
+              "the hotwords form field will be ignored", flush=True)
     lock = threading.Lock()  # one clip at a time; keeps GPU memory flat
     api_key = os.environ.get("ASR_API_KEY", "")
 
@@ -98,7 +114,8 @@ def build_app(model_name, device, compute_type, model_dir=None):
         file: UploadFile = File(...),
         model: str = Form(default=""),  # accepted for compatibility; this server has one model
         language: str = Form(default=""),
-        prompt: str = Form(default=""),
+        prompt: str = Form(default=""),   # -> initial_prompt (vocabulary spelling bias)
+        hotwords: str = Form(default=""),  # -> faster-whisper hotwords (>= 1.1 only)
         response_format: str = Form(default="json"),
         temperature: str = Form(default=""),  # str so a client sending "" does not 422
     ):
@@ -108,15 +125,15 @@ def build_app(model_name, device, compute_type, model_dir=None):
             temp = 0.0
         audio = io.BytesIO(file.file.read())
         started = time.monotonic()
+        kwargs = dict(language=language or None,
+                      initial_prompt=prompt or None,
+                      temperature=temp,
+                      beam_size=5,
+                      vad_filter=True)  # skips silence, so a long press with little speech stays fast
+        if hotwords and supports_hotwords:
+            kwargs["hotwords"] = hotwords
         with lock:
-            segments, info = whisper.transcribe(
-                audio,
-                language=language or None,
-                initial_prompt=prompt or None,
-                temperature=temp,
-                beam_size=5,
-                vad_filter=True,  # skips silence, so a long press with little speech stays fast
-            )
+            segments, info = whisper.transcribe(audio, **kwargs)
             # the generator materialises lazily: drain it inside the lock
             seg_list = list(segments)
         text = "".join(s.text for s in seg_list).strip()

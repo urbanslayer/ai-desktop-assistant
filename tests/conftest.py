@@ -389,6 +389,8 @@ class FakeHub:
                 ids.append(self.message_id)
                 self.messages.append({"id": self.message_id, "persona": pid, "role": role,
                                       "content": content, "source": body.get("source", "test"),
+                                      # a voice-aware hub stores the 🎤 flag (docs/API.md)
+                                      "voice": bool(body.get("voice")) and role == "user",
                                       "created_at": "2026-11-03T00:00:00Z"})
             self.version += 1
             audio_url = None

@@ -364,6 +364,8 @@ On the desktop PC set `asr: remote` in `character_config.yaml` and point `remote
 
 </details>
 
+**Hearing the names right.** Whisper has never seen a name like *Furina*, so it spells what it hears: *Farina*. Three layers fix that, in every ear mode (remote, local, groq). **1. Vocabulary prompt:** every clip rides with a short `initial_prompt` — `'Riko, Furina, senpai.'` — and Whisper biases the *spelling* of the words it sees there. The hub's persona names are collected automatically (active persona first, cached ~5 min); add your own words under `asr.vocabulary:` in `character_config.yaml`. **2. Fix-ups:** finished transcripts run through `asr.corrections:` (case-insensitive whole-word, logged as `[asr] corrected Farina -> Furina`) plus a conservative fuzzy pass that only touches capitalised near-misses of your vocabulary words — *Marina* and *Farm* stay, *Asooka* becomes *Asuka*. The corrected text is what shows in the "heard" bubble and what she receives. **3. The safety net:** voice turns send `voice: true` with the chat (docs/API.md), so the hub adds a line telling her the text came from speech recognition and she must silently assume the closest name — never point out the misspelling. The ears server also accepts an optional `hotwords` form field (faster-whisper ≥ 1.1; it composes with `prompt`); the client uses the prompt alone, which every backend supports.
+
 <a id="her-voice"></a>
 ## 🗣️ Her voice: hub voices with Breeze
 

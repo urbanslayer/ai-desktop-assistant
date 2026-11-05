@@ -265,6 +265,39 @@ def test_llm_failure_502_stores_nothing(client, fake_llm):
     assert client.get("/api/state").json()["version"] == v0
 
 
+# ── chat: the voice flag (speech-recognised turns) ───────────────────────
+
+def test_voice_true_adds_the_misheard_names_line(client, fake_llm):
+    add_persona(client)  # hub now knows Riko AND Asuka
+    r = client.post("/api/chat", json={"text": "farina says hi", "voice": True})
+    assert r.status_code == 200
+    req = fake_llm.chat_requests[-1]
+    system = req["messages"][0]["content"]
+    assert "speech recognition" in system and "never point out" in system
+    assert "Farina for Furina" in system           # the concrete example
+    assert "Riko" in system and "Asuka" in system  # the persona names ride along
+    # the line is prompt-only: the stored text is what was said
+    hist = client.get("/api/history").json()["messages"]
+    assert hist[-2]["content"] == "farina says hi"
+    assert hist[-2]["voice"] is True   # the 🎤 flag lives on the user row
+
+
+def test_voice_absent_or_false_adds_no_line(client, fake_llm):
+    client.post("/api/chat", json={"text": "typed text"})
+    assert "speech recognition" not in fake_llm.chat_requests[-1]["messages"][0]["content"]
+    client.post("/api/chat", json={"text": "typed again", "voice": False})
+    assert "speech recognition" not in fake_llm.chat_requests[-1]["messages"][0]["content"]
+    hist = client.get("/api/history").json()["messages"]
+    assert [m["voice"] for m in hist if m["role"] == "user"] == [False, False]
+
+
+def test_voice_flag_ignored_by_switch_turn(client, fake_llm):
+    # a voice turn saying a switch command still switches; nothing is stored
+    add_persona(client)
+    r = client.post("/api/chat", json={"text": "switch to asuka", "voice": True})
+    assert r.status_code == 200 and r.json()["switched"] is True
+
+
 # ── chat: switching ─────────────────────────────────────────────────────────
 
 def test_chat_switch_by_keyword_stores_nothing(client):

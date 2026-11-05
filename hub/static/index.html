@@ -722,6 +722,7 @@ async function loadHistory() {
       (m.role !== "user" && m.actions && m.actions.length
         ? m.actions.map((a) => `<span class="act">↝ ${esc(a.name)}</span>`).join("") : "") +
       `<div class="meta">#${m.id} · ${esc(m.created_at)} · via ${esc(m.source || "?")}` +
+      (m.role === "user" && m.voice ? " · 🎤 speech-recognised" : "") +
       (m.tools_used && m.tools_used.length ? ` · tools: ${esc(m.tools_used.map((t) => t.tool).join(", "))}` : "") +
       (m.memory_writes && m.memory_writes.length ? ` · 🧠 ${esc(m.memory_writes.map((w) => w.text).join("; ").slice(0, 80))}` : "") +
       `</div></div>`

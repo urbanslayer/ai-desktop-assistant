@@ -6,8 +6,10 @@ asr: remote -> Faster-Whisper on another machine (server/asr_server.py, or any
 asr: local  -> Faster-Whisper on this PC
 asr: groq   -> Groq's online Whisper
 """
+import difflib
 import io
 import os
+import re
 import threading
 from collections import deque
 
@@ -325,6 +327,221 @@ class AlwaysListener:
             pass
 
 
+# ── getting the names right ──────────────────────────────────
+# Whisper turns 'Furina' into 'Farina' when it has never seen the word.
+# Two layers fix that:
+#  1. a short vocabulary prompt (initial_prompt) rides along with every
+#     clip: Whisper biases the SPELLING of words it sees there;
+#  2. deterministic fix-ups on the finished text: an exact corrections
+#     table plus a conservative fuzzy pass over capitalised near-misses.
+ASR_PROMPT_MAX = 200               # Whisper truncates initial_prompt at 224 tokens anyway
+FUZZY_MIN_RATIO = 0.8              # SequenceMatcher ratio a near-miss must reach
+FUZZY_MIN_LEN = 4                  # shorter words fuzzy-match too easily
+
+# Names the app always knows (the owner's persona and friends); hub
+# persona names are merged in at runtime, and `asr.vocabulary:` in
+# character_config.yaml adds the rest.
+DEFAULT_VOCABULARY = ("Furina", "Riko", "senpai", "Starburst 1200")
+
+# Exact fix-ups: a misheard spelling -> the right word. Case-insensitive,
+# whole-word. `asr.corrections:` in character_config.yaml merges on top of
+# this (an identity entry like `Farina: Farina` switches one off).
+DEFAULT_CORRECTIONS = {
+    "Farina": "Furina", "Fareena": "Furina",
+    "Furena": "Furina", "Fureena": "Furina",
+}
+
+# Real English words the fuzzy pass must never rewrite, however close they
+# look to a vocabulary word (Marina vs Furina). The exact corrections table
+# still applies to them — that one is an explicit statement that the word
+# was misheard; `asr.corrections` can override it (see above).
+COMMON_WORD_GUARD = frozenset("""
+farina marina arena sienna fiona flora fauna piranha senora senor amigo
+forma formula family famous finally friend banana pizza pasta salsa ninja
+rina rico miko
+""".split())
+
+
+def _asr_opt(cfg, name, default):
+    """Read an `asr.<name>` option: the dotted top-level yaml key
+    (`asr.vocabulary:` next to `asr: remote`) or, if `asr:` were ever a
+    mapping, `asr: {<name>: ...}`."""
+    value = cfg.get(f"asr.{name}")
+    if value is None and isinstance(cfg.get("asr"), dict):
+        value = cfg["asr"].get(name)
+    return default if value is None else value
+
+
+def asr_vocabulary(cfg):
+    """Words Whisper should know: active persona first, the hub's other
+    persona names, the built-in defaults, then `asr.vocabulary:` from the
+    config. Deduped case-insensitively, order preserved. Never raises: a
+    hub that is down just contributes no names."""
+    words = []
+    try:
+        from riko import hub_client
+        words += hub_client.persona_names()
+    except Exception:  # no hub client (terminal use), hub down, bad data
+        pass
+    words += list(DEFAULT_VOCABULARY)
+    extra = _asr_opt(cfg, "vocabulary", [])
+    if isinstance(extra, str):
+        extra = [extra]
+    try:
+        words += [str(w) for w in extra]
+    except TypeError:  # not a list at all: ignore the config typo
+        pass
+    out, seen = [], set()
+    for w in words:
+        w = str(w).strip()
+        if w and w.lower() not in seen:
+            seen.add(w.lower())
+            out.append(w)
+    return out
+
+
+def asr_prompt(cfg):
+    """The initial_prompt sentence: 'Riko, Furina, Asuka, senpai.' capped
+    at ASR_PROMPT_MAX chars (words are dropped from the end, never cut
+    mid-word). '' = send no prompt."""
+    out = ""
+    for w in asr_vocabulary(cfg):
+        cand = f"{out}, {w}" if out else w
+        if len(cand) + 1 > ASR_PROMPT_MAX:  # +1 for the closing '.'
+            break
+        out = cand
+    return f"{out}." if out else ""
+
+
+def _match_case(source, target):
+    """Spell `target` the way `source` was spelled (Farina->Furina,
+    farina->furina, FARINA->FURINA)."""
+    if source.isupper():
+        return target.upper()
+    if source[:1].isupper():
+        return target[:1].upper() + target[1:]
+    if source.islower():
+        return target.lower()
+    return target
+
+
+def _correction_table(cfg):
+    table = dict(DEFAULT_CORRECTIONS)
+    user = _asr_opt(cfg, "corrections", {})
+    if isinstance(user, dict):
+        for bad, good in user.items():
+            bad, good = str(bad).strip(), str(good).strip()
+            if bad and good:
+                table[bad] = good
+    return {k: v for k, v in table.items() if k.lower() != v.lower()}
+
+
+def _jaro_winkler(a: str, b: str) -> float:
+    """Plain Jaro-Winkler (Winkler prefix bonus 0.1, prefix capped at 4)."""
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    window = max(len(a), len(b)) // 2 - 1
+    a_hit = [False] * len(a)
+    b_hit = [False] * len(b)
+    matches = 0
+    for i, ch in enumerate(a):
+        for j in range(max(0, i - window), min(i + window + 1, len(b))):
+            if not b_hit[j] and b[j] == ch:
+                a_hit[i] = b_hit[j] = True
+                matches += 1
+                break
+    if not matches:
+        return 0.0
+    k = transposes = 0
+    for i in range(len(a)):
+        if a_hit[i]:
+            while not b_hit[k]:
+                k += 1
+            if a[i] != b[k]:
+                transposes += 1
+            k += 1
+    transposes //= 2
+    jaro = (matches / len(a) + matches / len(b)
+            + (matches - transposes) / matches) / 3
+    prefix = 0
+    for i in range(min(4, len(a), len(b))):
+        if a[i] != b[i]:
+            break
+        prefix += 1
+    return jaro + 0.1 * prefix * (1 - jaro)
+
+
+def _similar(a: str, b: str) -> float:
+    """Similarity of two lowercase words, 0..1: the better of difflib's ratio
+    and Jaro-Winkler. difflib alone misses phonetic spellings whose shared
+    letters split into blocks ('Asooka'/'asuka' = 0.73, two edits that should
+    count); Jaro-Winkler catches them (0.86) while staying under 0.8 on the
+    non-names ('Farm'/'furina' 0.61, 'Marina'/'furina' 0.78)."""
+    return max(difflib.SequenceMatcher(None, a, b).ratio(), _jaro_winkler(a, b))
+
+
+def _fuzzy_targets(cfg):
+    """Targets for the fuzzy pass: whole vocabulary entries plus the
+    alphabetic words inside multi-word entries ('Starburst 1200' -> also
+    'Starburst'). Only name-like words (length >= FUZZY_MIN_LEN)."""
+    targets, seen = [], set()
+    for entry in asr_vocabulary(cfg):
+        parts = [entry] + [p for p in entry.split() if len(p) >= FUZZY_MIN_LEN]
+        for p in parts:
+            if len(p) >= FUZZY_MIN_LEN and p.lower() not in seen:
+                seen.add(p.lower())
+                targets.append(p)
+    return targets
+
+
+def apply_corrections(text, cfg):
+    """Fix words Whisper misheard, and log every fix ('[asr] corrected
+    Farina -> Furina'). The corrected text is what gets shown and sent.
+
+    Pass 1: the exact corrections table (case-insensitive, whole-word).
+    Pass 2: capitalised words (name-shaped) fuzzy-match a vocabulary word —
+    ratio >= 0.8, length >= 4, real English words (COMMON_WORD_GUARD) and
+    vocabulary words themselves are never touched. Deliberately
+    conservative: 'Marina' and 'Farm' stay, 'Asooka' becomes 'Asuka'."""
+    if not text:
+        return text
+    out = text
+    for bad, good in _correction_table(cfg).items():
+        pattern = re.compile(rf"\b{re.escape(bad)}\b", re.IGNORECASE)
+
+        def _sub(m, good=good):
+            fixed = _match_case(m.group(0), good)
+            if fixed != m.group(0):
+                print(f"[asr] corrected {m.group(0)} -> {fixed}")
+            return fixed
+
+        out = pattern.sub(_sub, out)
+    targets = _fuzzy_targets(cfg)
+    target_lowers = {t.lower() for t in targets}
+
+    def _fuzzy(m):
+        word = m.group(0)
+        low = word.lower()
+        if low in target_lowers or low in COMMON_WORD_GUARD:
+            return word
+        best, ratio = None, 0.0
+        for t in targets:
+            r = _similar(low, t.lower())
+            if r > ratio:
+                best, ratio = t, r
+        if best and ratio >= FUZZY_MIN_RATIO:
+            fixed = _match_case(word, best)
+            if fixed != word:
+                print(f"[asr] corrected {word} -> {fixed} "
+                      f"(fuzzy {ratio:.2f})")
+                return fixed
+        return word
+
+    return re.sub(r"\b[A-Z][A-Za-z'’-]{3,}\b", _fuzzy, out)
+
+
 # ── what counts as "Whisper invented that" ───────────────────
 # No phrase blocklist: "Thank you." is a real sentence a person says. A VAD
 # segment is only dropped when the evidence says nobody spoke:
@@ -422,21 +639,27 @@ def _segments_evidence(segs) -> dict:
 
 def transcribe(wav_bytes, cfg):
     mode = cfg["asr"]
+    prompt = asr_prompt(cfg)  # vocabulary bias: 'Riko, Furina, senpai.'
     if mode == "groq":
         groq = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
-        text = groq.audio.transcriptions.create(model=GROQ_MODEL, file=("you.wav", wav_bytes)).text
+        extra: dict = {"prompt": prompt} if prompt else {}
+        text = groq.audio.transcriptions.create(model=GROQ_MODEL, file=("you.wav", wav_bytes),
+                                                **extra).text
     elif mode == "remote":
         if _remote is None:
             raise RuntimeError("remote ASR was never set up: call asr.check(cfg) first "
                                "(it failed? start server/asr_server.py on that machine, or set asr: local)")
         r = cfg["remote_asr"]
-        extra = {"language": r["language"]} if r.get("language") else {}
+        extra: dict = {"language": r["language"]} if r.get("language") else {}
+        if prompt:
+            extra["prompt"] = prompt  # asr_server.py passes it to initial_prompt
         text = _remote.audio.transcriptions.create(model=r.get("model", "whisper-1"),
                                                    file=("you.wav", wav_bytes), **extra).text
     else:
         if _whisper is None:
             raise RuntimeError("local ASR was never loaded: call asr.check(cfg) first")
-        segments, _ = _whisper.transcribe(io.BytesIO(wav_bytes))
+        segments, _ = _whisper.transcribe(io.BytesIO(wav_bytes),
+                                          initial_prompt=prompt or None)
         text = "".join(s.text for s in segments)  # each segment already starts with a space
     return text.strip()
 
@@ -448,11 +671,13 @@ def transcribe_verbose(wav_bytes, cfg):
     backend has no verbose_json fields (an ASR server from before segments
     were added; the caller then falls back to the Silero-only rule)."""
     mode = cfg["asr"]
+    prompt = asr_prompt(cfg)  # same vocabulary bias as transcribe()
     try:
         if mode == "local":
             if _whisper is None:
                 raise RuntimeError("local ASR was never loaded: call asr.check(cfg) first")
-            segments, _ = _whisper.transcribe(io.BytesIO(wav_bytes))
+            segments, _ = _whisper.transcribe(io.BytesIO(wav_bytes),
+                                              initial_prompt=prompt or None)
             text, segs = [], []
             for s in segments:  # the generator must be drained inside no lock here
                 text.append(s.text)
@@ -468,6 +693,8 @@ def transcribe_verbose(wav_bytes, cfg):
             client, r = _remote, cfg["remote_asr"]
             model = r.get("model", "whisper-1")
             extra = {"language": r["language"]} if r.get("language") else {}
+        if prompt:
+            extra["prompt"] = prompt
         resp = client.audio.transcriptions.create(
             model=model, file=("you.wav", wav_bytes),
             response_format="verbose_json", **extra)

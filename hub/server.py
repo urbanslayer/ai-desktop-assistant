@@ -140,6 +140,18 @@ def normalize_switch_text(text: str) -> str:
     return str(text).strip().lower().rstrip(".!?,")
 
 
+def voice_prompt(known_names: list) -> str:
+    """System-prompt line for a speech-recognition turn (`voice: true` in
+    POST /api/chat, docs/API.md): names get misheard, and she must roll
+    with it instead of commenting. The known names ride along so the
+    closest match is the name from the hub, not some other spelling."""
+    return ("The user is speaking; their words come from speech recognition "
+            "and names may be misheard (e.g. Farina for Furina). "
+            f"Names you know: {', '.join(known_names) if known_names else 'none listed'}. "
+            "Silently assume the closest name you know; never point out or "
+            "comment on the misspelling.")
+
+
 def create_app(data_dir, api_key: str | None = None,
                llm_defaults: dict | None = None,
                tts_defaults: dict | None = None,
@@ -794,6 +806,7 @@ def create_app(data_dir, api_key: str | None = None,
         source = str(body.get("source") or "")
         override = str(body.get("persona") or "")
         speak = body.get("speak", True) is not False  # default true (docs/VOICE.md)
+        voice = bool(body.get("voice"))  # speech-recognised text (docs/API.md)
         norm = normalize_switch_text(text)
 
         def turn():  # blocking section: store + LLM, one chat at a time
@@ -882,6 +895,9 @@ def create_app(data_dir, api_key: str | None = None,
                 appearance = str(persona.get("appearance") or "").strip()
                 if appearance:
                     system += "\n\n" + _body.appearance_prompt(appearance)
+                if voice:  # speech-recognised turn: never comment on misheard names
+                    system += "\n\n" + voice_prompt(
+                        [p["name"] for p in store.list_personas()])
                 # memory round: the "What you remember" block goes in even
                 # when the tool loop is off (facts stay useful as notes); the
                 # memory tools themselves only exist while tools are on.
@@ -936,7 +952,7 @@ def create_app(data_dir, api_key: str | None = None,
                     text, actions, body_actions if persona.get("embodied", True) else [])
                 tools_used = out["tools_used"]
 
-                user_id = store.add_message(pid, "user", text, source)
+                user_id = store.add_message(pid, "user", text, source, voice=voice)
                 # the spoken text is the cleaned reply (hub/speech.py): audio
                 # and any client-side TTS use it, the bubble keeps all of it.
                 spoken = _speech.speech_text(answer)

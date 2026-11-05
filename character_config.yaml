@@ -42,6 +42,22 @@ llm:
 # groq   = Groq's online Whisper, needs GROQ_API_KEY in .env
 asr: remote
 
+# Words she must get right. Whisper's model has never met 'Furina', so it
+# spells what it hears ('Farina'). Every recorded clip rides along with a
+# short vocabulary prompt ('Riko, Furina, senpai.') that biases the
+# spelling of exactly these words, and finished transcripts get fix-ups.
+# The hub's persona names are added automatically (active persona first) —
+# list the extras here. Keep it to names and jargon, not sentences.
+asr.vocabulary: ["Furina", "Riko", "senpai", "Starburst 1200"]
+
+# Exact spelling fix-ups applied after transcription (case-insensitive,
+# whole-word, logged as '[asr] corrected Farina -> Furina'). Merged on top
+# of a small built-in table; an identity entry (Farina: Farina) switches a
+# built-in one off, e.g. when you really do talk about farina flour.
+# Near-misses of the words in asr.vocabulary are also fuzzy-corrected
+# automatically (capitalised words only, real English words untouched).
+asr.corrections: {Farina: Furina, Fareena: Furina, Furena: Furina, Fureena: Furina}
+
 remote_asr:
   url: http://192.0.2.51:8001/v1   # server/asr_server.py, or any OpenAI-compatible STT server (e.g. speaches)
   api_key_env: ASR_API_KEY           # only needed if the server was started with ASR_API_KEY set

@@ -108,6 +108,7 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   "memory_writes": [               // [] unless the turn saved facts (memory round M)
     {"id": 7, "text": "User's cat is called Miso"}
   ],
+  "voice": false,                  // user messages: true when the text came from speech recognition
   "created_at": "2026-11-03T18:00:00Z"
 }
 ```
@@ -345,7 +346,13 @@ Appends (or with `replace: true`, clears then appends) with `source:
 ### POST /api/chat → ChatResult
 
 Body: `{"text": "…", "source": "android", "persona": optional id,
-"speak": optional bool (default true)}`.
+"speak": optional bool (default true), "voice": optional bool (default
+false)}`. `voice: true` says the text came off speech recognition: the hub
+adds one line to the system prompt telling her names may be misheard
+(e.g. *Farina* for *Furina*, with the hub's persona names listed) and that
+she must silently assume the closest name instead of commenting, and the
+stored user message carries `voice: true` (🎤 on the web page). Clients on
+older hubs may send it anyway — the field is simply ignored there.
 
 ```json
 {
@@ -375,7 +382,8 @@ Two outcomes:
    `embodied` and the online body set has `wave` (see *Body actions*), else
    `[]`.
 2. **Normal turn**: the hub builds `system_prompt + emotion/body/appearance
-   prompt lines + last <max_history> stored messages + your text`, runs the
+   prompt lines (+ the speech-recognition line when `voice: true`) + last
+   <max_history> stored messages + your text`, runs the
    model (possibly through the tool loop — see *Tools*), strips any emotion
    tag and action tags, then stores your message and the clean reply (both
    with your `source`, the assistant one with `emotion` + `actions` +

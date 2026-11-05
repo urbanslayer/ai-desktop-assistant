@@ -111,15 +111,20 @@ class HubClient:
         """Switch persona by id, name or keyword (case-insensitive, hub-side)."""
         return self._json("POST", "/api/active", json={"persona": name_or_id})
 
-    def chat(self, text, source="desktop", persona=None):
+    def chat(self, text, source="desktop", persona=None, voice=False):
         """One turn. Returns the ChatResult: {reply, speech, persona, switched,
         message_ids, state_version}. `speech` is the cleaned spoken text
         (docs/API.md): speak it, display `reply`. A keyword turn (e.g.
         'switch to asuka') comes back as switched=true with the persona's
-        greeting as reply."""
+        greeting as reply. `voice=True` marks the text as speech-recognised
+        (docs/API.md): the hub adds a never-comment-on-misheard-names line
+        to the system prompt and stores a 🎤 flag on the user message;
+        hubs before this field simply ignore it."""
         body = {"text": text, "source": source}
         if persona:
             body["persona"] = persona
+        if voice:
+            body["voice"] = True
         return self._json("POST", "/api/chat", json=body, timeout=CHAT_TIMEOUT)
 
     def history(self, persona=None, after=0, limit=50):
@@ -227,12 +232,15 @@ class HubClient:
 # ── The one client every module in the app shares ────────────
 _client = None
 _active = None  # last-seen active Persona (id, name, avatar_version, tts_voice, ...)
+_names_cache = None  # (expiry_monotonic, [persona names]) — see persona_names()
+PERSONA_NAMES_TTL = 300.0  # names change rarely; the ASR prompt asks at most every 5 min
 
 
 def _reset():
-    global _client, _active
+    global _client, _active, _names_cache
     _client = None
     _active = None
+    _names_cache = None
 
 
 def get():
@@ -257,12 +265,39 @@ def connect(cfg):
 
 def note_active(state):
     """Remember the active persona from a State answer (no UI events)."""
-    global _active
-    _active = state.get("active") if isinstance(state, dict) else None
+    global _active, _names_cache
+    new = state.get("active") if isinstance(state, dict) else None
+    if (new or {}).get("id") != (_active or {}).get("id"):
+        _names_cache = None  # persona_names() puts the ACTIVE persona first
+    _active = new
 
 
 def active_persona():
     return _active
+
+
+def persona_names():
+    """Persona names from the hub — the ACTIVE persona first, then the rest —
+    for riko.asr's vocabulary prompt. Cached ~5 min (names change rarely;
+    this is asked once per recorded clip). Never raises: no client yet or a
+    hub failure returns the stale cache, or [] the first time."""
+    global _names_cache
+    now = time.monotonic()
+    if _names_cache is not None and now < _names_cache[0]:
+        return list(_names_cache[1])
+    try:
+        listed = get().personas()
+        names = [str(p["name"]).strip() for p in listed
+                 if isinstance(p, dict) and str(p.get("name") or "").strip()]
+        active_id = (_active or {}).get("id")
+        active_name = next((str(p["name"]).strip() for p in listed
+                            if isinstance(p, dict) and p.get("id") == active_id), "")
+        if active_name:  # Whisper biases the prompt words it sees first hardest
+            names = [active_name] + [n for n in names if n.lower() != active_name.lower()]
+    except Exception:
+        return list(_names_cache[1]) if _names_cache else []
+    _names_cache = (now + PERSONA_NAMES_TTL, names)
+    return list(names)
 
 
 def announce_persona(state):
