@@ -7,6 +7,7 @@ network beyond localhost. Nothing here ever opens a real audio device.
 import importlib.util
 import os
 import queue
+import threading
 import time
 from pathlib import Path
 
@@ -34,48 +35,82 @@ def wait_for(pred, timeout=3.0):
 
 # ── fake audio world ──────────────────────────────────────────
 class FakeStream:
-    """Pull-based stand-in for sd.InputStream (AlwaysListener.read). A real mic
-    always has data; so this returns silence on an empty queue instead of
-    blocking forever, or the reader could never notice a suspend/close."""
+    """Stand-in for sd.InputStream in CALLBACK mode. A little 'device thread'
+    calls the callback with queued frames, exactly like PortAudio: callbacks
+    arrive from a FOREIGN thread, while the thread that opened the stream is
+    the only one allowed to stop/close it. A foreign stop/close (or any
+    blocking read at all — the old crash pattern) is recorded in
+    sd.violations instead of segfaulting, so the tests can assert the
+    ownership rule held."""
 
-    def __init__(self, sd):
+    def __init__(self, sd, callback):
         self.sd = sd
+        self.opener = threading.get_ident()
+        self.closer = None
         self.stopped = False
         self.closed = False
+        self.cb_threads = set()      # threads that ran the callback
+        self._halt = threading.Event()   # stop delivering frames
+        self._dead = threading.Event()   # pump thread may exit
+        self._thread = None
+        if callback is not None:
+            def traced(data, *rest):  # record WHICH thread PortAudio used
+                self.cb_threads.add(threading.get_ident())
+                callback(data, *rest)
+            self._thread = threading.Thread(target=self._pump, args=(traced,),
+                                            daemon=True, name="fake-portaudio")
+            self._thread.start()
+
+    def _pump(self, callback):  # the fake PortAudio callback thread
+        while not self._dead.is_set():
+            if self.sd.stall or self._halt.is_set():
+                time.sleep(0.005)  # device delivers nothing right now
+                continue
+            try:
+                item = self.sd.frames.get(timeout=0.005)
+            except queue.Empty:
+                continue
+            if self._dead.is_set() or self._halt.is_set():
+                break
+            callback(item, vad_mod.FRAME_SAMPLES, None, None)
 
     def start(self):
         pass
 
-    def read(self, n):
-        if self.sd.read_error:
-            raise RuntimeError("device disappeared")
-        try:
-            item = self.sd.frames.get(timeout=0.02)
-        except queue.Empty:
-            item = None  # room tone: a live stream never starves like this
-        if item is None:
-            return np.zeros(n, np.float32), False
-        return item, False
+    def read(self, n):  # the old blocking-read mode must be gone
+        self.sd.violations.append("stream.read() called at all "
+                                  "(the reader must use callback mode)")
+        raise RuntimeError("fake stream: read() is not supported")
 
     def stop(self):
+        if threading.get_ident() != self.opener:
+            self.sd.violations.append(
+                f"stop() from {threading.get_ident()} != opener {self.opener}")
         self.stopped = True
-        self.sd.frames.put(None)
+        self._halt.set()
 
     def close(self):
+        if threading.get_ident() != self.opener:
+            self.sd.violations.append(
+                f"close() from {threading.get_ident()} != opener {self.opener}")
+        self.closer = threading.get_ident()
         self.closed = True
+        self._halt.set()
+        self._dead.set()
 
 
 class FakeSD:
     def __init__(self, fail_open=False):
         self.streams = []
         self.fail_open = fail_open
-        self.read_error = False
+        self.stall = False       # True: the fake device delivers no frames
         self.frames = queue.Queue()
+        self.violations = []     # cross-thread stop/close, read() usage
 
     def InputStream(self, **kwargs):  # noqa: N802 (sounddevice API)
         if self.fail_open:
             raise OSError("no such input device")
-        stream = FakeStream(self)
+        stream = FakeStream(self, kwargs.get("callback"))
         self.streams.append(stream)
         return stream
 
@@ -87,6 +122,15 @@ def put_frames(sd, idle=0, loud=0, quiet=0):
         sd.frames.put(np.full(N, 0.05, np.float32))
     for _ in range(quiet):
         sd.frames.put(np.full(N, 0.001, np.float32))
+
+
+def assert_owned(sd):
+    """The ownership rule held: no foreign-thread stop/close, no read(),
+    and every stream ended closed by the very thread that opened it."""
+    assert sd.violations == [], sd.violations
+    for s in sd.streams:
+        assert s.closed, "a stream was left open"
+        assert s.closer == s.opener, "stream closed by a foreign thread"
 
 
 class FakeListener:
@@ -315,7 +359,12 @@ def test_listener_delivers_a_wav_segment_with_stats():
     st = stats_box[0]  # the Silero evidence the noise filter weighs
     assert st["voiced_seconds"] >= 0.5 and st["mean_prob"] == 1.0  # EnergyVad: 1/0
     assert not listener.running
-    assert sd.streams[-1].closed  # shutdown releases the device
+    stream = sd.streams[-1]
+    assert stream.closed  # shutdown releases the device
+    assert stream.closer == stream.opener  # ... by the thread that opened it
+    assert stream.cb_threads and stream.opener not in stream.cb_threads, \
+        "the callback must arrive on the PortAudio thread, never the reader's"
+    assert_owned(sd)
 
 
 def test_listener_pause_drops_frames():
@@ -406,29 +455,109 @@ def test_listener_suspend_gives_the_mic_up_and_release_takes_it_back():
     try:
         first = sd.streams[0]
         listener.suspend()  # Space held: the Recorder owns the device
-        assert wait_for(lambda: first.stopped), "stream stayed open while suspended"
+        # suspend() now BLOCKS until the reader has closed its own stream,
+        # so a Recorder opened right after can never race for the device.
+        assert first.stopped and first.closed, "stream stayed open while suspended"
         listener.release()
         assert wait_for(lambda: len(sd.streams) > 1), "no fresh stream after release"
         put_frames(sd, idle=20, loud=25, quiet=30)
         assert wait_for(lambda: segs), "no segment after release"
     finally:
         listener.close()
+    assert_owned(sd)
+
+
+def test_close_while_blocked_waiting_for_a_frame():
+    """The owner's L-key crash, pinned as a test: close() arrives from a
+    foreign thread while the reader is waiting inside its frame queue. The
+    reader must notice, close its OWN stream, and exit — and the caller must
+    come back bounded, with the device actually released."""
+    sd = FakeSD()
+    sd.stall = True  # not a single frame ever arrives
+    listener = asr.AlwaysListener(lambda w, s=None: None, sd_module=sd,
+                                  vad=vad.EnergyVad(), stall_seconds=60)
+    listener.start()
+    stream = sd.streams[0]
+    t0 = time.monotonic()
+    listener.close()  # the OTHER thread, while the reader is stuck waiting
+    assert time.monotonic() - t0 < 1.0, "close() blocked on a stuck reader"
+    assert stream.closed, "the reader never released the device"
+    assert stream.closer == stream.opener
+    assert not listener.running
+    assert_owned(sd)
+
+
+def test_suspend_while_blocked_is_bounded_and_owns_its_close():
+    sd = FakeSD()
+    sd.stall = True
+    listener = asr.AlwaysListener(lambda w, s=None: None, sd_module=sd,
+                                  vad=vad.EnergyVad(), stall_seconds=60)
+    listener.start()
+    stream = sd.streams[0]
+    t0 = time.monotonic()
+    listener.suspend()  # blocked reader: returns promptly once idle is set
+    assert time.monotonic() - t0 < 1.0
+    assert stream.closed and stream.closer == stream.opener
+    listener.release()
+    assert wait_for(lambda: len(sd.streams) > 1), "release after a bounded suspend"
+    listener.close()
+    assert_owned(sd)
+
+
+def test_start_close_x100_never_touches_a_foreign_stream():
+    """L-key hammering: 100 full start/close lifetimes in a row. Every
+    stream ends closed by its opener; a single foreign stop/close in this
+    loop is what used to SIGSEGV the desktop app."""
+    sd = FakeSD()
+    for i in range(100):
+        listener = asr.AlwaysListener(lambda w, s=None: None, sd_module=sd,
+                                      vad=vad.EnergyVad())
+        listener.start()
+        if i % 4 == 0:
+            put_frames(sd, idle=3)  # give the pump/reader something to chew
+        listener.close()
+        assert not listener.running
+    assert_owned(sd)
+    assert len(sd.streams) == 100
+
+
+def test_suspend_release_x50_then_close():
+    """Space-held in always mode, hammered: suspend hands the device over,
+    release takes it back, close ends it — all closes on the owning thread."""
+    sd = FakeSD()
+    listener = asr.AlwaysListener(lambda w, s=None: None, sd_module=sd,
+                                  vad=vad.EnergyVad())
+    listener.start()
+    for i in range(50):
+        listener.suspend()
+        assert sd.streams[-1].closed, "suspend left the device held"
+        if i % 3:
+            listener.release()
+            assert wait_for(lambda: not listener._idle.is_set(), timeout=2), \
+                "release never reopened the stream"
+    listener.close()
+    assert not listener.running
+    assert_owned(sd)
 
 
 def test_listener_retries_after_device_error():
+    """A device that dies mid-stream (here: stops delivering frames) is
+    noticed by the reader's stall timer; the reader closes ITS OWN stream
+    and reopens — never a foreign-thread close."""
     segs, sd = [], FakeSD()
     listener = asr.AlwaysListener(collector(segs), sd_module=sd, vad=vad.EnergyVad(),
-                                  retry_delay=0.05, retry_max=0.2)
+                                  retry_delay=0.05, retry_max=0.2, stall_seconds=0.15)
     listener.start()
     try:
-        sd.read_error = True
-        put_frames(sd, idle=1)
-        time.sleep(0.3)
-        sd.read_error = False
+        sd.stall = True
+        time.sleep(0.5)  # several stall-retry rounds
+        assert len(sd.streams) > 1, "stalled device never triggered a retry"
+        sd.stall = False
         put_frames(sd, idle=20, loud=25, quiet=30)
         assert wait_for(lambda: segs, timeout=5), "listener died instead of retrying"
     finally:
         listener.close()
+    assert_owned(sd)
 
 
 def test_listener_start_raises_on_a_dead_mic():
@@ -837,7 +966,8 @@ def test_toggle_persists_and_restores(listen_env):
     assert len(made) == 1 and made[0].started == 1
     s.toggle_listen_mode()
     assert s.listen_mode == "push_to_talk" and appstate.load_mode() == "push_to_talk"
-    assert made[0].closed_count == 1
+    # the VAD shutdown runs on its own short-lived thread (never the caller's)
+    assert wait_for(lambda: made[0].closed_count == 1), "VAD close never ran"
     s.close()
     # the next start honours the persisted choice, not the yaml seed
     appstate.save_mode("always")
@@ -906,3 +1036,62 @@ def test_close_releases_the_listener(listen_env):
     s = session.Session(cfg, source="desktop")
     s.close()
     assert made[0].closed_count == 1 and s._vad is None
+
+
+def test_rapid_toggles_survive(listen_env, monkeypatch):
+    """L hammered 50× with the REAL AlwaysListener on fake hardware: every
+    listener's whole life cycle (reader thread, callback pump, stream) is
+    opened and closed by its owner thread, and the Session ends where it
+    started. This is the sequence that used to SIGSEGV the desktop app."""
+    cfg, url, made, _, _ = listen_env
+    fake_sd = FakeSD()
+
+    def factory(on_segment, cfg=None):
+        listener = RealAlwaysListener(on_segment, cfg=cfg, sd_module=fake_sd,
+                                      vad=vad.EnergyVad())
+        made.append(listener)
+        return listener
+
+    monkeypatch.setattr(asr, "AlwaysListener", factory)
+    monkeypatch.setattr(asr, "sd", fake_sd)
+    s = session.Session(cfg, source="desktop")  # push_to_talk
+    for _ in range(50):
+        s.toggle_listen_mode()
+    assert s.listen_mode == "push_to_talk"
+    assert len(made) == 25, f"expected 25 always-mode lifetimes, got {len(made)}"
+    # the close dispatch is async: every stream must still END closed,
+    # closed by the very thread that opened it
+    assert wait_for(lambda: len(fake_sd.streams) >= 25
+                    and all(st.closed for st in fake_sd.streams), timeout=15), \
+        "a toggled-off listener never released its stream"
+    assert_owned(fake_sd)
+    s.close()
+
+
+def test_toggling_off_does_not_wait_for_the_mic_close(listen_env, monkeypatch):
+    """The Qt thread lesson: set_listen_mode('push_to_talk') hands the VAD
+    shutdown to a short-lived thread and returns at once — a slow PortAudio
+    teardown must never stall the L key or the tray."""
+    cfg, url, made, _, _ = listen_env
+
+    class SlowClose(FakeListener):
+        def close(self):
+            time.sleep(0.5)  # a teardown that dawdles
+            super().close()
+
+    def factory(on_segment, cfg=None):
+        listener = SlowClose(on_segment, cfg)
+        made.append(listener)
+        return listener
+
+    monkeypatch.setattr(asr, "AlwaysListener", factory)
+    s = session.Session(cfg, source="desktop")
+    s.toggle_listen_mode()  # -> always
+    assert s.listen_mode == "always"
+    t0 = time.monotonic()
+    s.toggle_listen_mode()  # -> push_to_talk: returns long before the close
+    dt = time.monotonic() - t0
+    assert dt < 0.25, f"set_listen_mode blocked the caller for {dt:.2f}s"
+    assert s.listen_mode == "push_to_talk"
+    assert wait_for(lambda: made[0].closed_count == 1), "the shutdown thread died"
+    s.close()

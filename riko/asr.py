@@ -9,8 +9,10 @@ asr: groq   -> Groq's online Whisper
 import difflib
 import io
 import os
+import queue
 import re
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -137,25 +139,47 @@ class AlwaysListener:
     (before tail()) are never fed into a segment. suspend()/release() hand
     the mic device itself to the push-to-talk Recorder while Space is held.
     A device error mid-stream retries with backoff; start() raises so the
-    caller can fall back to push-to-talk. Thread-safe: everything the reader
-    mutates runs on one reader thread; the cross-thread setters only touch
-    events and the tail ring.
+    caller can fall back to push-to-talk.
+
+    Stream ownership (the owner's L-key crash: pressing L closed the
+    PortAudio stream from the Qt thread while the reader thread was inside a
+    blocking stream.read() — undefined behaviour, SIGSEGV/SIGABRT, the whole
+    app died with no traceback): exactly ONE thread, the reader, opens,
+    reads, stops and closes the stream. The stream runs in sounddevice
+    CALLBACK mode — PortAudio's own thread only enqueues frames into a
+    queue — so the reader never sits inside PortAudio: it pulls from the
+    queue with a short timeout and notices close()/suspend() requests
+    between frames (tens of ms). Those setters only set events; close()
+    joins the reader (which closes its own stream on the way out) and
+    suspend() waits on an Event the reader sets once the device is
+    released — both bounded, so a stuck device delays, never hangs. A
+    device that stops delivering frames entirely (stall_seconds) is treated
+    as gone: the reader closes its stream and reopens with backoff.
     """
 
+    CLOSE_TIMEOUT = 1.5   # how long close()/suspend() wait for the reader
+
     def __init__(self, on_segment, cfg=None, sd_module=None, vad=None,
-                 retry_delay=0.5, retry_max=10.0):
+                 retry_delay=0.5, retry_max=10.0, device=None,
+                 stall_seconds=2.0, poll_interval=0.02):
         self.on_segment = on_segment
         self._sd = sd_module or sd
         self._cfg = dict(vad_mod.DEFAULTS, **(cfg or {}))
         self._vad = vad          # None -> backend chosen at start()
         self.vad_name = getattr(vad, "name", "injected") if vad else None
         self._segmenter = None
-        self._stream = None
         self._thread = None
         self._stop = threading.Event()
         self._pause = threading.Event()      # frames ignored, stream stays open
         self._suspend = threading.Event()    # device handed to the Recorder
         self._resume = threading.Event()     # released / resumed, loop wakes up
+        self._idle = threading.Event()       # reader holds NO stream right now
+        self._idle.set()
+        self._started = threading.Event()    # first open attempt finished
+        self._start_error = None             # ... and what it raised, if anything
+        self._device = device                # sounddevice device (None = default)
+        self._stall_seconds = float(stall_seconds)
+        self._poll = float(poll_interval)
         self._retry_delay = retry_delay
         self._retry_max = retry_max
         self._lock = threading.Lock()
@@ -170,7 +194,9 @@ class AlwaysListener:
         return self._thread is not None
 
     def start(self):
-        """Open the stream and start the reader thread; raises if the mic won't open."""
+        """Start the reader thread, which opens the stream; raises if the mic
+        won't open (the first open attempt is reported back here so the
+        caller can fall back to push-to-talk)."""
         with self._lock:
             if self._thread is not None:
                 return
@@ -189,39 +215,66 @@ class AlwaysListener:
             self._pause.clear()
             self._suspend.clear()
             self._resume.set()
-            self._stream = self._open_stream()  # first failure must reach the caller
-            self._thread = threading.Thread(target=self._run, daemon=True,
-                                            name="riko-vad")
-            self._thread.start()
+            self._started.clear()
+            self._start_error = None
+            thread = threading.Thread(target=self._run, daemon=True,
+                                      name="riko-vad")
+            self._thread = thread
+            thread.start()
+        if not self._started.wait(timeout=10.0):
+            # the device open itself hung: nothing was opened we must close
+            self._stop.set()
+            self._resume.set()
+            thread.join(timeout=1.0)
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+            raise OSError("opening the mic stream timed out")
+        if self._start_error is not None:
+            err, self._start_error = self._start_error, None
+            thread.join(timeout=1.0)
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+            raise err
 
-    def _open_stream(self):
+    def _open_stream(self, frames: queue.Queue):
+        """Open + start the capture stream in CALLBACK mode: PortAudio's own
+        thread calls `callback`, which only enqueues. The stream belongs to
+        the calling reader thread from here until that same thread closes
+        it. (A blocking stream.read() is what made a close() from another
+        thread crash the process — there is no read left to block in.)"""
+
+        def callback(indata, count, time_info, status):  # PortAudio's thread
+            frames.put(np.asarray(indata).copy())
+
         stream = self._sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                                      dtype="float32")
+                                      dtype="float32", device=self._device,
+                                      callback=callback)
         try:
-            stream.start()
+            stream.start()  # no-op with a callback; kept for parity with Recorder
         except Exception:
-            stream.close()
+            stream.close()  # same thread that just opened it, nothing reading
             raise
         return stream
 
     def close(self):
-        """Stop the reader and release the device (shutdown)."""
+        """Stop the reader and release the device (shutdown).
+
+        Never touches the stream from this thread: only the reader thread
+        stops/closes it (closing from here while the reader is inside
+        PortAudio aborts the process — no Python traceback, the app 'just
+        closes'). We set the events and wait, bounded, for the reader to
+        dismantle its own stream and exit."""
         with self._lock:
             thread, self._thread = self._thread, None
-            stream, self._stream = self._stream, None
         self._stop.set()
         self._resume.set()  # wake a suspended reader so join is quick
-        if stream is not None:
-            try:
-                stream.stop()
-            except Exception:
-                pass
-            try:
-                stream.close()
-            except Exception:
-                pass
         if thread is not None:
-            thread.join(timeout=3)
+            thread.join(timeout=self.CLOSE_TIMEOUT)
+            if thread.is_alive():
+                print("[listen] the mic reader is still finishing; "
+                      "it will close its stream on its own")
 
     def pause(self):
         """Ignore frames and forget the half-built segment (she is speaking).
@@ -250,73 +303,135 @@ class AlwaysListener:
         self._pause.clear()
 
     def suspend(self):
-        """Give the mic device to the push-to-talk Recorder (Space held)."""
+        """Give the mic device to the push-to-talk Recorder (Space held).
+
+        Waits (bounded) for the reader to close its own stream, so the
+        Recorder cannot open a second capture on a device the VAD has not
+        released yet."""
         self._suspend.set()
+        if not self._idle.wait(timeout=self.CLOSE_TIMEOUT):
+            print("[listen] the mic stream did not release in time; "
+                  "the recorder may find the device busy")
 
     def release(self):
         if self._suspend.is_set():
             self._suspend.clear()
             self._resume.set()
 
-    # ── the reader thread ─────────────────────────────────────
+    # ── the reader thread: the stream's ONLY owner ──────────
     def _run(self):
         delay = self._retry_delay
-        while not self._stop.is_set():
-            if self._suspend.is_set():
-                self._close_quiet()
-                self._resume.wait(timeout=0.2)
-                continue
-            try:
-                if self._stream is None:
-                    self._stream = self._open_stream()
+        stream = None
+        frames: queue.Queue = queue.Queue()
+        carry = np.zeros(0, dtype=np.float32)  # partial frame between callbacks
+        last_frame = 0.0
+        first_open = True
+        try:
+            while not self._stop.is_set():
+                if stream is None or self._suspend.is_set():
+                    if stream is not None:
+                        self._close_quiet(stream)  # the opener closes: always safe
+                        stream = None
+                        carry = np.zeros(0, dtype=np.float32)
+                        self._idle.set()
+                    if self._suspend.is_set():     # the Recorder owns the device
+                        self._resume.wait(timeout=self._poll)
+                        continue
+                    try:
+                        stream = self._open_stream(frames)
+                    except Exception as e:
+                        if first_open:             # dead mic: let start() raise
+                            self._start_error = e
+                            self._started.set()
+                            return
+                        print(f"[listen] mic stream failed ({type(e).__name__}: {e}); "
+                              f"retrying in {delay:.1f}s")
+                        if self._stop.wait(delay) or self._suspend.is_set():
+                            delay = self._retry_delay
+                        else:
+                            delay = min(delay * 2, self._retry_max)
+                        continue
+                    first_open = False
+                    self._start_error = None
+                    self._started.set()
+                    self._idle.clear()
                     delay = self._retry_delay
+                    last_frame = time.monotonic()
+                    while True:  # drop anything the previous stream had queued
+                        try:
+                            frames.get_nowait()
+                        except queue.Empty:
+                            break
                     print("[listen] mic stream back up")
-                frame, _overflowed = self._stream.read(vad_mod.FRAME_SAMPLES)
-            except Exception as e:
-                if self._stop.is_set() or self._suspend.is_set():
                     continue
-                self._close_quiet()
-                print(f"[listen] mic stream failed ({type(e).__name__}: {e}); "
-                      f"retrying in {delay:.1f}s")
-                if self._stop.wait(delay) or self._suspend.wait(0) :
+                try:
+                    data = frames.get(timeout=self._poll)
+                except queue.Empty:
+                    if time.monotonic() - last_frame <= self._stall_seconds:
+                        continue  # between callbacks: check the events, poll again
+                    data = TimeoutError(f"no audio frames for {self._stall_seconds:.1f}s")
+                if isinstance(data, BaseException):
+                    # device gone: close OUR stream here, back off, reopen
+                    self._close_quiet(stream)
+                    stream = None
+                    carry = np.zeros(0, dtype=np.float32)
+                    self._idle.set()
+                    print(f"[listen] mic stream failed ({type(data).__name__}: {data}); "
+                          f"retrying in {delay:.1f}s")
+                    if self._stop.wait(delay) or self._suspend.is_set():
+                        delay = self._retry_delay
+                    else:
+                        delay = min(delay * 2, self._retry_max)
                     continue
-                delay = min(delay * 2, self._retry_max)
-                continue
-            # Every frame feeds the VAD, even while paused: Silero is
-            # recurrent, and keeping it warm across her turn is exactly what
-            # lets the first frames after resume read true speech at once.
-            prob = float(self._vad(frame))
-            if self._pause.is_set() or self._suspend.is_set():
-                if self._pause.is_set():  # rolling echo-era audio, not her voice
-                    with self._lock:
-                        self._tail_ring.append((np.asarray(frame).reshape(-1),
-                                                self._tail_kept))
-                self._segmenter.reset()
-                continue
-            if self._seed:
-                self._segmenter.prime(self._seed)
-                self._seed = None
-            end = self._segmenter.push(np.asarray(frame).reshape(-1), prob)
-            if end is None:
-                continue
-            if end.audio is None:
-                print(f"[asr] always-listen: dropped a {end.seconds:.1f}s blip "
-                      f"({end.voiced_seconds:.2f}s of speech)")
-                continue
-            wav = io.BytesIO()
-            sf.write(wav, end.audio, SAMPLE_RATE, format="WAV")
-            print(f"[asr] always-listen: caught {end.seconds:.1f}s")
-            stats = {"seconds": end.seconds, "voiced_seconds": end.voiced_seconds,
-                     "mean_prob": end.mean_prob}
-            try:
-                self.on_segment(wav.getvalue(), stats)
-            except Exception as e:  # a segment must not kill the reader
-                print(f"[asr] always-listen: segment dropped ({type(e).__name__}: {e})")
+                last_frame = time.monotonic()
+                chunk = np.asarray(data, dtype=np.float32).reshape(-1)
+                carry = np.concatenate((carry, chunk)) if carry.size else chunk
+                while carry.size >= vad_mod.FRAME_SAMPLES and not self._stop.is_set():
+                    frame = carry[:vad_mod.FRAME_SAMPLES]
+                    carry = carry[vad_mod.FRAME_SAMPLES:]
+                    self._handle_frame(frame)
+        finally:
+            # shutdown with a stream still in hand (close() during a read
+            # wait — the L key): release the device HERE, on the thread that
+            # opened it, before the thread ends.
+            if stream is not None:
+                self._close_quiet(stream)
+                self._idle.set()
 
-    def _close_quiet(self):
-        stream, self._stream = self._stream, None
-        if stream is None:
+    def _handle_frame(self, frame):
+        # Every frame feeds the VAD, even while paused: Silero is
+        # recurrent, and keeping it warm across her turn is exactly what
+        # lets the first frames after resume read true speech at once.
+        prob = float(self._vad(frame))
+        if self._pause.is_set() or self._suspend.is_set():
+            if self._pause.is_set():  # rolling echo-era audio, not her voice
+                with self._lock:
+                    self._tail_ring.append((np.asarray(frame).reshape(-1),
+                                            self._tail_kept))
+            self._segmenter.reset()
             return
+        if self._seed:
+            self._segmenter.prime(self._seed)
+            self._seed = None
+        end = self._segmenter.push(np.asarray(frame).reshape(-1), prob)
+        if end is None:
+            return
+        if end.audio is None:
+            print(f"[asr] always-listen: dropped a {end.seconds:.1f}s blip "
+                  f"({end.voiced_seconds:.2f}s of speech)")
+            return
+        wav = io.BytesIO()
+        sf.write(wav, end.audio, SAMPLE_RATE, format="WAV")
+        print(f"[asr] always-listen: caught {end.seconds:.1f}s")
+        stats = {"seconds": end.seconds, "voiced_seconds": end.voiced_seconds,
+                 "mean_prob": end.mean_prob}
+        try:
+            self.on_segment(wav.getvalue(), stats)
+        except Exception as e:  # a segment must not kill the reader
+            print(f"[asr] always-listen: segment dropped ({type(e).__name__}: {e})")
+
+    def _close_quiet(self, stream):
+        """Stop + close a stream. Call ONLY from the thread that opened it."""
         try:
             stream.stop()
         except Exception:

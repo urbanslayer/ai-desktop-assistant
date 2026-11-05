@@ -110,11 +110,18 @@ class Session:
             self.listen_mode = mode
             print("[listen] always on")
         else:
-            if self._vad is not None:
-                self._vad.close()
-                self._vad = None
+            vad_ref = self._vad
+            self._vad = None
             self.listen_mode = mode
             print("[listen] push-to-talk")
+            if vad_ref is not None:
+                # Never close the mic on the caller: this is often the Qt
+                # thread (L key / tray) or the riko-ctl HTTP thread, and the
+                # reader thread must dismantle its own PortAudio stream
+                # without a foreign close racing it. Hand the shutdown to a
+                # short-lived thread and update the tray/UI right away.
+                threading.Thread(target=vad_ref.close, daemon=True,
+                                 name="riko-vad-close").start()
         if persist:
             appstate.save_mode(mode)  # remembered for the next start
         if self.on_listen_mode:
