@@ -206,6 +206,7 @@ def test_chat_stores_both_messages(client, fake_llm):
                    "persona": "riko", "switched": False,
                    "emotion": "neutral", "tools_used": [], "actions": [],
                    "memory_writes": [],  # memory round M: facts this turn saved
+                   "timers_set": [],     # timers round: timers this turn created
                    "message_ids": [1, 2], "state_version": st0["version"] + 1,
                    "audio_url": None}  # no TTS configured on this hub
 
