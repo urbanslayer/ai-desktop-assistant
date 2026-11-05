@@ -34,9 +34,7 @@ PLACES = {"london": [LONDON_UK, LONDON_CA], "gloucester, uk": [GLOUCESTER],
           "gloucester": [GLOUCESTER], "tokyo": [TOKYO]}
 
 
-def _forecast(lat, units="metric", fdays=1):
-    t = "°F" if units == "fahrenheit" else "°C"
-    w = "mph" if units == "mph" else "km/h"
+def _forecast(lat, temp="°C", wind="km/h", precip="mm", fdays=1):
     dates = [f"2026-11-{5 + i:02d}" for i in range(fdays)]
     hourly_time = [f"{d}T{h:02d}:00" for d in dates for h in range(24)]
     n = len(hourly_time)
@@ -46,7 +44,8 @@ def _forecast(lat, units="metric", fdays=1):
                     "apparent_temperature": 12.1, "relative_humidity_2m": 81,
                     "weather_code": 61, "wind_speed_10m": 13.3,
                     "precipitation": 0.1, "is_day": 1},
-        "current_units": {"temperature_2m": t, "wind_speed_10m": w},
+        "current_units": {"temperature_2m": temp, "wind_speed_10m": wind,
+                          "precipitation": precip},
         "daily": {"time": dates,
                   "weather_code": [61, 3] * fdays,
                   "temperature_2m_max": [15.1, 13.0] * fdays,
@@ -81,9 +80,14 @@ class FakeOpenMeteo:
                 raise weather.WeatherError("geocode down")
             key = str(params.get("name") or "").lower().strip()
             return {"results": [dict(r) for r in PLACES.get(key, [])]}
-        units = str(params.get("temperature_unit") or "")
+        units = str(params.get("temperature_unit") or "celsius")
+        wind = str(params.get("wind_speed_unit") or "kmh")
+        precip = str(params.get("precipitation_unit") or "mm")
         return _forecast(params.get("latitude"),
-                         units="fahrenheit" if units == "fahrenheit" else "metric",
+                         temp="°F" if units == "fahrenheit" else "°C",
+                         wind={"kmh": "km/h", "mph": "mph", "ms": "m/s",
+                               "kn": "kn"}[wind],
+                         precip="in" if precip == "inch" else "mm",
                          fdays=max(1, int(params.get("forecast_days") or 1)))
 
     def forecast_calls(self):
@@ -105,7 +109,7 @@ def wx():
 
 SAVED_LONDON = {"name": "London", "latitude": 51.50853, "longitude": -0.12574,
                 "timezone": "Europe/London", "country": "United Kingdom",
-                "admin1": "England"}
+                "country_code": "GB", "admin1": "England"}
 
 
 def make_client(tmp_path, steps=None, location_defaults=None,
@@ -148,6 +152,7 @@ def test_location_save_clear_and_reset(tmp_path, wx):
     assert r.status_code == 200
     got = r.json()["location"]
     assert got["latitude"] == 51.50853 and got["admin1"] == "England"
+    assert got["country_code"] == "GB"          # drives the auto unit preset
     assert r.json()["location_source"]["name"] == "saved"
     assert client.get("/api/settings").json()["location"]["timezone"] == "Europe/London"
 
@@ -185,14 +190,115 @@ def test_location_env_default_shown_but_lazy(tmp_path, wx):
 def test_weather_units_setting(tmp_path, wx):
     client, _ = make_client(tmp_path)
     st = client.get("/api/settings").json()
-    assert st["tools"]["units"] == "metric"
+    assert st["tools"]["units"] == "auto"                  # preset default
+    assert st["tools"]["units_wind"] == ""                 # blank = from preset
     assert st["tools_source"]["units"] == "default"
-    assert client.put("/api/settings", json={"tools": {"units": "imperial"}})\
-        .json()["tools"]["units"] == "imperial"
+    assert st["tools_source"]["units_wind"] == "default"
+    for good in ("metric", "uk", "us"):
+        assert client.put("/api/settings", json={"tools": {"units": good}})\
+            .json()["tools"]["units"] == good
+    # legacy imperial is accepted and saved as us
+    r = client.put("/api/settings", json={"tools": {"units": "imperial"}})
+    assert r.json()["tools"]["units"] == "us"
+    assert r.json()["tools_source"]["units"] == "saved"
     assert client.put("/api/settings", json={"tools": {"units": "kelvin"}})\
         .status_code == 422
     assert client.put("/api/settings", json={"tools": {"units": ""}})\
-        .json()["tools"]["units"] == "metric"      # blank = default again
+        .json()["tools"]["units"] == "auto"    # blank = default again
+    # per-quantity overrides: set, blank-back-to-preset, invalid
+    r = client.put("/api/settings", json={"tools": {
+        "units_temperature": "fahrenheit", "units_wind": "kn",
+        "units_precipitation": "inch"}})
+    assert r.json()["tools"]["units_temperature"] == "fahrenheit"
+    assert r.json()["tools"]["units_wind"] == "kn"
+    assert r.json()["tools"]["units_precipitation"] == "inch"
+    assert r.json()["tools_source"]["units_wind"] == "saved"
+    assert client.put("/api/settings",
+                      json={"tools": {"units_wind": "barns"}}).status_code == 422
+    assert client.put("/api/settings",
+                      json={"tools": {"units_precipitation": "hands"}})\
+        .status_code == 422
+    assert client.put("/api/settings", json={"tools": {"units_wind": ""}})\
+        .json()["tools"]["units_wind"] == ""   # blank = from the preset
+    # reset drops every units override back to the defaults
+    client.put("/api/settings", json={"tools": {"units": "uk",
+                                                "units_wind": "ms"}})
+    r = client.post("/api/settings/reset", json={"tools": True})
+    assert r.json()["tools"]["units"] == "auto"
+    assert r.json()["tools"]["units_wind"] == ""
+
+
+def test_weather_units_env_default(tmp_path, wx):
+    # RIKO_UNITS keeps working through tools_defaults (main() normalizes it)
+    client, _ = make_client(tmp_path, tools_defaults={"units": "imperial"})
+    assert client.get("/api/settings").json()["tools"]["units"] == "us"
+    client, _ = make_client(tmp_path, tools_defaults={"units": "uk"})
+    st = client.get("/api/settings").json()
+    assert st["tools"]["units"] == "uk"
+    assert st["defaults"]["tools"]["units"] == "uk"
+
+
+def test_units_effective(tmp_path, wx):
+    client, _ = make_client(tmp_path)
+    # no location + auto -> metric
+    assert client.get("/api/settings").json()["units_effective"] == \
+        {"preset": "metric", "temperature": "°C", "wind": "km/h",
+         "precipitation": "mm"}
+    # auto follows the SAVED place's country: GB -> uk (°C + mph)
+    client.put("/api/settings", json={"location": SAVED_LONDON})
+    assert client.get("/api/settings").json()["units_effective"] == \
+        {"preset": "uk", "temperature": "°C", "wind": "mph",
+         "precipitation": "mm"}
+    # a per-quantity override shows up in the resolved line
+    client.put("/api/settings", json={"tools": {"units_wind": "ms"}})
+    assert client.get("/api/settings").json()["units_effective"]["wind"] == "m/s"
+    # an explicit preset ignores the country
+    client.put("/api/settings", json={"tools": {"units": "us", "units_wind": ""}})
+    assert client.get("/api/settings").json()["units_effective"]["preset"] == "us"
+    # GET still never geocodes (the lazy env default reads as metric)
+    client2, _ = make_client(tmp_path / "b", location_defaults={"place": "Gloucester, UK"})
+    assert client2.get("/api/settings").json()["units_effective"]["preset"] == "metric"
+    assert wx.calls == []
+
+
+# ── preset resolution (pure) ────────────────────────────────────────────────
+
+def test_unit_preset_tables():
+    assert weather.UNIT_PRESETS["metric"] == {"temperature": "celsius",
+                                              "wind": "kmh", "precipitation": "mm"}
+    assert weather.UNIT_PRESETS["uk"] == {"temperature": "celsius",
+                                          "wind": "mph", "precipitation": "mm"}
+    assert weather.UNIT_PRESETS["us"] == {"temperature": "fahrenheit",
+                                          "wind": "mph", "precipitation": "inch"}
+
+
+def test_resolve_units_presets_and_auto_by_country():
+    assert weather.resolve_units("metric")["wind"] == "kmh"
+    assert weather.resolve_units("uk") == {"preset": "uk", "temperature": "celsius",
+                                           "wind": "mph", "precipitation": "mm"}
+    assert weather.resolve_units("imperial")["preset"] == "us"   # legacy alias
+    assert weather.resolve_units("kelvin")["preset"] == "metric"  # junk -> auto, no loc
+    gb = {"country_code": "GB"}
+    assert weather.resolve_units("auto", loc=gb)["preset"] == "uk"
+    for cc in ("US", "LR", "MM"):
+        assert weather.resolve_units("auto", loc={"country_code": cc})["preset"] == "us"
+    # Ireland drives in km/h -> metric; any other country too
+    assert weather.resolve_units("auto", loc={"country_code": "IE"})["preset"] == "metric"
+    assert weather.resolve_units("auto", loc={"country_code": "JP"})["preset"] == "metric"
+    assert weather.resolve_units("auto", loc=None)["preset"] == "metric"
+    # country-name fallback for places saved before country_code existed
+    assert weather.resolve_units("auto", loc={"country": "United Kingdom"})["preset"] == "uk"
+
+
+def test_resolve_units_overrides():
+    r = weather.resolve_units("uk", {"units_temperature": "fahrenheit"})
+    assert r == {"preset": "uk", "temperature": "fahrenheit", "wind": "mph",
+                 "precipitation": "mm"}
+    # blank or invalid overrides fall back to the preset quantity
+    r = weather.resolve_units("metric", {"units_wind": "", "units_precipitation": "hands"})
+    assert r["wind"] == "kmh" and r["precipitation"] == "mm"
+    for w in ("kmh", "mph", "ms", "kn"):
+        assert weather.resolve_units("metric", {"units_wind": w})["wind"] == w
 
 
 # ── the tool itself ─────────────────────────────────────────────────────────
@@ -287,15 +393,79 @@ def test_weather_timeout_retries_once_then_succeeds(tmp_path, wx):
                       "units": "metric"}).run({"days": 3})
 
 
-def test_weather_imperial_units(tmp_path, wx):
+def test_weather_unit_presets_call_openmeteo(tmp_path, wx):
+    # the resolved units travel as Open-Meteo's own params, no conversion
     out = weather_spec({"resolve": lambda: dict(SAVED_LONDON),
-                        "units": "imperial"}).run({})
+                        "units": "uk"}).run({})
+    call = wx.forecast_calls()[-1]
+    assert call["params"]["temperature_unit"] == "celsius"
+    assert call["params"]["wind_speed_unit"] == "mph"
+    assert call["params"]["precipitation_unit"] == "mm"
+    assert out["units"] == {"preset": "uk", "temperature": "°C",
+                            "wind": "mph", "precipitation": "mm"}
+    assert "temp_c" in out["current"] and "wind_mph" in out["current"]
+    assert "precipitation_mm" in out["current"] and "max_c" in out["days"][0]
+
+    out = weather_spec({"resolve": lambda: dict(SAVED_LONDON),
+                        "units": "us"}).run({})
     call = wx.forecast_calls()[-1]
     assert call["params"]["temperature_unit"] == "fahrenheit"
     assert call["params"]["wind_speed_unit"] == "mph"
-    assert out["units"] == "imperial"
-    assert "temp_f" in out["current"] and "wind_mph" in out["current"]
-    assert "max_f" in out["days"][0]
+    assert call["params"]["precipitation_unit"] == "inch"
+    assert out["units"]["wind"] == "mph" and out["units"]["temperature"] == "°F"
+    assert "temp_f" in out["current"] and "precipitation_in" in out["current"]
+
+    # legacy "imperial" answers exactly like us
+    out = weather_spec({"resolve": lambda: dict(SAVED_LONDON),
+                        "units": "imperial"}).run({})
+    assert out["units"]["preset"] == "us" and "temp_f" in out["current"]
+
+
+def test_weather_units_overrides_win_over_preset(tmp_path, wx):
+    ctx = {"resolve": lambda: dict(SAVED_LONDON), "units": "metric",
+           "units_temperature": "fahrenheit", "units_wind": "kn",
+           "units_precipitation": ""}
+    out = weather_spec(ctx).run({})
+    call = wx.forecast_calls()[-1]
+    assert call["params"]["temperature_unit"] == "fahrenheit"
+    assert call["params"]["wind_speed_unit"] == "kn"
+    assert call["params"]["precipitation_unit"] == "mm"   # blank = from metric
+    assert "wind_kn" in out["current"] and "temp_f" in out["current"]
+    # m/s through an override
+    ctx2 = dict(ctx, units_wind="ms", units_temperature="", units_precipitation="")
+    out = weather_spec(ctx2).run({"days": 1, "hourly": False})
+    assert "wind_ms" in out["current"]
+    assert out["units"] == {"preset": "metric", "temperature": "°C",
+                            "wind": "m/s", "precipitation": "mm"}
+
+
+def test_weather_auto_follows_place_country(tmp_path, wx):
+    auto = {"resolve": lambda: dict(SAVED_LONDON), "units": "auto"}
+    out = weather_spec(auto).run({})                    # saved GB place -> uk
+    assert wx.forecast_calls()[-1]["params"]["wind_speed_unit"] == "mph"
+    assert out["units"]["preset"] == "uk"
+
+    tokyo = weather_spec({"units": "auto"}).run({"place": "Tokyo"})
+    assert wx.forecast_calls()[-1]["params"]["wind_speed_unit"] == "kmh"
+    assert tokyo["units"]["preset"] == "metric"         # explicit place decides
+
+    # a place with no country info at all falls back to metric
+    plain = {"resolve": lambda: {"name": "Nowhere", "latitude": 1.0,
+                                 "longitude": 2.0}}
+    assert weather_spec(dict(plain, units="auto")).run({})["units"]["preset"] == "metric"
+
+
+def test_weather_units_in_cache_key(tmp_path, wx):
+    # metric vs uk differ ONLY in the wind unit — still two cache entries
+    loc = {"resolve": lambda: dict(SAVED_LONDON)}
+    weather_spec(dict(loc, units="metric")).run({})
+    weather_spec(dict(loc, units="metric")).run({})
+    assert len(wx.forecast_calls()) == 1
+    weather_spec(dict(loc, units="uk")).run({})
+    assert len(wx.forecast_calls()) == 2
+    # and an override that matches another preset's wind is still keyed apart
+    weather_spec(dict(loc, units="metric", units_wind="mph")).run({})
+    assert len(wx.forecast_calls()) == 2   # same resolved units as uk -> hit
 
 
 def test_weather_hourly_next_12h(tmp_path, wx):

@@ -49,7 +49,7 @@ a spoken URL in them) are regenerated.
 """
 import re
 
-SPEECH_RULES_VERSION = 6
+SPEECH_RULES_VERSION = 7
 
 # Upper bound on what one reply says out loud; text past it is cut at the
 # last sentence end inside the cap (then at a word boundary). Documented in
@@ -149,6 +149,12 @@ _DEG_F = re.compile(r"[\u00b0\u2109]\s*[Ff](?![A-Za-z])")
 _DEG_ANY = re.compile(r"\u00b0\s*(?![A-Za-z])")
 _KMH = re.compile(r"(?<![\w/])k[m]\s*/\s*h(?![\w/])")
 _MPH = re.compile(r"(?<![\w])mph(?![\w])")
+# per-quantity units (unit-presets round): m/s and kn are weather units,
+# never "m slash s" or "kay en". A bare "in" is inches only right after a
+# number AND at a clause end — "5 in 10" / "3 in the night" keep the preposition.
+_MS = re.compile(r"(?<![\w/])m\s*/\s*s(?![\w/])")
+_KN = re.compile(r"(?<![\w])kn(?![\w])")
+_INCH = re.compile(r"(?<=\d)(\s?)in\b(?=\s*(?:[.,;:!?)\]]|$))")
 
 _HAS_WORD = re.compile(r"[A-Za-z\u00C0-\u024F\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\u0590-\u05FF\u0600-\u06FF]")
 _EMPTY_PAIR = re.compile(r"[\[(]\s*[\])]")
@@ -421,6 +427,9 @@ def clean_prose(text: str) -> str:
     text = _DEG_ANY.sub(" degrees", text)
     text = _KMH.sub(" kilometres an hour", text)
     text = _MPH.sub(" miles an hour", text)
+    text = _MS.sub(" metres per second", text)
+    text = _KN.sub(" knots", text)
+    text = _INCH.sub(r"\g<1>inches", text)
     text = _INLINE_CODE.sub(" ", text)
     text = _MD_IMAGE.sub(" ", text)
     text = _MD_LINK.sub(lambda m: m.group(1), text)

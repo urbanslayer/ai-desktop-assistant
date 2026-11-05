@@ -620,6 +620,26 @@
     "expect": "Gusts to 8 miles an hour."
   },
   {
+    "name": "metres per second spoken as words",
+    "input": "Wind 6 m/s.",
+    "expect": "Wind 6 metres per second."
+  },
+  {
+    "name": "kn spoken as knots",
+    "input": "Gusts to 12 kn.",
+    "expect": "Gusts to 12 knots."
+  },
+  {
+    "name": "inch after a number spoken as inches",
+    "input": "Rain 0.4 in.",
+    "expect": "Rain 0.4 inches."
+  },
+  {
+    "name": "in as a preposition stays in",
+    "input": "There's a 5 in 10 chance.",
+    "expect": "There's a 5 in 10 chance."
+  },
+  {
     "name": "bare degree sign spoken as degrees",
     "input": "Around 3° at dusk.",
     "expect": "Around 3 degrees at dusk."

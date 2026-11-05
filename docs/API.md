@@ -485,7 +485,8 @@ is what the page PUTs as `settings.location`.
           "timeout": 120, "parallel_note": ""},
   "tools": {"enabled": true, "max_steps": 8, "max_seconds": 120,
             "max_result_chars": 12000, "searxng_url": "http://192.0.2.101:8989",
-            "allow_private_fetch": false, "units": "metric",
+            "allow_private_fetch": false, "units": "auto",
+            "units_temperature": "", "units_wind": "mph", "units_precipitation": "",
             "permissions": {"desktop__do_thing": "never"}},
   "mcp": {"servers": [{"name": "time", "transport": "stdio", "enabled": true,
                        "command": "uvx", "args": ["mcp-server-time"], "env": {},
@@ -499,9 +500,12 @@ is what the page PUTs as `settings.location`.
   "timezone_source": "default",                    // docs/TIMERS.md: timers + spoken times
   "location": {"name": "Gloucester", "latitude": 51.86772, "longitude": -2.24435,
                "timezone": "Europe/London", "country": "United Kingdom",
+               "country_code": "GB",
                "admin1": "England"},               // Weather: the picked place ({} / {name:""} = none)
   "location_source": {"name": "saved", "latitude": "saved", "timezone": "saved",
                       "...": "saved | env | default"},   // "env" = the RIKO_LOCATION default
+  "units_effective": {"preset": "uk", "temperature": "°C", "wind": "mph",
+                      "precipitation": "mm"},      // Weather: the units resolved right now
   "defaults": {"llm": {"base_url": "http://192.0.2.51:8000/v1", "model": "auto",
                        "temperature": 0.8, "max_tokens": 4096, "max_history": 40,
                        "reasoning_effort": "", "extra_body": {}, "api_key_set": true},
@@ -509,7 +513,9 @@ is what the page PUTs as `settings.location`.
                        "timeout": 120, "parallel_note": ""},
                "tools": {"enabled": true, "max_steps": 8, "max_seconds": 120,
                          "max_result_chars": 12000, "searxng_url": "",
-                         "allow_private_fetch": false, "units": "metric",
+                         "allow_private_fetch": false, "units": "auto",
+                         "units_temperature": "", "units_wind": "",
+                         "units_precipitation": "",
                          "permissions": {}},
                "mcp": {"servers": []},
                "memory": {"enabled": true, "prompt_budget_tokens": 600,
@@ -567,12 +573,27 @@ Semantics (made so a careless form save cannot break the hub):
   `max_result_chars` 500–100000 (out of range → `422`). `permissions` **is
   replaced wholesale** when sent: `{tool_name: "always" | "ask" | "never"}`,
   and a `null` value for one name removes that explicit override (back to
-  the risk-based default). `units` is `"metric"` (default) or `"imperial"`
-  — what the **Weather** tool answers in (`°C`/`km/h`/`mm` vs
-  `°F`/`mph`/inches); blank = default, anything else → `422`.
+  the risk-based default). `units` is the **Weather unit preset**: `"auto"`
+  (default — follows the location's country), `"metric"` (°C · km/h · mm),
+  `"uk"` (°C · mph · mm) or `"us"` (°F · mph · in); the legacy `"imperial"`
+  is accepted and saved as `"us"`, anything else → `422`, blank = default.
+  Per-quantity overrides `units_temperature` (`celsius|fahrenheit`),
+  `units_wind` (`kmh|mph|ms|kn`) and `units_precipitation` (`mm|inch`) win
+  over the preset; blank = from the preset, invalid → `422`. The resolved
+  units go straight into Open-Meteo's own `temperature_unit` /
+  `wind_speed_unit` / `precipitation_unit` params (no client-side
+  conversion) and the tool result carries a `units` block
+  (`{"preset": "uk", "temperature": "°C", "wind": "mph", "precipitation":
+  "mm"}`) next to unit-named value keys (`temp_c`, `wind_mph`, …).
+  `GET /api/settings` also answers `units_effective` with that same block —
+  the page shows it as "currently: °C · mph · mm". `auto` maps countries to
+  presets: GB → uk; US, LR, MM → us; everything else (and no location) →
+  metric. `units_effective` uses only the SAVED place (GET never geocodes,
+  so a lazy `RIKO_LOCATION` env default reads as metric there; the tool
+  itself resolves it properly).
 - **The `location` block** (Weather): the place the owner picked on the
   Settings page (resolved via `GET /api/geocode`, stored as `{name, latitude,
-  longitude, timezone, country, admin1}`; missing coords or |lat| > 90 /
+  longitude, timezone, country, country_code, admin1}`; missing coords or |lat| > 90 /
   |lon| > 180 → `422`). `null`, `{}` or a blank `name` deletes the saved
   place, so the `RIKO_LOCATION` env default (a plain place name, geocoded
   lazily at first use and cached) applies again; with neither, the hub has

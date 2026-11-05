@@ -35,9 +35,10 @@ services:
       # Weather (docs/API.md "Weather"): the weather tool needs no key (it
       # calls Open-Meteo directly). RIKO_LOCATION is a default home place
       # (e.g. "Gloucester, UK") until the owner picks one on the Settings
-      # page; RIKO_UNITS=imperial switches weather to °F/mph/inches.
+      # page; RIKO_UNITS picks the weather unit preset: auto | metric |
+      # uk (°C, mph) | us (°F, mph, in); legacy imperial = us.
       RIKO_LOCATION: "${RIKO_LOCATION:-}"
-      RIKO_UNITS: "${RIKO_UNITS:-metric}"
+      RIKO_UNITS: "${RIKO_UNITS:-auto}"
       # Home Assistant (README "Home Assistant"): RIKO_HA_URL is the HA base
       # URL, RIKO_HA_TOKEN the long-lived access token. Both set = the hub
       # offers the built-in 'homeassistant' MCP server (…/api/mcp/assist).
