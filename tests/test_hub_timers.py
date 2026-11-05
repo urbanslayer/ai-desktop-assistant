@@ -512,3 +512,284 @@ def test_live_scheduler_thread_fires_end_to_end(tmp_path):
         assert fired[0]["reply"] == "hi!"
     finally:
         app.state.timer_scheduler.stop()
+
+
+# ── asked-for fallback + chain guard (docs/TIMERS.md "Reviewer additions") ───
+
+# (text, time passed to parse_timer_time, label, prompt)
+POSITIVE_ASKS = [
+    ("remind me in 20 seconds to stretch",
+     "20s", "stretch", "Reminder: stretch"),
+    ("Remind me in 5 minutes to check the oven",
+     "300s", "check the oven", "Reminder: check the oven"),
+    ("hey, remind me in 5 minutes to check the oven please",
+     "300s", "check the oven", "Reminder: check the oven"),
+    ("please remind me in 3 days to pay the rent",
+     "259200s", "pay the rent", "Reminder: pay the rent"),
+    ("could you remind me in 5 minutes to hydrate",
+     "300s", "hydrate", "Reminder: hydrate"),
+    ("and then remind me in 1 hour to turn the oven off",
+     "3600s", "turn the oven off", "Reminder: turn the oven off"),
+    ("remind me to stretch in 20 minutes",
+     "1200s", "stretch", "Reminder: stretch"),
+    ("remind me to call mum in 2 hours",
+     "7200s", "call mum", "Reminder: call mum"),
+    ("remind me in an hour to check the kettle",
+     "3600s", "check the kettle", "Reminder: check the kettle"),
+    ("remind me in half an hour to check the kettle",
+     "1800s", "check the kettle", "Reminder: check the kettle"),
+    ("remind me in 1d to renew the domain",
+     "86400s", "renew the domain", "Reminder: renew the domain"),
+    ("remind me in twenty minutes to stretch",
+     "1200s", "stretch", "Reminder: stretch"),
+    ("remind me in ninety seconds to flip the burgers",
+     "90s", "flip the burgers", "Reminder: flip the burgers"),
+    ("remind me in 1h30m to stretch",
+     "5400s", "stretch", "Reminder: stretch"),
+    ("in 20 minutes remind me to stretch",
+     "1200s", "stretch", "Reminder: stretch"),
+    ("in 5 minutes, remind me to check the oven",
+     "300s", "check the oven", "Reminder: check the oven"),
+    ("in 30 seconds remind me",
+     "30s", "check in with the owner", "Reminder: check in with the owner"),
+    ("set a timer for 30 seconds",
+     "30s", "timer", 'Timer "timer" is up.'),
+    ("set a timer for 30 seconds labelled stretch",
+     "30s", "stretch", 'Timer "stretch" is up.'),
+    ("Please set a timer for 30 seconds labelled stretch, using your timer tool",
+     "30s", "stretch, using your timer tool",
+     'Timer "stretch, using your timer tool" is up.'),
+    ("could you set a timer for 5 minutes?",
+     "300s", "timer", 'Timer "timer" is up.'),
+    ("set a reminder for 1 hour to take meds",
+     "3600s", "take meds", 'Timer "take meds" is up.'),
+    ("set an alarm for 6 hours called workout",
+     "21600s", "workout", 'Timer "workout" is up.'),
+    ("set a 15 second tea timer",
+     "15s", "tea", 'Timer "tea" is up.'),
+    ("set a 10 minute timer",
+     "600s", "timer", 'Timer "timer" is up.'),
+    ("set a 2 hour timer for the roast",
+     "7200s", "the roast", 'Timer "the roast" is up.'),
+    ("10 minute timer for pasta",
+     "600s", "pasta", 'Timer "pasta" is up.'),
+    ("20 second timer", "20s", "timer", 'Timer "timer" is up.'),
+    ("timer for 45 seconds", "45s", "timer", 'Timer "timer" is up.'),
+    ("tea timer for 20 seconds", "20s", "tea", 'Timer "tea" is up.'),
+    ("I need a 10 minute timer for pasta",
+     "600s", "pasta", 'Timer "pasta" is up.'),
+    ("wake me in 3 hours",
+     "10800s", "wake up", "Reminder: wake the owner up"),
+    ("wake me up in 20 minutes",
+     "1200s", "wake up", "Reminder: wake the owner up"),
+    ("wake me up in 1 hour to start dinner",
+     "3600s", "wake up", "Reminder: start dinner"),
+    # at-HH:MM resolves in the OWNER's zone, today or tomorrow (now =
+    # 12:00 UTC 2026-11-05, London = UTC in November)
+    ("remind me at 14:30 to stretch",
+     "2026-11-05T14:30:00+00:00", "stretch", "Reminder: stretch"),
+    ("remind me at 11:00",
+     "2026-11-06T11:00:00+00:00", "check in with the owner",
+     "Reminder: check in with the owner"),
+    ("remind me at 7:30 pm to lock the door",
+     "2026-11-05T19:30:00+00:00", "lock the door", "Reminder: lock the door"),
+    ("remind me at 20:00",
+     "2026-11-05T20:00:00+00:00", "check in with the owner",
+     "Reminder: check in with the owner"),
+]
+
+NEGATIVE_ASKS = [
+    # questions about timers
+    "what timers do I have", "how long is left", "tell me how long is left",
+    "how much time is left", "when does my tea timer go off",
+    "is my timer still running", "do I have a timer for 5 minutes",
+    "tell me what timers I have set",
+    # past-tense mentions
+    "I set a timer for 20 seconds", "I set a tea timer earlier",
+    "did I set a timer?", "you reminded me yesterday",
+    "she reminded me in 5 minutes", "the timer went off",
+    "you just set a timer for 10 minutes", "my timer for 20 minutes is done",
+    # negations
+    "don't remind me about that", "dont set a timer", "do not remind me",
+    "no reminder needed", "never mind the timer",
+    # cancellations
+    "cancel the 10 minute timer", "cancel my reminder",
+    "delete the timer called tea", "stop the timer",
+    # hypotheticals
+    "if I asked you to remind me in 10 minutes what would you do",
+    "what if I wanted a timer for 5 minutes", "imagine a timer for 10 minutes",
+    # no time attached: the hub will not guess
+    "remind me", "remind me to stretch", "set a timer", "tea timer",
+    "what time is it",
+]
+
+
+@pytest.mark.parametrize("text,time,label,prompt", POSITIVE_ASKS)
+def test_detect_timer_request_positive(text, time, label, prompt):
+    got = T.detect_timer_request(text, now=NOW, tz_name="Europe/London")
+    assert got is not None, text
+    assert got["time"] == time
+    assert got["label"] == label
+    assert got["prompt"] == prompt
+    # the time is exactly what parse_timer_time accepts
+    T.parse_timer_time(got["time"], NOW)
+
+
+@pytest.mark.parametrize("text", NEGATIVE_ASKS)
+def test_detect_timer_request_negative(text):
+    assert T.detect_timer_request(text, now=NOW, tz_name="Europe/London") is None
+
+
+def test_refusal_detection():
+    assert T.reply_refuses("Sorry senpai, I can't set timers right now.")
+    assert T.reply_refuses("I won't be doing that today.")
+    assert T.reply_refuses("I was unable to reach the scheduler.")
+    assert not T.reply_refuses("Twenty seconds, then I'll nudge you!")
+    assert not T.reply_refuses("Sure — timer set for 20 seconds.")
+
+
+def test_fallback_creates_timer_when_model_only_claims(tmp_path):
+    """Live finding A: she answers 'Twenty seconds, then…' with only a
+    list_timers call — the hub creates the asked timer itself."""
+    steps = [call_step("list_timers", {}),
+             {"content": "Twenty seconds, then I'll nudge you, senpai!"}]
+    client, llm, app = timer_client(tmp_path, steps)
+
+    res = client.post("/api/chat",
+                      json={"text": "remind me in 20 seconds to stretch"}).json()
+    assert [x["tool"] for x in res["tools_used"]] == ["list_timers"]
+    timers = client.get("/api/timers").json()["timers"]
+    assert len(timers) == 1
+    row = timers[0]
+    assert row["status"] == "pending" and row["label"] == "stretch"
+    assert row["asked"] is True and row["chain_depth"] == 0
+    stored = app.state.store.get_timer(row["id"])
+    assert stored["prompt"] == "Reminder: stretch"
+    assert stored["captured"]["asked"] is True
+    assert res["timers_set"] == [{"id": row["id"], "label": "stretch",
+                                  "due_at_local": row["due_at_local"],
+                                  "asked": True}]
+    due = datetime.strptime(row["due_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc)
+    assert 15 <= (due - datetime.now(UTC)).total_seconds() <= 22
+    ev = events_of(client, "timer_set")[-1]
+    assert ev["id"] == row["id"] and ev["asked"] is True
+
+    # the prompt hint rode along on the asked turn
+    assert "The user just asked for a timer" in \
+        llm.chat_requests[0]["messages"][0]["content"]
+    assert 'time="20s"' in llm.chat_requests[0]["messages"][0]["content"]
+
+
+def test_no_duplicate_when_model_sets_itself(tmp_path):
+    steps = [call_step("timer", {"prompt": "Reminder: stretch",
+                                 "time": "20 seconds", "label": "stretch"}),
+             {"content": "Done — twenty seconds!"}]
+    client, llm, app = timer_client(tmp_path, steps)
+    res = client.post("/api/chat",
+                      json={"text": "remind me in 20 seconds to stretch"}).json()
+    timers = client.get("/api/timers").json()["timers"]
+    assert len(timers) == 1                      # no fallback duplicate
+    assert res["timers_set"] == [{"id": timers[0]["id"], "label": "stretch",
+                                  "due_at_local": timers[0]["due_at_local"],
+                                  "asked": False}]
+
+
+def test_fallback_skips_on_refusal_and_without_tools(tmp_path):
+    steps = [{"content": "I can't set timers right now, senpai."}]
+    client, llm, app = timer_client(tmp_path, steps)
+    res = client.post("/api/chat",
+                      json={"text": "remind me in 20 seconds to stretch"}).json()
+    assert client.get("/api/timers").json()["timers"] == []
+    assert res["timers_set"] == []
+    # tools off entirely: no timer tool offered, so no scheduling behind her back
+    client.put("/api/settings", json={"tools": {"enabled": False}})
+    client.post("/api/chat", json={"text": "remind me in 20 seconds to stretch"})
+    assert client.get("/api/timers").json()["timers"] == []
+
+
+def _seed_timer(app, prompt="tell the owner the tea is ready", **cap_kw):
+    captured = {"settings": {}, "memory": {},
+                "tool_ids": ["timer", "list_timers", "cancel_timer"]}
+    captured.update(cap_kw)
+    return app.state.store.add_timer(
+        persona_id="riko", label="tea", prompt=prompt,
+        due_at=iso(datetime.now(UTC) + timedelta(seconds=5)),
+        cancel_on=[], captured=captured)
+
+
+def test_chain_guard_fired_turn_lacks_timer_tool(tmp_path):
+    """The fired turn keeps list_timers/cancel_timer but NOT timer, and the
+    asked-for fallback never fires on its prompt."""
+    steps = [{"content": "noted."},                      # seeding chat turn
+             {"content": "Tea is ready, senpai!"}]        # the fired turn
+    client, llm, app = timer_client(tmp_path, steps)
+    t = _seed_timer(app, prompt="remind me to stretch in 20 minutes")
+    client.post("/api/chat", json={"text": "hello"})      # step 0
+    assert fire_now(app) == 1
+    fired_req = llm.chat_requests[-1]
+    names = [x["function"]["name"] for x in fired_req.get("tools", [])]
+    assert "timer" not in names
+    assert {"list_timers", "cancel_timer"} <= set(names)   # still available
+    # the prompt read like an ask, yet no timer was created and the fallback
+    # left it alone (no duplicate, the row itself is fired)
+    assert client.get("/api/timers?status=pending").json()["timers"] == []
+    assert client.get("/api/timers?status=fired").json()["timers"][0]["id"] == t["id"]
+    # the fired turn's system prompt carries no "just asked for a timer" hint
+    assert "The user just asked for a timer" not in fired_req["messages"][0]["content"]
+
+
+def test_chaining_enabled_depth_cap(tmp_path):
+    # fire 1 asks for a link (depth 1); fire 2 (depth-3 parent) asks again
+    # and must hit the chain limit
+    link_call = call_step("timer", {"prompt": "next link", "time": "1h"})
+    steps = [link_call, {"content": "queued the next one"},
+             link_call, {"content": "the chain ends here"}]
+    client, llm, app = timer_client(tmp_path, steps)
+    assert client.put("/api/settings",
+                      json={"timers": {"allow_chaining": True}}).status_code == 200
+    _seed_timer(app)                             # root: no chain_depth
+    assert fire_now(app) == 1
+    fired_req = llm.chat_requests[0]
+    names = [x["function"]["name"] for x in fired_req.get("tools", [])]
+    assert "timer" in names                      # chaining on: tool is back
+    pending = client.get("/api/timers?status=pending").json()["timers"]
+    link = next(r for r in pending if r["prompt"] == "next link")
+    # the model-created link inherits the parent depth + 1
+    assert app.state.store.get_timer(link["id"])["captured"]["chain_depth"] == 1
+
+    # depth 3 parent: the next link would be 4 — refused, nothing created
+    _seed_timer(app, prompt="last link", chain_depth=3)
+    assert fire_now(app) == 1
+    tool_msg = json.dumps(llm.chat_requests[-1]["messages"])
+    assert "chain limit" in tool_msg
+    pending = client.get("/api/timers?status=pending").json()["timers"]
+    assert [r["id"] for r in pending] == [link["id"]]   # only the depth-1 link
+    assert client.get("/api/timers?status=failed").json()["timers"] == []
+
+
+def test_timer_settings_roundtrip(tmp_path):
+    client, llm, app = timer_client(tmp_path, [{"content": "ok"}])
+    s = client.get("/api/settings").json()
+    assert s["timers"] == {"allow_chaining": False}
+    assert s["timers_source"] == {"allow_chaining": "default"}
+    r = client.put("/api/settings", json={"timers": {"allow_chaining": True}})
+    assert r.status_code == 200
+    s = r.json()
+    assert s["timers"] == {"allow_chaining": True}
+    assert s["timers_source"] == {"allow_chaining": "saved"}
+    assert client.put("/api/settings",
+                      json={"timers": {"allow_chaining": "yes"}}).status_code == 422
+    assert client.put("/api/settings", json={"timers": []}).status_code == 422
+    s = client.post("/api/settings/reset", json={"timers": True}).json()
+    assert s["timers"] == {"allow_chaining": False}
+    assert s["timers_source"] == {"allow_chaining": "default"}
+
+
+def test_fallback_never_fires_when_permission_never(tmp_path):
+    steps = [{"content": "Sure, twenty seconds!"}]
+    client, llm, app = timer_client(tmp_path, steps)
+    client.put("/api/settings", json={"tools": {"permissions": {"timer": "never"}}})
+    client.post("/api/chat",
+                json={"text": "remind me in 20 seconds to stretch"})
+    assert client.get("/api/timers").json()["timers"] == []

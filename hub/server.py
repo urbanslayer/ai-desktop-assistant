@@ -112,6 +112,13 @@ MEMORY_DEFAULTS = {
     "auto_remember": True,       # false = only remember when explicitly asked
 }
 
+# Timer settings (docs/TIMERS.md "Reviewer additions"). Blank = default:
+# timer-FIRED turns do not get the `timer` tool by default, so a fired
+# reminder cannot schedule another one forever (chain guard).
+TIMER_SETTINGS_DEFAULTS = {
+    "allow_chaining": False,
+}
+
 # Seed persona: the system prompt copied from character_config.yaml at build
 # time (the Docker image has no access to that file).
 SEED_PERSONA = {
@@ -340,6 +347,29 @@ def create_app(data_dir, api_key: str | None = None,
         merged.update(stored_memory())
         return merged
 
+    # ── timer settings (docs/TIMERS.md "Reviewer additions") ────────────
+    # blank = default semantics: allow_chaining defaults False, so fired
+    # turns never get the `timer` tool unless the owner turns it on.
+    def stored_timers() -> dict:
+        saved = store.get_json("timers_settings", {})
+        return dict(saved) if isinstance(saved, dict) else {}
+
+    def default_timers() -> dict:
+        merged = dict(TIMER_SETTINGS_DEFAULTS)
+        for key in TIMER_SETTINGS_DEFAULTS:
+            if key in timers_defaults:
+                merged[key] = timers_defaults[key]
+        merged["allow_chaining"] = bool(merged.get("allow_chaining"))
+        return merged
+
+    def timers_settings() -> dict:
+        merged = default_timers()
+        saved = stored_timers()
+        for key in TIMER_SETTINGS_DEFAULTS:
+            if key in saved:
+                merged[key] = bool(saved[key])
+        return merged
+
     # ── MCP settings + manager (docs/ROUNDS.md R2-M) ───────────────────
     # settings `mcp.servers` env default: the built-in Home Assistant server
     # when RIKO_HA_URL + RIKO_HA_TOKEN are set (mcp_defaults). The manager
@@ -425,11 +455,15 @@ def create_app(data_dir, api_key: str | None = None,
         saved_memory = stored_memory()
         memory_source = {k: ("saved" if k in saved_memory else "default")
                          for k in MEMORY_DEFAULTS}
+        saved_timers = stored_timers()
+        timers_source = {k: ("saved" if k in saved_timers else "default")
+                         for k in TIMER_SETTINGS_DEFAULTS}
         return {
             "llm": public_llm(llm_settings()),
             "tts": tts_settings(),
             "tools": tools_settings(),
             "memory": memory_settings(),
+            "timers": timers_settings(),
             "mcp": {"servers": public_mcp_servers(mcp_servers())},
             "switch_phrases": switch_phrases(),
             "timezone": stored_timezone(),
@@ -438,6 +472,7 @@ def create_app(data_dir, api_key: str | None = None,
                          "tts": default_tts(),
                          "tools": default_tools(),
                          "memory": default_memory(),
+                         "timers": default_timers(),
                          "mcp": {"servers": public_mcp_servers([preset])
                                  if preset else []},
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES),
@@ -446,6 +481,7 @@ def create_app(data_dir, api_key: str | None = None,
             "tts_source": tts_source,
             "tools_source": tools_source,
             "memory_source": memory_source,
+            "timers_source": timers_source,
             "mcp_source": {"servers": "saved" if has_mcp
                            else ("env" if preset else "default")},
         }
@@ -855,12 +891,21 @@ def create_app(data_dir, api_key: str | None = None,
     # Timers speak the hub's configured timezone (saved `timezone` setting →
     # TZ env → UTC).
     def create_timer(persona_id: str, prompt: str, time_raw, label: str,
-                     cancel_on: list, snapshot: dict) -> dict:
+                     cancel_on: list, snapshot: dict, asked: bool = False,
+                     chain_depth: int = 0) -> dict:
         prompt = str(prompt or "").strip()
         if not prompt:
             raise ValueError("timer_error: 'prompt' is required")
         if len(prompt) > 4000:
             prompt = prompt[:4000]
+        # chain guard (docs/TIMERS.md "Reviewer additions"): a timer created
+        # during a fired timer's turn inherits the parent depth + 1 and is
+        # refused past MAX_CHAIN_DEPTH, so chained reminders cannot run away.
+        if chain_depth > _timers.MAX_CHAIN_DEPTH:
+            raise ValueError(
+                "timer_error: chain limit — this reminder has already "
+                f"chained {_timers.MAX_CHAIN_DEPTH} timers; finish the chain "
+                "instead of scheduling another")
         if store.open_timer_count() >= _timers.MAX_PENDING_TIMERS:
             raise ValueError(
                 f"timer_error: at most {_timers.MAX_PENDING_TIMERS} pending "
@@ -868,11 +913,16 @@ def create_app(data_dir, api_key: str | None = None,
         tz = effective_timezone()
         now_utc = datetime.now(timezone.utc)
         due = _timers.parse_timer_time(time_raw, now_utc)
+        captured = dict(snapshot or {})
+        if asked:
+            captured["asked"] = True
+        if chain_depth:
+            captured["chain_depth"] = int(chain_depth)
         row = store.add_timer(persona_id=persona_id,
                               label=(label or _timers.label_from_prompt(prompt))[:80],
                               prompt=prompt,
                               due_at=due.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                              cancel_on=cancel_on, captured=snapshot)
+                              cancel_on=cancel_on, captured=captured)
         if row is None:
             raise RuntimeError("timer_error: could not store the timer")
         local = due if tz is None else due.astimezone(tz)
@@ -881,7 +931,8 @@ def create_app(data_dir, api_key: str | None = None,
         row["local_time"] = local.strftime("%Y-%m-%d %H:%M")
         events.publish("timer_set", id=row["id"], label=row["label"],
                        persona_id=row["persona_id"], due_at=row["due_at"],
-                       due_at_local=row["due_at_local"], cancel_on=row["cancel_on"])
+                       due_at_local=row["due_at_local"], cancel_on=row["cancel_on"],
+                       asked=bool(asked), chain_depth=int(chain_depth))
         bump_state()
         return row
 
@@ -971,6 +1022,29 @@ def create_app(data_dir, api_key: str | None = None,
         if not settings.get("base_url"):
             return ("err", 503, "LLM not configured")
 
+        # docs/TIMERS.md "Reviewer additions": per-turn creation trace (the
+        # asked-for fallback must tell "the model set one" from "she only
+        # claimed one", and the timers_set result field lists both).
+        turn_created: list = []
+        # chain guard: a timer created during a fired timer's turn inherits
+        # the parent's chain_depth + 1 (create_timer refuses past the cap)
+        parent_depth = int(captured.get("chain_depth") or 0) if timer else 0
+
+        def create_for_turn(**kw):
+            row = create_timer(**kw,
+                               chain_depth=(parent_depth + 1 if timer else 0))
+            turn_created.append(row)
+            return row
+
+        turn_timers_api = dict(timers_api, create=create_for_turn)
+        # the asked-for matcher never runs on a timer-fired turn: its "user"
+        # message is the timer's own prompt, not a fresh ask
+        asked_timer = None
+        if timer is None:
+            asked_timer = _timers.detect_timer_request(
+                text, now=datetime.now(timezone.utc),
+                tz_name=effective_timezone_name())
+
         # offered tools: hub built-ins + online client tools, minus anything
         # the permission table says `never` (docs/ROUNDS.md)
         tools_cfg = tools_settings()
@@ -994,7 +1068,8 @@ def create_app(data_dir, api_key: str | None = None,
             # cancel_timer, same per-turn build as the memory tools.
             # timer_capture is filled in once the turn's offered tool ids
             # are known; a timer set during this turn stores it as `captured`.
-            hub_specs += _timers.build_timer_specs(store, pid, timers_api,
+            # turn_timers_api also records creations for the fallback.
+            hub_specs += _timers.build_timer_specs(store, pid, turn_timers_api,
                                                    lambda: timer_capture)
             for s in hub_specs:
                 if permission_for(s.name, "hub", s.risk, permissions) != "never":
@@ -1014,6 +1089,12 @@ def create_app(data_dir, api_key: str | None = None,
                 # fired timer: only the tools the set-turn had offered
                 allowed = set(captured["tool_ids"])
                 specs = [s for s in specs if s.name in allowed]
+        if timer is not None and not timers_settings().get("allow_chaining"):
+            # chain guard (docs/TIMERS.md "Reviewer additions"): a fired
+            # timer's turn answers, it does not schedule — the `timer` tool
+            # stays off the offer unless the owner enabled
+            # timers.allow_chaining (list_timers/cancel_timer remain)
+            specs = [s for s in specs if s.name != "timer"]
         offered_names = [s.name for s in specs if s.available]
         turn_tool_ids.extend(offered_names)
         timer_capture["tool_ids"] = list(offered_names)
@@ -1035,6 +1116,11 @@ def create_app(data_dir, api_key: str | None = None,
         appearance = str(persona.get("appearance") or "").strip()
         if appearance:
             system += "\n\n" + _body.appearance_prompt(appearance)
+        # docs/TIMERS.md "Reviewer additions": the user message clearly asks
+        # for a timer — nudge her to call the tool, not just talk about it
+        # (same trick as the body request hint).
+        if asked_timer:
+            system += "\n\n" + _timers.request_hint(asked_timer)
         if voice_flag:  # speech-recognised turn: never comment on misheard names
             system += "\n\n" + voice_prompt(
                 [p["name"] for p in store.list_personas()])
@@ -1102,6 +1188,31 @@ def create_app(data_dir, api_key: str | None = None,
             text, actions, body_actions if persona.get("embodied", True) else [])
         tools_used = out["tools_used"]
 
+        # asked-for fallback (docs/TIMERS.md "Reviewer additions"): she
+        # answered "remind me in 20 seconds…" as if the timer existed but
+        # never called the tool — the hub creates the timer the user
+        # actually asked for. Skipped when the turn made one itself, when
+        # the reply clearly refused, on timer-fired turns, and when the
+        # `timer` tool was not offered this turn (tools off / permission
+        # never — the hub never schedules behind her back). The reply text
+        # may already state the time; no text rewrite.
+        if (asked_timer and timer is None and not turn_created
+                and "timer" in offered_names
+                and not _timers.reply_refuses(answer)):
+            try:
+                turn_created.append(create_timer(
+                    persona_id=pid, prompt=asked_timer["prompt"],
+                    time_raw=asked_timer["time"], label=asked_timer["label"],
+                    cancel_on=[], snapshot=timer_capture, asked=True))
+                log.info("timer fallback persona=%s time=%s label=%s",
+                         pid, asked_timer["time"], asked_timer["label"])
+            except ValueError as exc:
+                log.info("timer fallback skipped persona=%s: %s", pid, exc)
+        timers_set = [{"id": r["id"], "label": r["label"],
+                       "due_at_local": r.get("due_at_local", ""),
+                       "asked": bool((r.get("captured") or {}).get("asked"))}
+                      for r in turn_created]
+
         timer_id = timer["id"] if timer else None
         user_id = store.add_message(pid, "user", text, source, voice=voice_flag,
                                     timer_id=timer_id)
@@ -1132,6 +1243,7 @@ def create_app(data_dir, api_key: str | None = None,
                 "emotion": emotion, "tools_used": tools_used,
                 "actions": actions, "speech": spoken,
                 "memory_writes": memory_writes,
+                "timers_set": timers_set,
                 "message_ids": [user_id, assistant_id],
                 "state_version": store.version(),
                 "audio_url": audio_url}
@@ -1188,7 +1300,7 @@ def create_app(data_dir, api_key: str | None = None,
                                "emotion": None, "tools_used": [], "actions": greet_actions,
                                "speech": _speech.speech_text(reply),
                                "message_ids": [], "state_version": store.version(),
-                               "audio_url": audio_url})
+                               "timers_set": [], "audio_url": audio_url})
 
             pid = override or store.active()
             if not store.persona_exists(pid):
@@ -1207,9 +1319,13 @@ def create_app(data_dir, api_key: str | None = None,
     # ── timer routes (docs/TIMERS.md H) ─────────────────────────────────
     def timer_public(row: dict) -> dict:
         """API view: no captured snapshot (its settings carry the api_key —
-        write-only, like GET /api/settings never returns it)."""
+        write-only, like GET /api/settings never returns it). `asked` and
+        `chain_depth` come out of the snapshot (docs/TIMERS.md additions)."""
         tz = effective_timezone()
         out = {k: v for k, v in row.items() if k != "captured"}
+        cap = row.get("captured") or {}
+        out["asked"] = bool(cap.get("asked"))
+        out["chain_depth"] = int(cap.get("chain_depth") or 0)
         out["timezone"] = effective_timezone_name()
         try:
             due = datetime.strptime(row["due_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -1404,6 +1520,16 @@ def create_app(data_dir, api_key: str | None = None,
                                     "an integer between 100 and 4000")
                 saved_mem["prompt_budget_tokens"] = int(raw)
             store.set_json("memory", saved_mem)
+        if "timers" in body:
+            tmr = body["timers"]
+            if not isinstance(tmr, dict):
+                return err(422, "timers must be an object")
+            saved_tmr = stored_timers()
+            if "allow_chaining" in tmr:
+                if not isinstance(tmr["allow_chaining"], bool):
+                    return err(422, "timers.allow_chaining must be a boolean")
+                saved_tmr["allow_chaining"] = tmr["allow_chaining"]
+            store.set_json("timers_settings", saved_tmr)
         if "mcp" in body:
             mcp = body["mcp"]
             if not isinstance(mcp, dict):
@@ -1457,6 +1583,8 @@ def create_app(data_dir, api_key: str | None = None,
             changed |= store.del_json("tools")
         if body.get("memory"):
             changed |= store.del_json("memory")
+        if body.get("timers"):
+            changed |= store.del_json("timers_settings")
         if body.get("mcp"):
             changed |= store.del_json("mcp")
             mcp_manager.sync(mcp_servers())
@@ -1465,10 +1593,10 @@ def create_app(data_dir, api_key: str | None = None,
         if body.get("timezone"):
             changed |= store.del_json("timezone")
         if not (body.get("llm") or body.get("tts") or body.get("tools")
-                or body.get("memory") or body.get("mcp")
+                or body.get("memory") or body.get("mcp") or body.get("timers")
                 or body.get("switch_phrases") or body.get("timezone")):
             return err(422, 'set "llm", "tts", "tools", "memory", "mcp", '
-                            '"switch_phrases" and/or "timezone" to true')
+                            '"timers", "switch_phrases" and/or "timezone" to true')
         if changed:
             bump_state()
         return settings_response()
@@ -2173,7 +2301,10 @@ def main():
     app = create_app(data_dir, api_key=os.getenv("RIKO_HUB_KEY") or None,
                      llm_defaults=llm_defaults, tts_defaults=tts_defaults,
                      tools_defaults=tools_defaults, mcp_defaults=mcp_defaults,
-                     timers_defaults={"poll_s": os.getenv("RIKO_TIMER_POLL_S", "1")})
+                     timers_defaults={"poll_s": os.getenv("RIKO_TIMER_POLL_S", "1"),
+                                      "allow_chaining": os.getenv(
+                                          "RIKO_TIMER_ALLOW_CHAINING", "")
+                                      .strip().lower() in ("1", "true", "yes", "on")})
     host = os.getenv("RIKO_HUB_HOST", "0.0.0.0")
     port = int(os.getenv("RIKO_HUB_PORT", "8002"))
     print(f"[hub] data={data_dir} llm={llm_defaults['base_url'] or '(not configured)'} "

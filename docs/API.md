@@ -215,7 +215,7 @@ transcript with `after=0`).
 | `POST /api/personas/{id}/voice/lock` | freeze designed voice: its take becomes the clone |
 | `GET /api/settings` | LLM + TTS + tools settings + defaults + per-field source (key never returned) |
 | `PUT /api/settings` | change settings (blank field = unset → default; `clear_api_key`) |
-| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timezone/switch-phrase overrides → defaults |
+| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timers/timezone/switch-phrase overrides → defaults |
 | `POST /api/settings/test` | model probe + breeze health → `{ok, model, tts}` |
 | `GET /api/timers` | one-shot timers (docs/TIMERS.md; `?status=` filter) |
 | `DELETE /api/timers/{id}` | cancel a pending/firing timer |
@@ -368,6 +368,8 @@ older hubs may send it anyway — the field is simply ignored there.
   "actions": [{"name": "wave", "at": 0.0}],
   "tools_used": [{"tool": "web_search", "label": "searching the web for “tokyo weather”"}],
   "memory_writes": [{"id": 7, "text": "User's cat is called Miso"}],
+  "timers_set": [{"id": 3, "label": "stretch",
+                  "due_at_local": "2026-11-05T12:30:00+00:00", "asked": false}],
   "message_ids": [41, 42],
   "audio_url": "/api/messages/42/audio",
   "state_version": 17
@@ -402,7 +404,12 @@ comes from the **final** reply only (see *Body actions*). `tools_used` is
 `[]` when no tools ran; `memory_writes` is likewise **always present** and
 lists the long-term facts this turn saved with `remember`
 (`[{id, text}]`) — render it as a "remembered" chip on the reply (see
-*Memory*); while a turn runs you can watch live progress on
+*Memory*). `timers_set` is likewise **always present** and lists the timers
+this turn created (`[{id, label, due_at_local, asked}]`, see *Timers*):
+`asked: true` marks the hub's asked-for fallback timer — created because the
+owner explicitly asked for one and the model answered without calling the
+tool. A switch's ChatResult carries `timers_set: []`. While a turn runs you
+can watch live progress on
 `GET /api/events` (see *Events*). A turn that uses tools can take noticeably
 longer than a plain one (each tool step is another model call): keep your
 chat timeout generous (minutes, not seconds).
@@ -468,6 +475,7 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                        "tool_permissions": {}, "timeout": 60}]},
   "memory": {"enabled": true, "prompt_budget_tokens": 600,
              "auto_remember": true},
+  "timers": {"allow_chaining": false},              // docs/TIMERS.md reviewer additions
   "switch_phrases": ["switch to", "change to", "become", "persona",
                      "talk to", "i want to talk to"],
   "timezone": "",                                  // saved override, "" = server zone
@@ -483,6 +491,7 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                "mcp": {"servers": []},
                "memory": {"enabled": true, "prompt_budget_tokens": 600,
                           "auto_remember": true},
+               "timers": {"allow_chaining": false},
                "switch_phrases": ["switch to", "..."],
                "timezone": "Europe/London"},
   "llm_source": {"base_url": "saved", "model": "default", "api_key": "default",
@@ -491,7 +500,8 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
   "tools_source": {"enabled": "default", "searxng_url": "saved", "...": "..."},
   "mcp_source": {"servers": "saved"},
   "memory_source": {"enabled": "default", "prompt_budget_tokens": "default",
-                    "auto_remember": "saved"}
+                    "auto_remember": "saved"},
+  "timers_source": {"allow_chaining": "saved"}
 }
 ```
 
@@ -547,9 +557,13 @@ Semantics (made so a careless form save cannot break the hub):
   (bad name/transport/command/url, duplicate names, `timeout` < 1) → `422`.
 - Numbers validate as before: `422` on non-numeric or negative
   temperature/max_tokens/max_history, or non-object `extra_body`.
+- **The `timers` block** (docs/TIMERS.md reviewer additions):
+  `allow_chaining` (bool) decides whether a timer-**fired** turn may set
+  another timer at all; non-boolean → `422`. Blank = default = `false`.
+  Default-overridable with `RIKO_TIMER_ALLOW_CHAINING=1`.
 
 `POST /api/settings/reset` with `{"llm": true, "tts": true, "tools": true,
-"memory": true, "mcp": true, "timezone": true, "switch_phrases": true}` (each side optional,
+"memory": true, "mcp": true, "timers": true, "timezone": true, "switch_phrases": true}` (each side optional,
 `422` if none)
 drops the saved overrides so the defaults apply again. Returns the same body
 as `GET`.
@@ -669,6 +683,13 @@ actions, speech, audio, memory and tools all apply). One-shot only.
 - **Timezone:** timer times speak the hub's configured zone — the
   `timezone` setting (Settings page; blank = server zone, the hub
   container's `TZ`, `Europe/London` in compose).
+- **Asked-for fallback** (docs/TIMERS.md reviewer additions): when the
+  owner's message explicitly asks for a timer and the model answers without
+  calling the tool, the hub creates the requested timer itself —
+  `asked: true` on the timer and in the ChatResult's `timers_set`.
+- **Chain guard:** a timer-fired turn does not get the `timer` tool unless
+  the `timers.allow_chaining` setting is on, and a chained timer inherits
+  `chain_depth` +1 with a hard cap of 3 (`chain limit` tool error past it).
 
 Cancel events (`cancel_on`): `chat.user_message` — the owner sends any
 message to that persona first; `chat.read` — the owner opens that persona's
@@ -689,6 +710,7 @@ curl -s -H "$AUTH" "$HUB/api/timers?status=pending"
   "due_at_local": "2026-11-05T12:30:00+00:00", "timezone": "Europe/London",
   "cancel_on": ["chat.user_message"],
   "status": "pending",                             // pending|firing|fired|cancelled|failed
+  "asked": false, "chain_depth": 0,
   "created_at": "2026-11-05T12:25:00Z",
   "fired_at": null, "result_message_id": null, "error": null, "retry_count": 0
 }]}
@@ -1156,7 +1178,7 @@ curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 #   {"seq":15,"time":"…","type":"approval_needed","request_id":"…","client_id":"my-desktop","tool":"desktop__do_thing","summary":"do_thing {}"},
 #   {"seq":16,"time":"…","type":"turn_finished","persona":"riko","message_id":42,"emotion":"happy","actions":[{"name":"wave","at":0.0}]},
 #   {"seq":17,"time":"…","type":"memory_changed","id":7,"op":"added"},
-#   {"seq":18,"time":"…","type":"timer_set","id":3,"label":"tea","persona_id":"riko","due_at":"2026-11-05T12:30:00Z","due_at_local":"2026-11-05T12:30:00+00:00","cancel_on":[]},
+#   {"seq":18,"time":"…","type":"timer_set","id":3,"label":"tea","persona_id":"riko","due_at":"2026-11-05T12:30:00Z","due_at_local":"2026-11-05T12:30:00+00:00","cancel_on":[],"asked":false},
 #   {"seq":19,"time":"…","type":"timer_fired","id":3,"label":"tea","persona_id":"riko","message_id":42},
 #   {"seq":20,"time":"…","type":"turn_finished","persona":"riko","origin":"timer","persona_id":"riko","timer":{"id":3,"label":"tea"},"message_id":42,"reply":"Your tea is ready!","speech":"Your tea is ready!","emotion":"happy","actions":[],"audio_url":"/api/messages/42/audio"},
 #   {"seq":21,"time":"…","type":"state_changed","version":21}

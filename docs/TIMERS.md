@@ -113,3 +113,71 @@ report problems instead of editing it.
 |---|---|
 | `hub/**`, `tests/test_hub_*.py`, `docs/API.md`, hub compose/.env.example | H |
 | `riko/**`, `desktop.py`, `main.py`, `client/**`, `bin/**`, `character_config.yaml`, non-hub tests, README (timers paragraph) | D |
+
+---
+
+## Reviewer additions (asked-for fallback & chain guard)
+
+Two live-hub failure modes with a real model at temperature 1.0:
+
+- **"I said it, so it must be done."** *"remind me in 20 seconds to
+  stretch"* → she called only `list_timers` and answered "Twenty seconds,
+  then…" — no timer existed. An explicit *"Please set a timer for 30
+  seconds labelled stretch, using your timer tool"* worked, so the ask
+  itself is understood; it just loses to the persona when the wording is
+  casual.
+- **Timer chains.** The *fired* turn itself called `timer` and queued a
+  follow-up ("mochi-grace-45s"): every link is another model call and
+  another nudge, forever.
+
+Same fix shape as `docs/BODY.md` §3: a conservative hub-side matcher owns
+the recognition; the model owns the doing when it cooperates.
+
+### §1 Asked-for fallback (`hub/tools/timers.py`, `run_chat_turn`)
+
+`detect_timer_request(text, now, tz_name)` matches explicit asks **in the
+owner's own user message**: `remind me (in <dur>|to <task> in <dur>|at
+<HH:MM>)`, `in <dur> remind me …`, `set a (timer|reminder|alarm) for
+<dur> (labelled|for <label>)?`, `<dur> timer (for <label>)?`,
+`wake me (up)? in <dur>`. Durations take digits or spelled numbers
+(`twenty minutes`, `1h30m`, `half an hour`); `at HH:MM` resolves in the
+owner's effective timezone, today, or tomorrow if already past.
+Conservative by design: questions about timers (`what timers do I have`,
+`how long is left`), past tense (`I set a timer`), negations
+(`don't remind me`), cancellations (`cancel the timer`), hypotheticals
+(`if I asked you to remind me…`) and asks with **no time attached**
+(`remind me to stretch` — no clock, no guess) all return `None`.
+
+- **Hint first:** a matched ask appends one line to that turn's system
+  prompt (`request_hint`: *call the timer tool (time=…, label=…) before
+  replying*), exactly like the body-action hint.
+- **Then the fallback:** after the turn, if the matcher fired, the timer
+  tool was offered, no timer was created during the turn, and the reply
+  does not clearly refuse (`reply_refuses`), the hub creates the timer
+  itself — parsed time/label/prompt (`Reminder: <task>` or
+  `Timer "<label>" is up.`), `asked: true` in the captured snapshot,
+  `timer_set` published. The reply text is not rewritten: it already
+  claims the time, and now that claim is true.
+- The ChatResult carries `timers_set: [{id, label, due_at_local, asked}]`
+  for every timer the turn created — the model's own (`asked: false`) or
+  the fallback's (`asked: true`). `GET /api/timers` rows expose
+  `asked`/`chain_depth`; `timer_set` events carry `asked`.
+
+### §2 Chain guard
+
+- **The fired turn does not get the `timer` tool** by default — a fired
+  timer answers its prompt; it does not schedule. `list_timers` and
+  `cancel_timer` stay available (she can still manage the schedule).
+  Setting `timers.allow_chaining: true` (Settings API; env default
+  `RIKO_TIMER_ALLOW_CHAINING=1`; blank = default = off) gives it back.
+- The asked-for fallback **never** fires on a timer-fired turn — its
+  "user" message is the timer's own prompt, and a prompt that reads like
+  an ask ("remind me to stretch in 20 minutes") must not re-arm itself.
+- **Hard cap:** when chaining is on, a timer created during a fired turn
+  inherits `chain_depth = parent + 1` in its captured snapshot, and
+  creation beyond `MAX_CHAIN_DEPTH = 3` is refused with a `chain limit`
+  tool error. Depth 0 = set by an ordinary chat turn.
+
+Tests: `tests/test_hub_timers.py` (matcher table, fallback vs
+model-set/no-duplicate/refusal/tools-off paths, fired-turn tool list,
+depth cap, settings roundtrip).

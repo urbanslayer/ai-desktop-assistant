@@ -183,6 +183,253 @@ def due_fields(due_utc: datetime, tz: "ZoneInfo | None") -> dict:
     }
 
 
+# ── asked-for request matcher (docs/TIMERS.md "Reviewer additions") ─────────
+#
+# Same failure mode as body actions (docs/BODY.md §3): at the owner's
+# temperature the model often ANSWERS "remind me in 20 seconds to stretch"
+# as if it had set the timer without calling the `timer` tool at all. The
+# hub therefore keeps a conservative matcher over the USER message: it only
+# fires on explicit set-a-timer requests that carry a time, never on
+# questions about timers, past-tense mentions, negations ("don't remind
+# me"), cancellations or hypotheticals. A match (1) hints the model to call
+# the tool this turn and (2) lets the hub create the timer itself if the
+# turn ends without one (the asked-for fallback, server.py).
+
+MAX_CHAIN_DEPTH = 3   # chained timers deeper than this are refused
+
+_NUM_WORDS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30, "forty": 40,
+    "fourty": 40, "fifty": 50, "sixty": 60, "ninety": 90,
+}
+_HALF = r"half\s+(?:an?\s+)?hour"
+_NUM = r"(?:\d+(?:[.,]\d+)?|" + \
+       "|".join(sorted(_NUM_WORDS, key=len, reverse=True)) + r")"
+_UNIT = r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|day|s|m|h|d)(?![a-z])"
+_PAIR = rf"(?:{_HALF}|{_NUM}\s*{_UNIT})"
+_DUR = rf"{_PAIR}(?:\s*(?:and\s+)?{_PAIR})?"
+_AT = r"\d{1,2}[:.]\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?"
+_TASK = r"[^.?!;\n]{1,120}"
+_SETV = r"(?:set|start|make|add|create|want|need|put)"
+_BOUND = r"(?:^|[.!?:;,]\s+)"
+# Politeness / discourse words may open the request: "please remind me…",
+# "so, remind me…", "could you remind me…".
+_POLITE_PREFIX = (r"(?:(?:so|and|then|also|but|just|now|okay|ok|please|pls"
+                  r"|hey|um|uh|kindly|could\s+you|can\s+you|will\s+you"
+                  r"|would\s+you|pls)\s+)*")
+# Label candidates never start with a determiner ("my timer for 20 minutes
+# is done" is a mention, not an ask).
+_LABEL = r"(?!(?:my|the|this|that|our|your|his|her|a|an)\s)[a-z][a-z0-9 _-]{0,24}?"
+
+_PAIR_RES = re.compile(rf"({_NUM})\s*({_UNIT})", re.IGNORECASE)
+
+# Question words opening the message, or question words naming a timer: the
+# owner is ASKING about timers, not setting one.
+_NEGATIVES = [
+    r"^\s*(?:who|what|when|where|why|how|which|do|does|did|is|are|was|were"
+    r"|have|has|tell)\b",
+    r"\b(?:what|which|how\s+many|how\s+long|how\s+much|when)\b[^?!]*"
+    r"\b(?:timer|reminder|alarm)s?\b",
+    r"\bhow\s+long\b|\btime\s+(?:is\s+)?left\b|\bleft\s+on\s+(?:my|the)\b",
+    # past-tense mentions: "I set a timer", "you reminded me", "the timer rang".
+    # bare "could YOU SET a timer" is a request, so "you" only counts with an
+    # explicit past marker.
+    r"\b(?:i|we|he|she|they|it|there)\s+(?:just\s+|already\s+|once\s+)?"
+    r"(?:set|made|created|started|had|put)\b[^?!]*\b(?:timer|reminder|alarm)s?\b",
+    r"\byou\s+(?:just|already|once|earlier|previously)\s+"
+    r"(?:set|made|created|started|put)\b",
+    r"\breminded\b|\btimers?\s+(?:went\s+off|fired|rang|expired)\b",
+    r"\b(?:timer|reminder|alarm)s?\b[^?!]*\b(?:went\s+off|fired|rang|expired"
+    r"|is\s+done|is\s+up|was\s+set)\b",
+    r"\b(?:earlier|yesterday|before)\b[^?!]*\b(?:timer|reminder)s?\b",
+    # negations and cancellations
+    r"\b(?:don'?t|dont|do\s+not|never\s+mind|no)\b[^?!]*"
+    r"\b(?:remind|timer|reminder|alarm)\b",
+    r"\b(?:cancel|cancell?ed?|delete|remove|stop|clear|kill|snooze)\b[^?!]*"
+    r"\b(?:timer|reminder|alarm)s?\b",
+    # hypotheticals: "if I asked you to remind me…", "what if…"
+    r"\bif\s+i\b|\bwhat\s+if\b|^\s*(?:suppose|imagine)\b",
+]
+_NEGATIVE_RES = [re.compile(p, re.IGNORECASE) for p in _NEGATIVES]
+
+# Explicit request forms. Every one carries a duration or an at-time; a bare
+# "remind me" without a time is NOT a timer request (the hub will not guess).
+_REQUEST_RES: list[tuple[str, re.Pattern]] = [
+    ("remind", re.compile(
+        _BOUND + _POLITE_PREFIX + rf"remind\s+(?:me|us)\s+in\s+(?P<dur>{_DUR})"
+        rf"(?:\s*,?\s*(?:to|that|about)\s+(?P<task>{_TASK}))?", re.IGNORECASE)),
+    ("remind", re.compile(
+        _BOUND + _POLITE_PREFIX + rf"remind\s+(?:me|us)\s+to\s+"
+        rf"(?P<task>{_TASK}?)\s+in\s+(?P<dur>{_DUR})", re.IGNORECASE)),
+    ("remind", re.compile(
+        _BOUND + _POLITE_PREFIX + rf"remind\s+(?:me|us)\s+"
+        rf"(?:today\s+|tonight\s+|tomorrow\s+)?at\s+(?P<at>{_AT})"
+        rf"(?:\s*(?:to|that|about)\s+(?P<task>{_TASK}))?", re.IGNORECASE)),
+    ("remind", re.compile(
+        rf"(?:^|[.!?:;]\s+){_POLITE_PREFIX}in\s+(?P<dur>{_DUR})\s*,?\s*"
+        rf"remind\s+(?:me|us)(?:\s+to\s+(?P<task>{_TASK}))?", re.IGNORECASE)),
+    ("timer", re.compile(
+        rf"\b{_SETV}\s+(?:up\s+)?(?:a|an|another|my|the)\s+"
+        rf"(?P<kind>timer|reminder|alarm)s?\s+for\s+(?P<dur>{_DUR})"
+        rf"(?:\s+(?:called|cawed|labell?ed|named|as|for|to)\s+"
+        rf"(?P<label>{_TASK}))?", re.IGNORECASE)),
+    ("timer", re.compile(
+        rf"(?:{_BOUND}(?:{_SETV}\s+(?:up\s+)?(?:a|an|the|my)\s+)?"
+        rf"|(?:\b{_SETV}\s+(?:up\s+)?(?:a|an|the|my)\s+))"
+        rf"(?P<dur>{_DUR})\s+(?:(?P<label>{_LABEL})\s+)?"
+        rf"(?:timer|reminder|alarm)\b"
+        rf"(?:\s+for\s+(?P<for>[^.?!;\n]{{1,60}}))?", re.IGNORECASE)),
+    ("timer", re.compile(
+        _BOUND + rf"(?:(?:{_SETV}\s+(?:up\s+)?(?:a|an)\s+)|(?:a|an)\s+)?"
+        rf"(?:(?P<label>{_LABEL})\s+)?"
+        rf"(?:timer|reminder|alarm)s?\s+for\s+(?P<dur>{_DUR})"
+        rf"(?:\s+(?:called|labell?ed|named|as)\s+(?P<label2>[^.?!;\n]{{1,60}}))?",
+        re.IGNORECASE)),
+    ("wake", re.compile(
+        _BOUND + _POLITE_PREFIX + rf"wake\s+me\s+(?:up\s+)?in\s+(?P<dur>{_DUR})"
+        rf"(?:\s+to\s+(?P<task>{_TASK}))?", re.IGNORECASE)),
+    ("wake", re.compile(
+        _BOUND + _POLITE_PREFIX + rf"wake\s+me\s+(?:up\s+)?at\s+(?P<at>{_AT})",
+        re.IGNORECASE)),
+]
+
+# A reply that clearly refused: the hub must not create the timer anyway.
+_REFUSAL = re.compile(
+    r"\b(?:can(?:not|'?t)|couldn'?t|could\s+not|wasn'?t\s+able|am\s+not\s+able"
+    r"|not\s+able|unable|won'?t|will\s+not|refus\w*|declin\w*)\b",
+    re.IGNORECASE)
+
+# Trailing politeness that must not ride into the label/prompt.
+_POLITE = re.compile(r"[\s,]*(?:please|pls|thanks|thank\s+you|ty|kthx|now"
+                     r"|ok|okay|alright|for\s+me)\b[\s.!]*$", re.IGNORECASE)
+
+
+def _clean_phrase(text: str) -> str:
+    text = re.sub(r"\s+", " ", str(text or "").strip())
+    for _ in range(3):
+        text = _POLITE.sub("", text).strip()
+    return text.strip(" ,.;:'\"-").strip()
+
+
+def _dur_seconds(raw: str) -> float | None:
+    """Seconds in a duration phrase ("20 seconds", "1h30m", "twenty minutes",
+    "half an hour"), None when nothing parses."""
+    text = re.sub(_HALF, "0.5h", str(raw or ""), flags=re.IGNORECASE)
+    total = 0.0
+    matched_any = False
+    for num, unit in _PAIR_RES.findall(text):
+        num, unit = num.lower().strip(), unit.lower().strip()
+        if unit not in _UNIT_SECONDS:
+            continue
+        try:
+            value = float(num.replace(",", "."))
+        except ValueError:
+            value = float(_NUM_WORDS.get(num, 0))
+        if value <= 0:
+            continue
+        total += value * _UNIT_SECONDS[unit]
+        matched_any = True
+    return total if matched_any else None
+
+
+def _resolve_at(raw_at: str, now: datetime, tz_name: str) -> datetime | None:
+    """'HH:MM' / '7.30 pm' in the owner's zone → aware datetime: today, or
+    tomorrow when it already passed. None when the clock value is bogus."""
+    text = str(raw_at or "").lower().strip().replace(".", ":")
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(am|pm)?$", text)
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    ampm = m.group(3)
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    try:
+        zone = ZoneInfo(tz_name) if tz_name else ZoneInfo("UTC")
+    except Exception:
+        zone = ZoneInfo("UTC")
+    local_now = now.astimezone(zone)
+    try:
+        target = local_now.replace(hour=hour, minute=minute,
+                                   second=0, microsecond=0)
+    except ValueError:
+        return None
+    if target <= local_now:
+        target += timedelta(days=1)
+    return target
+
+
+def detect_timer_request(text: str, now: datetime | None = None,
+                         tz_name: str = "") -> dict | None:
+    """The timer the USER message explicitly asks for, or None.
+
+    Returns {"time", "label", "task", "prompt"} where `time` is ready for
+    ``parse_timer_time`` (a normalized duration like "1200s" — word numbers
+    the model's parser does not speak are converted — or an RFC 3339 time
+    WITH the owner's timezone offset for the at-HH:MM forms). Conservative:
+    questions about timers, past-tense mentions, negations, cancellations
+    and hypotheticals never match; a request without a time never matches.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return None
+    for neg in _NEGATIVE_RES:
+        if neg.search(raw):
+            return None
+    now = now or datetime.now(timezone.utc)
+    for kind, pat in _REQUEST_RES:
+        m = pat.search(raw)
+        if not m:
+            continue
+        groups = m.groupdict()
+        task = _clean_phrase(groups.get("task") or "")
+        label = _clean_phrase(groups.get("label") or groups.get("label2")
+                              or groups.get("for") or "")
+        time_raw = ""
+        if groups.get("dur"):
+            secs = _dur_seconds(groups["dur"])
+            if not secs or secs < MIN_SECONDS_AHEAD:
+                continue
+            time_raw = f"{secs:g}s"
+        elif groups.get("at"):
+            target = _resolve_at(groups["at"], now, tz_name)
+            if target is None:
+                continue
+            time_raw = target.isoformat(timespec="seconds")
+        else:
+            continue
+        if kind == "remind":
+            task = task or "check in with the owner"
+            label = label or task
+            prompt = f"Reminder: {task}"
+        elif kind == "wake":
+            task = task or "wake the owner up"
+            label = label or "wake up"
+            prompt = f"Reminder: {task}"
+        else:
+            label = label or "timer"
+            prompt = f'Timer "{label}" is up.'
+        return {"time": time_raw, "label": label[:80], "task": task,
+                "prompt": prompt[:4000]}
+    return None
+
+
+def request_hint(req: dict) -> str:
+    """One-line prompt nudge for a turn whose user message asked for a timer."""
+    return (f'The user just asked for a timer: call the timer tool '
+            f'(time="{req["time"]}", label="{req["label"]}", '
+            f'prompt="{req["prompt"]}") before replying.')
+
+
+def reply_refuses(text: str) -> bool:
+    """True when the reply clearly refuses the ask (fallback must stand down)."""
+    return bool(_REFUSAL.search(str(text or "")))
+
+
 CANCEL_EVENTS = ("chat.user_message", "chat.read")
 
 
