@@ -1,0 +1,8 @@
+{
+  "uuid": "riko-windows@riko",
+  "name": "Riko Windows",
+  "description": "Read-only window and monitor list for the Riko desktop companion (no keystrokes, no screenshots).",
+  "shell-version": ["42", "43", "44", "45", "46", "47", "48"],
+  "url": "https://github.com/urbanslayer/ai-desktop-assistant",
+  "version": 1
+}

@@ -212,8 +212,22 @@ def tools_prompt(spec_names: list[str], now_local: str = "",
         "blank line is spoken in full, so write it as prose. In what you "
         "say out loud, never write a URL or website address; name the site "
         "instead (\"the Godot docs\"). "
-        f"Current date/time: {now} (UTC)." + local
+        + _desktop_sense_line(spec_names)
+        + f"Current date/time: {now} (UTC)." + local
     )
+
+
+def _desktop_sense_line(spec_names) -> str:
+    """One line while the desktop-awareness tools are offered
+    (docs/DESKTOP_SENSE.md 'Prompt')."""
+    if any(str(n).endswith(("desktop_windows", "desktop_monitors")) or
+           "__desktop_windows" in str(n) or "__desktop_monitors" in str(n)
+           for n in (spec_names or [])):
+        return ("You can see the owner's open windows, browser tabs and "
+                "screens, and open apps on a given screen, with the "
+                "desktop_* and browser_tabs tools; look before guessing, "
+                "and say which screen you used. ")
+    return ""
 
 
 def now_iso_static() -> str:

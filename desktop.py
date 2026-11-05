@@ -684,7 +684,7 @@ def main():
     # Client-tool channel (docs/ROUNDS.md R2-F): register on the hub, run the
     # tools it asks for, show approvals, and serve the Riko Helper Firefox
     # extension over a local token-authenticated WebSocket.
-    runtime, browser = client_tools.start_desktop(cfg, hub_client.get())
+    runtime, browser, sense = client_tools.start_desktop(cfg, hub_client.get())
     hub_client.start_state_poller()  # notice switches made from the web page or another PC
     session.follow_hub_events()  # hub-fired timer replies reach her like normal turns (docs/TIMERS.md D)
     session.greet_on_start()  # she says hello once when the page is ready (desktop.greet_on_start)
@@ -821,6 +821,21 @@ def main():
             return runtime.approve_hook() if cmd == "approve" else runtime.deny_hook()
         elif cmd == "approval-pending":
             return {"ok": True, "pending": runtime.pending_approval() if runtime else None}
+        elif cmd in ("desktop-sense", "desktop-awareness"):
+            # docs/DESKTOP_SENSE.md: the privacy master toggle (same toggle
+            # as the tray checkbox; riko-ctl desktop-sense [on|off])
+            if sense is None:
+                return {"ok": False, "error": "desktop awareness is unavailable on this PC"}
+            want = str(args.get("enabled", "")).strip().lower()
+            if want in ("on", "true", "1", "yes"):
+                sense.awareness.set(True)
+            elif want in ("off", "false", "0", "no"):
+                sense.awareness.set(False)
+            elif want:
+                return {"ok": False, "error": "desktop-sense: on | off"}
+            if runtime is not None:
+                client_tools.apply_awareness(runtime, cfg, browser, sense)
+            return {"ok": True, "enabled": sense.awareness.enabled}
         elif cmd == "browser-status":
             on = bool(browser and browser.connected())
             return {"ok": True, "enabled": runtime is not None, "connected": on,
@@ -901,12 +916,32 @@ def main():
                              "pauses while she speaks")
     listen_action.triggered.connect(lambda checked=None: session.toggle_listen_mode())
 
+    # Desktop awareness (docs/DESKTOP_SENSE.md): "Let her see my desktop" —
+    # the privacy master toggle. Off (the default) she has no desktop_*
+    # tools at all; turning it on registers them with the hub right away.
+    sense_action = QAction("Let her see my desktop", menu)
+    sense_action.setCheckable(True)
+    sense_action.setToolTip("desktop awareness: your open windows, browser tabs "
+                            "and screens, and opening apps for you")
+    sense_action.setEnabled(sense is not None)
+
+    def toggle_desktop_sense(checked=None):
+        want = (not sense.awareness.enabled) if checked is None else bool(checked)
+        new = sense.awareness.set(want)
+        if runtime is not None:
+            client_tools.apply_awareness(runtime, cfg, browser, sense)
+        sense_action.setChecked(new)
+        print(f"[desktop] desktop awareness {'on' if new else 'off'}", flush=True)
+
+    sense_action.triggered.connect(toggle_desktop_sense)
+
     for label, fn in ((f"Type to her{hint('type')}", lambda: on_command("type")),
                       (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle)):
         action = QAction(label, menu)
         action.triggered.connect(fn)
         menu.addAction(action)
     menu.addAction(listen_action)
+    menu.addAction(sense_action)
     for label, fn in ((f"Show / hide{hint('hide')}", toggle_window),
                       (f"Forget the chat{hint('forget')}", session.forget),
                       (f"Quit{hint('quit')}", app.quit)):
@@ -914,6 +949,8 @@ def main():
         action.triggered.connect(fn)
         menu.addAction(action)
     listen_action.setChecked(session.listen_mode == "always")
+    if sense is not None:
+        sense_action.setChecked(sense.awareness.enabled)
     if session.listen_mode == "always":
         tray.setToolTip("Riko — always listening (L switches back)")
     # keep the tray honest when the mode changes elsewhere (L key, riko-ctl)

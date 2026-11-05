@@ -74,6 +74,12 @@ class ClientHub:
             if risk not in ("read", "act", "danger"):
                 raise ValueError(f"tool '{tname}' risk must be read, act or danger")
             params = raw.get("parameters")
+            # optional soft default permission a client declares for its own
+            # tool (docs/DESKTOP_SENSE.md: open_app/focus_window are `act`
+            # but the owner approved them without confirmation)
+            pdef = str(raw.get("permission_default") or "")
+            if pdef not in ("always", "ask", "never"):
+                pdef = ""
             clean_tools[tname] = {
                 "name": tname,
                 "model_name": model_name,
@@ -81,6 +87,7 @@ class ClientHub:
                 "parameters": params if isinstance(params, dict) else {
                     "type": "object", "properties": {}},
                 "risk": risk,
+                "permission_default": pdef,
             }
         record = {"client_id": client_id, "name": str(name or client_id)[:100],
                   "kind": kind, "tools": clean_tools, "last_seen": time.monotonic(),
@@ -149,6 +156,7 @@ class ClientHub:
                          description=t["description"] or f"client tool {t['name']}",
                          parameters=t["parameters"], source="client", risk=t["risk"],
                          client_id=rec["client_id"], run=None,
+                         permission_default=t.get("permission_default", ""),
                          label=(lambda nm: lambda args: summarize(nm, args))(t["name"]))
                 for name, (rec, t) in found.items()]
 

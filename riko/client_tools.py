@@ -357,11 +357,14 @@ def browser_tools():
     ]
 
 
-def desktop_tools():
+def desktop_tools(sense=None):
     """Everything the desktop app offers the model (browser tools included —
-    they answer 'the Firefox helper is not connected' until it is)."""
+    they answer 'the Firefox helper is not connected' until it is). With a
+    DesktopSense whose awareness toggle is on, the desktop_* tools join the
+    catalogue (docs/DESKTOP_SENSE.md: absent entirely while awareness is
+    off — the privacy toggle is the registration gate)."""
     obj = {"type": "object", "additionalProperties": False}
-    return [
+    tools = [
         {"name": "open_url", "risk": "read",
          "description": "Open an http(s) URL in the user's default browser.",
          "parameters": dict(obj, properties={"url": {"type": "string"}}, required=["url"])},
@@ -378,6 +381,10 @@ def desktop_tools():
                             required=["text"])},
         *browser_tools(),
     ]
+    if sense is not None and sense.awareness.enabled:
+        from riko.desktop_sense.sense import sense_tools
+        tools += sense_tools()
+    return tools
 
 
 # ── The Firefox side: token-authenticated WebSocket server ───
@@ -660,6 +667,21 @@ class ClientRuntime:
               f"({len(self.tools)} tools, body: {len(self.body['actions'])} actions)")
         return out
 
+    def set_tools(self, tools, executors):
+        """Swap the offered catalogue at runtime (the desktop.awareness tray
+        toggle adds/removes the desktop_* tools; docs/DESKTOP_SENSE.md). A
+        hub that is down gets the new catalogue at the next re-register."""
+        self.tools = [t for t in tools if TOOL_NAME_OK.match(t.get("name", ""))]
+        self.executors = dict(executors)
+        if self._registered.is_set():
+            try:
+                self._register()
+            except hub_client.HubError as e:
+                print(f"[client] the tool list changed but the hub refused a "
+                      f"re-register: {e}")
+                return {"ok": False, "error": str(e)}
+        return {"ok": True, "tools": len(self.tools)}
+
     def set_body(self, raw):
         """The avatar page reports the gesture library it can actually play
         (built-ins + .vrma drop-ins; docs/BODY.md §1/§5). Re-register with the
@@ -832,8 +854,11 @@ class ClientRuntime:
         post(ok=True, approved=True, result=result, error="")
 
 
-def make_executors(bridge):
-    """The name -> callable map a ClientRuntime runs (browser_* relay to `bridge`)."""
+def make_executors(bridge, sense=None):
+    """The name -> callable map a ClientRuntime runs (browser_* relay to
+    `bridge`). `sense` (a DesktopSense) owns browser_tabs — listTabs with
+    old-extension fallback — and adds the desktop_* executors when the
+    awareness toggle is on."""
 
     def relay(method, params):
         if bridge is None:
@@ -860,12 +885,17 @@ def make_executors(bridge):
             return relay(method, params)
         return run
 
-    return {
+    def _tabs(**kw):
+        if sense is not None:
+            return sense.browser_tabs()
+        return relay("tabs", {})
+
+    ex = {
         "open_url": open_url,
         "clipboard_read": clipboard_read,
         "clipboard_write": clipboard_write,
         "notify": notify,
-        "browser_tabs": _mk("tabs", []),
+        "browser_tabs": _tabs,
         "browser_open": _mk("open", ("url", "new_tab")),
         "browser_read": _mk("read", ("tab",)),
         "browser_click": _mk("click", ("n",)),
@@ -876,19 +906,44 @@ def make_executors(bridge):
         "browser_screenshot": _mk("screenshot", ("tab",)),
         "browser_close": _mk("close", ("tab",)),
     }
+    if sense is not None and sense.awareness.enabled:
+        ex.update(sense.executors())
+    return ex
 
 
 # ── Desktop glue: what desktop.py calls ──────────────────────
+def build_sense(cfg, bridge):
+    """The DesktopSense for this PC (docs/DESKTOP_SENSE.md). Cheap: the
+    backend is only detected when a tool actually runs."""
+    try:
+        from riko.desktop_sense.sense import DesktopSense
+    except ImportError:
+        return None
+    try:
+        return DesktopSense(cfg, bridge)
+    except Exception as e:
+        print(f"[client] desktop awareness unavailable ({e})")
+        return None
+
+
+def apply_awareness(runtime, cfg, bridge, sense):
+    """(Re)build the offered tool catalogue from the awareness toggle; the
+    tray checkbox calls this after flipping. Returns whether sense is on."""
+    on = bool(sense is not None and sense.awareness.enabled)
+    runtime.set_tools(desktop_tools(sense), make_executors(bridge, sense))
+    return on
+
+
 def start_desktop(cfg, hub, viewer_module=None):
     """Start the browser bridge + client runtime for the desktop app.
 
-    Returns (runtime, bridge). Both are best-effort: a hub that is down just
-    retries quietly, and a busy WS port only loses the browser tools.
+    Returns (runtime, bridge, sense). All best-effort: a hub that is down
+    just retries quietly, and a busy WS port only loses the browser tools.
     """
     d = (cfg or {}).get("desktop") or {}
     cc = d.get("client") or {}
     if not cc.get("enabled", True):
-        return None, None
+        return None, None, None
     if viewer_module is None:
         from riko import viewer as viewer_module
     viewer = viewer_module
@@ -903,6 +958,8 @@ def start_desktop(cfg, hub, viewer_module=None):
     except Exception as e:
         print(f"[client] the browser WebSocket server didn't start ({e}); "
               f"browser tools will report 'not connected'")
+
+    sense = build_sense(cfg, bridge)
 
     def show_approval(summary, respond, timeout):
         viewer.emit("approval", summary=summary, timeout_s=int(timeout))
@@ -924,7 +981,7 @@ def start_desktop(cfg, hub, viewer_module=None):
         viewer.emit("approval_done")
 
     runtime = ClientRuntime(
-        hub, desktop_tools(), make_executors(bridge),
+        hub, desktop_tools(sense), make_executors(bridge, sense),
         client_id=str(cc.get("id") or "").strip() or client_id(),
         name=str(cc.get("name") or "Riko desktop"),
         on_approval=lambda summary, respond, timeout: show_approval(
@@ -944,4 +1001,4 @@ def start_desktop(cfg, hub, viewer_module=None):
 
     runtime.approve_hook, runtime.deny_hook = approve, deny
     runtime.start()
-    return runtime, bridge
+    return runtime, bridge, sense

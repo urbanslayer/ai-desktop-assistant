@@ -2248,7 +2248,8 @@ def create_app(data_dir, api_key: str | None = None,
                           "risk": s.risk, "available": True,
                           "description": s.description,
                           "permission": permission_for(s.name, "client", s.risk,
-                                                       permissions),
+                                                       permissions, "",
+                                                       s.permission_default),
                           "client_id": s.client_id})
         for s in mcp_manager.tool_info():
             tools.append({**s,

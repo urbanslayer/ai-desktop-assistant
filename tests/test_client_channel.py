@@ -334,15 +334,30 @@ def test_start_desktop_glue(fake_hub, hub_connected, tmp_path, monkeypatch):
             events.append((kind, data))
 
     monkeypatch.setenv("RIKO_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path / "state"))  # awareness default: off
     cfg = {"desktop": {"client": {"browser_port": free_port(),
                                   "approval_timeout": 5}}}
-    rt, br = client_tools.start_desktop(cfg, hub_connected, viewer_module=StubViewer)
+    rt, br, sense = client_tools.start_desktop(cfg, hub_connected, viewer_module=StubViewer)
     try:
         assert rt is not None and br is not None
         assert fake_hub.wait_for_register(rt.client_id)
         tools = [t["name"] for t in fake_hub.registered[rt.client_id]["tools"]]
         assert {"open_url", "clipboard_read", "clipboard_write", "notify",
                 "browser_read", "browser_click"} <= set(tools)
+        # docs/DESKTOP_SENSE.md: awareness is off by default, so the
+        # desktop_* tools are absent from the catalogue entirely
+        assert sense is not None and not sense.awareness.enabled
+        assert not {t for t in tools if t.startswith("desktop_")}
+        # and flipping the toggle registers them (tray checkbox path)
+        sense.awareness.set(True)
+        client_tools.apply_awareness(rt, cfg, br, sense)
+        tools2 = [t["name"] for t in fake_hub.registered[rt.client_id]["tools"]]
+        assert {"desktop_windows", "desktop_focused", "desktop_monitors",
+                "desktop_apps", "open_app", "focus_window"} <= set(tools2)
+        sense.awareness.set(False)
+        client_tools.apply_awareness(rt, cfg, br, sense)
+        tools3 = [t["name"] for t in fake_hub.registered[rt.client_id]["tools"]]
+        assert not {t for t in tools3 if t.startswith("desktop_")}
         # the per-install token file is there and readable only by us
         token_file = tmp_path / "cfg" / "browser_token"
         assert token_file.exists() and oct(token_file.stat().st_mode & 0o777) == "0o600"
@@ -363,9 +378,9 @@ def test_start_desktop_glue(fake_hub, hub_connected, tmp_path, monkeypatch):
 
 def test_start_desktop_disabled(fake_hub, hub_connected, tmp_path, monkeypatch):
     monkeypatch.setenv("RIKO_CONFIG_DIR", str(tmp_path / "cfg"))
-    rt, br = client_tools.start_desktop({"desktop": {"client": {"enabled": False}}},
-                                        hub_connected, viewer_module=None)
-    assert rt is None and br is None
+    rt, br, sense = client_tools.start_desktop({"desktop": {"client": {"enabled": False}}},
+                                               hub_connected, viewer_module=None)
+    assert rt is None and br is None and sense is None
 
 
 def test_link_page_is_served(bridge):
