@@ -122,12 +122,17 @@ class Awareness:
         return self._title_res
 
     def hides(self, app: str = "", title: str = "") -> bool:
-        """True when this window must not be named (denylist hit)."""
+        """True when this window must not be named (denylist hit). App-id
+        substrings also match titles: keepassxc windows often say the class
+        nowhere and "KeePassXC" only in the caption."""
         app_l = str(app or "").lower()
         apps = self.hide_apps()
         if any(h in app_l for h in apps if h):
             return True
         t = str(title or "")
+        t_l = t.lower()
+        if any(h in t_l for h in apps if h):
+            return True
         return any(rx.search(t) for rx in self.title_res)
 
     def hides_private(self, title: str = "", url: str = "") -> bool:

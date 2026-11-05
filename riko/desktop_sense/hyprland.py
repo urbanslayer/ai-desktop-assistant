@@ -94,15 +94,20 @@ class HyprlandBackend:
             mon_names = {m["id"]: m["name"] for m in self.monitors()}
         except ToolError:
             mon_names = {}
+        safe = {str(w.get("name", "")) for w in self._safe_workspaces()}
         out = []
         for c in clients if isinstance(clients, list) else []:
+            ws_name = (c.get("workspace") or {}).get("name", "")
+            if ws_name.startswith("special:") or (safe and ws_name and
+                                                  ws_name not in safe):
+                continue        # scratchpad/special workspaces are not exposed
             mid = c.get("monitor")
             mon = mon_names.get(mid, "" if mid is None else str(mid))
             out.append({
                 "id": c.get("address", ""),
                 "app": c.get("class", ""),
                 "title": clean_title(c.get("title", "")),
-                "workspace": (c.get("workspace") or {}).get("name", ""),
+                "workspace": ws_name,
                 "monitor": mon or str(mid),
                 "focused": c.get("address") == focused_addr,
                 "fullscreen": bool(c.get("fullscreen")),

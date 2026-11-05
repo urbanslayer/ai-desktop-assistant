@@ -154,6 +154,14 @@ def parse_lua_table(src: str, variables=None) -> dict:
     return _TableParser(toks, variables or {}).parse_table()
 
 
+def _as_table(t):
+    """parse_lua_table returns a bare list when the source was one `{...}`
+    value; unwrap so callers always get the dict."""
+    if isinstance(t, list) and len(t) == 1 and isinstance(t[0], dict):
+        return t[0]
+    return t
+
+
 def _call_bodies(text: str, fname: str):
     """Every `fname( ... )` balanced-paren body (string-aware)."""
     for m in re.finditer(re.escape(fname) + r"\s*\(", text):
@@ -254,16 +262,27 @@ class HyprLua:
         text = expand(text, vars_)
         self.env.update({k: str(v) for k, v in vars_.items()})
         for body in _call_bodies(text, "hl.monitor"):
-            t = parse_lua_table(body, vars_)
+            t = _as_table(parse_lua_table(body, vars_))
             if isinstance(t, dict) and t.get("output"):
                 self.monitors.append(t)
         for body in _call_bodies(text, "hl.workspace_rule"):
-            t = parse_lua_table(body, vars_)
-            if isinstance(t, dict) and t.get("workspace"):
+            t = _as_table(parse_lua_table(body, vars_))
+            if isinstance(t, dict) and t.get("workspace") not in (None, ""):
+                t["workspace"] = str(t["workspace"])   # 8 and "8" mean one ws
+                if t.get("monitor") is not None:
+                    t["monitor"] = str(t["monitor"])
                 self.workspace_rules.append(t)
         for body in _call_bodies(text, "hl.env"):
             t = _TableParser(_tokenize(body), vars_)
-            vals = [t.parse_value() for _ in range(2) if t.peek()[0]]
+            vals = []
+            while len(vals) < 2:
+                k2, v2 = t.peek()
+                if k2 is None:
+                    break
+                if k2 == "op" and v2 == ",":
+                    t.i += 1
+                    continue
+                vals.append(t.parse_value())
             if len(vals) == 2 and vals[0]:
                 self.env[str(vals[0])] = str(vals[1])
         # keybinds that launch apps: hl.bind(<keys>, hl.dsp.exec_cmd("…"))

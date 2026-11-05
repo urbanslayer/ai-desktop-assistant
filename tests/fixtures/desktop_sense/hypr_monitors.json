@@ -1,0 +1,62 @@
+[
+ {
+  "id": 0,
+  "name": "DP-1",
+  "description": "Dell Inc. DELL U2518D 3C4YP99OB39L",
+  "make": "Dell Inc.",
+  "model": "DELL U2518D",
+  "size": {
+   "x": 2560,
+   "y": 1440
+  },
+  "x": 0,
+  "y": 0,
+  "scale": 1.0,
+  "focused": false,
+  "disabled": false,
+  "activeWorkspace": {
+   "id": 2,
+   "name": "2"
+  }
+ },
+ {
+  "id": 1,
+  "name": "DP-2",
+  "description": "Dell Inc. DELL U2518D 3C4YP82K504L",
+  "make": "Dell Inc.",
+  "model": "DELL U2518D",
+  "size": {
+   "x": 2560,
+   "y": 1440
+  },
+  "x": 2560,
+  "y": 0,
+  "scale": 1.0,
+  "focused": true,
+  "disabled": false,
+  "activeWorkspace": {
+   "id": 1,
+   "name": "1"
+  }
+ },
+ {
+  "id": 2,
+  "name": "HDMI-A-1",
+  "description": "GWD ARZOPA 2022110200001",
+  "make": "GWD",
+  "model": "ARZOPA",
+  "size": {
+   "x": 2560,
+   "y": 1440
+  },
+  "x": 5120,
+  "y": 0,
+  "scale": 1.25,
+  "focused": false,
+  "disabled": false,
+  "activeWorkspace": {
+   "id": 8,
+   "name": "8"
+  }
+ }
+]

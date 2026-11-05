@@ -1,0 +1,15 @@
+{
+ "address": "0x222",
+ "class": "kitty",
+ "title": "user@arch: ~",
+ "workspace": {
+  "id": 1,
+  "name": "1"
+ },
+ "monitor": 1,
+ "pid": 4002,
+ "fullscreen": 0,
+ "floating": {
+  "state": 0
+ }
+}

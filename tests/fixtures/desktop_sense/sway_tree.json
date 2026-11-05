@@ -1,0 +1,131 @@
+{
+ "id": 1,
+ "type": "root",
+ "name": "root",
+ "nodes": [
+  {
+   "id": 900,
+   "type": "output",
+   "name": "DP-1",
+   "description": "Dell Inc. DELL U2518D 3C4YP99OB39L",
+   "rect": {
+    "x": 0,
+    "y": 0,
+    "width": 2560,
+    "height": 1440
+   },
+   "scale": 1,
+   "layout": "output",
+   "focused": false,
+   "nodes": [
+    {
+     "id": 950,
+     "type": "workspace",
+     "name": "2",
+     "focused": true,
+     "layout": "splith",
+     "nodes": [
+      {
+       "id": 101,
+       "type": "con",
+       "app_id": "firefox",
+       "name": "Arch Wiki - Mozilla Firefox",
+       "pid": 7101,
+       "focused": false,
+       "fullscreen_mode": 0,
+       "layout": "none",
+       "rect": {
+        "x": 10,
+        "y": 10,
+        "width": 800,
+        "height": 600
+       },
+       "nodes": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": 3460,
+   "type": "output",
+   "name": "DP-2",
+   "description": "Dell Inc. DELL U2518D 3C4YP82K504L",
+   "rect": {
+    "x": 2560,
+    "y": 0,
+    "width": 2560,
+    "height": 1440
+   },
+   "scale": 1,
+   "layout": "output",
+   "focused": false,
+   "nodes": [
+    {
+     "id": 3510,
+     "type": "workspace",
+     "name": "1",
+     "focused": true,
+     "layout": "splith",
+     "nodes": [
+      {
+       "id": 102,
+       "type": "con",
+       "app_id": "kitty",
+       "name": "user@arch: ~",
+       "pid": 7102,
+       "focused": true,
+       "fullscreen_mode": 0,
+       "layout": "none",
+       "rect": {
+        "x": 10,
+        "y": 10,
+        "width": 800,
+        "height": 600
+       },
+       "nodes": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": 6020,
+   "type": "output",
+   "name": "HDMI-A-1",
+   "description": "GWD ARZOPA 2022110200001",
+   "rect": {
+    "x": 5120,
+    "y": 0,
+    "width": 2560,
+    "height": 1440
+   },
+   "scale": 1,
+   "layout": "output",
+   "focused": false,
+   "nodes": [
+    {
+     "id": 6070,
+     "type": "workspace",
+     "name": "3",
+     "focused": true,
+     "layout": "splith",
+     "nodes": []
+    }
+   ]
+  },
+  {
+   "id": 2,
+   "type": "output",
+   "name": "__i3",
+   "rect": {
+    "x": 0,
+    "y": 0,
+    "width": 1280,
+    "height": 720
+   },
+   "nodes": [],
+   "layout": "none"
+  }
+ ]
+}

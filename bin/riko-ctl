@@ -15,6 +15,7 @@ a compositor keybind or a script, without focusing her first.
     riko-ctl persona NAME switch who she is (id, name or keyword; case doesn't matter)
     riko-ctl persona-next switch to the next persona on the hub (cycles around)
     riko-ctl listen-mode  flip push-to-talk <-> always listen (or: listen-mode always / push_to_talk)
+    riko-ctl desktop-sense  flip "let her see my desktop" (or: desktop-sense on / off)
     riko-ctl approve        say yes to the action she is asking about (Enter in her window also works)
     riko-ctl deny           say no (Esc in her window also works; a timeout denies by itself)
     riko-ctl browser-status is the Riko Helper Firefox extension connected?
@@ -36,7 +37,8 @@ URL = os.environ.get("RIKO_URL", "http://127.0.0.1:8080")
 APP_ID = "riko"
 COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide", "forget",
             "personas", "persona", "persona-next", "quit", "status",
-            "approve", "deny", "browser-status", "browser-token", "wave", "listen-mode"}
+            "approve", "deny", "browser-status", "browser-token", "wave", "listen-mode",
+            "desktop-sense"}
 
 
 def focus_window():
@@ -66,6 +68,8 @@ def main():
         body = {"name": name}
     if cmd == "listen-mode" and len(sys.argv) > 2:
         body = {"mode": sys.argv[2].strip().lower()}
+    if cmd == "desktop-sense" and len(sys.argv) > 2:
+        body = {"enabled": sys.argv[2].strip().lower()}
     if cmd in ("type", "show"):
         focus_window()
     request = urllib.request.Request(f"{URL}/control/{cmd}", data=json.dumps(body).encode(),
@@ -88,7 +92,7 @@ def main():
         print(f"firefox extension connected: {'yes' if reply.get('connected') else 'no'}")
         sys.exit(0)
     if cmd in ("status", "personas", "persona", "persona-next", "browser-status",
-               "listen-mode") or not reply.get("ok", True):
+               "listen-mode", "desktop-sense") or not reply.get("ok", True):
         print(json.dumps(reply))
     sys.exit(0 if reply.get("ok", True) else 1)
 

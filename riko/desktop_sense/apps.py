@@ -272,10 +272,11 @@ def open_app(app: str, monitor: str | None = None, workspace=None, *,
     mon_name = None
     mon_note = ""
     if monitor and backend is not None and resolve_monitor is not None:
-        mon_name, err = resolve_monitor_phrase(monitor, resolve_monitor(),
+        resolved, err = resolve_monitor_phrase(monitor, resolve_monitor(),
                                                backend_name=backend.name)
         if err:
             raise ToolError(err)
+        mon_name = str(resolved.get("name") or "")
     elif monitor:
         mon_note = " (this desktop cannot place windows on a screen; opened anyway)"
 

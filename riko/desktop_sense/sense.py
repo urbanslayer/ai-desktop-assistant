@@ -216,18 +216,19 @@ class DesktopSense:
     def desktop_focused(self) -> dict:
         b = self._need_backend()
         w = b.focused()
-        out = {"backend": b.name, "window": self._filter_window(w) if w else None}
-        if w and self.bridge is not None and self.bridge.connected() \
+        shown = self._filter_window(w) if w else None
+        if shown is not None and shown.get("app") == "<hidden>":
+            shown = None      # denylisted: dropped from the focused answer
+        out = {"backend": b.name, "window": shown}
+        if w and shown and self.bridge is not None and self.bridge.connected() \
                 and FIREFOX_CLASSES.search(w.get("app") or ""):
-            shown = self._filter_window(w) or {}
-            if shown.get("app") != "<hidden>":
-                try:
-                    tab = self.active_tab()
-                    if tab and self.awareness.hides_private(tab["title"], tab["url"]):
-                        tab = {"title": "<hidden>", "url": ""}
-                    out["browser_tab"] = tab
-                except ToolError as e:
-                    out["browser_tab_note"] = str(e)
+            try:
+                tab = self.active_tab()
+                if tab and self.awareness.hides_private(tab["title"], tab["url"]):
+                    tab = {"title": "<hidden>", "url": ""}
+                out["browser_tab"] = tab
+            except ToolError as e:
+                out["browser_tab_note"] = str(e)
         return out
 
     def desktop_monitors(self) -> dict:

@@ -150,10 +150,23 @@ desktop:
   roam_backend: auto   # auto | layer | xcb: which windowing path the strip uses
                        # (auto = layer-shell if usable, else XWayland)
 
+  # Desktop awareness (docs/DESKTOP_SENSE.md): lets her see your open windows,
+  # browser tabs and screens (desktop_windows / desktop_focused /
+  # desktop_monitors / desktop_apps) and open or focus apps for you (open_app,
+  # focus_window). Like listen_mode this only SEEDS the initial default: the
+  # tray checkbox "Let her see my desktop" (or riko-ctl desktop-sense) is
+  # remembered in ~/.config/riko/desktop_awareness.json and wins on the next
+  # start. Off (the default) = the desktop_* tools are not offered at all.
+  # Password managers and private/incognito windows are never named; add your
+  # own with awareness: {enabled: on, hide: [app-word, "title-regex.*"]}.
+  awareness: off
+
   # The client-tool channel (docs/API.md "client tools"): she registers this PC
   # with the hub and runs what the model asks — open_url, clipboard_read,
-  # clipboard_write, notify, and the browser_* tools relayed to the Riko Helper
-  # Firefox extension (browser-ext/, see README "🌐 Her hands: client tools").
+  # clipboard_write, notify, the browser_* tools relayed to the Riko Helper
+  # Firefox extension (browser-ext/, see README "🌐 Her hands: client tools"),
+  # and — while desktop.awareness is on — the desktop_* awareness tools
+  # (docs/DESKTOP_SENSE.md).
   client:
     enabled: true
     # id: my-desktop       # hub-side identity; default is <user>-desktop, remembered

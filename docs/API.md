@@ -1315,6 +1315,19 @@ A running app can expose its own tools; the hub pushes the work to the app
 over HTTP long-poll and feeds the result back to the model. Model-facing
 name is **`<kind>__<name>`** (double underscore), e.g. `desktop__open_url`.
 
+Desktop awareness (docs/DESKTOP_SENSE.md): while the tray checkbox "Let her
+see my desktop" is on, the desktop client also registers `desktop_windows`,
+`desktop_focused`, `desktop_monitors`, `desktop_apps`, `open_app` and
+`focus_window` — the two `act` tools carry `permission_default: "always"` in
+their registration (owner decision: no confirmation), which
+`permission_for` honours exactly like an MCP default (a user-set permission
+still wins). While awareness is off those tools are not registered at all.
+`browser_tabs` answers from the Riko Helper's `listTabs` method (falls back
+to the old `tabs` on an outdated extension and says "update the Riko Helper
+extension" when it knows neither); the focused-tab part of
+`desktop_focused` uses `activeTab`. Private/incognito tabs and denylisted
+apps are privacy-filtered client-side before results reach the hub.
+
 Protocol (client side, all with `$AUTH`):
 
 1. **Register** at startup — `POST /api/clients/{id}/register` with

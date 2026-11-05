@@ -485,6 +485,15 @@ To start her with the session, copy `desktop/riko.desktop` to `~/.config/autosta
 
 Method selection, in order: a **wlr-layer-shell** band with a shaped input region would be ideal, but Qt ships no layer-shell shell-integration plugin its own apps can use (the system one is a different ABI), so today the strip runs on **XWayland (xcb)**: an override-redirect window placed at the bottom edge and shaped with an XFIXES input region that follows her projected bounding box ~10× a second — that's what makes everything but her body click-through. If neither method works on your system she keeps the small window and the terminal says why. The strip is transparent everywhere, so any compositor (or X11 compositor) is fine; it deliberately bypasses the window manager, so no window rules apply to it.
 
+**She can see your desktop (optional, off by default).** Tick **"Let her see my desktop"** in the tray menu (or `riko-ctl desktop-sense on`) and she gains the desktop tools (docs/DESKTOP_SENSE.md): `desktop_windows` and `desktop_focused` (open windows and the window under your cursor, plus the focused Firefox tab when the Riko Helper is linked), `desktop_monitors` (your screens — on Hyprland she also reads your `hyprland.lua` monitors/workspaces/app keybinds, read-only, never a reload), `desktop_apps` + `open_app` ("put a terminal on the portable screen" — only installed `.desktop` entries ever run, never a shell string from her), and `focus_window`. Password managers and private/incognito windows are never named, whatever the tick says. Untick and the tools vanish from her side entirely; your choice is remembered across starts (`desktop.awareness:` only seeds the first default). Backends: Hyprland, Sway, KDE (KWin script over D-Bus) work out of the box. GNOME needs one optional Shell extension we ship:
+
+```bash
+cp -r desktop/gnome-extension/riko-windows@riko ~/.local/share/gnome-shell/extensions/
+gnome-extensions enable riko-windows@riko   # then log out/in (or Alt-F2 r on X11)
+```
+
+Without it she keeps the app list and launcher and says why the window list is empty.
+
 <a id="three-ways"></a>
 ## 💎 Three ways to have Riko
 

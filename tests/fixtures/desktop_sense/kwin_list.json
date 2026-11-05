@@ -1,0 +1,58 @@
+{
+ "ok": true,
+ "windows": [
+  {
+   "id": "4211",
+   "app": "firefox",
+   "title": "Arch Wiki",
+   "workspace": "1",
+   "monitor": "DP-1",
+   "focused": false,
+   "fullscreen": false,
+   "floating": false,
+   "pid": 501
+  },
+  {
+   "id": "4212",
+   "app": "konsole",
+   "title": "zsh",
+   "workspace": "0",
+   "monitor": "DP-2",
+   "focused": true,
+   "fullscreen": false,
+   "floating": false,
+   "pid": 502
+  }
+ ],
+ "monitors": [
+  {
+   "name": "DP-1",
+   "description": "Dell Inc. DELL U2518D",
+   "size": "2560x1440",
+   "position": "0x0",
+   "scale": 1,
+   "focused": false,
+   "active_workspace": ""
+  },
+  {
+   "name": "DP-2",
+   "description": "Dell Inc. DELL U2518D",
+   "size": "2560x1440",
+   "position": "2560x0",
+   "scale": 1,
+   "focused": true,
+   "active_workspace": ""
+  }
+ ],
+ "focused": {
+  "id": "4212",
+  "app": "konsole",
+  "title": "zsh",
+  "workspace": "0",
+  "monitor": "DP-2",
+  "focused": true,
+  "fullscreen": false,
+  "floating": false,
+  "pid": 502
+ }
+}

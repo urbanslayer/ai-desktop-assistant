@@ -90,9 +90,7 @@ def resolve_monitor_phrase(phrase, monitors, backend_name=""):
         if hits:
             wordy.append((hits, m))
     # 'portable' is not in EDIDs; treat it as a brand hint (ARZOPA etc.)
-    if any(w in words for w in _PORTABLE_WORDS) and \
-            not any(any(b in dw for b in _PORTABLE_BRANDS)
-                    for m in monitors for dw in [_desc_words(m)]):
+    if any(w in words for w in _PORTABLE_WORDS):
         words = words | set(_PORTABLE_BRANDS)
     if any(w in words for w in _PORTABLE_BRANDS):
         extra = [m for m in monitors

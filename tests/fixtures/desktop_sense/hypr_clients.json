@@ -1,0 +1,41 @@
+[
+ {
+  "address": "0x111",
+  "class": "firefox",
+  "title": "Arch  Wiki   -  Mozilla Firefox",
+  "workspace": {
+   "id": 2,
+   "name": "2"
+  },
+  "monitor": 0,
+  "pid": 4001,
+  "fullscreen": false,
+  "floating": false
+ },
+ {
+  "address": "0x222",
+  "class": "kitty",
+  "title": "user@arch: ~",
+  "workspace": {
+   "id": 1,
+   "name": "1"
+  },
+  "monitor": 1,
+  "pid": 4002,
+  "fullscreen": false,
+  "floating": false
+ },
+ {
+  "address": "0x333",
+  "class": "org.keepassxc.KeePassXC",
+  "title": "vault.kdbx - KeePassXC",
+  "workspace": {
+   "id": -99,
+   "name": "special:1"
+  },
+  "monitor": 1,
+  "pid": 4003,
+  "fullscreen": false,
+  "floating": true
+ }
+]

@@ -58,15 +58,21 @@ class SwayBackend:
         for node, _, _ in _walk(tree):
             if node.get("type") != "output":
                 continue
+            name = node.get("name", "")
+            if not name or name == "__i3":   # "__i3" = sway's unplaced-window fallback
+                continue
             rect = node.get("rect") or {}
             # sway puts modes on the output node only in newer versions;
             # fall back to the current rect
             modes = node.get("modes") or []
             current = next((m for m in modes if isinstance(m, dict)
                             and m.get("width")), {})
+            desc = node.get("description") or " ".join(
+                str(node[k]) for k in ("make", "manufacturer", "model")
+                if node.get(k)).strip()
             out.append({
-                "name": node.get("name", ""),
-                "description": node.get("description", ""),
+                "name": name,
+                "description": desc,
                 "size": "{}x{}".format(
                     current.get("width", rect.get("width")),
                     current.get("height", rect.get("height"))),
