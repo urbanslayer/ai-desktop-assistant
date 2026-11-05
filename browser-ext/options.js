@@ -8,12 +8,13 @@ const $ = (id) => document.getElementById(id);
 
 async function load() {
   const s = await browser.storage.local.get({ token: "", port: 8766, allowlist: [],
-                                              autoReopen: true });
+                                              autoReopen: true, shareIncognito: false });
   console.log(`[riko-helper] options loaded, query token=${params.get("token") ? "present" : "none"} stored=${s.token ? "set" : "empty"}`);
   $("token").value = params.get("token") || s.token;
   $("port").value = params.get("port") || s.port;
   $("allowlist").value = (s.allowlist || []).join("\n");
   $("auto_reopen").checked = s.autoReopen !== false;
+  $("share_incognito").checked = s.shareIncognito === true;
   const granted = await browser.permissions.contains({ origins: ["<all_urls>"] });
   $("perm").textContent = granted ? "All sites allowed ✓" : "Allow reading all sites";
   if (params.get("token") && params.get("token") !== s.token) {
@@ -30,7 +31,8 @@ async function save() {
     try { new URL(o); } catch { $("status").textContent = `not a valid origin: ${o}`; return; }
   }
   await browser.storage.local.set({ token, port, allowlist,
-                                    autoReopen: $("auto_reopen").checked });
+                                    autoReopen: $("auto_reopen").checked,
+                                    shareIncognito: $("share_incognito").checked });
   $("status").textContent = token
     ? `Saved. Reconnecting to ws://127.0.0.1:${port} …`
     : "Saved (no token yet — paste one to pair).";

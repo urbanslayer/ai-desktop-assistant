@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Riko Helper",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Lets Riko (the desktop avatar) read and drive this Firefox through the local Riko desktop app \u2014 with your approval for anything risky.",
   "browser_specific_settings": {
     "gecko": {

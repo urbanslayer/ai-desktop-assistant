@@ -13,6 +13,29 @@
  *                    needs_confirmation:true, reason}
  *   link tab -> us:  {rikoState: "up"|"down"|"reject"} (drives the badge)
  *
+ * ── Read-only tab survey (desktop awareness, docs/DESKTOP_SENSE.md ──
+ * ── "Browser tabs". The desktop side (riko/desktop_sense) calls these     ──
+ * EXACT names and shapes over the link — don't rename without D:           ──
+ *                                                                          ──
+ *   listTabs (no params) -> {ok: true, result: [TabInfo, ...]}             ──
+ *     Every tab of every normal window, ordered by windowId then index.    ──
+ *     Incognito tabs are included ONLY when the options-page checkbox      ──
+ *     "Share private-window tabs" (storage key shareIncognito, default     ──
+ *     false) is on. Internal pages (about:, moz-extension:) are INCLUDED   ──
+ *     with their titles — they're harmless. The only tab ever filtered out ──
+ *     is the Riko link tab itself (http://127.0.0.1:<port>/link, plus its  ──
+ *     error-page URL form).                                                ──
+ *   activeTab (no params) -> {ok: true, result: TabInfo | null}            ──
+ *     The active tab of the last-focused normal window. Same filters as    ──
+ *     listTabs: null when that tab is the link tab, when it is incognito   ──
+ *     and shareIncognito is off, or when no normal window answers.         ──
+ *                                                                          ──
+ *   TabInfo = { id, windowId, title (capped at 200 chars), url, active,    ──
+ *               pinned, audible, incognito, lastAccessed (epoch ms|null) } ──
+ *                                                                          ──
+ *   Both are read-only: no tab messaging, no risk prompt, no allow-list    ──
+ *   gate. They still respect the toolbar kill switch (paused).             ──
+ *
  * Safety rails that live HERE (not in the app, so a rogue app can't bypass):
  *   - toolbar kill switch (popup toggle): paused answers every command
  *     with "paused".
@@ -30,6 +53,7 @@ let probeFailStreak = 0;        // consecutive /hello probe failures
 let nextProbeAt = 0;            // fake-clock-agnostic backoff gate (Date.now)
 const settingsCache = {
   token: "", port: 8766, paused: false, allowlist: [], autoReopen: true,
+  shareIncognito: false,
 };
 
 // Probe/backoff policy: never spend a tab (or a console line) on a desktop
@@ -44,6 +68,7 @@ const REOPEN_COOLDOWN_MS = 60 * 1000;
 const storageGet = async () => {
   const got = await browser.storage.local.get({
     token: "", port: 8766, paused: false, allowlist: [], autoReopen: true,
+    shareIncognito: false,
   });
   Object.assign(settingsCache, got);
   return got;
@@ -254,7 +279,7 @@ async function handleCommand(method, params) {
     return await ({
       tabs: doTabs, open: doOpen, read: doRead, click: doClick, type: doType,
       select: doSelect, scroll: doScroll, back: doBack, screenshot: doScreenshot,
-      close: doClose,
+      close: doClose, listTabs: doListTabs, activeTab: doActiveTab,
     })[method](params);
   } catch (e) {
     return { ok: false, error: String(e && e.message || e) };
@@ -266,6 +291,49 @@ async function doTabs() {
   return { ok: true, result: tabs.map((t, i) => ({
     n: i + 1, title: t.title || "", url: t.url || "", active: !!t.active,
   })) };
+}
+
+// ── Read-only tab survey (desktop awareness; see the protocol block above) ──
+const TAB_TITLE_CAP = 200;
+
+function tabInfo(t) {
+  return {
+    id: t.id,
+    windowId: t.windowId,
+    title: String(t.title || "").slice(0, TAB_TITLE_CAP),
+    url: t.url || "",
+    active: !!t.active,
+    pinned: !!t.pinned,
+    audible: !!t.audible,
+    incognito: !!t.incognito,
+    lastAccessed: typeof t.lastAccessed === "number" ? t.lastAccessed : null,
+  };
+}
+
+// shareableTab: the two filters both survey methods share — never the link
+// tab itself, and no private-window tabs unless the owner opted in. Internal
+// pages (about:, moz-extension:) stay: they're harmless with their titles.
+function shareableTab(t) {
+  if (isLinkTab(t)) return false;
+  if (t.incognito && !settingsCache.shareIncognito) return false;
+  return true;
+}
+
+async function doListTabs() {
+  const tabs = await browser.tabs.query({ windowType: "normal" });
+  return { ok: true, result: tabs.filter(shareableTab)
+    .sort((a, b) => (a.windowId - b.windowId) || (a.index - b.index))
+    .map(tabInfo) };
+}
+
+async function doActiveTab() {
+  // last-focused NORMAL window (popup/devtools windows never qualify);
+  // "no window at all" answers null, per the protocol block above
+  const win = await browser.windows
+    .getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+  if (!win) return { ok: true, result: null };
+  const [tab] = await browser.tabs.query({ windowId: win.id, active: true });
+  return { ok: true, result: tab && shareableTab(tab) ? tabInfo(tab) : null };
 }
 
 async function doOpen(params) {
