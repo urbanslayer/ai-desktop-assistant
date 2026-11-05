@@ -101,7 +101,12 @@ TOOLS_DEFAULTS = {
     "max_result_chars": 12000,  # per tool result before truncation
     "searxng_url": "",        # SearXNG base URL; empty = web_search unavailable
     "allow_private_fetch": False,  # let fetch_page hit loopback/private IPs (dev)
-    "units": "metric",        # weather units: metric (°C, km/h) | imperial
+    # Weather unit preset (docs/API.md "Weather"): auto (follows the saved
+    # location's country) | metric | uk | us; legacy imperial -> us. The
+    # per-quantity overrides (blank = from the preset): units_temperature
+    # celsius|fahrenheit, units_wind kmh|mph|ms|kn, units_precipitation mm|inch.
+    "units": "auto",
+    "units_temperature": "", "units_wind": "", "units_precipitation": "",
     "permissions": {},        # tool name -> always | ask | never
 }
 
@@ -110,7 +115,7 @@ TOOLS_DEFAULTS = {
 # admin1}; blank/reset = the RIKO_LOCATION env default (a plain place name,
 # geocoded lazily at first use and cached) or no location at all.
 LOCATION_PLACE_KEYS = ("name", "latitude", "longitude", "timezone",
-                       "country", "admin1")
+                       "country", "country_code", "admin1")
 
 # MCP settings (docs/ROUNDS.md R2-M): no servers out of the box; the only
 # env default is the built-in Home Assistant server composed in main() from
@@ -303,7 +308,8 @@ def create_app(data_dir, api_key: str | None = None,
         return bool(settings.get("enabled")) and bool(str(settings.get("base_url") or "").strip())
 
     # ── tools settings — same "blank = server default" semantics ────────
-    _TOOLS_BLANK_MEANS_UNSET = ("searxng_url", "units")
+    _TOOLS_BLANK_MEANS_UNSET = ("searxng_url", "units", "units_temperature",
+                                "units_wind", "units_precipitation")
 
     def stored_tools() -> dict:
         saved = dict(store.get_json("tools", {}))
@@ -321,6 +327,9 @@ def create_app(data_dir, api_key: str | None = None,
     def tools_settings() -> dict:
         merged = default_tools()
         merged.update(stored_tools())
+        # normalize on read: a pre-preset "imperial" still on disk (or in an
+        # env default) answers as us; junk answers as the auto default
+        merged["units"] = _weather.normalize_preset(merged.get("units"))
         return merged
 
     def tools_status_response() -> dict:
@@ -423,6 +432,20 @@ def create_app(data_dir, api_key: str | None = None,
         """Name for tool progress labels — never touches the network."""
         return (str(stored_location().get("name") or "").strip()
                 or str(location_defaults.get("place") or "").strip())
+
+    def units_effective() -> dict:
+        """The units the Weather tool answers in right now (docs/API.md
+        "Weather"), for the Settings page line "currently: °C · mph · mm".
+        `auto` follows the SAVED place's country; a lazy RIKO_LOCATION env
+        default is NOT geocoded here (GET /api/settings never touches the
+        network) and reads as metric."""
+        cfg = tools_settings()
+        saved = stored_location()
+        loc = saved if saved.get("latitude") is not None else None
+        return _weather.unit_symbols(_weather.resolve_units(
+            cfg.get("units"),
+            {k: cfg.get("units_" + k) for k in
+             ("temperature", "wind", "precipitation")}, loc))
 
     # ── MCP settings + manager (docs/ROUNDS.md R2-M) ───────────────────
     # settings `mcp.servers` env default: the built-in Home Assistant server
@@ -552,6 +575,7 @@ def create_app(data_dir, api_key: str | None = None,
             "timezone_source": "saved" if stored_timezone() else "default",
             "location": location_settings(),
             "location_source": location_source,
+            "units_effective": units_effective(),
             "defaults": {"llm": defaults_public,
                          "tts": default_tts(),
                          "tools": default_tools(),
@@ -1684,10 +1708,25 @@ def create_app(data_dir, api_key: str | None = None,
                 units_val = str(tools["units"] or "").strip().lower()
                 if not units_val:
                     saved_tools.pop("units", None)   # blank = back to the default
-                elif units_val not in ("metric", "imperial"):
-                    return err(422, "tools.units must be metric or imperial")
+                elif units_val == "imperial":
+                    saved_tools["units"] = "us"      # legacy alias (docs/API.md)
+                elif units_val not in ("auto", "metric", "uk", "us"):
+                    return err(422, "tools.units must be auto, metric, uk or us")
                 else:
                     saved_tools["units"] = units_val
+            for qty_key, allowed in (
+                    ("units_temperature", ("celsius", "fahrenheit")),
+                    ("units_wind", ("kmh", "mph", "ms", "kn")),
+                    ("units_precipitation", ("mm", "inch"))):
+                if qty_key in tools:
+                    q_val = str(tools[qty_key] or "").strip().lower()
+                    if not q_val:
+                        saved_tools.pop(qty_key, None)  # blank = from the preset
+                    elif q_val not in allowed:
+                        return err(422, f"tools.{qty_key} must be one of "
+                                        f"{' | '.join(allowed)} (or blank)")
+                    else:
+                        saved_tools[qty_key] = q_val
             if "permissions" in tools:
                 perms = tools["permissions"]
                 if not isinstance(perms, dict):
@@ -1788,7 +1827,7 @@ def create_app(data_dir, api_key: str | None = None,
                     if not name:
                         return err(422, "location.name is required with a place")
                     new_loc = {"name": name[:200], "latitude": lat, "longitude": lon}
-                    for k in ("timezone", "country", "admin1"):
+                    for k in ("timezone", "country", "country_code", "admin1"):
                         new_loc[k] = str(loc.get(k) or "").strip()[:100]
                     saved_loc = {**saved_loc, **new_loc}
                 store.set_json("location", saved_loc)
@@ -2539,8 +2578,8 @@ def main():
         "searxng_url": os.getenv("RIKO_SEARXNG_URL", ""),  # empty = web_search off
         "allow_private_fetch": os.getenv("RIKO_ALLOW_PRIVATE_FETCH", "")
                                .strip().lower() in ("1", "true", "yes", "on"),
-        "units": "imperial" if os.getenv("RIKO_UNITS", "").strip().lower()
-                 == "imperial" else "metric",
+        # weather unit preset: auto|metric|uk|us (legacy imperial -> us)
+        "units": _weather.normalize_preset(os.getenv("RIKO_UNITS", "")),
     }
     # Location (docs/API.md "Weather"): RIKO_LOCATION is a plain place name
     # ("Gloucester, UK" or a postcode-ish town) used until the owner picks a

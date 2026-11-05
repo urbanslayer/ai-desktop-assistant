@@ -300,12 +300,43 @@
       <p class="hint">She answers weather, time and local questions for this place. Type a town
         or postcode-ish name, press Find, pick a match, then Save. Clear = the server default
         (RIKO_LOCATION) or no location (docs/API.md “Weather”).</p>
-      <div class="row" style="max-width:320px"><div>
-        <label>Weather units <span class="src" id="sunitsrc"></span></label>
+      <div class="row" style="max-width:460px; align-items:flex-end"><div style="flex:1">
+        <label>Units <span class="src" id="sunitsrc"></span></label>
         <select id="sunits">
-          <option value="metric">metric (°C, km/h, mm)</option>
-          <option value="imperial">imperial (°F, mph, in)</option>
-        </select></div></div>
+          <option value="auto">Auto (from location)</option>
+          <option value="metric">Metric (°C, km/h, mm)</option>
+          <option value="uk">UK (°C, mph, mm)</option>
+          <option value="us">US (°F, mph, in)</option>
+        </select></div>
+        <div style="flex:1"><label>&nbsp;</label>
+          <div class="hint" id="sunitnow" style="padding-bottom:6px"></div></div></div>
+      <details style="max-width:640px"><summary class="hint">Advanced: per-quantity overrides</summary>
+        <div class="row" style="margin-top:8px">
+          <div><label>Temperature <span class="src" id="sunitsrc_temperature"></span></label>
+            <select id="sunits_temperature">
+              <option value="">from preset</option>
+              <option value="celsius">°C</option>
+              <option value="fahrenheit">°F</option>
+            </select></div>
+          <div><label>Wind <span class="src" id="sunitsrc_wind"></span></label>
+            <select id="sunits_wind">
+              <option value="">from preset</option>
+              <option value="kmh">km/h</option>
+              <option value="mph">mph</option>
+              <option value="ms">m/s</option>
+              <option value="kn">kn</option>
+            </select></div>
+          <div><label>Precipitation <span class="src" id="sunitsrc_precipitation"></span></label>
+            <select id="sunits_precipitation">
+              <option value="">from preset</option>
+              <option value="mm">mm</option>
+              <option value="inch">inch</option>
+            </select></div>
+        </div>
+        <p class="hint">Each quantity follows the preset unless you pick one here.
+          Auto follows the saved location's country: UK → °C + mph, US → °F + mph + in,
+          everywhere else metric (docs/API.md “Weather”).</p>
+      </details>
 
       <h2 style="margin-top:14px">TTS — hub voice</h2>
       <label><input type="checkbox" id="sttsenabled" style="width:auto; vertical-align:middle">
@@ -885,7 +916,7 @@ $("mimport").onchange = async () => {
 };
 
 /* ── settings ─────────────────────────────────────────────────────── */
-const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "stimezone", "sunits", "sttsbase", "sttstimeout",
+const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "stimezone", "sunits", "sunits_temperature", "sunits_wind", "sunits_precipitation", "sttsbase", "sttstimeout",
                      "stoolsteps", "stoolsecs", "stoolchars", "stsearxng", "smembudget"];
 let settingsSnap = null;    // field values as loaded — the diff base for Save
 let permSnap = {};          // saved per-tool permission overrides ("" = default)
@@ -957,6 +988,7 @@ async function loadSettings() {
     locSaved = (lsrc.latitude === "saved" && loc.latitude != null && loc.longitude != null)
       ? { name: String(loc.name || ""), latitude: loc.latitude, longitude: loc.longitude,
           timezone: String(loc.timezone || ""), country: String(loc.country || ""),
+          country_code: String(loc.country_code || ""),
           admin1: String(loc.admin1 || "") }
       : null;
     locPicked = locSaved;
@@ -965,8 +997,21 @@ async function loadSettings() {
     $("slocsrc").textContent = locSaved ? "· saved"
       : (lsrc.name === "env" ? "· server default: " + defLoc.name : "· none set");
     $("slocres").innerHTML = "";
-    $("sunits").value = (s.tools || {}).units === "imperial" ? "imperial" : "metric";
-    $("sunitsrc").textContent = (s.tools_source || {}).units === "default" ? "· default" : "";
+    const tu = s.tools || {}, ts = s.tools_source || {};
+    // Units (docs/API.md "Weather"): preset select + resolved-units line +
+    // per-quantity overrides ("" = follow the preset). The server already
+    // normalizes legacy "imperial" to "us" on read.
+    $("sunits").value = ["auto", "metric", "uk", "us"].includes(tu.units) ? tu.units : "auto";
+    $("sunitsrc").textContent = ts.units === "default" ? "· default" : "";
+    const unitPick = (id, val, allowed) => { $(id).value = allowed.includes(val) ? val : ""; };
+    unitPick("sunits_temperature", tu.units_temperature, ["celsius", "fahrenheit"]);
+    unitPick("sunits_wind", tu.units_wind, ["kmh", "mph", "ms", "kn"]);
+    unitPick("sunits_precipitation", tu.units_precipitation, ["mm", "inch"]);
+    for (const q of ["temperature", "wind", "precipitation"])
+      $("sunitsrc_" + q).textContent = ts["units_" + q] === "default" ? "· from preset" : "";
+    const ue = s.units_effective || {};
+    $("sunitnow").textContent = ue.temperature
+      ? "currently: " + [ue.temperature, ue.wind, ue.precipitation].join(" · ") : "";
     loadTools();
     loadMcp();
     $("apikey").value = "";
@@ -1054,7 +1099,11 @@ $("ssave").onclick = async () => {
     tools[k] = v;
   }
   if (changed("stsearxng")) tools.searxng_url = now.stsearxng;   // blank → server default again
-  if (changed("sunits")) tools.units = now.sunits;                // metric | imperial
+  if (changed("sunits")) tools.units = now.sunits;                // auto|metric|uk|us
+  for (const [id, k] of [["sunits_temperature", "units_temperature"],
+                         ["sunits_wind", "units_wind"],
+                         ["sunits_precipitation", "units_precipitation"]])
+    if (changed(id)) tools[k] = now[id];                          // "" → from preset again
   if (changed("stoolpriv")) tools.allow_private_fetch = now.stoolpriv === "1";
   const perms = {};
   document.querySelectorAll("#tperm select").forEach((sel) => {
@@ -1101,6 +1150,7 @@ $("slocfind").onclick = async () => {
       b.onclick = () => {
         locPicked = { name: String(h.name || ""), latitude: h.latitude, longitude: h.longitude,
                       timezone: String(h.timezone || ""), country: String(h.country || ""),
+                      country_code: String(h.country_code || ""),
                       admin1: String(h.admin1 || "") };
         $("sloc").value = locPicked.name;
         $("slocres").innerHTML = "";

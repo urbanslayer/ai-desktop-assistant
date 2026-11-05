@@ -117,15 +117,17 @@ def build_hub_specs(tools_cfg: dict, memory_ctx: dict | None = None,
     {store, events, persona_id, writes, auto_remember}; without it the
     memory tools are listed for Settings but carry a stub run (GET
     /api/tools never executes them). `location_ctx` (weather round) is
-    {resolve: () -> saved-or-env location dict | None, units: str,
+    {resolve: () -> saved-or-env location dict | None, units: preset,
+    units_temperature/units_wind/units_precipitation: overrides,
     label_name: () -> str}; without it the weather tool is listed but
     reports "no location set" if executed."""
     searxng = str(tools_cfg.get("searxng_url") or "").strip()
     allow_private = bool(tools_cfg.get("allow_private_fetch"))
-    units = ("imperial" if str(tools_cfg.get("units") or "").lower() == "imperial"
-             else "metric")
     loc_ctx = dict(location_ctx or {})
-    loc_ctx.setdefault("units", units)
+    loc_ctx.setdefault("units", _weather.normalize_preset(tools_cfg.get("units")))
+    for qty in ("temperature", "wind", "precipitation"):
+        loc_ctx.setdefault("units_" + qty,
+                           str(tools_cfg.get("units_" + qty) or "").strip().lower())
 
     def _weather_label(args: dict) -> str:
         place = str((args or {}).get("place") or "").strip()
