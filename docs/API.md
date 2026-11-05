@@ -457,6 +457,48 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"text":"hi","source":"android"}' $HUB/api/chat
 ```
 
+#### Weather pre-fetch
+
+When the user message is a weather question (deterministic conservative
+matcher in `hub/intents.py`: today/now/tomorrow/tonight/this week/weekend,
+"is it going to rain", "do I need a coat/umbrella", "how hot/cold is it",
+"what's it like outside", "weather in <place>", "forecast" — but **not**
+idioms ("under the weather", "weather the storm"), past weather, questions
+*about* the weather tool, or timer/reminder asks), the hub calls the weather
+tool **itself before the LLM** and injects the compact result into the
+system prompt:
+
+> `Live weather data (fetched just now for <place>): {…}. Answer from this;
+> do not call the weather tool again unless they ask about another place.`
+
+The place is the one named in the message (geocoded like the tool does) or
+the saved location; horizon: 1 day today, 2 for tomorrow, up to 7 for
+week/weekend, hourly added for tonight/"later". Units follow
+`tools.units` + overrides exactly like the tool. The pre-fetch is logged in
+the tools log (`approval: "auto (hub pre-fetch)"`) and surfaces in
+`tools_used` as `{"tool": "weather", "label": "checking the weather in
+<place>", "source": "hub", "auto": true}` so the chip/progress show it.
+Weather answers then cost **one** LLM round-trip. Skipped when the weather
+permission is `never` (with tools enabled). If the pre-fetch fails (bad
+place, upstream down, no location saved) the turn falls back to normal tool
+behaviour plus a hint to *call the weather tool* — never an invented answer.
+
+#### Promised-action guard
+
+If a chat turn ends with **no tool call** while tools were offered, and the
+final reply merely *announces* an action (`let me check`, `I'll check/look/
+search/find`, `checking (it|that) now`, `one moment`, `give me a sec(ond)`,
+`hold on`, `let me look that up`, `I'll set (a|that) timer`, … — conservative
+list, case-insensitive, final reply only), the hub re-runs the model **once**
+in the same turn with an extra assistant+system nudge ("You said you would
+check but didn't call a tool. Call the appropriate tool now, then answer.")
+and replaces the announced-only reply with the real one. The discarded reply
+is never stored and never spoken. Cap: one retry per turn; skipped when a
+tool ran, when the reply announces nothing, when tools are off, or when the
+server rejected tools. The hub log records
+`[turn] nudged: promised action without a tool call persona=<id>`.
+
+
 ### GET /api/geocode
 
 Keyless proxy for the Open-Meteo geocoder (5 s timeout, 10-min cache) that
