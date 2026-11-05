@@ -29,6 +29,31 @@
  *     The active tab of the last-focused normal window. Same filters as    ──
  *     listTabs: null when that tab is the link tab, when it is incognito   ──
  *     and shareIncognito is off, or when no normal window answers.         ──
+ *     Kept for compatibility; it only sees ONE window (the last-focused    ──
+ *     one), which is why activeTabs exists.                                ──
+ *                                                                          ──
+ *   activeTabs (no params) -> {ok: true, result: ActiveTabs}               ──
+ *     ActiveTabs = { focusedWindowId: int|null,                            ──
+ *                    windows: [WindowActive, ...] }                        ──
+ *     WindowActive = { windowId, focused: bool,                            ──
+ *                      state: "normal"|"maximized"|"minimized"|            ──
+ *                              "fullscreen" (pass-through),                ──
+ *                      title: the window's active tab title (<=200 chars;  ──
+ *                              "" when activeTab is null),                 ──
+ *                      tabCount: int,   // window tabs minus the link tab  ──
+ *                      lastFocusedAt: epoch ms|null, // from the focus     ──
+ *                              // tracker; null = never observed           ──
+ *                      activeTab: TabInfo|null }                           ──
+ *     EVERY normal window (private ones only when shareIncognito is on),   ──
+ *     ordered most-recently-focused first. Focus order comes from          ──
+ *     windows.onFocusChanged (mirrored in storage.session so an MV3        ──
+ *     worker restart keeps it); on first load the worker adopts whatever   ──
+ *     windows.getLastFocused reports as the last-focused window (a window  ──
+ *     focused before the extension started never fires a focus event).     ──
+ *     focusedWindowId is null when nothing has focus                       ──
+ *     (onFocusChanged(WINDOW_ID_NONE), e.g. all windows minimized).        ──
+ *     The Riko link tab is never counted and never reported: when it is    ──
+ *     the window's active tab, activeTab is null (title "" likewise).      ──
  *                                                                          ──
  *   TabInfo = { id, windowId, title (capped at 200 chars), url, active,    ──
  *               pinned, audible, incognito, lastAccessed (epoch ms|null) } ──
@@ -271,6 +296,106 @@ async function toTab(tabId, msg) {
 
 const banner = (tabId, on) => browser.tabs.sendMessage(tabId, { cmd: "banner", on }).catch(() => {});
 
+// ── Window focus order (drives activeTabs; see the protocol block) ──
+// Firefox fires windows.onFocusChanged only while this worker lives, so the
+// order is mirrored in storage.session (extension-only, survives MV3 worker
+// restarts, not browser restarts). WINDOW_ID_NONE (all windows minimized,
+// transient dialogs) records "nothing focused" but never reorders. On the
+// first load with nothing persisted, the worker adopts the window the
+// browser already reports as focused (getLastFocused): a window focused
+// before the extension started never fires an onFocusChanged event.
+let focusOrder = [];          // windowIds, most recently focused first
+let focusTimes = {};          // windowId -> epoch ms of that focus change
+let focusedWindowId = null;   // null = nothing focused / nothing seen yet
+let focusTracked = false;     // true once any focus event was seen/persisted
+let focusLoadPromise = null;
+
+async function doLoadFocusOrder() {
+  try {
+    const got = await browser.storage.session?.get(
+      ["focusOrder", "focusTimes", "focusedWindowId"]);
+    if (got && Array.isArray(got.focusOrder) && got.focusOrder.length) {
+      focusOrder = got.focusOrder.filter((id) => Number.isInteger(id));
+      focusTimes = { ...(got.focusTimes || {}) };
+      focusedWindowId = Number.isInteger(got.focusedWindowId)
+        ? got.focusedWindowId : null;
+      focusTracked = true;
+    }
+  } catch { /* no storage.session (old harness): stay in-memory */ }
+  if (!focusOrder.length) {
+    // Browser start: the already-focused window never fires a focus event,
+    // so adopt it as last-focused with a real timestamp. Otherwise its
+    // lastFocusedAt would stay null until its next focus change.
+    try {
+      const lf = await browser.windows?.getLastFocused?.(
+        { windowTypes: ["normal"] });
+      if (lf && Number.isInteger(lf.id)
+          && lf.id !== (browser.windows?.WINDOW_ID_NONE ?? -1)) {
+        noteWindowFocus(lf.id);
+      }
+    } catch { /* no windows API (old harness): stay empty */ }
+  }
+}
+
+// One shared load: every caller awaits the SAME promise, so focus events
+// and surveys can never race past (or duplicate) the initial load.
+function loadFocusOrder() {
+  if (!focusLoadPromise) focusLoadPromise = doLoadFocusOrder();
+  return focusLoadPromise;
+}
+// Start at worker start, not lazily: adoption must see the window focused
+// NOW (browser start), not whatever grabbed focus by the first command.
+try { loadFocusOrder().catch(() => {}); } catch { /* harness safety */ }
+
+function persistFocusOrder() {
+  try {
+    browser.storage.session?.set({
+      focusOrder: focusOrder.slice(0, 32),
+      focusTimes,
+      focusedWindowId,
+    })?.catch?.(() => {});
+  } catch { /* best-effort mirror only */ }
+}
+
+function noteWindowFocus(windowId, now = Date.now()) {
+  focusTracked = true;
+  if (windowId === (browser.windows.WINDOW_ID_NONE ?? -1)) {
+    focusedWindowId = null;               // nothing focused: order unchanged
+  } else if (Number.isInteger(windowId)) {
+    const i = focusOrder.indexOf(windowId);
+    if (i !== -1) focusOrder.splice(i, 1);
+    focusOrder.unshift(windowId);
+    focusTimes[windowId] = now;
+    focusedWindowId = windowId;
+  }
+  persistFocusOrder();
+}
+
+function forgetWindow(windowId) {
+  const i = focusOrder.indexOf(windowId);
+  if (i !== -1) focusOrder.splice(i, 1);
+  delete focusTimes[windowId];
+  if (focusedWindowId === windowId) focusedWindowId = null;
+  persistFocusOrder();
+}
+
+// guarded so harnesses without a windows API keep loading (0.1.2 tests).
+// Events are serialized through one promise chain: the FIRST event waits on
+// the storage.session load, and later events must not overtake it.
+let focusQueue = Promise.resolve();
+browser.windows?.onFocusChanged?.addListener((windowId) => {
+  focusQueue = focusQueue
+    .then(() => loadFocusOrder())
+    .then(() => noteWindowFocus(windowId))
+    .catch(() => {});
+});
+browser.windows?.onRemoved?.addListener((windowId) => {
+  focusQueue = focusQueue
+    .then(() => loadFocusOrder())
+    .then(() => forgetWindow(windowId))
+    .catch(() => {});
+});
+
 // ── The tools ────────────────────────────────────────────────
 async function handleCommand(method, params) {
   await storageGet();
@@ -280,6 +405,7 @@ async function handleCommand(method, params) {
       tabs: doTabs, open: doOpen, read: doRead, click: doClick, type: doType,
       select: doSelect, scroll: doScroll, back: doBack, screenshot: doScreenshot,
       close: doClose, listTabs: doListTabs, activeTab: doActiveTab,
+      activeTabs: doActiveTabs,
     })[method](params);
   } catch (e) {
     return { ok: false, error: String(e && e.message || e) };
@@ -334,6 +460,46 @@ async function doActiveTab() {
   if (!win) return { ok: true, result: null };
   const [tab] = await browser.tabs.query({ windowId: win.id, active: true });
   return { ok: true, result: tab && shareableTab(tab) ? tabInfo(tab) : null };
+}
+
+async function doActiveTabs() {
+  await loadFocusOrder();
+  const all = await browser.windows
+    .getAll({ populate: true, windowTypes: ["normal"] }).catch(() => []);
+  // private windows only join when the owner opted into private-tab sharing
+  const wins = all.filter((w) => !w.incognito || settingsCache.shareIncognito);
+  // closed windows must not keep a place in the remembered focus order
+  const live = new Set(wins.map((w) => w.id));
+  focusOrder = focusOrder.filter((id) => live.has(id));
+  let fid = focusedWindowId;
+  if (!focusTracked) {
+    // fresh worker, nothing persisted: the classic activeTab oracle
+    const lf = await browser.windows
+      .getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+    fid = lf && Number.isInteger(lf.id) ? lf.id : null;
+  }
+  // the focused window may be one we must not report (e.g. private with
+  // sharing off): then no reported window is focused
+  if (fid != null && !live.has(fid)) fid = null;
+  const rank = (id) => (id === fid ? -1
+    : focusOrder.includes(id) ? focusOrder.indexOf(id) : focusOrder.length + 1);
+  const windows = wins.map((w) => {
+    const tabs = (w.tabs || []).filter(shareableTab);
+    const activeRaw = (w.tabs || []).find((t) => t.active);
+    const act = activeRaw && shareableTab(activeRaw) ? tabInfo(activeRaw) : null;
+    return {
+      windowId: w.id,
+      focused: fid != null && w.id === fid,
+      state: w.state || "normal",
+      title: act ? act.title : "",
+      tabCount: tabs.length,
+      lastFocusedAt: typeof focusTimes[w.id] === "number" ? focusTimes[w.id] : null,
+      activeTab: act,
+    };
+  });
+  windows.sort((a, b) => (rank(a.windowId) - rank(b.windowId))
+    || (a.windowId - b.windowId));
+  return { ok: true, result: { focusedWindowId: fid, windows } };
 }
 
 async function doOpen(params) {

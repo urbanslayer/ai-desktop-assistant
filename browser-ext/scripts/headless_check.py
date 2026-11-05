@@ -24,6 +24,14 @@ Finally it opens a second page tab and drives the read-only tab survey
 (listTabs / activeTab): both page tabs listed, the link tab filtered, the
 TabInfo shape (id, windowId, title<=200, url, active, pinned, audible,
 incognito, lastAccessed) intact, and activeTab = the newest active tab.
+Phase 4 covers activeTabs (multi-window survey, v0.1.3): a SECOND real
+browser window opens through web-ext's devtools server (RDP console actor ->
+openTrustedUrl(forceNewWindow); content window.open can't make a NORMAL
+window in Gecko 157 and the remote CLI can't reach a headless instance).
+The new window takes focus, so activeTabs must list BOTH windows
+most-recently-focused first, focused=true only on the leader, the new
+window's own tab as its activeTab, link tabs never counted, and
+lastFocusedAt strictly descending along the order.
 
 Everything on the scratch port is OUR process: stub first, bridge after;
 nothing on the machine besides our PIDs is touched.
@@ -31,10 +39,12 @@ nothing on the machine besides our PIDs is touched.
 Exits 0 on success, 1 on any failure, 3 if firefox/web-ext are missing.
 """
 import functools
+import base64
 import http.server
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -58,6 +68,8 @@ PAGE = """<!doctype html><html><head><title>Riko headless test</title></head>
 </body></html>"""
 PAGE2 = """<!doctype html><html><head><title>Riko headless test 2</title></head>
 <body><h1>Second tab for the tab survey</h1></body></html>"""
+PAGE_B = """<!doctype html><html><head><title>Riko headless window</title></head>
+<body><h1>Second window for the activeTabs survey</h1></body></html>"""
 
 
 def free_port():
@@ -89,6 +101,111 @@ class DownStub(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _ws_connect(port, path, timeout=15.0):
+    """Minimal stdlib WebSocket (client): handshake, masked text frames one
+    way, unmasked text frames back. Enough for WebDriver BiDi."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall(("GET %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n" % (path, port, key)).encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        ch = s.recv(1)
+        if not ch:
+            raise RuntimeError("closed during ws handshake")
+        head += ch
+    if b"101" not in head.split(b"\r\n", 1)[0]:
+        raise RuntimeError("ws handshake failed: %r" % head[:120])
+    return s
+
+
+def _ws_send(s, obj):
+    data = json.dumps(obj).encode()
+    mask = os.urandom(4)
+    n = len(data)
+    hdr = bytearray([0x81])
+    if n < 126:
+        hdr.append(0x80 | n)
+    elif n < 65536:
+        hdr.extend([0x80 | 126, n >> 8, n & 0xFF])
+    else:
+        hdr.append(0x80 | 127)
+        hdr.extend((n >> sh) & 0xFF for sh in range(56, -1, -8))
+    s.sendall(bytes(hdr) + mask
+              + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def _ws_recv(s):
+    s.recv(1)  # FIN/opcode byte
+    second = s.recv(1)
+    if not second:
+        raise RuntimeError("ws closed")
+    ln = second[0] & 0x7F
+    if ln == 126:
+        ln = int.from_bytes(s.recv(2), "big")
+    elif ln == 127:
+        ln = int.from_bytes(s.recv(8), "big")
+    data = b""
+    while len(data) < ln:
+        chunk = s.recv(ln - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return json.loads(data)
+
+
+def bidi_open_window(port, url, timeout=60.0):
+    """Open a real NORMAL browser window (and focus it) in the running
+    Firefox through its built-in remote agent: WebDriver BiDi over
+    WebSocket -- session.new, browsingContext.create(type=window),
+    browsingContext.navigate, browsingContext.activate. Neither the
+    extension link methods nor window.open() can produce a window (Gecko
+    makes tabs instead), and the legacy RDP chrome console is gone in
+    Firefox 157."""
+    deadline = time.time() + timeout
+    seq = [0]
+
+    def next_id():
+        seq[0] += 1
+        return seq[0]
+
+    last_err = None
+    while time.time() < deadline:
+        try:
+            s = _ws_connect(port, "/session", timeout=min(10.0, max(1.0, deadline - time.time())))
+            break
+        except OSError as e:
+            last_err = e
+            time.sleep(1.0)
+    else:
+        raise RuntimeError(f"remote agent ws port {port} never opened: {last_err}")
+
+    def cmd(method, params, sid=None):
+        cid = next_id()
+        msg = {"id": cid, "method": method, "params": params}
+        if sid:
+            msg["session"] = sid
+        _ws_send(s, msg)
+        t0 = time.time()
+        while time.time() - t0 < 30:
+            got = _ws_recv(s)
+            if got.get("id") == cid:
+                if got.get("type") == "error":
+                    raise RuntimeError(f"bidi {method}: {got.get('message')}")
+                return got.get("result") or {}
+        raise RuntimeError(f"bidi {method}: no reply")
+
+    sid = cmd("session.new", {"capabilities": {"alwaysMatch": {}}})["sessionId"]
+    ctx = cmd("browsingContext.create", {"url": "about:blank", "type": "window"}, sid)["context"]
+    # create(type=window) never navigates the fresh window (remote-agent
+    # quirk), so drive the URL in explicitly and wait for the load.
+    cmd("browsingContext.navigate", {"context": ctx, "url": url, "wait": "complete"}, sid)
+    cmd("browsingContext.activate", {"context": ctx}, sid)
+    s.close()
+    return ctx
+
+
 def main():
     firefox = shutil.which("firefox") or shutil.which("firefox-esr") or shutil.which("firefox-esp")
     npx = shutil.which("npx")
@@ -104,11 +221,19 @@ def main():
     page_dir = Path(tempfile.mkdtemp(prefix="riko-testpage-"))
     (page_dir / "index.html").write_text(PAGE)
     (page_dir / "second.html").write_text(PAGE2)
+    (page_dir / "window.html").write_text(PAGE_B)
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(page_dir))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", page_port), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     page_url = f"http://127.0.0.1:{page_port}/index.html"
     page2_url = f"http://127.0.0.1:{page_port}/second.html"
+    pageB_url = f"http://127.0.0.1:{page_port}/window.html"
+
+    # Headless contract: MOZ_HEADLESS=1 and the session's display env unset,
+    # so this check can never touch the owner's display, even by accident.
+    fx_env = {k: v for k, v in os.environ.items()
+              if k not in ("DISPLAY", "WAYLAND_DISPLAY", "MOZ_ENABLE_WAYLAND")}
+    fx_env["MOZ_HEADLESS"] = "1"
 
     profile = Path(tempfile.mkdtemp(prefix="riko-headless-profile-"))
     # Seeding storage.local: Firefox 151 no longer reads webextensions.*
@@ -135,11 +260,15 @@ def main():
 
     log_path = Path(os.environ.get("TMPDIR", "/tmp")) / "riko-web-ext.log"
     log = open(log_path, "w")
+    # Firefox's built-in remote agent gets its own scratch port: phase 4
+    # uses WebDriver BiDi on it to open a second real window.
+    bidi_port = free_port()
     proc = subprocess.Popen(
         [npx, "--yes", "web-ext", "run", "--verbose", "--target", "firefox-desktop",
          "--firefox", firefox, "--firefox-profile", str(profile),
-         "--keep-profile-changes", "--no-reload", "--args=-headless"],
-        cwd=REPO / "browser-ext", stdout=log, stderr=subprocess.STDOUT)
+         "--keep-profile-changes", "--no-reload",
+         "--args=-headless", f"--args=--remote-debugging-port={bidi_port}"],
+        cwd=REPO / "browser-ext", stdout=log, stderr=subprocess.STDOUT, env=fx_env)
 
     bridge = None
     ok = False
@@ -259,6 +388,57 @@ def main():
             f"activeTab is {act['url']!r}, expected the just-opened {page2_url!r}"
         assert act["active"] is True and act["incognito"] is False
         assert act["id"] in [e["id"] for e in entries], "activeTab id not in listTabs"
+
+        # Phase 4: activeTabs (multi-window survey, v0.1.3). Open a SECOND
+        # real browser window through Firefox's built-in remote agent (BiDi
+        # on the debug port passed to web-ext above). The new window is
+        # activated, so activeTabs must lead with it (focused=true) and keep
+        # the old window — still holding phase 3's tabs — behind it.
+        print("phase 4: opening a second window via BiDi")
+        bidi_open_window(bidi_port, pageB_url)
+        ab = {}
+        wins = []
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            ab = bridge.call("activeTabs", {})
+            wins = (ab.get("result") or {}).get("windows") or []
+            # wait for the new window's own page to load, not just the window
+            if (ab.get("ok") is True and len(wins) >= 2
+                    and (wins[0].get("activeTab") or {}).get("url") == pageB_url):
+                break
+            time.sleep(1.0)
+        print("activeTabs ->", json.dumps(ab.get("result"), ensure_ascii=False)[:900])
+        assert ab.get("ok") is True, f"activeTabs failed: {ab}"
+        assert len(wins) >= 2, f"expected >= 2 windows, got: {wins}"
+        needw = {"windowId", "focused", "state", "title", "tabCount",
+                 "lastFocusedAt", "activeTab"}
+        assert all(needw.issubset(w) for w in wins), f"window entry fields missing: {wins[0]}"
+        fid = ab["result"]["focusedWindowId"]
+        assert fid == wins[0]["windowId"], f"the focused window must lead: {wins}"
+        assert wins[0]["focused"] is True
+        assert sum(1 for w in wins if w["focused"]) == 1, "exactly one window may be focused"
+        assert all(w["focused"] == (w["windowId"] == fid) for w in wins)
+        assert wins[0]["state"] in ("normal", "maximized", "minimized", "fullscreen")
+        assert (wins[0]["activeTab"] or {}).get("url") == pageB_url, \
+            f"the new window must lead with its own tab: {wins[0]}"
+        assert wins[0]["title"] == "Riko headless window" and len(wins[0]["title"]) <= 200
+        # the previously focused window still holds phase 3's page tabs
+        old = [w for w in wins[1:] if w["windowId"] != fid]
+        assert old, f"the previously focused window is missing: {wins}"
+        assert all(w["focused"] is False for w in old)
+        assert old[0]["tabCount"] >= 2, \
+            f"tabCount must cover the page tabs (link tab excluded): {old[0]}"
+        for w in wins:  # the link tab is never counted and never reported
+            act = w["activeTab"]
+            assert act is None or not (act["url"] or "").startswith(link_pref), \
+                f"the link tab leaked into activeTabs: {w}"
+            assert isinstance(w["tabCount"], int) and w["tabCount"] >= 0
+            assert len(w["title"]) <= 200
+        times = [w["lastFocusedAt"] for w in wins if w["lastFocusedAt"] is not None]
+        assert len(times) >= 2, f"focus tracking must cover both windows: {wins}"
+        assert all(times[i] > times[i + 1] for i in range(len(times) - 1)), \
+            f"windows not ordered by last focus: {times}"
+        print(f"activeTabs: {len(wins)} windows, focus order {[w['windowId'] for w in wins]}")
         ok = True
     finally:
         proc.send_signal(subprocess.SIGINT if hasattr(subprocess, "SIGINT") else 2)
