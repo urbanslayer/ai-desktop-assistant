@@ -289,6 +289,24 @@
       <p class="hint">Timer due times and every spoken time use this zone. Blank = the server's
         own zone (the hub container's TZ). Timers round (docs/TIMERS.md).</p>
 
+      <h2 style="margin-top:14px">Location <span class="src" id="slocsrc"></span></h2>
+      <div class="row" style="align-items:flex-end">
+        <div style="flex:1"><label>Home place</label>
+          <input id="sloc" placeholder="Gloucester, UK" autocomplete="off"></div>
+        <div><label>&nbsp;</label><button class="btn small" id="slocfind">Find</button></div>
+        <div><label>&nbsp;</label><button class="btn small" id="slocclear">Clear location</button></div>
+      </div>
+      <div id="slocres" style="display:flex;flex-direction:column;gap:4px"></div>
+      <p class="hint">She answers weather, time and local questions for this place. Type a town
+        or postcode-ish name, press Find, pick a match, then Save. Clear = the server default
+        (RIKO_LOCATION) or no location (docs/API.md “Weather”).</p>
+      <div class="row" style="max-width:320px"><div>
+        <label>Weather units <span class="src" id="sunitsrc"></span></label>
+        <select id="sunits">
+          <option value="metric">metric (°C, km/h, mm)</option>
+          <option value="imperial">imperial (°F, mph, in)</option>
+        </select></div></div>
+
       <h2 style="margin-top:14px">TTS — hub voice</h2>
       <label><input type="checkbox" id="sttsenabled" style="width:auto; vertical-align:middle">
         Speak replies with Breeze-TTS-2 (English &amp; Chinese only, non-commercial weights)</label>
@@ -867,10 +885,12 @@ $("mimport").onchange = async () => {
 };
 
 /* ── settings ─────────────────────────────────────────────────────── */
-const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "stimezone", "sttsbase", "sttstimeout",
+const SETTING_IDS = ["sbase", "smodel", "stemp", "smaxtok", "smaxhist", "seffort", "sextra", "sphrases", "stimezone", "sunits", "sttsbase", "sttstimeout",
                      "stoolsteps", "stoolsecs", "stoolchars", "stsearxng", "smembudget"];
 let settingsSnap = null;    // field values as loaded — the diff base for Save
 let permSnap = {};          // saved per-tool permission overrides ("" = default)
+let locSaved = null;        // saved place object (null = none saved)
+let locPicked = null;       // place the page will send on Save (null = none/clear)
 let apikeyTyped = false;    // the user typed into the key field (autofill does not count... mostly)
 $("apikey").addEventListener("input", () => { apikeyTyped = true; });
 
@@ -929,6 +949,24 @@ async function loadSettings() {
     $("stimezone").value = s.timezone_source === "saved" ? (s.timezone || "") : "";
     $("stimezone").placeholder = ((s.defaults || {}).timezone || "UTC");
     $("stzsrc").textContent = s.timezone_source === "saved" ? "· saved" : "· using server zone";
+    // Location (docs/API.md "Weather"): show the SAVED place only — an
+    // untouched field never re-saves, and the RIKO_LOCATION env default
+    // shows as the placeholder/source chip instead of a fake saved value.
+    const loc = s.location || {}, lsrc = s.location_source || {};
+    const defLoc = ((s.defaults || {}).location || {});
+    locSaved = (lsrc.latitude === "saved" && loc.latitude != null && loc.longitude != null)
+      ? { name: String(loc.name || ""), latitude: loc.latitude, longitude: loc.longitude,
+          timezone: String(loc.timezone || ""), country: String(loc.country || ""),
+          admin1: String(loc.admin1 || "") }
+      : null;
+    locPicked = locSaved;
+    $("sloc").value = locSaved ? locSaved.name : "";
+    $("sloc").placeholder = defLoc.name || "no server default";
+    $("slocsrc").textContent = locSaved ? "· saved"
+      : (lsrc.name === "env" ? "· server default: " + defLoc.name : "· none set");
+    $("slocres").innerHTML = "";
+    $("sunits").value = (s.tools || {}).units === "imperial" ? "imperial" : "metric";
+    $("sunitsrc").textContent = (s.tools_source || {}).units === "default" ? "· default" : "";
     loadTools();
     loadMcp();
     $("apikey").value = "";
@@ -1016,6 +1054,7 @@ $("ssave").onclick = async () => {
     tools[k] = v;
   }
   if (changed("stsearxng")) tools.searxng_url = now.stsearxng;   // blank → server default again
+  if (changed("sunits")) tools.units = now.sunits;                // metric | imperial
   if (changed("stoolpriv")) tools.allow_private_fetch = now.stoolpriv === "1";
   const perms = {};
   document.querySelectorAll("#tperm select").forEach((sel) => {
@@ -1033,6 +1072,9 @@ $("ssave").onclick = async () => {
     memory.prompt_budget_tokens = v;
   }
   if (Object.keys(memory).length) body.memory = memory;
+  // Location: only the PICKED object travels (Find → pick sets it); an
+  // edited input without a pick sends nothing. null = clear → env default.
+  if (JSON.stringify(locPicked) !== JSON.stringify(locSaved)) body.location = locPicked;
   if (!Object.keys(body).length) { setSerr("nothing changed", true); return; }
   try {
     await api("/api/settings", { method: "PUT", json: body });
@@ -1042,8 +1084,48 @@ $("ssave").onclick = async () => {
     await reportLlmState();  // show the resolved model (or the LLM error) right away
   } catch (e) { setSerr(e.message); }
 };
+$("slocfind").onclick = async () => {
+  const q = $("sloc").value.trim();
+  if (!q) { setSerr("type a place first"); return; }
+  $("slocres").innerHTML = "";
+  setSerr("searching…", true);
+  try {
+    const r = await api("/api/geocode?q=" + encodeURIComponent(q));
+    const hits = (r.results || []).slice(0, 5);
+    if (!hits.length) { setSerr("no place matched “" + q + "”"); return; }
+    hits.forEach((h) => {
+      const b = document.createElement("button");
+      b.className = "btn small"; b.type = "button";
+      b.textContent = [h.name, h.admin1, h.country].filter(Boolean).join(", ") +
+        " (" + Number(h.latitude).toFixed(2) + ", " + Number(h.longitude).toFixed(2) + ")";
+      b.onclick = () => {
+        locPicked = { name: String(h.name || ""), latitude: h.latitude, longitude: h.longitude,
+                      timezone: String(h.timezone || ""), country: String(h.country || ""),
+                      admin1: String(h.admin1 || "") };
+        $("sloc").value = locPicked.name;
+        $("slocres").innerHTML = "";
+        let note = "picked " + locPicked.name + " — press Save";
+        if (locPicked.timezone && !$("stimezone").value) {
+          $("stimezone").value = locPicked.timezone;   // offer the zone for timers
+          note += " · timezone filled in — Save to keep it";
+        }
+        setSerr(note, true);
+      };
+      $("slocres").appendChild(b);
+    });
+    setSerr("pick a match, then Save", true);
+  } catch (e) { setSerr("place search failed: " + e.message); }
+};
+$("slocclear").onclick = async () => {
+  setSerr("");
+  try {
+    await api("/api/settings", { method: "PUT", json: { location: null } });
+    await loadSettings();
+    setSerr("location cleared — the server default (or none) applies", true);
+  } catch (e) { setSerr(e.message); }
+};
 $("skeyclear").onclick = async () => {
-  setSerr(""); 
+  setSerr("");
   try {
     await api("/api/settings", { method: "PUT", json: { llm: { clear_api_key: true } } });
     await loadSettings();
@@ -1052,10 +1134,10 @@ $("skeyclear").onclick = async () => {
   } catch (e) { setSerr(e.message); }
 };
 $("sreset").onclick = async () => {
-  if (!confirm("Drop the saved LLM settings, TTS settings, tools settings, memory settings, MCP servers, timezone and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* / RIKO_SEARXNG_URL / TZ env) apply?")) return;
+  if (!confirm("Drop the saved LLM settings, TTS settings, tools settings, memory settings, MCP servers, timezone, location and switch phrases, so the server defaults (RIKO_LLM_* / RIKO_TTS_* / RIKO_SEARXNG_URL / RIKO_LOCATION / TZ env) apply?")) return;
   setSerr("");
   try {
-    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, tools: true, memory: true, mcp: true, timezone: true, switch_phrases: true } });
+    await api("/api/settings/reset", { method: "POST", json: { llm: true, tts: true, tools: true, memory: true, mcp: true, timezone: true, location: true, switch_phrases: true } });
     setSerr("reset to server defaults ✔", true);
     await loadSettings(); await poll();
     await reportLlmState();

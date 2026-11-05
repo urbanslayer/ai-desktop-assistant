@@ -14,7 +14,7 @@ SPEECH_RULES_VERSION there (the hub's audio cache keys on it).
 """
 import re
 
-SPEECH_RULES_VERSION = 5
+SPEECH_RULES_VERSION = 6
 
 # Upper bound on what one reply says out loud; text past it is cut at the
 # last sentence end inside the cap (then at a word boundary). Documented in
@@ -103,6 +103,17 @@ _EMOJI = re.compile(
     "\u2B00-\u2BFF"               # arrows/star of david etc. (⬆ ⭐ ...)
     "\u2B50\u2B55\uFE0F\u20E3\u2122\u2139"
     "\u2049\u203C\u24C2\u2934\u2935\u3030\u303D\u3297\u3299]+")
+
+# ── units read as words (weather round, docs/API.md "Weather") ─────────────
+# "14 °C" must not be dictated "fourteen degree sign C": degree units and
+# wind speeds are spoken as words. °C/°F KEEP their scale — dropping the C/F
+# would silently turn a Fahrenheit reply into Celsius. A lone "14°" is just
+# "degrees". km/h/mph expand so TTS never spells the abbreviations out.
+_DEG_C = re.compile(r"[\u00b0\u2103]\s*[Cc](?![A-Za-z])")
+_DEG_F = re.compile(r"[\u00b0\u2109]\s*[Ff](?![A-Za-z])")
+_DEG_ANY = re.compile(r"\u00b0\s*(?![A-Za-z])")
+_KMH = re.compile(r"(?<![\w/])k[m]\s*/\s*h(?![\w/])")
+_MPH = re.compile(r"(?<![\w])mph(?![\w])")
 
 _HAS_WORD = re.compile(r"[A-Za-z\u00C0-\u024F\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\u0590-\u05FF\u0600-\u06FF]")
 _EMPTY_PAIR = re.compile(r"[\[(]\s*[\])]")
@@ -370,6 +381,11 @@ def _strip_blocks(text: str) -> str:
 def clean_prose(text: str) -> str:
     """All inline removal/replacement rules over one block of text."""
     text = str(text or "")
+    text = _DEG_F.sub(" degrees Fahrenheit", text)
+    text = _DEG_C.sub(" degrees Celsius", text)
+    text = _DEG_ANY.sub(" degrees", text)
+    text = _KMH.sub(" kilometres an hour", text)
+    text = _MPH.sub(" miles an hour", text)
     text = _INLINE_CODE.sub(" ", text)
     text = _MD_IMAGE.sub(" ", text)
     text = _MD_LINK.sub(lambda m: m.group(1), text)

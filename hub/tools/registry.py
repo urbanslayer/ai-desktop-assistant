@@ -11,6 +11,7 @@ import dataclasses
 import re
 
 from . import web
+from . import weather as _weather
 
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 PERMISSIONS = ("always", "ask", "never")
@@ -77,6 +78,13 @@ HUB_TOOL_DESCRIPTIONS = {
                    "search result you need more of."),
     "get_time": ("Current date and time (ISO) plus the weekday, optionally in an "
                  "IANA timezone. The only reliable clock you have."),
+    "weather": ("Current conditions and a short forecast, fast (Open-Meteo). "
+                "place: a place name — omit it to use the location saved in "
+                "Settings (the result names the place you answered for). "
+                "days: 1-7 (default 1 = today, 2 includes tomorrow). "
+                "hourly: true adds the next 12 hours. Metric (°C, km/h, mm) "
+                "unless the hub settings say imperial. Always call this for "
+                "weather — never guess it from memory."),
     "remember": ("Save one lasting fact to long-term memory so it survives "
                  "across conversations (scope 'user' shared, 'persona' private "
                  "to this persona). Never store secrets or one-off trivia."),
@@ -101,15 +109,33 @@ HUB_TOOL_DESCRIPTIONS = {
 }
 
 
-def build_hub_specs(tools_cfg: dict, memory_ctx: dict | None = None) -> list[ToolSpec]:
+def build_hub_specs(tools_cfg: dict, memory_ctx: dict | None = None,
+                    location_ctx: dict | None = None) -> list[ToolSpec]:
     """The built-in hub tools under the current merged tools settings.
     web_search is `available: False` (listed but not offered) while no
     SearXNG URL is configured. `memory_ctx` (memory round) is a dict
     {store, events, persona_id, writes, auto_remember}; without it the
     memory tools are listed for Settings but carry a stub run (GET
-    /api/tools never executes them)."""
+    /api/tools never executes them). `location_ctx` (weather round) is
+    {resolve: () -> saved-or-env location dict | None, units: str,
+    label_name: () -> str}; without it the weather tool is listed but
+    reports "no location set" if executed."""
     searxng = str(tools_cfg.get("searxng_url") or "").strip()
     allow_private = bool(tools_cfg.get("allow_private_fetch"))
+    units = ("imperial" if str(tools_cfg.get("units") or "").lower() == "imperial"
+             else "metric")
+    loc_ctx = dict(location_ctx or {})
+    loc_ctx.setdefault("units", units)
+
+    def _weather_label(args: dict) -> str:
+        place = str((args or {}).get("place") or "").strip()
+        if not place:
+            try:
+                place = str((loc_ctx.get("label_name") or (lambda: ""))() or "").strip()
+            except Exception:
+                place = ""
+        return f"checking the weather in {place or 'their area'}"
+
     specs = [
         ToolSpec(
             name="web_search", display="web_search",
@@ -133,6 +159,13 @@ def build_hub_specs(tools_cfg: dict, memory_ctx: dict | None = None) -> list[Too
             parameters=web.GET_TIME_SCHEMA, source="hub", risk="read",
             run=lambda args: web.get_time(args.get("timezone", "")),
             label=lambda args: "checking the date and time",
+        ),
+        ToolSpec(
+            name="weather", display="weather",
+            description=HUB_TOOL_DESCRIPTIONS["weather"],
+            parameters=_weather.WEATHER_SCHEMA, source="hub", risk="read",
+            run=lambda args: _weather.weather_tool(args, loc_ctx),
+            label=_weather_label,
         ),
     ]
     if memory_ctx:

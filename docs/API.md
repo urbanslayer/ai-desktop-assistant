@@ -215,7 +215,8 @@ transcript with `after=0`).
 | `POST /api/personas/{id}/voice/lock` | freeze designed voice: its take becomes the clone |
 | `GET /api/settings` | LLM + TTS + tools settings + defaults + per-field source (key never returned) |
 | `PUT /api/settings` | change settings (blank field = unset → default; `clear_api_key`) |
-| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timers/timezone/switch-phrase overrides → defaults |
+| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timers/timezone/location/switch-phrase overrides → defaults |
+| `GET /api/geocode?q=<place>` | Open-Meteo geocoder for the Settings Location picker (up to 5 matches) |
 | `POST /api/settings/test` | model probe + breeze health → `{ok, model, tts}` |
 | `GET /api/timers` | one-shot timers (docs/TIMERS.md; `?status=` filter) |
 | `DELETE /api/timers/{id}` | cancel a pending/firing timer |
@@ -456,6 +457,21 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"text":"hi","source":"android"}' $HUB/api/chat
 ```
 
+### GET /api/geocode
+
+Keyless proxy for the Open-Meteo geocoder (5 s timeout, 10-min cache) that
+backs the Settings **Location** picker:
+
+```bash
+curl -s -H "$AUTH" '$HUB/api/geocode?q=Gloucester%2C%20UK'
+# {"results": [{"name": "Gloucester", "latitude": 51.86772, "longitude": -2.24435,
+#               "country": "United Kingdom", "country_code": "GB",
+#               "admin1": "England", "timezone": "Europe/London"}, … up to 5]}
+```
+
+`422` without `q`, `502` when the geocoder is unreachable. The picked entry
+is what the page PUTs as `settings.location`.
+
 ### GET /api/settings · PUT /api/settings · POST /api/settings/reset · POST /api/settings/test
 
 `GET` returns the **merged** settings plus where each value came from:
@@ -469,7 +485,8 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
           "timeout": 120, "parallel_note": ""},
   "tools": {"enabled": true, "max_steps": 8, "max_seconds": 120,
             "max_result_chars": 12000, "searxng_url": "http://192.0.2.101:8989",
-            "allow_private_fetch": false, "permissions": {"desktop__do_thing": "never"}},
+            "allow_private_fetch": false, "units": "metric",
+            "permissions": {"desktop__do_thing": "never"}},
   "mcp": {"servers": [{"name": "time", "transport": "stdio", "enabled": true,
                        "command": "uvx", "args": ["mcp-server-time"], "env": {},
                        "tool_permissions": {}, "timeout": 60}]},
@@ -480,6 +497,11 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                      "talk to", "i want to talk to"],
   "timezone": "",                                  // saved override, "" = server zone
   "timezone_source": "default",                    // docs/TIMERS.md: timers + spoken times
+  "location": {"name": "Gloucester", "latitude": 51.86772, "longitude": -2.24435,
+               "timezone": "Europe/London", "country": "United Kingdom",
+               "admin1": "England"},               // Weather: the picked place ({} / {name:""} = none)
+  "location_source": {"name": "saved", "latitude": "saved", "timezone": "saved",
+                      "...": "saved | env | default"},   // "env" = the RIKO_LOCATION default
   "defaults": {"llm": {"base_url": "http://192.0.2.51:8000/v1", "model": "auto",
                        "temperature": 0.8, "max_tokens": 4096, "max_history": 40,
                        "reasoning_effort": "", "extra_body": {}, "api_key_set": true},
@@ -487,13 +509,15 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                        "timeout": 120, "parallel_note": ""},
                "tools": {"enabled": true, "max_steps": 8, "max_seconds": 120,
                          "max_result_chars": 12000, "searxng_url": "",
-                         "allow_private_fetch": false, "permissions": {}},
+                         "allow_private_fetch": false, "units": "metric",
+                         "permissions": {}},
                "mcp": {"servers": []},
                "memory": {"enabled": true, "prompt_budget_tokens": 600,
                           "auto_remember": true},
                "timers": {"allow_chaining": false},
                "switch_phrases": ["switch to", "..."],
-               "timezone": "Europe/London"},
+               "timezone": "Europe/London",
+               "location": {"name": ""}},          // RIKO_LOCATION env default (name only)
   "llm_source": {"base_url": "saved", "model": "default", "api_key": "default",
                  "temperature": "default", "...": "...", "switch_phrases": "default"},
   "tts_source": {"base_url": "default", "enabled": "default", "...": "..."},
@@ -543,7 +567,21 @@ Semantics (made so a careless form save cannot break the hub):
   `max_result_chars` 500–100000 (out of range → `422`). `permissions` **is
   replaced wholesale** when sent: `{tool_name: "always" | "ask" | "never"}`,
   and a `null` value for one name removes that explicit override (back to
-  the risk-based default).
+  the risk-based default). `units` is `"metric"` (default) or `"imperial"`
+  — what the **Weather** tool answers in (`°C`/`km/h`/`mm` vs
+  `°F`/`mph`/inches); blank = default, anything else → `422`.
+- **The `location` block** (Weather): the place the owner picked on the
+  Settings page (resolved via `GET /api/geocode`, stored as `{name, latitude,
+  longitude, timezone, country, admin1}`; missing coords or |lat| > 90 /
+  |lon| > 180 → `422`). `null`, `{}` or a blank `name` deletes the saved
+  place, so the `RIKO_LOCATION` env default (a plain place name, geocoded
+  lazily at first use and cached) applies again; with neither, the hub has
+  no location and the weather tool asks the model to ask her where they are.
+  A saved location also drives the spoken-time line when `timezone` is
+  blank (saved zone → location zone → server zone), and the chat prompt
+  gains one line — "The user lives in <name> (<admin1>, <country>); use it
+  for weather, time and local questions unless they name another place." —
+  whenever a location resolves.
 - **The `memory` block** (see *Memory*): `enabled` and `auto_remember` are
   booleans; `prompt_budget_tokens` an integer 100–4000 (the cap for the
   "What you remember" prompt block). Missing keys stay at their saved (or
@@ -563,7 +601,7 @@ Semantics (made so a careless form save cannot break the hub):
   Default-overridable with `RIKO_TIMER_ALLOW_CHAINING=1`.
 
 `POST /api/settings/reset` with `{"llm": true, "tts": true, "tools": true,
-"memory": true, "mcp": true, "timers": true, "timezone": true, "switch_phrases": true}` (each side optional,
+"memory": true, "mcp": true, "timers": true, "timezone": true, "location": true, "switch_phrases": true}` (each side optional,
 `422` if none)
 drops the saved overrides so the defaults apply again. Returns the same body
 as `GET`.

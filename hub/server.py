@@ -40,6 +40,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
                              sdk_available as mcp_available,
                              validate_servers as validate_mcp_servers)
     from .toolloop import run_turn
+    from .tools import weather as _weather
     from .tools.memory_tools import build_memory_specs
     from .tools.registry import build_hub_specs, hub_tool_info, permission_for, tools_prompt
     from .tools import timers as _timers
@@ -60,6 +61,7 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
                             sdk_available as mcp_available,
                             validate_servers as validate_mcp_servers)
     from toolloop import run_turn  # type: ignore[no-redef]
+    from tools import weather as _weather  # type: ignore[no-redef]
     from tools.memory_tools import build_memory_specs  # type: ignore[no-redef]
     from tools.registry import (build_hub_specs, hub_tool_info,  # type: ignore[no-redef]
                                 permission_for, tools_prompt)
@@ -97,8 +99,16 @@ TOOLS_DEFAULTS = {
     "max_result_chars": 12000,  # per tool result before truncation
     "searxng_url": "",        # SearXNG base URL; empty = web_search unavailable
     "allow_private_fetch": False,  # let fetch_page hit loopback/private IPs (dev)
+    "units": "metric",        # weather units: metric (°C, km/h) | imperial
     "permissions": {},        # tool name -> always | ask | never
 }
+
+# Location settings (weather round, docs/API.md "Weather"). The saved object
+# holds the resolved place {name, latitude, longitude, timezone, country,
+# admin1}; blank/reset = the RIKO_LOCATION env default (a plain place name,
+# geocoded lazily at first use and cached) or no location at all.
+LOCATION_PLACE_KEYS = ("name", "latitude", "longitude", "timezone",
+                       "country", "admin1")
 
 # MCP settings (docs/ROUNDS.md R2-M): no servers out of the box; the only
 # env default is the built-in Home Assistant server composed in main() from
@@ -171,7 +181,8 @@ def create_app(data_dir, api_key: str | None = None,
                tools_defaults: dict | None = None,
                memory_defaults: dict | None = None,
                mcp_defaults: dict | None = None,
-               timers_defaults: dict | None = None) -> FastAPI:
+               timers_defaults: dict | None = None,
+               location_defaults: dict | None = None) -> FastAPI:
     """Build the hub app over `data_dir` (SQLite + avatars live there).
 
     api_key None/empty disables auth. llm_defaults fills any LLM settings
@@ -205,6 +216,7 @@ def create_app(data_dir, api_key: str | None = None,
     memory_defaults = dict(memory_defaults or {})
     mcp_defaults = dict(mcp_defaults or {})
     timers_defaults = dict(timers_defaults or {})
+    location_defaults = dict(location_defaults or {})
     app = FastAPI(title="riko-hub", version=HUB_VERSION, docs_url=None, redoc_url=None)
     # one chat turn at a time PER PERSONA (docs/TIMERS.md H): a fired timer
     # waits for its own persona's chat to free without blocking the others
@@ -289,7 +301,7 @@ def create_app(data_dir, api_key: str | None = None,
         return bool(settings.get("enabled")) and bool(str(settings.get("base_url") or "").strip())
 
     # ── tools settings — same "blank = server default" semantics ────────
-    _TOOLS_BLANK_MEANS_UNSET = ("searxng_url",)
+    _TOOLS_BLANK_MEANS_UNSET = ("searxng_url", "units")
 
     def stored_tools() -> dict:
         saved = dict(store.get_json("tools", {}))
@@ -370,6 +382,46 @@ def create_app(data_dir, api_key: str | None = None,
                 merged[key] = bool(saved[key])
         return merged
 
+    # ── location settings (weather round, docs/API.md "Weather") ────────
+    # Saved place wins; blank/reset falls back to the RIKO_LOCATION env
+    # default (a plain place name geocoded lazily at first use, cached in
+    # hub.tools.weather) or, with no env default, no location at all.
+    def stored_location() -> dict:
+        saved = store.get_json("location", {})
+        return dict(saved) if isinstance(saved, dict) else {}
+
+    def default_location() -> dict:
+        # `name` is the UNRESOLVED env default (shown on the page; resolved
+        # lazily by resolve_location, never by GET /api/settings). Weather
+        # units are the separate `tools.units` setting.
+        return {"name": str(location_defaults.get("place") or "").strip()}
+
+    def location_settings() -> dict:
+        merged = default_location()
+        merged.update(stored_location())
+        return merged
+
+    def resolve_location() -> dict | None:
+        """The place weather/prompt questions resolve to: saved fields, else
+        the env default geocoded on first use (10-min cache). None = none.
+        Geocoding failure returns None, never raises (GET /api/state and the
+        chat prompt both call this on hot paths)."""
+        saved = stored_location()
+        if saved.get("latitude") is not None and saved.get("longitude") is not None:
+            return saved
+        env = str(location_defaults.get("place") or "").strip()
+        if not env:
+            return None
+        try:
+            return _weather.geocode_first(env)
+        except Exception:
+            return None
+
+    def location_label_name() -> str:
+        """Name for tool progress labels — never touches the network."""
+        return (str(stored_location().get("name") or "").strip()
+                or str(location_defaults.get("place") or "").strip())
+
     # ── MCP settings + manager (docs/ROUNDS.md R2-M) ───────────────────
     # settings `mcp.servers` env default: the built-in Home Assistant server
     # when RIKO_HA_URL + RIKO_HA_TOKEN are set (mcp_defaults). The manager
@@ -415,9 +467,27 @@ def create_app(data_dir, api_key: str | None = None,
     def default_timezone() -> str:
         return _timers.default_timezone_name()
 
+    def location_timezone() -> str:
+        """IANA zone of the resolved location ('' when none)."""
+        loc = resolve_location() or {}
+        return str(loc.get("timezone") or "").strip()
+
     def effective_timezone():
-        """ZoneInfo the hub speaks times in: saved → TZ env → UTC."""
-        return _timers.resolve_timezone(stored_timezone() or default_timezone())
+        """ZoneInfo the hub speaks times in: saved → the location's zone
+        (weather round: an owner who picked a place wants local times for
+        it) → TZ env → UTC."""
+        saved = stored_timezone()
+        if saved:
+            tz = _timers.resolve_timezone(saved)
+            if tz is not None:
+                return tz
+        else:
+            loc_tz = location_timezone()
+            if loc_tz:
+                tz = _timers.resolve_timezone(loc_tz)
+                if tz is not None:
+                    return tz
+        return _timers.resolve_timezone(default_timezone())
 
     def effective_timezone_name() -> str:
         tz = effective_timezone()
@@ -458,6 +528,16 @@ def create_app(data_dir, api_key: str | None = None,
         saved_timers = stored_timers()
         timers_source = {k: ("saved" if k in saved_timers else "default")
                          for k in TIMER_SETTINGS_DEFAULTS}
+        saved_loc = stored_location()
+        env_place = str(location_defaults.get("place") or "").strip()
+        location_source = {}
+        for k in LOCATION_PLACE_KEYS:
+            if k in saved_loc:
+                location_source[k] = "saved"
+            elif k == "name" and env_place:
+                location_source[k] = "env"      # the RIKO_LOCATION default
+            else:
+                location_source[k] = "default"  # default = no location
         return {
             "llm": public_llm(llm_settings()),
             "tts": tts_settings(),
@@ -468,6 +548,8 @@ def create_app(data_dir, api_key: str | None = None,
             "switch_phrases": switch_phrases(),
             "timezone": stored_timezone(),
             "timezone_source": "saved" if stored_timezone() else "default",
+            "location": location_settings(),
+            "location_source": location_source,
             "defaults": {"llm": defaults_public,
                          "tts": default_tts(),
                          "tools": default_tools(),
@@ -476,7 +558,8 @@ def create_app(data_dir, api_key: str | None = None,
                          "mcp": {"servers": public_mcp_servers([preset])
                                  if preset else []},
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES),
-                         "timezone": default_timezone()},
+                         "timezone": default_timezone(),
+                         "location": default_location()},
             "llm_source": source,
             "tts_source": tts_source,
             "tools_source": tools_source,
@@ -1056,7 +1139,10 @@ def create_app(data_dir, api_key: str | None = None,
                                "tool_ids": []}
         if tools_cfg.get("enabled"):
             permissions = tools_cfg.get("permissions") or {}
-            hub_specs = build_hub_specs(tools_cfg)
+            hub_specs = build_hub_specs(
+                tools_cfg,
+                location_ctx={"resolve": resolve_location,
+                              "label_name": location_label_name})
             # memory round (docs/WALK_MEMORY.md M): remember/recall/
             # forget_fact ride the tool loop, default permission always,
             # and vanish when memory or tools are off
@@ -1155,6 +1241,13 @@ def create_app(data_dir, api_key: str | None = None,
             mcp_notes = mcp_manager.prompt_notes(offered_names)
             if mcp_notes:
                 system += "\n\n" + mcp_notes
+        # weather round (docs/API.md "Weather"): one line naming the owner's
+        # place, whether or not tools are on — it also grounds time and
+        # local questions. The local-time line above already follows the
+        # location zone when settings.timezone is blank (effective_timezone).
+        turn_loc = resolve_location()
+        if turn_loc and str(turn_loc.get("name") or "").strip():
+            system += "\n\n" + _weather.location_prompt(turn_loc)
 
         max_history = int(settings.get("max_history") or 40)
         history = store.recent_messages(pid, max_history)
@@ -1488,6 +1581,14 @@ def create_app(data_dir, api_key: str | None = None,
                     if not lo <= num <= hi:
                         return err(422, f"tools.{key} must be between {lo} and {hi}")
                     saved_tools[key] = num
+            if "units" in tools:
+                units_val = str(tools["units"] or "").strip().lower()
+                if not units_val:
+                    saved_tools.pop("units", None)   # blank = back to the default
+                elif units_val not in ("metric", "imperial"):
+                    return err(422, "tools.units must be metric or imperial")
+                else:
+                    saved_tools["units"] = units_val
             if "permissions" in tools:
                 perms = tools["permissions"]
                 if not isinstance(perms, dict):
@@ -1560,6 +1661,38 @@ def create_app(data_dir, api_key: str | None = None,
                                 "(e.g. Europe/London)")
             else:
                 store.set_json("timezone", tz_val)
+        if "location" in body:
+            # docs/API.md "Weather": the resolved place the web page picked
+            # from GET /api/geocode. null / {} / blank name = unset → the
+            # RIKO_LOCATION env default (or no location at all).
+            loc = body["location"]
+            if loc is None or loc == {}:
+                store.del_json("location")
+            elif not isinstance(loc, dict):
+                return err(422, "location must be an object or null")
+            else:
+                saved_loc = stored_location()
+                name = str(loc.get("name") or "").strip()
+                if "name" in loc and not name:
+                    for k in LOCATION_PLACE_KEYS:
+                        saved_loc.pop(k, None)   # blank = env default / none
+                elif any(k in loc for k in ("name", "latitude", "longitude")):
+                    # a full resolved pick replaces the whole place block
+                    try:
+                        lat = float(str(loc.get("latitude")))
+                        lon = float(str(loc.get("longitude")))
+                    except (TypeError, ValueError):
+                        return err(422, "location.latitude/longitude must be "
+                                        "numbers (pick a match from the search)")
+                    if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+                        return err(422, "location latitude/longitude out of range")
+                    if not name:
+                        return err(422, "location.name is required with a place")
+                    new_loc = {"name": name[:200], "latitude": lat, "longitude": lon}
+                    for k in ("timezone", "country", "admin1"):
+                        new_loc[k] = str(loc.get(k) or "").strip()[:100]
+                    saved_loc = {**saved_loc, **new_loc}
+                store.set_json("location", saved_loc)
         bump_state()
         return settings_response()
 
@@ -1592,11 +1725,15 @@ def create_app(data_dir, api_key: str | None = None,
             changed |= store.del_json("switch_phrases")
         if body.get("timezone"):
             changed |= store.del_json("timezone")
+        if body.get("location"):
+            changed |= store.del_json("location")
         if not (body.get("llm") or body.get("tts") or body.get("tools")
                 or body.get("memory") or body.get("mcp") or body.get("timers")
-                or body.get("switch_phrases") or body.get("timezone")):
+                or body.get("switch_phrases") or body.get("timezone")
+                or body.get("location")):
             return err(422, 'set "llm", "tts", "tools", "memory", "mcp", '
-                            '"timers", "switch_phrases" and/or "timezone" to true')
+                            '"timers", "switch_phrases", "timezone" '
+                            'and/or "location" to true')
         if changed:
             bump_state()
         return settings_response()
@@ -1985,6 +2122,20 @@ def create_app(data_dir, api_key: str | None = None,
                 # online body set (docs/BODY.md §1): what she can do right now
                 "body_actions": clients_hub.body_actions()}
 
+    @app.get("/api/geocode")
+    def get_geocode(request: Request):
+        """Location picker proxy for the Settings page (docs/API.md
+        "Weather"): Open-Meteo geocoding, up to 5 matches, best first.
+        5 s timeout; nothing is cached at the route beyond the weather
+        module's shared 10-min geocode cache."""
+        q = str(request.query_params.get("q") or "").strip()
+        if not q:
+            return err(422, "q (a place name) is required")
+        try:
+            return {"results": _weather.geocode(q)}
+        except _weather.WeatherError as e:
+            return err(502, str(e))
+
     @app.get("/api/tools/log")
     def get_tools_log(request: Request):
         try:
@@ -2289,7 +2440,13 @@ def main():
         "searxng_url": os.getenv("RIKO_SEARXNG_URL", ""),  # empty = web_search off
         "allow_private_fetch": os.getenv("RIKO_ALLOW_PRIVATE_FETCH", "")
                                .strip().lower() in ("1", "true", "yes", "on"),
+        "units": "imperial" if os.getenv("RIKO_UNITS", "").strip().lower()
+                 == "imperial" else "metric",
     }
+    # Location (docs/API.md "Weather"): RIKO_LOCATION is a plain place name
+    # ("Gloucester, UK" or a postcode-ish town) used until the owner picks a
+    # place on the Settings page; geocoded lazily at first use (cached).
+    location_defaults = {"place": os.getenv("RIKO_LOCATION", "")}
     # Home Assistant (docs/API.md "Home Assistant via MCP"): RIKO_HA_URL is
     # the HA base URL, RIKO_HA_TOKEN the long-lived access token; both set =
     # the built-in 'homeassistant' MCP server is offered. The token never
@@ -2301,6 +2458,7 @@ def main():
     app = create_app(data_dir, api_key=os.getenv("RIKO_HUB_KEY") or None,
                      llm_defaults=llm_defaults, tts_defaults=tts_defaults,
                      tools_defaults=tools_defaults, mcp_defaults=mcp_defaults,
+                     location_defaults=location_defaults,
                      timers_defaults={"poll_s": os.getenv("RIKO_TIMER_POLL_S", "1"),
                                       "allow_chaining": os.getenv(
                                           "RIKO_TIMER_ALLOW_CHAINING", "")

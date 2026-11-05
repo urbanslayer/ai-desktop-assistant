@@ -593,5 +593,35 @@
     "name": "spoken reply capped at sentence end",
     "input": "That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.\n\nThat is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai.",
     "expect": "That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai. That is a perfectly fine sentence, senpai."
+  },
+  {
+    "name": "celsius spoken as words",
+    "input": "It's 14 °C in London, feels like 11 °C.",
+    "expect": "It's 14 degrees Celsius in London, feels like 11 degrees Celsius."
+  },
+  {
+    "name": "celsius glued without space",
+    "input": "22°C and rising.",
+    "expect": "22 degrees Celsius and rising."
+  },
+  {
+    "name": "fahrenheit keeps its scale",
+    "input": "-5 °F tonight.",
+    "expect": "-5 degrees Fahrenheit tonight."
+  },
+  {
+    "name": "km per hour spoken as words",
+    "input": "Wind 13 km/h.",
+    "expect": "Wind 13 kilometres an hour."
+  },
+  {
+    "name": "mph spoken as words",
+    "input": "Gusts to 8 mph.",
+    "expect": "Gusts to 8 miles an hour."
+  },
+  {
+    "name": "bare degree sign spoken as degrees",
+    "input": "Around 3° at dusk.",
+    "expect": "Around 3 degrees at dusk."
   }
 ]
