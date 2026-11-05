@@ -4,6 +4,7 @@ through a `runner=` fake fed by recorded JSON in tests/fixtures/
 desktop_sense/ (shapes recorded from real hyprctl/swaymsg/KWin/GNOME
 output), and the launcher tests only record what WOULD run."""
 import json
+import os
 import re
 from pathlib import Path
 
@@ -547,6 +548,197 @@ def test_no_backend_message(tmp_path, monkeypatch):
     s._backend, s._backend_tried = None, True
     with pytest.raises(ToolError, match="no supported window manager"):
         s.desktop_windows()
+
+
+# ── never launch a compositor / session / power action ───────
+@pytest.fixture
+def session_dir(tmp_path):
+    """An applications dir plus a wayland-sessions dir."""
+    d = tmp_path / "applications"
+    d.mkdir()
+    sess = tmp_path / "wayland-sessions"
+    sess.mkdir()
+    (d / "foot.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Foot\nExec=foot\n")
+    (d / "Hyprland.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Hyprland\nExec=Hyprland\n")
+    (d / "start-hyprland.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Hyprland (wrapped)\n"
+        "Exec=start-hyprland\n")
+    (d / "envsway.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Sway via env\n"
+        "Exec=env WLR_BACKENDS=headless sway\n")
+    (d / "kwin.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=KWin\n"
+        "Exec=kwin_wayland --x11\n")
+    (d / "plasma.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Plasma\n"
+        "Exec=startplasma-wayland\n")
+    (d / "shell.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Plasma Shell\n"
+        "Exec=env GTK_USE_PORTAL=1 plasmashell --replace\n")
+    (d / "gnome-shell.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=GNOME Shell\n"
+        "Exec=gnome-shell --wayland\n")
+    (d / "tryexec.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Needs Hyprland\n"
+        "TryExec=Hyprland\nExec=some-tool --in-hyprland\n")
+    (d / "xorg.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Xorg\nExec=/usr/lib/Xorg\n")
+    (d / "xvfb.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Xvfb\nExec=Xvfb :99\n")
+    (d / "sddm.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=SDDM\nExec=sddm\n")
+    (d / "reboot.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Restart\nExec=reboot\n")
+    (d / "sysctl.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Suspend\n"
+        "Exec=systemctl suspend\n")
+    (d / "loginctl.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Lock\n"
+        "Exec=loginctl lock-session\n")
+    (sess / "sway.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Swam\nExec=sway\n")
+    (sess / "gnome.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=GNOME\n"
+        "Exec=gnome-session\n")
+    return d, sess
+
+
+def _wants(idx, runner=None):
+    return lambda w: apps_mod.open_app(w, index=idx,
+                                       runner=runner or recording_runner(
+                                           {r".": Done("")}))
+
+
+def test_compositor_session_entries_are_hidden(session_dir):
+    d, sess = session_dir
+    idx = apps_mod.AppIndex([d, sess])
+    ids = {a["id"] for a in idx.all()}
+    assert ids == {"foot.desktop"}          # everything else is hidden
+    for hidden in ("Hyprland.desktop", "start-hyprland.desktop",
+                   "envsway.desktop", "kwin.desktop", "plasma.desktop",
+                   "shell.desktop", "gnome-shell.desktop",
+                   "tryexec.desktop", "xorg.desktop", "xvfb.desktop",
+                   "sddm.desktop", "reboot.desktop", "sysctl.desktop",
+                   "loginctl.desktop", "sway.desktop", "gnome.desktop"):
+        assert hidden not in ids
+    assert not [a for a in idx.find("hyprland") or [] if "sway" not in a["id"]]
+
+
+def test_open_app_refuses_compositor_session_and_power(session_dir):
+    d, sess = session_dir
+    idx = apps_mod.AppIndex([d, sess])
+    runner = recording_runner({r".": Done("")})
+    ask = _wants(idx, runner)
+    with pytest.raises(ToolError, match="compositor"):
+        ask("Hyprland")
+    with pytest.raises(ToolError, match="compositor"):
+        ask("start-hyprland")
+    with pytest.raises(ToolError, match="compositor"):     # behind env=
+        ask("envsway")
+    with pytest.raises(ToolError, match="compositor"):     # kwin* prefix
+        ask("kwin")
+    with pytest.raises(ToolError, match="compositor"):     # startplasma*
+        ask("plasma")
+    with pytest.raises(ToolError, match="compositor"):     # env-wrapped shell
+        ask("shell")
+    with pytest.raises(ToolError, match="compositor"):     # gnome-shell
+        ask("gnome-shell")
+    with pytest.raises(ToolError, match="compositor"):     # TryExec names it
+        ask("Needs Hyprland")
+    with pytest.raises(ToolError, match="compositor"):     # Xorg / Xvfb
+        ask("xorg")
+    with pytest.raises(ToolError, match="compositor"):
+        ask("xvfb")
+    with pytest.raises(ToolError, match="compositor"):     # display manager
+        ask("sddm")
+    with pytest.raises(ToolError, match="power"):          # power levers
+        ask("reboot")
+    with pytest.raises(ToolError, match="power"):
+        ask("sysctl")
+    with pytest.raises(ToolError, match="power"):
+        ask("loginctl")
+    with pytest.raises(ToolError, match="login-session"):  # wayland-sessions
+        ask("sway")
+    assert runner.calls == []               # nothing ever reached the launcher
+    # ordinary apps still launch, and the refusal text explains why
+    out = ask("foot")
+    assert out["launched"] and out["app"] == "Foot"
+
+
+def test_open_app_refuses_compositor_preferences(session_dir, monkeypatch):
+    """Even the owner's configured preference can't smuggle a compositor in
+    (a TERMINAL=Hyprland-style preference, or a .desktop pref id)."""
+    d, _ = session_dir
+    idx = apps_mod.AppIndex([d])
+    monkeypatch.setattr(apps_mod.shutil, "which",
+                        lambda n: f"/usr/bin/{n}" if n == "Hyprland" else None)
+    with pytest.raises(ToolError, match="compositor"):
+        apps_mod.open_app("terminal", index=idx,
+                          preferences={"terminal": "Hyprland"},
+                          runner=recording_runner({r".": Done("")}))
+
+
+def test_generic_launchers_carry_their_session_argument():
+    """gtk-launch hyprland / gio launch .../wayland-sessions/x.desktop — the
+    session is the ARGUMENT, the launcher is harmless alone."""
+    assert apps_mod.block_reason({"exec": "gtk-launch hyprland"})
+    assert apps_mod.block_reason(
+        {"exec": "gio launch /usr/share/wayland-sessions/sway.desktop"})
+    assert apps_mod.block_reason(
+        {"exec": "gio launch /usr/share/xsessions/plasma.desktop"})
+    assert apps_mod.block_reason(
+        {"exec": "dbus-run-session -- sway"}) is not None
+    assert apps_mod.block_reason({"exec": "gtk-launch foot"}) is None
+    assert apps_mod.block_reason({"exec": "gio launch /usr/share/applications/"
+                                          "foot.desktop"}) is None
+    assert apps_mod.block_reason({"exec": "foot -e %u"}) is None
+
+
+# ── conftest guards: no real compositor, ever ────────────────
+def test_conftest_guard_blocks_real_compositor_subprocess():
+    """A missing fake runner must fail LOUDLY, not spawn a compositor."""
+    import subprocess as sp
+    for prog in ("hyprctl", "swaymsg", "qdbus", "qdbus-qt6", "gdbus",
+                 "busctl", "dbus-send", "kwin_wayland", "Hyprland", "sway",
+                 "gnome-shell", "weston", "Xvfb", "Xephyr", "plasmashell",
+                 "startplasma-wayland", "/usr/bin/hyprctl", "grim"):
+        with pytest.raises(RuntimeError, match="compositor"):
+            sp.run([prog, "--version"])
+        with pytest.raises(RuntimeError, match="compositor"):
+            sp.Popen([prog])
+    # the fake-runner path is untouched: backends never reach subprocess
+    # when a runner is injected
+    from riko.desktop_sense.util import run as ds_run
+    assert ds_run(["hyprctl", "monitors"], runner=lambda a, **k: Done("{}")) \
+        .stdout == "{}"
+    # and unrelated binaries still run normally
+    assert sp.run(["/bin/echo", "ok"], capture_output=True,
+                  text=True).stdout.strip() == "ok"
+
+
+def test_session_env_is_stripped_from_the_test_run():
+    for var in ("HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "DISPLAY",
+                "SWAYSOCK", "DBUS_SESSION_BUS_ADDRESS"):
+        assert var not in os.environ, f"{var} leaked into the test env"
+    # backend detection in the cleaned env finds nothing (no live session),
+    # unless a test injects an explicit env
+    from riko.desktop_sense.sense import detect_backend
+    assert detect_backend(env={}) is None
+
+
+# ── the tray checkbox wiring (main(); source-checked, no window) ──
+def test_tray_toggle_consumes_checked_and_persists():
+    """'Let her see my desktop' must swallow QAction's checked bool (skill
+    pitfall), persist via awareness.set, and re-register the tool list."""
+    import inspect
+    import desktop
+    src = inspect.getsource(desktop)
+    assert "def toggle_desktop_sense(checked=None):" in src
+    assert "sense.awareness.set(want)" in src
+    assert "client_tools.apply_awareness(runtime, cfg, browser, sense)" in src
+    assert 'QAction("Let her see my desktop"' in src
 
 
 # ── hub prompt line ───────────────────────────────────────────

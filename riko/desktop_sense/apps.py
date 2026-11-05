@@ -7,7 +7,14 @@ Rules from docs/DESKTOP_SENSE.md:
   Exec, quotes are unquoted per the desktop-entry spec, and the result runs
   as an argv list (no shell), so `foo; rm -rf /` in a Name/Exec is data;
 - launches are detached (start_new_session, /dev/null stdio) and inherit
-  the owner's environment.
+  the owner's environment;
+- she never starts a compositor, window manager, login session or display
+  manager, and never pulls a system power/session lever: entries whose
+  Exec/TryExec binary or desktop id names one (Hyprland, sway, kwin*,
+  startplasma*, gnome-session, sddm, Xorg, ...), entries that live in
+  wayland-sessions/ or xsessions/, and systemctl/loginctl/shutdown/reboot/
+  poweroff are hidden from desktop_apps and refused by open_app (owner rule
+  after a nested-compositor crash killed their live session).
 """
 from __future__ import annotations
 
@@ -72,6 +79,7 @@ def parse_desktop_file(path: Path) -> dict | None:
         "generic": _unquote_local(kv.get("GenericName") or ""),
         "keywords": _unquote_local(kv.get("Keywords") or ""),
         "exec": exec_line,
+        "tryexec": kv.get("TryExec") or "",
         "terminal": kv.get("Terminal", "").lower() == "true",
         "path": str(path),
         "categories": kv.get("Categories") or "",
@@ -133,9 +141,105 @@ def split_exec(exec_line: str) -> list[str]:
     return [a for a in argv if a]
 
 
+# ── never start a compositor / session / power action ─────────
+# Owner rule (docs/DESKTOP_SENSE.md): a child's nested-Hyprland experiment
+# SIGSEGV'd their LIVE Hyprland. Neither the app nor the model may ever
+# launch a second compositor, window manager, login session, display
+# manager, or a system power/session lever. Matched against the Exec and
+# TryExec binaries (also behind wrappers like `env`/`dbus-run-session`/
+# `gtk-launch`), the desktop id/app name, and the .desktop file's path.
+_SESSION_BINARIES = {
+    # compositors / WMs
+    "hyprland", "start-hyprland", "sway", "cage", "labwc", "niri", "river",
+    "wayfire", "waymonad", "qtile", "awesome", "bspwm", "dwm",
+    "herbstluftwm", "i3", "openbox", "xfwm4", "marco", "compiz",
+    # shells / sessions
+    "plasmashell", "startplasma-wayland", "startplasma-x11", "gnome-shell",
+    "gnome-session", "gnome-session-binary", "mutter", "xfce4-session",
+    "lxqt-session", "mate-session", "mate-session-binary",
+    "cinnamon-session", "budgie-desktop", "ukui-session", "deepin-session",
+    "lumina-session", "enlightenment",
+    # display servers / servers
+    "weston", "xorg", "xfree86", "xwayland", "xvfb", "xephyr", "xinit",
+    "startx", "Xwayland",
+    # display managers
+    "sddm", "gdm", "gdm-x-session", "gdm-wayland-session", "lightdm",
+    "lxdm", "light-locker", "lxdm-gtk", "sddm-helper",
+}
+# matched as prefixes (kwin_wayland/kwin_x11, startplasma*, gdm-wayland-…)
+_SESSION_BIN_PREFIXES = ("kwin", "startplasma", "gnome-session", "gdm-",
+                         "sddm-", "lightdm-", "weston", "hyprland", "xorg",
+                         "xwayland", "xvfb", "xephyr", "xserver")
+# bare desktop ids that name a session (wayland-sessions/gnome.desktop …)
+_SESSION_IDS = _SESSION_BINARIES | {
+    "gnome", "gnome-classic", "gnome-classic-wayland", "gnome-wayland",
+    "plasma", "kde", "kde-plasma", "xfce", "xfce4", "lxqt", "lxde", "mate",
+    "budgie", "pantheon", "ukui", "deepin", "cinnamon", "i3-wm", "x11",
+    "wayland", "hydrland",
+}
+# system power/session levers: never something she fires off casually
+_POWER_COMMANDS = {"systemctl", "loginctl", "shutdown", "reboot", "poweroff",
+                   "halt"}
+# Exec wrappers whose REAL payload is a later token (env FOO=1 Hyprland,
+# dbus-run-session sway, gtk-launch hyprland, gio launch …/xsessions/x…)
+_LAUNCHER_WRAPPERS = {"env", "sh", "bash", "dash", "zsh", "dbus-run-session",
+                      "dbus-launch", "systemd-run", "gtk-launch", "gio",
+                      "xdg-open", "systemctl"}
+_SESSION_DIR_MARKERS = ("wayland-sessions/", "xsessions/")
+
+
+def _tok_name(tok) -> str:
+    """basename of a token, .desktop suffix dropped, lowercased."""
+    return str(tok).rsplit("/", 1)[-1].removesuffix(".desktop").lower()
+
+
+def _is_session_name(name: str) -> bool:
+    return (name in _SESSION_BINARIES
+            or any(name.startswith(p) for p in _SESSION_BIN_PREFIXES))
+
+
+def block_reason(entry: dict) -> str | None:
+    """Why this .desktop entry must never be launched, or None.
+    'login-session' / 'compositor' / 'power' are the three families."""
+    low = str(entry.get("path") or "").lower().replace("\\", "/")
+    if any(m in low for m in _SESSION_DIR_MARKERS):
+        return "login-session entry (wayland-sessions/xsessions)"
+    for key in ("exec", "tryexec"):
+        argv = split_exec(str(entry.get(key) or ""))
+        if not argv:
+            continue
+        first = _tok_name(argv[0])
+        tokens = argv[1:] if first in _LAUNCHER_WRAPPERS else argv[:1]
+        if first in _POWER_COMMANDS:
+            return f"system power/session command ({first})"
+        if _is_session_name(first):
+            return f"compositor/session binary ({first})"
+        for tok in tokens:
+            tl = str(tok).lower()
+            if first in ("gtk-launch", "gio", "xdg-open", "systemd-run",
+                         "dbus-run-session") \
+                    and any(m in tl for m in _SESSION_DIR_MARKERS):
+                return "login-session entry (wayland-sessions/xsessions)"
+            tb = _tok_name(tok)
+            if tb in _POWER_COMMANDS:
+                return f"system power/session command ({tb})"
+            if tb in _SESSION_IDS or _is_session_name(tb):
+                return f"compositor/session binary ({tb})"
+    for ident in (str(entry.get("app") or ""),
+                  str(entry.get("id") or "").removesuffix(".desktop")):
+        if ident.lower() in _SESSION_IDS:
+            return f"compositor/session entry ({ident.lower()})"
+    return None
+
+
 class AppIndex:
     """Installed launchable apps, fuzzy-searched. Reads the XDG dirs lazily
-    per call (apps get installed and uninstalled); `dirs` pins them (tests)."""
+    per call (apps get installed and uninstalled); `dirs` pins them (tests).
+
+    Compositor / session / power entries (block_reason below) never appear
+    in listings; `resolve` still sees them so open_app can REFUSE loudly
+    instead of answering "no app matches".
+    """
 
     def __init__(self, dirs=None):
         self._dirs = [Path(d) for d in dirs] if dirs else None
@@ -143,7 +247,7 @@ class AppIndex:
     def _search_dirs(self) -> list[Path]:
         return self._dirs or xdg_app_dirs()
 
-    def all(self) -> list[dict]:
+    def all(self, include_blocked: bool = False) -> list[dict]:
         seen: dict[str, dict] = {}
         for d in self._search_dirs():
             try:
@@ -153,7 +257,8 @@ class AppIndex:
             for f in entries:
                 app = parse_desktop_file(f)
                 if app and app["id"] not in seen:   # user dir wins (first)
-                    seen[app["id"]] = app
+                    if include_blocked or block_reason(app) is None:
+                        seen[app["id"]] = app
         return sorted(seen.values(), key=lambda a: a["name"].lower())
 
     def find(self, query: str = "", limit: int = 25) -> list[dict]:
@@ -193,12 +298,13 @@ class AppIndex:
 
     def resolve(self, want: str) -> dict | None:
         """Exact desktop id / app id first, then best fuzzy match. None = no
-        confident match (callers must NOT launch a weak guess)."""
+        confident match (callers must NOT launch a weak guess). Blocked
+        entries are matched here so open_app can refuse them by name."""
         want_l = str(want or "").strip().lower()
         want_l = re.sub(r"\.desktop$", "", want_l)
         if not want_l:
             return None
-        apps = self.all()
+        apps = self.all(include_blocked=True)
         for a in apps:
             if want_l in (a["id"].lower(), a["app"].lower(),
                           a["name"].lower(), a["startup_wmclass"].lower()):
@@ -268,6 +374,13 @@ def open_app(app: str, monitor: str | None = None, workspace=None, *,
     argv = split_exec(entry["exec"])
     if not argv:
         raise ToolError(f"{entry['id'] or want}: empty Exec line")
+
+    reason = block_reason(entry)
+    if reason:
+        raise ToolError(
+            f"open_app: not launching {entry.get('name') or want} — "
+            f"{reason}. She never starts your compositor, login session or "
+            "system power actions (you own those).")
 
     mon_name = None
     mon_note = ""

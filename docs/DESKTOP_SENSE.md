@@ -98,16 +98,42 @@ before guessing, and say which screen you used."
 
 ## Testing rules (children)
 
-- Never query or screenshot the owner's live session in tests. Unit tests use fake backends: recorded
-  JSON fixtures of hyprctl/KWin/GNOME output, and fake .desktop dirs.
-- For a REAL check, use a **nested headless compositor**:
-  - `sway --headless` plus a nested Hyprland if possible (`Hyprland` with
-    `WLR_BACKENDS=headless`, private XDG_RUNTIME_DIR);
-  - KDE via `kwin_wayland --virtual` if installed.
-  - Launch test apps there and list, focus and open on a monitor. Report what was verified per backend.
-- Parse a COPY of the owner's `~/.config/hypr/*.lua` (read-only) in a test to prove the monitor-mapping
-  parser handles the real file: the Dell U2518D ×2 and the ARZOPA portable, `desc:` outputs and commented
-  blocks.
+**Owner rule (replaces the old nested-compositor section — REVOKED after an
+incident): never START or QUERY a compositor in tests.** A child's "nested
+headless Hyprland" attempts aborted and the owner's LIVE Hyprland SIGSEGV'd
+at the same second, killing their session. So:
+
+- No compositor, window manager or display server is ever launched by a
+  test — not nested, not "headless", not `--virtual`: no Hyprland, sway,
+  kwin_wayland, weston, gnome-shell, cage, mutter, labwc, niri, river,
+  wayfire, Xorg, Xwayland, Xvfb, Xephyr, sddm/gdm/lightdm.
+- Never query the owner's live session either: no `hyprctl`, `swaymsg`,
+  `qdbus`, `gdbus`, `busctl`, `dbus-send`, `grim` against it.
+- **Verification = recorded fixtures + offscreen Qt only.**
+  - every backend answers from recorded JSON fixtures
+    (`tests/fixtures/desktop_sense/`: hyprctl clients/activewindow/
+    monitors/workspaces, sway tree, KWin script payload, GNOME extension
+    replies) injected through the `runner=` fake — a backend call that
+    reaches real `subprocess` in a test is a bug;
+    - the launcher tests only record what WOULD run (fake runner records
+      argv); nothing is ever spawned;
+    - tray/UI behaviour is covered with `QT_QPA_PLATFORM=offscreen` tests
+      that trigger the real QAction;
+    - `tests/conftest.py` pops `HYPRLAND_INSTANCE_SIGNATURE`,
+      `WAYLAND_DISPLAY`, `DISPLAY`, `SWAYSOCK` and
+      `DBUS_SESSION_BUS_ADDRESS` for the whole run (so detection code sees
+      "no compositor" and test-started subprocesses inherit a clean env)
+      and raises if any `subprocess.run/Popen` targets a compositor,
+      display server or session-bus binary without a fake runner.
+- Parse a COPY of the owner's `~/.config/hypr/*.lua` (read-only) in a test
+  to prove the monitor-mapping parser handles the real file: the Dell
+  U2518D ×2 and the ARZOPA portable, `desc:` outputs and commented blocks
+  (`tests/fixtures/hypr_lua/`).
+- Anything that needs a live compositor — real hyprctl output, KWin script
+  loading, the GNOME extension in place, actual launches and moves — is
+  verified by the **owner on their session**. Children report what is
+  fixture-verified per backend and what still awaits that live check; they
+  never verify it themselves on the owner's display.
 
 ## Ownership
 

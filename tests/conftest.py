@@ -72,6 +72,81 @@ else:
     for _fn in ("InputStream", "OutputStream", "play", "rec", "record"):
         setattr(_sounddevice, _fn, _no_real_audio)
 
+# ── No compositor / session bus (owner rule after an incident) ──
+# A child's "nested headless Hyprland" test crashed the owner's LIVE
+# Hyprland (SIGSEGV, all their apps died with it). From here on:
+#  1. the test run inherits NO session env: hyprctl/swaymsg/qdbus/gdbus
+#     cannot find the live session, and subprocesses started by tests
+#     inherit the cleaned environment. tests/conftest runs before any test
+#     module, so detection code (riko.desktop_sense) sees "no compositor"
+#     unless a test injects its own env dict explicitly;
+#  2. any subprocess.run/Popen aimed at a compositor, window manager,
+#     display server or session-bus tool raises immediately — the backends
+#     take a `runner=` fake, so reaching this guard at all is a bug.
+for _session_env in ("HYPRLAND_INSTANCE_SIGNATURE", "HYPRLAND_CMD",
+                     "WAYLAND_DISPLAY", "DISPLAY", "SWAYSOCK",
+                     "DBUS_SESSION_BUS_ADDRESS"):
+    os.environ.pop(_session_env, None)
+del _session_env
+
+import subprocess as _subprocess  # noqa: E402
+
+_COMPOSITOR_ARGV0 = re.compile(
+    r"^(hyprland|start-hyprland|hyprctl|sway|swaymsg|swaynag|kwin[-\w]*|"
+    r"kwrapper[-\w]*|startplasma[-\w]*|plasmashell|gnome-shell[-\w]*|"
+    r"gnome-session[-\w]*|mutter[-\w]*|weston[-\w]*|cage|labwc|niri|river|"
+    r"wayfire|waymonad|xorg[-\w]*|xwayland|xvfb|xephyr|xinit|startx|"
+    r"sddm[-\w]*|gdm[-\w]*|lightdm[-\w]*|lxdm[-\w]*|i3[-\w]*|openbox[-\w]*|"
+    r"xfwm4[-\w]*|xfce4-session|lxqt-session|qdbus[-\w]*|gdbus|busctl|"
+    r"dbus-send|grim|slurp)$", re.I)
+
+
+def _guard_compositor(name):
+    raise RuntimeError(
+        f"tests must not start or query a real compositor/session bus "
+        f"({name!r}): owner rule after a nested-compositor crash killed "
+        f"their live Hyprland. Inject a fake runner "
+        f"(riko/desktop_sense/util.run(runner=...)) or a recorded fixture.")
+
+
+def _guarded(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args") or kwargs.get("program")
+        if isinstance(argv, (list, tuple)) and argv:
+            first = str(argv[0])
+        elif isinstance(argv, str):
+            first = argv.strip().split(" ")[0] if argv.strip() else ""
+        else:
+            first = ""
+        if first and _COMPOSITOR_ARGV0.match(os.path.basename(first)):
+            _guard_compositor(first)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+_subprocess.run = _guarded(_subprocess.run)
+_subprocess.Popen = _guarded(_subprocess.Popen)
+
+
+@pytest.fixture(autouse=True)
+def _clean_session_env():
+    """Re-assert #1 per test: whoever set DISPLAY/WAYLAND_DISPLAY/... must
+    not leak it to the next test (monkeypatch restores what it set, and
+    what conftest popped is gone for good)."""
+    for _v in ("HYPRLAND_INSTANCE_SIGNATURE", "HYPRLAND_CMD",
+               "WAYLAND_DISPLAY", "DISPLAY", "SWAYSOCK",
+               "DBUS_SESSION_BUS_ADDRESS"):
+        os.environ.pop(_v, None)
+    yield
+    for _v in ("HYPRLAND_INSTANCE_SIGNATURE", "HYPRLAND_CMD",
+               "WAYLAND_DISPLAY", "DISPLAY", "SWAYSOCK",
+               "DBUS_SESSION_BUS_ADDRESS"):
+        os.environ.pop(_v, None)
+
+
 HUB_KEY = "test-hub-key"
 CHAT_REPLY = "[{name}] you said: {text}"
 
