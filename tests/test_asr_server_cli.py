@@ -30,6 +30,15 @@ class FakeWhisperModel:
         return iter([seg]), info
 
 
+@pytest.fixture(autouse=True)
+def no_ambient_asr_key(monkeypatch):
+    """build_app reads ASR_API_KEY from the environment at build time; a real
+    key in the owner's .env or shell would silently enable auth and turn every
+    keyless request below into a 401. Tests that want auth set the key
+    explicitly (see tests/test_asr_server.py, which runs a real subprocess)."""
+    monkeypatch.delenv("ASR_API_KEY", raising=False)
+
+
 @pytest.fixture
 def fake_whisper(monkeypatch):
     import faster_whisper

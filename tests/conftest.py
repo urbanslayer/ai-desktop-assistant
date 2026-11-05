@@ -36,6 +36,23 @@ os.environ.setdefault("RIKO_AVATAR_CACHE", os.path.join(_TEST_STATE_ROOT, "avata
 # the throwaway dir instead of the owner's ~/.config/riko.
 os.environ.setdefault("XDG_CONFIG_HOME", os.path.join(_TEST_STATE_ROOT, "xdg"))
 
+# ── Owner-key isolation: the checkout's .env must not steer tests ──
+# riko/config.py runs load_dotenv(ROOT/".env") at import time, so one real
+# key in the owner's .env (or exported in their shell) lands in os.environ
+# the moment anything imports riko and silently changes outcomes: the
+# in-process asr_server starts demanding auth (keyless TestClient requests
+# turn into 401s) and the hub picks up the owner's LLM/HA defaults. Force
+# that .env load to happen right now (import is cached, and load_dotenv
+# never re-reads or overwrites existing vars), then drop the secrets for
+# the whole run. Tests that need a key set it explicitly (monkeypatch.
+# setenv / a subprocess env), so this only removes ambient noise.
+import riko.config as _riko_config  # noqa: E402,F401 — triggers load_dotenv here
+for _secret_env in ("ASR_API_KEY", "RIKO_HUB_KEY", "LLM_API_KEY",
+                    "RIKO_LLM_API_KEY", "TTS_API_KEY", "GROQ_API_KEY",
+                    "FISH_API_KEY", "RIKO_HA_URL", "RIKO_HA_TOKEN"):
+    os.environ.pop(_secret_env, None)
+del _secret_env
+
 # ── No real audio devices ────────────────────────────────────
 # Same reason: a real PortAudio stream in a test process races pytest's
 # teardown and aborts it (exit 139/134 after 'passed'). Tests inject their
