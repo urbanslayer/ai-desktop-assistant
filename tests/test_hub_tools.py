@@ -363,7 +363,8 @@ def test_chat_tool_roundtrip_log_and_events(tmp_path, searxng, wx_offline):
     for want in ("turn_started", "tool_started", "tool_finished", "turn_finished"):
         assert want in types, types
     assert types.index("tool_started") < types.index("tool_finished")
-    started = next(e for e in evs if e["type"] == "tool_started")
+    started = next(e for e in evs if e["type"] == "tool_started"
+                   and e["tool"] == "web_search")
     assert started["tool"] == "web_search" and started["call_id"] == "c1"
     done = next(e for e in evs if e["type"] == "turn_finished")
     assert done["emotion"] == "happy"

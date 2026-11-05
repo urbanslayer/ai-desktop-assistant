@@ -1302,8 +1302,10 @@ def create_app(data_dir, api_key: str | None = None,
             if wx_ask["hourly"]:
                 wx_args["hourly"] = True
             wx_ctx = {"resolve": resolve_location,
-                      "units": ("imperial" if str(tools_cfg.get("units") or "")
-                                .lower() == "imperial" else "metric")}
+                      "units": _weather.normalize_preset(tools_cfg.get("units"))}
+            for _qty in ("temperature", "wind", "precipitation"):
+                wx_ctx["units_" + _qty] = str(
+                    tools_cfg.get("units_" + _qty) or "").strip().lower()
             call_id = f"hub-prefetch-{int(time.time() * 1000) % 1000000}"
             t0 = time.monotonic()
             if have_place:

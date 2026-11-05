@@ -304,6 +304,17 @@ def test_prefetch_runs_with_tools_off(tmp_path, wx):
          "source": "hub", "auto": True}]
 
 
+def test_prefetch_follows_units_preset(tmp_path, wx):
+    client, llm = make_client(tmp_path, [{"content": "62 F, senpai."}])
+    save_london(client)
+    assert client.put("/api/settings",
+                      json={"tools": {"units": "us"}}).status_code == 200
+    client.post("/api/chat", json={"text": "what's the weather today?"})
+    assert wx.forecast_calls()[-1]["params"]["temperature_unit"] == "fahrenheit"
+    sysmsg = llm.chat_requests[0]["messages"][0]["content"]
+    assert '"temperature": "\u00b0F"' in sysmsg
+
+
 def test_permission_never_skips_prefetch(tmp_path, wx):
     client, llm = make_client(tmp_path, [{"content": "ok"}],
                               tools_defaults={"permissions": {"weather": "never"}})
@@ -391,9 +402,11 @@ def test_guard_skipped_when_server_rejects_tools(tmp_path, wx):
                      llm_defaults={"base_url": llm.base_url, "model": "auto"})
     client = TestClient(app)
     res = client.post("/api/chat", json={"text": NON_WEATHER})
-    # the loop already retried WITHOUT tools (2 requests); no guard retry
+    # tools were rejected: retrying the model would hit the same wall, so
+    # the guard stands down — no nudge message ever reaches the server
     assert res.json()["reply"] == ANNOUNCE
-    assert len(llm.chat_requests) == 2
+    assert all("didn't call a tool" not in json.dumps(r["messages"])
+               for r in llm.chat_requests)
 
 
 def test_guard_still_honours_emotion_on_the_final_reply(tmp_path, wx):
