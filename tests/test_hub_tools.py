@@ -195,6 +195,23 @@ def searxng():
 
 
 @pytest.fixture
+def wx_offline():
+    """Weather pre-fetch must not touch the real network from this file:
+    fail the TRANSPORT so a weather-matching chat text falls back to the
+    hint + normal tool path."""
+    from hub.tools import weather as weather_mod
+
+    def boom(url, params, timeout):
+        raise weather_mod.WeatherError("offline in test")
+
+    weather_mod.TRANSPORT = boom
+    weather_mod.clear_cache()
+    yield
+    weather_mod.TRANSPORT = None
+    weather_mod.clear_cache()
+
+
+@pytest.fixture
 def pages():
     s = FakePageServer()
     yield s
@@ -315,7 +332,7 @@ def test_api_tools_lists_builtins(tmp_path):
 
 # ── the loop through /api/chat ──────────────────────────────────────────────
 
-def test_chat_tool_roundtrip_log_and_events(tmp_path, searxng):
+def test_chat_tool_roundtrip_log_and_events(tmp_path, searxng, wx_offline):
     client, llm = llm_client(tmp_path, [
         call_step("web_search", {"query": "tokyo weather"}),
         {"content": f"{L}happy{R} It is 21 C and sunny in Tokyo today!"},

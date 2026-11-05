@@ -317,6 +317,10 @@ def test_chat_weather_roundtrip_and_prompt(tmp_path, wx):
     assert r.status_code == 200
     sysmsg = llm.chat_requests[0]["messages"][0]["content"]
     assert "The user lives in London (England, United Kingdom)" in sysmsg
+    # the hub pre-fetched weather BEFORE the model: data + instruction are
+    # already in the first request (docs/API.md "Weather pre-fetch")
+    assert "Live weather data (fetched just now for London" in sysmsg
+    assert "do not call the weather tool again" in sysmsg
     assert "weather" in [t["function"]["name"] for t in llm.chat_requests[0]["tools"]]
     # settings.timezone blank -> the local-time line follows the location zone
     assert "(Europe/London)" in sysmsg
@@ -325,8 +329,12 @@ def test_chat_weather_roundtrip_and_prompt(tmp_path, wx):
     assert payload["place"]["name"] == "London"
     assert payload["current"]["condition"] == "light rain"
     out = r.json()
-    assert out["tools_used"] == [{"tool": "weather",
-                                  "label": "checking the weather in London"}]
+    # entry 0: the hub's own pre-fetch (auto); entry 1: this scripted model
+    # calling the tool anyway despite the injected data
+    assert out["tools_used"] == [
+        {"tool": "weather", "label": "checking the weather in London",
+         "source": "hub", "auto": True},
+        {"tool": "weather", "label": "checking the weather in London"}]
     log = client.get("/api/tools/log", params={"limit": 5}).json()["entries"]
     assert log[0]["tool"] == "weather" and log[0]["ok"] is True
 

@@ -31,6 +31,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from . import brain as _brain
     from . import clients as _clients
     from . import emotion as _emotion
+    from . import intents as _intents
     from . import memory as _memory
     from . import speech as _speech
     from . import voice as _voice
@@ -51,6 +52,7 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     import brain as _brain  # type: ignore[no-redef]
     import clients as _clients  # type: ignore[no-redef]
     import emotion as _emotion  # type: ignore[no-redef]
+    import intents as _intents  # type: ignore[no-redef]
     import memory as _memory  # type: ignore[no-redef]
     import speech as _speech  # type: ignore[no-redef]
     import voice as _voice  # type: ignore[no-redef]
@@ -1249,6 +1251,77 @@ def create_app(data_dir, api_key: str | None = None,
         if turn_loc and str(turn_loc.get("name") or "").strip():
             system += "\n\n" + _weather.location_prompt(turn_loc)
 
+        # weather pre-fetch (docs/API.md "Weather pre-fetch"): the message
+        # asks about the weather, so the hub calls the weather tool itself
+        # BEFORE the model and injects the result. The answer becomes one
+        # LLM round-trip and cannot be invented from memory; the chip and
+        # the tool log still show the fetch (labelled, auto). Skipped when
+        # the owner set weather to permission `never`. On failure the turn
+        # falls back to the normal tool path plus a hint.
+        wx_ask = _intents.detect_weather_request(text)
+        wx_prefetch: dict | None = None
+        wx_used: dict | None = None
+        # permission `never` (weather not offered while tools are on) means
+        # the owner does not want weather fetched; with tools off entirely
+        # the pre-fetch is the hub's own answer grounding, so it runs
+        if wx_ask and (not tools_cfg.get("enabled")
+                       or "weather" in offered_names):
+            place_ask = str(wx_ask.get("place") or "").strip()
+            label = (f"checking the weather in "
+                     f"{place_ask or location_label_name() or 'their area'}")
+            have_place = bool(place_ask
+                              or (turn_loc and turn_loc.get("latitude")
+                                  is not None))
+            wx_args = {"days": wx_ask["days"]}
+            if place_ask:
+                wx_args["place"] = place_ask
+            if wx_ask["hourly"]:
+                wx_args["hourly"] = True
+            wx_ctx = {"resolve": resolve_location,
+                      "units": ("imperial" if str(tools_cfg.get("units") or "")
+                                .lower() == "imperial" else "metric")}
+            call_id = f"hub-prefetch-{int(time.time() * 1000) % 1000000}"
+            t0 = time.monotonic()
+            if have_place:
+                events.publish("tool_started", call_id=call_id,
+                               tool="weather", label=label)
+            try:
+                wx_payload = (_weather.weather_tool(wx_args, wx_ctx)
+                              if have_place else None)
+                if have_place and wx_payload is None:
+                    raise _weather.WeatherError("no location")
+                wx_prefetch = wx_payload
+                wx_error = ""
+            except Exception as e:  # WeatherError or a tool bug: fallback
+                wx_error = str(e) or type(e).__name__
+            ms = int((time.monotonic() - t0) * 1000)
+            if wx_prefetch is not None:
+                events.publish("tool_finished", call_id=call_id,
+                               tool="weather", ok=True, ms=ms)
+                store.log_tool(persona=pid, tool="weather", source="hub",
+                               arguments=json.dumps(wx_args), ok=True,
+                               error="", ms=ms,
+                               approval="auto (hub pre-fetch)")
+                system += "\n\n" + _intents.weather_data_block(wx_prefetch)
+                place_name = str(((wx_prefetch.get("place") or {})
+                                  .get("name") or "").strip()
+                                 or place_ask or "their area")
+                wx_used = {"tool": "weather",
+                           "label": f"checking the weather in {place_name}",
+                           "source": "hub", "auto": True}
+                log.info("[turn] weather pre-fetch persona=%s place=%s "
+                         "days=%d ms=%d", pid, place_name, wx_ask["days"], ms)
+            else:
+                if have_place:
+                    store.log_tool(persona=pid, tool="weather", source="hub",
+                                   arguments=json.dumps(wx_args), ok=False,
+                                   error=wx_error, ms=ms,
+                                   approval="auto (hub pre-fetch)")
+                system += "\n\n" + _intents.prefetch_hint(
+                    "weather" in offered_names)
+                log.info("[turn] weather pre-fetch skipped persona=%s: %s",
+                         pid, wx_error or "no location")
+
         max_history = int(settings.get("max_history") or 40)
         history = store.recent_messages(pid, max_history)
         messages = ([{"role": "system", "content": system}]
@@ -1265,6 +1338,28 @@ def create_app(data_dir, api_key: str | None = None,
         except Exception as e:
             return ("err", 502, f"{type(e).__name__}: {e}")
 
+        # promised-action guard (docs/API.md "Promised-action guard"): the
+        # turn made no tool call while tools were offered, yet the reply
+        # announces one ("Let me check…"). Re-run the model ONCE this turn
+        # with a nudge and keep that answer; the announced-only reply is
+        # discarded (never stored, never spoken). Cap: one retry per turn.
+        if (not out["tools_used"] and offered_names
+                and not out.get("tools_rejected")
+                and _intents.promises_action(out["text"])):
+            log.info("[turn] nudged: promised action without a tool call "
+                     "persona=%s", pid)
+            retry_msgs = messages + [
+                {"role": "assistant", "content": out["text"]},
+                {"role": "system", "content": _intents.PROMISE_NUDGE}]
+            try:
+                retry_out = run_turn(brain, settings, tools_cfg, specs,
+                                     retry_msgs, ctx)
+            except Exception as e:
+                log.info("[turn] nudge retry failed persona=%s: %s", pid, e)
+                retry_out = None
+            if retry_out and str(retry_out.get("text") or "").strip():
+                out = retry_out
+
         # the emotion tag never reaches the stored reply or the TTS
         emotion, answer = _emotion.parse_emotion(out["text"])
         # body actions are parsed from the FINAL reply only (the tool loop
@@ -1280,6 +1375,10 @@ def create_app(data_dir, api_key: str | None = None,
         actions = _body.apply_asked(
             text, actions, body_actions if persona.get("embodied", True) else [])
         tools_used = out["tools_used"]
+        if wx_used:
+            # the hub's own pre-fetched weather counts like a tool call for
+            # the chip and the stored trace (auto: nobody had to approve it)
+            tools_used.insert(0, wx_used)
 
         # asked-for fallback (docs/TIMERS.md "Reviewer additions"): she
         # answered "remind me in 20 seconds…" as if the timer existed but
