@@ -3,14 +3,14 @@ services:
   hub:
     build: ./
     image: riko-hub
-    # owner's wall-clock zone for timers + spoken times (docs/TIMERS.md H);
-    # the settings page `timezone` field overrides this per deployment
-    TZ: "${TZ:-Europe/London}"
     ports:
       - "${RIKO_HUB_PORT:-8002}:8002"
     environment:
       # server.py reads these; keep them in sync with .env.example and
       # tests/test_hub_packaging.py (it fails the build on a missing one).
+      # owner's wall-clock zone for timers + spoken times (docs/TIMERS.md H);
+      # the settings page `timezone` field overrides this per deployment
+      TZ: "${TZ:-Europe/London}"
       RIKO_HUB_KEY: "${RIKO_HUB_KEY:-}"
       # in-container listen address/data dir; the host port mapping is the
       # `ports:` entry above (RIKO_HUB_PORT in .env only moves the host port).

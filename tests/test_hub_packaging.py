@@ -6,13 +6,22 @@ events.py, toolloop.py, tools/), and compose.yaml never forwarded
 RIKO_SEARXNG_URL, so web_search had no backend inside Docker. These tests
 parse the real hub/Dockerfile, hub/.dockerignore, hub/compose.yaml and the
 hub source so the same miss fails CI instead of production.
+
+A later round put `TZ:` directly under `services.hub` (outside
+`environment:`); real `docker compose` refuses the file
+("services.hub.TZ false schema"), so the compose files are now also checked
+against the Compose spec's key sets, and against the docker CLI when present.
 """
 import ast
 import fnmatch
+import os
 import re
+import shutil
+import subprocess
+import yaml
 from pathlib import Path
 
-import yaml
+ROOT = Path(__file__).resolve().parents[1]
 
 HUB = Path(__file__).resolve().parents[1] / "hub"
 DOCKERFILE = (HUB / "Dockerfile").read_text(encoding="utf-8")
@@ -136,7 +145,10 @@ def test_compose_sets_the_owner_timezone_for_timers():
     """docs/TIMERS.md H: timers and spoken times follow the owner's wall
     clock — compose pins the container TZ (and the poll knob is forwarded)."""
     svc = COMPOSE["services"]["hub"]
-    assert svc["TZ"] == "${TZ:-Europe/London}"
+    # TZ must live under environment: (a service-level `TZ:` key made real
+    # `docker compose` reject the file: "services.hub.TZ false schema").
+    assert "TZ" not in svc, "TZ is a top-level service key; compose rejects it"
+    assert svc["environment"]["TZ"] == "${TZ:-Europe/London}"
     assert svc["environment"]["RIKO_TIMER_POLL_S"] == "${RIKO_TIMER_POLL_S:-1}"
     env_example = (HUB / ".env.example").read_text(encoding="utf-8")
     assert "TZ=Europe/London" in env_example
@@ -182,3 +194,120 @@ def test_dependency_layer_is_cached_before_the_source_copy():
                      if re.match(r"COPY\s+\.(\s|$)", l, re.IGNORECASE)), None)
     if copy_all is not None:
         assert deps < copy_all, "uv sync deps layer must precede the source COPY"
+
+# --------------------------------------------------------------------------
+# Compose file shape (hub/ + tts/ + server/): the TZ-as-service-key bug made
+# `docker compose` reject hub/compose.yaml outright; catch that class of bug
+# statically, and against the docker CLI when it is available.
+# --------------------------------------------------------------------------
+
+# compose-spec service-level attributes (compose-spec/compose-spec), plus
+# a few still-accepted legacy keys; extension keys (x-*) are always allowed.
+ALLOWED_COMPOSE_SERVICE_KEYS = {
+    "annotations", "attach", "blkio_config", "build", "cap_add", "cap_drop",
+    "cgroup", "cgroup_parent", "container_name", "cpu_count", "cpu_percent",
+    "cpu_period", "cpu_quota", "cpu_rt_period", "cpu_rt_runtime",
+    "cpu_shares", "cpus", "cpuset", "credential_spec", "depends_on",
+    "deploy", "develop", "device_cgroup_rules", "devices", "dns", "dns_opt",
+    "dns_search", "domainname", "entrypoint", "env_file", "environment",
+    "expose", "extends", "extensions", "gpus", "group_add", "healthcheck",
+    "hostname", "image", "init", "ipc", "isolation", "labels", "links",
+    "logging", "mac_address", "mem_limit", "mem_reservation",
+    "mem_swappiness", "memswap_limit", "memory", "models", "mounts",
+    "network_mode", "networks", "oom_kill_disable", "oom_score_adj", "pid",
+    "pids_limit", "platform", "ports", "privileged", "profiles", "provider",
+    "pull_policy", "read_only", "restart", "runtime", "scale", "secrets",
+    "security_opt", "shm_size", "sidecars", "stdin_open", "stop_grace_period",
+    "stop_signal", "storage_opt", "sysctls", "tmpfs", "tty", "ulimits",
+    "user", "userns_mode", "uts", "volumes", "volumes_from", "working_dir",
+}
+
+ALLOWED_COMPOSE_TOP_KEYS = {
+    "name", "services", "networks", "volumes", "configs", "secrets", "include",
+}
+
+COMPOSE_DIRS = (ROOT / "hub", ROOT / "tts", ROOT / "server")
+
+
+def _load_compose(path):
+    """Parse a compose file with PyYAML, tolerating Compose-only YAML tags
+    (!reset, !override, ...) that the tts/server override files use."""
+    class _Loader(yaml.SafeLoader):
+        pass
+
+    def _construct_any(loader, _suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        return loader.construct_mapping(node)
+
+    _Loader.add_multi_constructor("!", _construct_any)
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=_Loader)
+
+
+def _compose_docker_runs():
+    """(files, env) pairs for `docker compose config -q`. Base files validate
+    alone; compose.<flavour>.yaml files are override layers (server/compose.
+    cpu.yaml has no image/build at all) and must ride on top of the base.
+    VIDEO_GID/RENDER_GID get placeholders because tts/compose.amd.yaml
+    interpolates them from the host without defaults."""
+    runs = []
+    for d in COMPOSE_DIRS:
+        files = sorted(d.glob("compose*.y*ml"))
+        base = next((f for f in files
+                     if f.name in ("compose.yaml", "compose.yml")), None)
+        for f in files:
+            stack = [f] if f == base or base is None else [base, f]
+            runs.append((stack, {"VIDEO_GID": "444", "RENDER_GID": "999"}))
+    return runs
+
+
+def test_compose_files_use_only_valid_compose_keys():
+    """Every top-level and per-service key must be a real Compose spec key.
+    This is the shape check that `docker compose` performs; a stray `TZ:`
+    (or any other env var) at the wrong level fails here, not on the box."""
+    files = [f for d in COMPOSE_DIRS for f in sorted(d.glob("compose*.y*ml"))]
+    assert files, "no compose files found"
+    for path in files:
+        doc = _load_compose(path)
+        rel = path.relative_to(ROOT)
+        assert isinstance(doc, dict), f"{rel}: empty or non-mapping file"
+        top_bad = {k for k in doc
+                   if k not in ALLOWED_COMPOSE_TOP_KEYS and not str(k).startswith("x-")}
+        assert not top_bad, f"{rel}: unknown top-level key(s): {sorted(top_bad)}"
+        for svc_name, svc in (doc.get("services") or {}).items():
+            assert isinstance(svc, dict), f"{rel}: service {svc_name} is not a mapping"
+            bad = {k for k in svc
+                   if k not in ALLOWED_COMPOSE_SERVICE_KEYS
+                   and not str(k).startswith("x-")}
+            assert not bad, (
+                f"{rel}: service {svc_name} has key(s) that are not Compose "
+                f"service keys: {sorted(bad)} (env vars belong under "
+                "`environment:` — a top-level TZ broke deployment this way)")
+
+
+def test_docker_compose_cli_accepts_every_compose_file():
+    """Ground truth: run `docker compose config -q` over every stack the way
+    the README deploys it (override flavours layered on the base). Skipped
+    when docker is missing or its daemon is unreachable."""
+    docker = shutil.which("docker")
+    if docker is None:
+        import pytest
+        pytest.skip("docker CLI not on PATH")
+    env = {**os.environ}
+    for path, extra_env in _compose_docker_runs():
+        env.update(extra_env)
+        args = [docker, "compose"]
+        for f in path:
+            args += ["-f", str(f)]
+        proc = subprocess.run(args + ["config", "-q"], cwd=ROOT, env=env,
+                              capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0 and ("Cannot connect to the Docker daemon" in proc.stderr
+                                     or "failed to connect to the docker API" in proc.stderr):
+            import pytest
+            pytest.skip("docker daemon unreachable")
+        shown = " + ".join(str(f.relative_to(ROOT)) for f in path)
+        assert proc.returncode == 0, (
+            f"docker compose config failed for {shown}:\n{proc.stderr.strip()}")
+
