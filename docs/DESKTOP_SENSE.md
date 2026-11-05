@@ -14,8 +14,8 @@ as the browser tools).
 | `browser_tabs()` | read / always | All Firefox tabs (title, URL, active, window, pinned, audible) via the Riko Helper extension, which already has the `tabs` permission. |
 | `desktop_monitors()` | read / always | Monitors: name, description/make/model, size, position, scale, focused, active workspace. On Hyprland, also the **configured** layout from the Lua config (see below). |
 | `desktop_apps(query?)` | read / always | Installed launchable apps from XDG `.desktop` files (Name, GenericName, Keywords, Exec id, NoDisplay/Hidden respected), fuzzy-searched. |
-| `open_app(app, monitor?, workspace?)` | act / **ask** (owner can set always) | Launch an installed app (by desktop id or fuzzy name). It can go to a given monitor (by name, description or position words like "left/middle/right", "the Dell on the right", "the portable screen") or workspace where the compositor allows it. |
-| `focus_window(window)` | act / ask | Bring an open window to the front (where the compositor allows it). |
+| `open_app(app, monitor?, workspace?)` | act / **always** (owner decision 2026-11-05: no confirmation) | Launch an installed app (by desktop id or fuzzy name). It can go to a given monitor (by name, description or position words like "left/middle/right", "the Dell on the right", "the portable screen") or workspace where the compositor allows it. |
+| `focus_window(window)` | act / always | Bring an open window to the front (where the compositor allows it). |
 
 Not in scope: keystrokes or mouse control of other apps, closing or killing windows, reading window
 *contents*, and screenshots. Screenshots ("look at my screen") are an optional later step, below.
