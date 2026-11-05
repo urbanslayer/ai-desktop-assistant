@@ -1,0 +1,55 @@
+{
+ "ok": true,
+ "result": [
+  {
+   "id": 11,
+   "windowId": 101,
+   "title": "Riko Hub",
+   "url": "http://127.0.0.1:8765/",
+   "active": true,
+   "pinned": false,
+   "audible": false,
+   "incognito": false
+  },
+  {
+   "id": 12,
+   "windowId": 101,
+   "title": "Music",
+   "url": "https://music.example",
+   "active": false,
+   "pinned": false,
+   "audible": false,
+   "incognito": false
+  },
+  {
+   "id": 13,
+   "windowId": 101,
+   "title": "Mail",
+   "url": "https://mail.example",
+   "active": false,
+   "pinned": false,
+   "audible": false,
+   "incognito": false
+  },
+  {
+   "id": 21,
+   "windowId": 102,
+   "title": "Godot Docs — Godot Engine",
+   "url": "https://docs.godotengine.org/en/stable/",
+   "active": true,
+   "pinned": false,
+   "audible": false,
+   "incognito": false
+  },
+  {
+   "id": 31,
+   "windowId": 103,
+   "title": "Search Results",
+   "url": "https://example.org/search",
+   "active": true,
+   "pinned": false,
+   "audible": false,
+   "incognito": true
+  }
+ ]
+}

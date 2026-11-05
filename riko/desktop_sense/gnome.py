@@ -84,6 +84,8 @@ class GnomeBackend:
                         "workspace": str(w.get("workspace", "")),
                         "monitor": str(w.get("monitor", "")),
                         "focused": bool(w.get("focused")),
+                        # Mutter via the extension reports no focus history
+                        "focus_recency": 0 if w.get("focused") else None,
                         "fullscreen": bool(w.get("fullscreen")),
                         "floating": bool(w.get("floating")),
                         "pid": w.get("pid")})
@@ -97,12 +99,33 @@ class GnomeBackend:
                 "title": clean_title(w.get("title", "")),
                 "workspace": str(w.get("workspace", "")),
                 "monitor": str(w.get("monitor", "")), "focused": True,
+                "focus_recency": 0,
                 "fullscreen": bool(w.get("fullscreen")),
                 "floating": bool(w.get("floating")), "pid": w.get("pid")}
 
     def monitors(self) -> list[dict]:
         data = self._json_from_reply(self._call("Monitors"))
         return data.get("monitors") or []
+
+    def switch_workspace(self, workspace, monitor=None) -> dict:
+        """ActivateWorkspace(index) on the shipped Shell extension.
+        GNOME has no per-monitor workspace choice on Wayland: a monitor
+        gets a note, not an error. Number refs are 1-based for the user
+        ('desktop 2' = index 1); a plain index or name passes through."""
+        ref = str(workspace or "").strip()
+        if not ref:
+            raise ToolError("switch_workspace: give a workspace number or name")
+        arg = str(int(ref) - 1) if ref.isdigit() else ref
+        data = self._json_from_reply(self._call("ActivateWorkspace", "s", [arg]))
+        if not data.get("ok"):
+            raise ToolError(data.get("error") or
+                            "GNOME could not switch to that workspace "
+                            "(update Riko's GNOME Shell extension)")
+        out = {"workspace": ref, "monitor": monitor or ""}
+        if monitor:
+            out["note"] = ("GNOME shows one workspace per screen; switched the "
+                           "active workspace (no per-screen placement)")
+        return out
 
     def focus_window(self, ref: str) -> dict:
         wins = self.windows()

@@ -1,0 +1,72 @@
+[
+ {
+  "address": "0x502",
+  "class": "firefox",
+  "title": "Godot Docs — Godot Engine — Mozilla Firefox",
+  "workspace": {
+   "id": 2,
+   "name": "2"
+  },
+  "monitor": 0,
+  "pid": 5002,
+  "fullscreen": false,
+  "floating": false,
+  "focusHistoryID": 0
+ },
+ {
+  "address": "0x222",
+  "class": "kitty",
+  "title": "user@arch: ~",
+  "workspace": {
+   "id": 1,
+   "name": "1"
+  },
+  "monitor": 1,
+  "pid": 4002,
+  "fullscreen": false,
+  "floating": false,
+  "focusHistoryID": 1
+ },
+ {
+  "address": "0x501",
+  "class": "firefox",
+  "title": "Riko Hub — Mozilla Firefox",
+  "workspace": {
+   "id": 1,
+   "name": "1"
+  },
+  "monitor": 1,
+  "pid": 5001,
+  "fullscreen": false,
+  "floating": false,
+  "focusHistoryID": 2
+ },
+ {
+  "address": "0x503",
+  "class": "firefox",
+  "title": "Search Results — Mozilla Firefox Private Browsing",
+  "workspace": {
+   "id": 8,
+   "name": "8"
+  },
+  "monitor": 2,
+  "pid": 5003,
+  "fullscreen": false,
+  "floating": false,
+  "focusHistoryID": 3
+ },
+ {
+  "address": "0x333",
+  "class": "org.keepassxc.KeePassXC",
+  "title": "vault.kdbx - KeePassXC",
+  "workspace": {
+   "id": -99,
+   "name": "special:1"
+  },
+  "monitor": 1,
+  "pid": 4003,
+  "fullscreen": false,
+  "floating": true,
+  "focusHistoryID": 4
+ }
+]

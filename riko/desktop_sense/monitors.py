@@ -60,6 +60,47 @@ def _names(monitors):
     return ", ".join(str(m.get("name") or "?") for m in monitors)
 
 
+_BRAND_SKIP = {"inc", "gwd", "display", "lcd", "led", "monitor", "computer",
+               "company", "limited", "co", "corp", "electronics"}
+
+
+def monitor_phrase(monitor, monitors) -> str:
+    """A short human phrase for a live monitor — the reverse direction of
+    resolve_monitor_phrase: 'left Dell', 'middle Dell', 'portable screen'.
+    Round-trips: resolve_monitor_phrase(monitor_phrase(m, ms), ms) == m for
+    the owner's layouts. Falls back to the raw name when nothing fits."""
+    monitors = [m for m in (monitors or []) if m.get("name")]
+    if not monitor:
+        return ""
+    desc = " ".join(str(monitor.get(k) or "") for k in
+                    ("description", "make", "model")).lower()
+    if any(b in desc for b in _PORTABLE_BRANDS):
+        base = "portable screen"
+    else:
+        words = [w for w in re.split(r"[^a-z0-9]+", desc)
+                 if len(w) >= 3 and not w.isdigit() and w not in _STOP
+                 and w not in _BRAND_SKIP and not re.search(r"\d", w)]
+        base = words[0].capitalize() if words else str(monitor.get("name"))
+    if base == "portable screen":
+        return base          # the owner's own name; no left/middle/right gloss
+    ordered = _ordered(monitors)
+    pos = ""
+    if len(ordered) > 1:
+        try:
+            idx = next(i for i, m in enumerate(ordered)
+                       if m.get("name") == monitor.get("name"))
+        except StopIteration:
+            idx = None
+        if idx == 0:
+            pos = "left"
+        elif idx == len(ordered) - 1:
+            pos = "right"
+        elif idx is not None:
+            pos = "middle" if len(ordered) % 2 == 1 else \
+                  ("left" if idx < len(ordered) / 2 else "right")
+    return f"{pos} {base}" if pos else base
+
+
 def resolve_monitor_phrase(phrase, monitors, backend_name=""):
     """Resolve a human monitor phrase to ONE live monitor dict.
 

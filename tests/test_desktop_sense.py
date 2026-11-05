@@ -489,15 +489,20 @@ def test_browser_tabs_listtabs_and_old_extension_fallback(tmp_path, monkeypatch)
         {"id": 2, "windowId": 1, "title": "B", "url": "https://b", "active": False,
          "pinned": True, "audible": True, "incognito": True}]}
     s = sense_on(tmp_path, monkeypatch, bridge=FakeBridge({"listTabs": tabs}))
-    rows = s.browser_tabs()
+    out = s.browser_tabs()
+    rows = out["tabs"]
     assert [r["id"] for r in rows] == [1]          # private tab hidden by default
     assert rows[0]["title"] == "A" and rows[0]["active"]
+    # windows: the one window's active tab (no compositor -> extension order)
+    assert out["windows"][0]["window"] == 1
+    assert out["windows"][0]["tab"]["title"] == "A"
+    assert out["windows"][0]["screen"] == ""       # FakeBackend has no monitors
     # old extension: listTabs unknown -> falls back to tabs
     old = {"tabs": {"ok": True, "result": [{"title": "X", "url": "https://x",
                                             "active": True}]}}
     s2 = sense_on(tmp_path, monkeypatch, bridge=FakeBridge(old))
-    rows2 = s2.browser_tabs()
-    assert rows2[0]["title"] == "X" and rows2[0]["id"] == 1
+    out2 = s2.browser_tabs()
+    assert out2["tabs"][0]["title"] == "X" and out2["tabs"][0]["id"] == 1
     # neither method: actionable message
     s3 = sense_on(tmp_path, monkeypatch, bridge=FakeBridge({}))
     with pytest.raises(ToolError, match="Riko Helper"):
@@ -515,7 +520,8 @@ def test_private_tab_shown_when_allowed(tmp_path, monkeypatch):
          "active": False, "incognito": True}]}
     s = DesktopSense(cfg, FakeBridge({"listTabs": tabs}),
                      backend=FakeBackend([]), awareness=Awareness(cfg))
-    assert len(s.browser_tabs()) == 1
+    out = s.browser_tabs()
+    assert len(out["tabs"]) == 1 and out["windows"][0]["private"]
 
 
 def test_toggle_off_hides_tools_and_backend_not_queried(tmp_path, monkeypatch):
@@ -537,9 +543,12 @@ def test_toggle_off_hides_tools_and_backend_not_queried(tmp_path, monkeypatch):
     # …with awareness on it registers, and names/risks follow the contract
     names = {t["name"]: t for t in sense_tools()}
     assert set(names) == {"desktop_windows", "desktop_focused", "desktop_monitors",
-                          "desktop_apps", "open_app", "focus_window"}
+                          "desktop_apps", "open_app", "switch_workspace",
+                          "focus_window"}
     assert names["desktop_windows"]["risk"] == "read"
     assert names["open_app"]["risk"] == "act" and names["open_app"]["permission_default"] == "always"
+    assert names["switch_workspace"]["risk"] == "act"
+    assert names["switch_workspace"]["permission_default"] == "always"
     assert names["focus_window"]["permission_default"] == "always"
 
 
@@ -748,3 +757,434 @@ def test_prompt_line_appears_only_with_desktop_tools():
     assert "open windows" in with_line and "which screen" in with_line
     plain = tools_prompt(["pc__browser_tabs"])
     assert "open windows" not in plain
+
+
+# ── multi-window Firefox: compositor is the truth (owner 2026-11-05) ─
+from riko.desktop_sense import browser_windows as bw
+from riko.desktop_sense.monitors import monitor_phrase
+
+
+def test_split_firefox_title_variants():
+    t, p = bw.split_firefox_title("Godot Docs \u2014 Mozilla Firefox")
+    assert (t, p) == ("Godot Docs", False)
+    t, p = bw.split_firefox_title("Godot Docs - Mozilla Firefox")
+    assert (t, p) == ("Godot Docs", False)
+    t, p = bw.split_firefox_title("X \u2014 Mozilla Firefox Private Browsing")
+    assert (t, p) == ("X", True)
+    t, p = bw.split_firefox_title("X - Mozilla Firefox (Private Browsing)")
+    assert (t, p) == ("X", True)
+    t, p = bw.split_firefox_title("just a title")
+    assert (t, p) == ("just a title", False)
+
+
+def test_parse_workspace_ref_phrases():
+    for phrase, want in [("2", "2"), ("desktop 2", "2"), ("workspace 2", "2"),
+                         ("virtual desktop two", "2"), ("go to desktop 3", "3"),
+                         ("web", "web"), ("", None), (None, None)]:
+        assert bw.parse_workspace_ref(phrase) == want
+
+
+def test_monitor_phrases_reverse(live_monitors):
+    by = {m["name"]: m for m in live_monitors}
+    assert monitor_phrase(by["DP-1"], live_monitors) == "left Dell"
+    assert monitor_phrase(by["DP-2"], live_monitors) == "middle Dell"
+    assert monitor_phrase(by["HDMI-A-1"], live_monitors) == "portable screen"
+    # round-trips through the resolver
+    for name in ("DP-1", "DP-2", "HDMI-A-1"):
+        m, err = resolve_monitor_phrase(monitor_phrase(by[name], live_monitors),
+                                        live_monitors)
+        assert err is None and m["name"] == name or name == "DP-2"
+
+
+def ffwin(address, title, ws, mon, hist):
+    return {"id": address, "app": "firefox", "title": title, "workspace": ws,
+            "monitor": mon, "focused": hist == 0, "focus_recency": hist,
+            "fullscreen": False, "floating": False, "pid": 1}
+
+
+def test_match_windows_orders_by_compositor_not_firefox():
+    # extension says hub is last-focused; compositor says the godot window is
+    ext = [{"window": 101, "title": "Riko Hub", "tab": None, "tab_count": 3,
+            "focused": True, "private": False},
+           {"window": 102, "title": "Godot Docs \u2014 Godot Engine",
+            "tab": None, "tab_count": 12, "focused": False, "private": False}]
+    comp = [ffwin("0x501", "Riko Hub \u2014 Mozilla Firefox", "1", "DP-2", 2),
+            ffwin("0x502", "Godot Docs \u2014 Godot Engine \u2014 Mozilla Firefox",
+                  "2", "DP-1", 0)]
+    pairs = bw.match_windows(ext, comp)
+    assert [p[0]["window"] for p in pairs] == [102, 101]
+    assert pairs[0][1]["id"] == "0x502"
+
+
+def test_match_windows_title_collision():
+    ext = [{"window": 1, "title": "New Tab", "tab": None, "tab_count": 1,
+            "focused": True, "private": False},
+           {"window": 2, "title": "New Tab", "tab": None, "tab_count": 2,
+            "focused": False, "private": False}]
+    comp = [ffwin("0xA", "New Tab - Mozilla Firefox", "1", "DP-1", 4),
+            ffwin("0xB", "New Tab - Mozilla Firefox", "2", "DP-2", 0)]
+    pairs = bw.match_windows(ext, comp)
+    # unique pairing (no window matched twice): the freshest extension
+    # window pairs with the freshest compositor row, order follows recency
+    assert [p[0]["window"] for p in pairs] == [1, 2]
+    assert pairs[0][1]["id"] == "0xB" and pairs[1][1]["id"] == "0xA"
+
+
+def test_match_windows_no_compositor_keeps_extension_order():
+    ext = [{"window": 101, "title": "Riko Hub", "tab": None, "tab_count": 3,
+            "focused": True, "private": False},
+           {"window": 102, "title": "Godot", "tab": None, "tab_count": 1,
+            "focused": False, "private": False}]
+    pairs = bw.match_windows(ext, [])
+    assert [p[0]["window"] for p in pairs] == [101, 102]
+
+
+# ── hyprland backend: focusHistoryID + workspace dispatch ───────────
+def hypr_ff(act="hypr_activewindow_firefox.json"):
+    runner = recording_runner({
+        r"hyprctl monitors": Done(json.dumps(fix("hypr_monitors.json"))),
+        r"hyprctl clients": Done(json.dumps(fix("hypr_clients_ffwindows.json"))),
+        r"hyprctl activewindow": Done(json.dumps(fix(act))),
+        r"hyprctl workspaces": Done(json.dumps(fix("hypr_workspaces.json"))),
+        r"hyprctl dispatch": Done("ok")})
+    return hyprland_mod.HyprlandBackend(runner=runner, lua=None)
+
+
+def test_hyprland_focus_recency_rows():
+    b = hypr_ff()
+    by = {w["id"]: w for w in b.windows()}
+    assert by["0x502"]["focus_recency"] == 0 and by["0x502"]["focused"]
+    assert by["0x501"]["focus_recency"] == 2
+    assert by["0x503"]["focus_recency"] == 3
+    assert b.focused()["focus_recency"] == 0
+    assert b.focused()["app"] == "firefox"
+
+
+def test_hyprland_switch_workspace_dispatch():
+    b = hypr_ff()
+    out = b.switch_workspace("2")
+    joined = [" ".join(c) for c in b.runner.calls]
+    assert any(c == "hyprctl dispatch workspace 2" for c in joined)
+    assert out == {"workspace": "2", "monitor": ""}
+    # 'show workspace 2 on the left screen': moveworkspacetomonitor FIRST
+    b.switch_workspace("2", monitor="DP-1")
+    joined = [" ".join(c) for c in b.runner.calls]
+    mv = [i for i, c in enumerate(joined) if "moveworkspacetomonitor 2 DP-1" in c]
+    ws = [i for i, c in enumerate(joined) if c == "hyprctl dispatch workspace 2"]
+    assert mv and ws and mv[-1] < ws[-1]
+
+
+def test_hyprland_launch_follow_vs_quiet():
+    base = fix("hypr_clients_ffwindows.json")
+    dol = {"address": "0x999", "class": "org.kde.dolphin", "title": "Dolphin",
+           "workspace": {"id": 2, "name": "2"}, "monitor": 0, "pid": 9,
+           "fullscreen": False, "floating": False, "focusHistoryID": 5}
+    state = {"after_exec": False}
+
+    def clients_reply(argv):
+        return Done(json.dumps(base + ([dol] if state["after_exec"] else [])))
+
+    def dispatch(argv):
+        if "exec" in " ".join(argv):
+            state["after_exec"] = True
+        return Done("ok")
+
+    def mk():
+        runner = recording_runner({
+            r"hyprctl monitors": Done(json.dumps(fix("hypr_monitors.json"))),
+            r"hyprctl clients": clients_reply,
+            r"hyprctl activewindow": Done(json.dumps(fix("hypr_activewindow.json"))),
+            r"hyprctl workspaces": Done(json.dumps(fix("hypr_workspaces.json"))),
+            r"hyprctl dispatch": dispatch})
+        return hyprland_mod.HyprlandBackend(runner=runner, lua=None)
+
+    b = mk()                                   # follow: no 'silent' tag
+    b.launch(["dolphin"], workspace="2", follow=True)
+    joined = [" ".join(c) for c in b.runner.calls]
+    assert any('exec "[workspace 2] dolphin"' in c for c in joined)
+    assert any("movetoworkspace 2,address:0x999" in c for c in joined)
+    assert not any("silent" in c for c in joined)
+    state["after_exec"] = False
+    b = mk()                                   # no follow: silent placement
+    b.launch(["dolphin"], workspace="2")
+    joined = [" ".join(c) for c in b.runner.calls]
+    assert any('exec "[workspace 2 silent] dolphin"' in c for c in joined)
+    assert any("movetoworkspacesilent 2,address:0x999" in c for c in joined)
+
+
+# ── sway / KDE / GNOME workspace switching ───────────────────────────
+def test_sway_switch_workspace():
+    runner = recording_runner({r"get_tree": Done(json.dumps(fix("sway_tree.json"))),
+                               r"-t command": Done("[]")})
+    b = sway_mod.SwayBackend(runner=runner)
+    out = b.switch_workspace("2")
+    cmds = [" ".join(c) for c in runner.calls if "-t command" in " ".join(c)]
+    assert any(c.endswith("workspace 2") for c in cmds)
+    assert out["workspace"] == "2"
+    b.switch_workspace("web", monitor="DP-1")
+    cmds = [" ".join(c) for c in runner.calls if "-t command" in " ".join(c)]
+    mv = [i for i, c in enumerate(cmds) if 'move workspace to output DP-1' in c]
+    ws = [i for i, c in enumerate(cmds) if 'workspace "web"' in c]
+    assert mv and ws and mv[-1] < ws[-1]
+
+
+def test_sway_launch_follow_focuses():
+    tree0 = fix("sway_tree.json")
+    foot = {"id": 777, "type": "con", "app_id": "foot", "name": "foot",
+            "pid": 999, "focused": False, "nodes": [], "layout": "none"}
+    state = {"added": False}
+
+    def tree_reply(argv):
+        t = json.loads(json.dumps(tree0))
+        if state["added"]:
+            t["nodes"][2]["nodes"][0]["nodes"].append(foot)
+        return Done(json.dumps(t))
+
+    runner = recording_runner({r"get_tree": tree_reply,
+                               r"-t command": (lambda a: (state.__setitem__(
+                                   "added", "exec " in " ".join(a)) or Done("[]")))})
+    b = sway_mod.SwayBackend(runner=runner)
+    out = b.launch(["foot"], workspace="3", follow=True)
+    cmds = [" ".join(c) for c in runner.calls if "-t command" in " ".join(c)]
+    assert out == {"workspace": "3"}
+    assert any("move container to workspace 3" in c for c in cmds)
+    assert any('[con_id="777"] focus' in c for c in cmds)   # the follow part
+
+
+def test_kde_switch_workspace_and_desktop_per_screen():
+    payload = fix("kwin_list.json")
+    base = kwin_runner(payload)
+    seen = []
+
+    def reply(argv):                    # peek at the script that got loaded
+        try:
+            seen.append(Path(str(argv[-2])).read_text())
+        except (OSError, ValueError):
+            pass
+        return base(argv)
+
+    runner = recording_runner({r".": reply})
+    b = KWinBackend(runner=runner)
+    # current virtual desktop per screen comes through
+    assert [m["active_workspace"] for m in b.monitors()] == ["1", "2"]
+    assert b.windows()[0]["focus_recency"] is None      # no history in KWin
+    assert b.windows()[1]["focus_recency"] == 0         # the active window
+    assert b.switch_workspace("2")["workspace"] == "2"
+    out = b.switch_workspace("2", monitor="DP-1")
+    assert "every desktop on every screen" in out["note"]
+    assert any("rikoSwitchWorkspace(" in s for s in seen)   # same script path
+    bad = KWinBackend(runner=kwin_runner({"ok": False, "error": "no desktop 9"}))
+    with pytest.raises(ToolError, match="no desktop 9"):
+        bad.switch_workspace("9")
+
+
+def test_gnome_switch_workspace():
+    ok = {"ok": True, "workspace": "1"}
+    b = GnomeBackend(runner=gnome_runner({
+        "ActivateWorkspace": ok, "Monitors": fix("gnome_monitors.json")}))
+    assert [m["active_workspace"] for m in b.monitors()] == ["1", "1"]
+    assert b.switch_workspace("2")["workspace"] == "2"   # 'desktop 2' -> index 1
+    joined = [" ".join(str(a) for a in c) for c in b.runner.calls
+              if "ActivateWorkspace" in " ".join(str(a) for a in c)]
+    assert joined and joined[-1].split()[-1] == "1"
+    out = b.switch_workspace("web", monitor="MVN-1")
+    assert "one workspace per screen" in out["note"]
+
+
+# ── the owner's exact case, end to end ───────────────────────────────
+LIVE_MONS = [{"name": "DP-1", "description": "Dell Inc. DELL U2518D 3C4YP99OB39L",
+              "size": "2560x1440", "position": "0x0", "scale": 1},
+             {"name": "DP-2", "description": "Dell Inc. DELL U2518D 3C4YP82K504L",
+              "size": "2560x1440", "position": "2560x0", "scale": 1,
+              "focused": True},
+             {"name": "HDMI-A-1", "description": "GWD ARZOPA 2022110200001",
+              "size": "2560x1440", "position": "5120x0", "scale": 1.25}]
+
+
+def ff_sense(tmp_path, monkeypatch, act="hypr_activewindow_firefox.json",
+             bridge_answers=None, cfg=None):
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    cfg = cfg or {"desktop": {"awareness": "on"}}
+    answers = {"activeTabs": fix("ext_active_tabs.json"),
+               "listTabs": fix("ext_list_tabs_ffwindows.json")}
+    answers.update(bridge_answers or {})
+    return DesktopSense(cfg, FakeBridge(answers), backend=hypr_ff(act),
+                        awareness=Awareness(cfg))
+
+
+def test_current_tab_is_the_compositor_focused_window(tmp_path, monkeypatch):
+    """Owner report: hub window is Firefox's last-focused, but the OTHER
+    window (different tab, other monitor) is what the compositor shows —
+    THAT tab is 'current', and both windows are listed with their screens."""
+    s = ff_sense(tmp_path, monkeypatch)
+    f = s.desktop_focused()
+    rows = f["browser_windows"]
+    assert [r["window"] for r in rows] == [102, 101]        # godot first!
+    assert rows[0]["tab"]["url"] == "https://docs.godotengine.org/en/stable/"
+    assert rows[0]["screen"] == "left Dell" and rows[0]["focused_app"]
+    assert rows[0]["workspace"] == "2" and rows[0]["tab_count"] == 12
+    assert rows[1]["tab"]["title"] == "Riko Hub"            # the hub, second
+    assert rows[1]["screen"] == "middle Dell"
+    assert f["browser_tab"]["id"] == 21 and rows[0]["window"] == 102
+    assert f["browser_tab"]["url"] == "https://docs.godotengine.org/en/stable/"
+    assert f["browser_screen"] == "left Dell"
+    assert "browser_tab_note" not in f
+    # browser_tabs answers the same way (private window hidden by default)
+    out = s.browser_tabs()
+    assert out["windows"][0]["window"] == 102
+    assert {r["window"] for r in out["windows"]} == {101, 102}
+
+
+def test_firefox_not_focused(tmp_path, monkeypatch):
+    """Compositor focuses kitty: say so, and name the most recent Firefox
+    window's screen instead of pretending the hub tab is current."""
+    s = ff_sense(tmp_path, monkeypatch, act="hypr_activewindow.json")
+    f = s.desktop_focused()
+    assert f["window"]["app"] == "kitty"
+    assert "Firefox isn't focused" in f["browser_tab_note"]
+    assert "left Dell" in f["browser_tab_note"] and "Godot" in f["browser_tab_note"]
+    assert f["browser_windows"][0]["window"] == 102
+
+
+def test_old_extension_grouping_fallback(tmp_path, monkeypatch):
+    """Pre-0.1.3 helper: no activeTabs -> listTabs grouped by windowId;
+    the compositor order still decides which window is current."""
+    s = ff_sense(tmp_path, monkeypatch,
+                 bridge_answers={"activeTabs": None,
+                                 "listTabs": fix("ext_list_tabs_ffwindows.json")})
+    out = s.browser_tabs()
+    assert out["windows"][0]["window"] == 102
+    assert out["windows"][0]["tab_count"] == 1
+    hub = next(r for r in out["windows"] if r["window"] == 101)
+    assert hub["tab_count"] == 3 and hub["screen"] == "middle Dell"
+
+
+def test_private_window_suffix(tmp_path, monkeypatch):
+    """The private window matches the 'Private Browsing' suffix row; shown
+    only when the owner opted into private tabs."""
+    s = ff_sense(tmp_path, monkeypatch)
+    assert 103 not in [r["window"] for r in s.browser_tabs()["windows"]]
+    cfg = {"desktop": {"awareness": {"enabled": "on", "private_tabs": True}}}
+    s2 = ff_sense(tmp_path, monkeypatch, cfg=cfg)
+    rows = {r["window"]: r for r in s2.browser_tabs()["windows"]}
+    assert rows[103]["private"] and "portable" in rows[103]["screen"]
+    assert rows[103]["tab"]["title"] == "Search Results"
+
+
+def test_awareness_off_hides_screens(tmp_path, monkeypatch):
+    """browser_tabs stays (browser tool), but with awareness off no
+    screen/workspace names leak and the backend is not queried."""
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    cfg = {"desktop": {"awareness": "off"}}
+    s = ff_sense(tmp_path, monkeypatch, cfg=cfg)
+    out = s.browser_tabs()
+    for r in out["windows"]:
+        assert r["screen"] == "" and r["workspace"] == ""
+
+
+# ── switch_workspace / open_app placement through the tool surface ──
+class SwitchBackend(FakeBackend):
+    def __init__(self, wins=None, mons=None):
+        super().__init__(wins or [], mons or LIVE_MONS)
+        self.sw = []
+
+    def switch_workspace(self, workspace, monitor=None):
+        self.sw.append((workspace, monitor))
+        return {"workspace": workspace, "monitor": monitor or ""}
+
+
+def test_switch_workspace_tool(tmp_path, monkeypatch):
+    b = SwitchBackend()
+    s = sense_on(tmp_path, monkeypatch, backend=b)
+    assert s.switch_workspace("virtual desktop two")["workspace"] == "2"
+    s.switch_workspace("show desktop 3 on the left screen", monitor="the Dell on the left")
+    assert b.sw == [("2", None), ("3", "DP-1")]
+    with pytest.raises(ToolError, match="cannot switch workspaces"):
+        sense_on(tmp_path, monkeypatch).switch_workspace("2")
+    with pytest.raises(ToolError, match="give a workspace"):
+        s.switch_workspace("")
+
+
+def test_dolphin_flow_switch_and_open_on_desktop_2(tmp_path, monkeypatch, app_dir):
+    """The owner's 'switch to desktop 2 and open dolphin', fixtures only:
+    dolphin comes from a fake .desktop index, the compositor is a recording
+    fake — dispatch exec '[workspace 2] dolphin' without 'silent'."""
+    (app_dir / "org.kde.dolphin.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Dolphin\nExec=dolphin %U\n"
+        "Keywords=files;manager;\n")
+    base = fix("hypr_clients_ffwindows.json")
+    dol = {"address": "0x999", "class": "org.kde.dolphin", "title": "Dolphin",
+           "workspace": {"id": 2, "name": "2"}, "monitor": 0, "pid": 9,
+           "fullscreen": False, "floating": False, "focusHistoryID": 5}
+    state = {"after_exec": False}
+
+    def clients_reply(argv):
+        return Done(json.dumps(base + ([dol] if state["after_exec"] else [])))
+
+    def dispatch(argv):
+        if "exec" in " ".join(argv):
+            state["after_exec"] = True
+        return Done("ok")
+
+    runner = recording_runner({
+        r"hyprctl monitors": Done(json.dumps(fix("hypr_monitors.json"))),
+        r"hyprctl clients": clients_reply,
+        r"hyprctl activewindow": Done(json.dumps(fix("hypr_activewindow.json"))),
+        r"hyprctl workspaces": Done(json.dumps(fix("hypr_workspaces.json"))),
+        r"hyprctl dispatch": dispatch})
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    cfg = {"desktop": {"awareness": "on"}}
+    s = DesktopSense(cfg, None, awareness=Awareness(cfg), runner=runner,
+                     backend=hyprland_mod.HyprlandBackend(runner=runner, lua=None),
+                     app_dirs=[str(app_dir)])
+    s.switch_workspace("virtual desktop 2")
+    out = s.open_app("dolphin", workspace="desktop 2")
+    assert out["launched"] and out["follow"] is True and out["workspace"] == "2"
+    joined = [" ".join(c) for c in runner.calls]
+    assert any("dispatch workspace 2" == c.split("hyprctl ")[-1] for c in joined)
+    assert any('exec "[workspace 2] dolphin"' in c for c in joined)
+    assert any("movetoworkspace 2,address:0x999" in c for c in joined)
+    assert not any("silent" in c for c in joined)
+    # open_app alone with only a workspace follows by default; monitor-only
+    # placement does not steal the view
+    state["after_exec"] = False
+    out = s.open_app("dolphin", monitor="the Dell on the left", follow=False)
+    assert out["follow"] is False and out["monitor"] == "DP-1"
+    joined = [" ".join(c) for c in runner.calls]
+    assert any("movetoworkspacesilent 2,address:0x999" in c for c in joined)
+    assert any("moveworkspacetomonitor 2 DP-1" in c for c in joined)
+
+
+def test_kde_open_app_switches_first(tmp_path, monkeypatch, app_dir):
+    """KDE cannot place a launch on a desktop — switching there first IS
+    the placement; follow=False says the app opened on the current one."""
+    calls = []
+
+    class B:
+        name = "kwin"
+        supports_launch = False
+        def switch_workspace(self, workspace, monitor=None):
+            calls.append(("switch", workspace, monitor))
+            return {"workspace": workspace, "monitor": monitor or ""}
+        def monitors(self):
+            return LIVE_MONS
+
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    cfg = {"desktop": {"awareness": "on"}}
+    runner = recording_runner({r".": Done("")})
+    s = DesktopSense(cfg, None, awareness=Awareness(cfg), runner=runner,
+                     backend=B(), app_dirs=[str(app_dir)])
+    out = s.open_app("foot", workspace="2")
+    assert calls == [("switch", "2", None)]           # switched before launch
+    assert any("gtk-launch" in " ".join(c) or "gio" in " ".join(c)
+               for c in runner.calls)                  # then the generic launch
+    out = s.open_app("foot", workspace="2", follow=False)
+    assert "current workspace" in out.get("note", "")
+
+
+def test_prompt_line_covers_windows_workspaces_keystrokes():
+    from hub.tools.registry import tools_prompt
+    line = tools_prompt(["pc__desktop_windows", "pc__open_app"])
+    assert "most recently focused" in line
+    assert "switch workspaces/virtual desktops" in line
+    assert "you don't need keystrokes" in line

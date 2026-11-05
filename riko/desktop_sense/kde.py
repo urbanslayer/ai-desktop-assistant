@@ -48,6 +48,17 @@ function rikoWin(w) {
         pid: (w.pid !== undefined ? w.pid : null)
     };
 }
+function rikoCurDesktop() {
+    // Plasma 6: currentDesktop is a Workspace/Desk object (id/name);
+    // KWin 5: a plain number
+    try {
+        var cd = workspace.currentDesktop;
+        if (cd === undefined || cd === null) return "";
+        if (cd.desktopId !== undefined) return String(cd.desktopId);
+        if (cd.name !== undefined && String(cd.name)) return String(cd.name);
+        return String(cd);
+    } catch (e) { return ""; }
+}
 function rikoList() {
     var list = [];
     var wins = rikoWins();
@@ -55,6 +66,7 @@ function rikoList() {
         try { list.push(rikoWin(wins[i])); } catch (e) {}
     }
     var screens = [];
+    var cur = rikoCurDesktop();
     try {
         var ss = workspace.screens || [];
         for (var s = 0; s < ss.length; s++) {
@@ -65,12 +77,37 @@ function rikoList() {
                           size: (g.width || 0) + "x" + (g.height || 0),
                           position: (g.x || 0) + "x" + (g.y || 0),
                           scale: Number(ss[s].scale || 1),
-                          focused: false, active_workspace: ""});
+                          focused: false, active_workspace: cur});
         }
     } catch (e) {}
     var focus = null;
     try { if (workspace.activeWindow) focus = rikoWin(workspace.activeWindow); } catch (e) {}
     return JSON.stringify({ok: true, windows: list, monitors: screens, focused: focus});
+}
+function rikoSwitchWorkspace(ref) {
+    // '2' / 'desktop 2' -> the 2nd virtual desktop; names match Plasma 6
+    // desktop names. KWin 5 uses numeric currentDesktop, Plasma 6 a Desk.
+    ref = String(ref || "");
+    var m = ref.match(/(\d+)/);
+    var ds = null;
+    try { ds = workspace.desktops ? workspace.desktops() : null; } catch (e) {}
+    if (ds && ds.length) {
+        var i = -1;
+        for (var k = 0; k < ds.length; k++) {
+            if (String(ds[k].name || "") === ref) { i = k; break; }
+        }
+        if (i < 0 && m) i = parseInt(m[1], 10) - 1;
+        if (i < 0 || i >= ds.length)
+            return JSON.stringify({ok: false, error: "no desktop " + ref});
+        try { workspace.currentDesktop = ds[i];
+              return JSON.stringify({ok: true, workspace: ref}); }
+        catch (e2) { return JSON.stringify({ok: false, error: String(e2)}); }
+    }
+    if (!m) return JSON.stringify({ok: false, error: "no desktop number in " + ref});
+    var n = parseInt(m[1], 10) - 1;
+    try { workspace.currentDesktop = n;
+          return JSON.stringify({ok: true, workspace: ref}); }
+    catch (e3) { return JSON.stringify({ok: false, error: String(e3)}); }
 }
 function rikoFocus(ref) {
     var wins = rikoWins();
@@ -170,6 +207,9 @@ class KWinBackend:
                 "workspace": str(w.get("workspace", "")),
                 "monitor": str(w.get("monitor", "")),
                 "focused": bool(w.get("focused")),
+                # KWin scripting has no focus history: only the active
+                # window has a known rank
+                "focus_recency": 0 if w.get("focused") else None,
                 "fullscreen": bool(w.get("fullscreen")),
                 "floating": bool(w.get("floating")), "pid": w.get("pid")}
 
@@ -185,6 +225,25 @@ class KWinBackend:
         return self._run_script("rikoList()").get("monitors") or []
 
     # ── actions ────────────────────────────────────────────────
+    def switch_workspace(self, workspace, monitor=None) -> dict:
+        """Virtual desktops via the same KWin script:
+        `workspace.currentDesktop = desktops[n-1]` (Plasma 6) or the
+        desktop number (KWin 5). KWin cannot move one desktop onto a
+        specific screen — screens show all desktops — so a monitor is
+        answered with a note, not an error."""
+        ref = str(workspace or "").strip()
+        if not ref:
+            raise ToolError("switch_workspace: give a desktop number or name")
+        data = self._run_script(f"rikoSwitchWorkspace({json.dumps(ref)})")
+        if not data.get("ok"):
+            raise ToolError(data.get("error") or
+                            "KWin could not switch to that desktop")
+        out = {"workspace": ref, "monitor": monitor or ""}
+        if monitor:
+            out["note"] = ("KDE shows every desktop on every screen; switched "
+                           "on the whole desktop (no per-screen placement)")
+        return out
+
     def focus_window(self, ref: str) -> dict:
         data = self._run_script(f"rikoFocus({json.dumps(str(ref))})")
         if not data.get("ok"):

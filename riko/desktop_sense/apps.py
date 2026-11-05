@@ -335,13 +335,19 @@ _ALIAS = {"terminal": "terminal", "files": "filemanager", "file manager":
 
 
 def open_app(app: str, monitor: str | None = None, workspace=None, *,
-             backend=None, index: AppIndex | None = None,
+             follow=None, backend=None, index: AppIndex | None = None,
              preferences: dict | None = None, runner=None,
              resolve_monitor=None, env=None) -> dict:
     """Launch an app by desktop id / name (or a role word when the owner's
     config names one). `backend.launch` (when the compositor supports
     placement) gets the resolved monitor name / workspace; otherwise the
     generic detached launcher runs.
+
+    `follow` (default True when a workspace was asked for — the user said
+    'open it there') also SWITCHES the view to where the app lands: the
+    compositor-native launchers get the flag, backends without placement
+    (KDE/GNOME) switch to the workspace first so the new window opens
+    there. follow=False places the app without touching the current view.
 
     Returns {app, id, launched, monitor?, workspace?, how, note?}.
     """
@@ -393,21 +399,60 @@ def open_app(app: str, monitor: str | None = None, workspace=None, *,
     elif monitor:
         mon_note = " (this desktop cannot place windows on a screen; opened anyway)"
 
+    has_ws = workspace not in (None, "")
+    if follow is None:
+        # 'open it on workspace 2' reads as 'and show me that one'; a bare
+        # monitor target does not — the owner keeps their current view
+        follow = has_ws
+    follow = bool(follow)
+
+    def _kw(fn, **wanted):
+        """Only pass kwargs the target actually accepts (old backends and
+        test fakes have the pre-follow signature; a TypeError from the
+        launch itself must never look like 'unsupported keyword')."""
+        import inspect
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return wanted
+        return {k: v for k, v in wanted.items() if k in params}
+
     if backend is not None and getattr(backend, "supports_launch", False):
-        backend.launch(argv, monitor=mon_name, workspace=workspace,
-                       runner=runner, env=env)
+        kwargs = _kw(backend.launch, runner=runner, env=env, follow=follow)
+        backend.launch(argv, monitor=mon_name, workspace=workspace, **kwargs)
         how = f"{backend.name} launch"
+        if follow and has_ws and "follow" not in kwargs \
+                and hasattr(backend, "switch_workspace"):
+            backend.switch_workspace(str(workspace))   # older launcher: follow manually
     else:
+        # KDE / GNOME: the generic launcher opens on the CURRENT desktop —
+        # the only reliable placement is to switch there first (the app
+        # then maps where the user asked). Without placement support and
+        # follow=False we launch in place and say so.
+        note_ws = ""
+        if has_ws and backend is not None and hasattr(backend, "switch_workspace"):
+            if follow:
+                backend.switch_workspace(str(workspace),
+                                         **_kw(backend.switch_workspace,
+                                               monitor=mon_name))
+            else:
+                note_ws = (" (this desktop places apps on the workspace that is "
+                           "shown: switched there anyway was skipped, the app "
+                           "opened on the current workspace)")
+        elif has_ws:
+            note_ws = " (this desktop cannot place apps on a workspace; opened anyway)"
         cmd = generic_launch_command(entry) or argv
         detached_launch(cmd, runner=runner, env=env)
         how = ("gtk-launch/gio (detached)" if cmd is not argv
                else "Exec argv (detached)")
+        if note_ws:
+            mon_note = (mon_note + note_ws).strip()
 
     out = {"app": entry.get("name") or entry["app"], "id": entry.get("id", ""),
-           "launched": True, "how": how, "cmd": argv[0]}
+           "launched": True, "how": how, "cmd": argv[0], "follow": follow}
     if mon_name:
         out["monitor"] = mon_name
-    if workspace not in (None, ""):
+    if has_ws:
         out["workspace"] = workspace
     if mon_note:
         out["note"] = mon_note.strip()

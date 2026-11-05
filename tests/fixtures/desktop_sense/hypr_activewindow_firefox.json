@@ -1,0 +1,15 @@
+{
+ "address": "0x502",
+ "class": "firefox",
+ "title": "Godot Docs — Godot Engine — Mozilla Firefox",
+ "workspace": {
+  "id": 2,
+  "name": "2"
+ },
+ "monitor": 0,
+ "pid": 5002,
+ "fullscreen": 0,
+ "floating": {
+  "state": 0
+ }
+}

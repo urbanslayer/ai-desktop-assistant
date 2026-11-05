@@ -10,15 +10,17 @@ as the browser tools).
 | tool | risk / default permission | what it returns / does |
 |---|---|---|
 | `desktop_windows()` | read / always | Open windows: app id/class, title, workspace, monitor, focused, fullscreen/floating, pid. Titles are capped at 120 chars. |
-| `desktop_focused()` | read / always | The focused window (same shape), plus the **focused browser tab** (title + URL) when Firefox is focused and the Riko Helper is linked. |
-| `browser_tabs()` | read / always | All Firefox tabs (title, URL, active, window, pinned, audible) via the Riko Helper extension, which already has the `tabs` permission. |
+| `desktop_focused()` | read / always | The focused window (same shape), plus the Firefox windows when the Riko Helper is linked: `browser_windows` lists **every Firefox window** (active tab, tab count, screen, workspace, rank — index 0 is the CURRENT tab, ordered by the compositor's focus recency, not Firefox's own last-focused order), `browser_tab`/`browser_screen` describe that window's tab. When Firefox has windows but isn't focused, `browser_tab_note` says so and names the most recent window's screen. |
+| `browser_tabs()` | read / always | `{windows, tabs}`: `windows` is the same per-Firefox-window list (most recently focused first — THE current tab is `windows[0]`; screens/workspaces only while desktop awareness is on), `tabs` is every tab (title, URL, active, window, pinned, audible) via the Riko Helper extension, which already has the `tabs` permission. |
 | `desktop_monitors()` | read / always | Monitors: name, description/make/model, size, position, scale, focused, active workspace. On Hyprland, also the **configured** layout from the Lua config (see below). |
 | `desktop_apps(query?)` | read / always | Installed launchable apps from XDG `.desktop` files (Name, GenericName, Keywords, Exec id, NoDisplay/Hidden respected), fuzzy-searched. |
-| `open_app(app, monitor?, workspace?)` | act / **always** (owner decision 2026-11-05: no confirmation) | Launch an installed app (by desktop id or fuzzy name). It can go to a given monitor (by name, description or position words like "left/middle/right", "the Dell on the right", "the portable screen") or workspace where the compositor allows it. |
+| `open_app(app, monitor?, workspace?, follow?)` | act / **always** (owner decision 2026-11-05: no confirmation) | Launch an installed app (by desktop id or fuzzy name). It can go to a given monitor (by name, description or position words like "left/middle/right", "the Dell on the right", "the portable screen") or workspace where the compositor allows it. `follow` (default true when a workspace was asked for — the user said "switch to X and open …") ALSO switches the view there; on Hyprland that's `hyprctl dispatch exec "[workspace N] <cmd>"` (no `silent` when following), on Sway move-container + focus, on KDE/GNOME switch-to-the-desktop-then-launch. |
+| `switch_workspace(workspace, monitor?)` | act / **always** (owner decision 2026-11-05, same as open_app) | Show a workspace / virtual desktop: accepts `2`, `desktop 2`, `virtual desktop two` or a workspace name. Hyprland `hyprctl dispatch workspace <n|name>` (with a monitor: `moveworkspacetomonitor` first — that is the dispatch that shows workspace 2 on the left screen), Sway `swaymsg workspace <n>` (`move workspace to output` first with a monitor), KDE via the KWin script (`workspace.currentDesktop = desktops[n-1]`, "virtual desktop" wording), GNOME via the extension's `ActivateWorkspace(index)`. |
 | `focus_window(window)` | act / always | Bring an open window to the front (where the compositor allows it). |
 
 Not in scope: keystrokes or mouse control of other apps, closing or killing windows, reading window
-*contents*, and screenshots. Screenshots ("look at my screen") are an optional later step, below.
+*contents*, and screenshots. Workspace switching is NOT a keystroke: it is a first-class compositor
+action (`switch_workspace`), so "switch to desktop 2" never needs key synthesis. Screenshots ("look at my screen") are an optional later step, below.
 
 ## Privacy rules
 
@@ -37,7 +39,11 @@ Not in scope: keystrokes or mouse control of other apps, closing or killing wind
    - windows/focus/monitors/workspaces from `hyprctl -j clients|activewindow|monitors|workspaces` (or the
      IPC socket directly);
    - launch with `hyprctl dispatch exec "[workspace N silent] <cmd>"` (or `[monitor <name>]` rules where
-     supported); focus with `hyprctl dispatch focuswindow address:<addr>`.
+     supported; drop `silent` when `follow` is set so the view switches with the app); focus with
+     `hyprctl dispatch focuswindow address:<addr>`; switch workspaces with
+     `hyprctl dispatch workspace <n|name>` (`moveworkspacetomonitor <n> <monitor>` first when the user
+     named a screen). Windows carry `focusHistoryID` (`hyprctl -j clients`) — 0 is the currently focused
+     window, larger is less recent — which decides which Firefox window owns "the current tab".
    - **Config awareness (owner instruction):** read `~/.config/hypr/hyprland.lua` FIRST, then follow its
      `require("…")` / `dofile` / `loadfile` lines. Module names resolve relative to `~/.config/hypr/`,
      e.g. `require("monitors")` → `monitors.lua`, and likewise `keybinds.lua` and `windowrules.lua`.
@@ -55,13 +61,16 @@ Not in scope: keystrokes or mouse control of other apps, closing or killing wind
    - windows via a small **KWin script** loaded at runtime over D-Bus (`org.kde.KWin /Scripting`
      `loadScript` + `run`). It reports `workspace.windowList()`, captions, resourceClass, output and
      desktop back through a D-Bus call or a temp file, then unloads.
-   - focus via the same script (`workspace.activeWindow = w`); monitors via the script's `workspace.screens`.
+   - focus via the same script (`workspace.activeWindow = w`); monitors (with the current virtual
+     desktop per screen) via the script's `workspace.screens`; switch virtual desktops via the same
+     script (`workspace.currentDesktop = desktops[n-1]`, name-aware on Plasma 6).
    - launch via `kioclient exec <desktop file>` / `gtk-launch`. A specific screen is best-effort: KWin rule
      or script move after it maps.
 3. **GNOME (Mutter):**
    - Wayland GNOME exposes no window list to normal apps (`Shell.Eval` is disabled since 41).
    - Support it via a tiny optional **GNOME Shell extension** we ship (`riko-windows@riko`). It exposes a
-     D-Bus `List()`/`Activate(id)` reading `global.get_window_actors()`, and Riko's README gives
+     D-Bus `List()`/`Activate(id)`/`ActivateWorkspace(index)` reading `global.get_window_actors()`
+     (workspace indexes/names come from `workspace_manager`), and Riko's README gives
      one-command install instructions.
    - Without the extension: only `desktop_apps`/`open_app` (via `gio launch`/`gtk-launch`) and the browser
      tools work, and the tools say why.
@@ -77,15 +86,23 @@ Not in scope: keystrokes or mouse control of other apps, closing or killing wind
 ## Browser tabs
 
 The Riko Helper extension already has `tabs`. It adds `listTabs` / `activeTab` methods on its existing
-link (title, URL, windowId, active, pinned, audible, incognito → dropped unless the owner opts in). The
-desktop answers `browser_tabs`/the focused-tab part from it. Firefox extension changes need a version bump
+link (title, URL, windowId, active, pinned, audible, incognito → dropped unless the owner opts in) and,
+from 0.1.3, `activeTabs`: `{focusedWindowId, windows: [{windowId, focused, state, title, tabCount,
+lastFocusedAt, activeTab}]}` ordered most-recently-focused first. Older extensions only know `activeTab`/
+`listTabs` — the desktop then groups `listTabs` by windowId (active tab per window, focus order unknown).
+Either way the **compositor** (focusHistoryID / the focused window) decides which Firefox window is
+"current", matched by the window's active-tab title. The desktop answers
+`browser_tabs`/the focused-tab part from it. Firefox extension changes need a version bump
 and re-signing (`web-ext sign --channel unlisted`, keys in browser-ext/.env, never printed).
 
 ## Prompt
 
 When the tools are offered, the hub's tools block gets one line: "You can see the owner's open windows,
 browser tabs and screens, and open apps on a given screen, with the desktop_* and browser_tabs tools; look
-before guessing, and say which screen you used."
+before guessing, and say which screen you used. There can be several Firefox windows; when asked for the
+current/active tab, give the most recently focused one first and mention the others with their screen if
+more than one window is open. You can switch workspaces/virtual desktops and open apps on a given workspace
+or screen; you don't need keystrokes for that."
 
 ## Optional later: "look at my screen"
 
