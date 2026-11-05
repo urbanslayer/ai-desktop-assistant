@@ -28,7 +28,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+import traceback
 from typing import Callable, Optional
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, Qt, QTimer, QUrl, Signal
@@ -649,7 +651,26 @@ def main():
     # Line-buffer stdout even when piped to a log file, so tail -f shows things as they happen.
     sys.stdout.reconfigure(line_buffering=True)
     import faulthandler
+    # A native crash (PortAudio used to SIGSEGV here when the L key closed
+    # the mic stream from the Qt thread mid-read) dies with no Python
+    # traceback: this makes even a SIGSEGV/SIGABRT print where it happened.
+    faulthandler.enable(file=sys.stderr, all_threads=True)
     faulthandler.register(signal.SIGUSR1)  # kill -USR1 -> python backtrace (hang debugging)
+
+    def _print_exc(etype, value, tb):
+        """Print an uncaught exception and KEEP RUNNING: a Qt slot or worker
+        thread raising must never be a second 'the app just closes'."""
+        traceback.print_exception(etype, value, tb)
+        sys.stderr.flush()
+
+    sys.excepthook = _print_exc
+
+    def _print_thread_exc(args):
+        print(f"[thread] uncaught exception in {args.thread.name!r}:",
+              file=sys.stderr, flush=True)
+        _print_exc(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = _print_thread_exc
 
     cfg = load_config()
     cfg["asr"] = args.asr or cfg["asr"]
