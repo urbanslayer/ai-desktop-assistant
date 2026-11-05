@@ -20,6 +20,10 @@ the tab's content script link_relay.js brings the WebSocket up (the tab's
 origin is http — see the wss-upgrade note in background.js). Then we drive
 browser_open + browser_read, one click that must come back as
 needs_confirmation (the "Buy now" danger upgrade), and one plain click.
+Finally it opens a second page tab and drives the read-only tab survey
+(listTabs / activeTab): both page tabs listed, the link tab filtered, the
+TabInfo shape (id, windowId, title<=200, url, active, pinned, audible,
+incognito, lastAccessed) intact, and activeTab = the newest active tab.
 
 Everything on the scratch port is OUR process: stub first, bridge after;
 nothing on the machine besides our PIDs is touched.
@@ -52,6 +56,8 @@ PAGE = """<!doctype html><html><head><title>Riko headless test</title></head>
 <button onclick="this.textContent='clicked'">Buy now</button>
 <a href="#top">a plain link</a>
 </body></html>"""
+PAGE2 = """<!doctype html><html><head><title>Riko headless test 2</title></head>
+<body><h1>Second tab for the tab survey</h1></body></html>"""
 
 
 def free_port():
@@ -97,10 +103,12 @@ def main():
     page_port = free_port()
     page_dir = Path(tempfile.mkdtemp(prefix="riko-testpage-"))
     (page_dir / "index.html").write_text(PAGE)
+    (page_dir / "second.html").write_text(PAGE2)
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(page_dir))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", page_port), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     page_url = f"http://127.0.0.1:{page_port}/index.html"
+    page2_url = f"http://127.0.0.1:{page_port}/second.html"
 
     profile = Path(tempfile.mkdtemp(prefix="riko-headless-profile-"))
     # Seeding storage.local: Firefox 151 no longer reads webextensions.*
@@ -209,6 +217,48 @@ def main():
         print("browser_tabs ->", titles)
         assert not any("Riko link" in (t[1] or "") for t in titles), \
             "the link tab leaked into browser_tabs numbering"
+
+        # Phase 3: read-only tab survey (desktop awareness, DESKTOP_SENSE.md).
+        # Open a SECOND tab so listTabs must show two page tabs, then check
+        # the documented shape: link tab filtered, no incognito in a plain
+        # session, titles capped, and activeTab = the newest (active) tab.
+        opened2 = bridge.call("open", {"url": page2_url, "new_tab": True})
+        print("browser_open(second) ->", opened2)
+        assert opened2.get("ok") is True, "opening the second tab failed"
+        time.sleep(1.0)  # let the new tab settle
+
+        lt = bridge.call("listTabs", {})
+        print("listTabs ->", json.dumps(lt.get("result"), ensure_ascii=False)[:600])
+        assert lt.get("ok") is True, f"listTabs failed: {lt}"
+        entries = lt["result"]
+        assert isinstance(entries, list) and entries, "listTabs returned nothing"
+        need = {"id", "windowId", "title", "url", "active", "pinned",
+                "audible", "incognito", "lastAccessed"}
+        missing = [e for e in entries if not need.issubset(e)]
+        assert not missing, f"TabInfo fields missing: {missing[:1]}"
+        urls = [e["url"] or "" for e in entries]
+        assert any(u.startswith(page_url) for u in urls), f"first page tab missing: {urls}"
+        assert page2_url in urls, f"second page tab missing: {urls}"
+        link_pref = f"http://127.0.0.1:{ws_port}/link"
+        assert not any(u.startswith(link_pref) for u in urls), \
+            f"the link tab leaked into listTabs: {urls}"
+        assert not any(f"127.0.0.1%3A{ws_port}%2Flink" in u for u in urls), \
+            "the link tab's error page leaked into listTabs"
+        assert all(e["incognito"] is False for e in entries), \
+            "incognito flag wrong in a plain session"
+        assert all(len(e["title"]) <= 200 for e in entries), "title over the 200-char cap"
+        assert sum(1 for e in entries if e["active"]) >= 1
+
+        at = bridge.call("activeTab", {})
+        print("activeTab ->", json.dumps(at.get("result"), ensure_ascii=False))
+        assert at.get("ok") is True, f"activeTab failed: {at}"
+        act = at["result"]
+        assert isinstance(act, dict), f"activeTab returned {act!r}, expected the active tab"
+        assert set(act) == need, f"activeTab TabInfo shape wrong: {sorted(act)}"
+        assert act["url"] == page2_url, \
+            f"activeTab is {act['url']!r}, expected the just-opened {page2_url!r}"
+        assert act["active"] is True and act["incognito"] is False
+        assert act["id"] in [e["id"] for e in entries], "activeTab id not in listTabs"
         ok = True
     finally:
         proc.send_signal(subprocess.SIGINT if hasattr(subprocess, "SIGINT") else 2)
