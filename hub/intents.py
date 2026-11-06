@@ -1,9 +1,9 @@
-"""Hub-side intent matchers: the weather pre-fetch + the action guards.
+"""Hub-side intent matchers: the weather/workspace pre-acts + the guards.
 
-Three deterministic matchers the chat turn consults so answers are grounded
+Four deterministic matchers the chat turn consults so answers are grounded
 and promises are kept, even when the model (owner temperature 1.0) talks
-about acting instead of acting (docs/API.md "Weather pre-fetch",
-"Promised-action guard", "Claimed-action guard"):
+about acting instead of acting (docs/API.md "Weather pre-fetch", "Workspace
+pre-act", "Promised-action guard", "Claimed-action guard"):
 
 * ``detect_weather_request`` — is this USER message a question about the
   weather? Conservative like ``timers.detect_timer_request``: only direct
@@ -20,12 +20,28 @@ about acting instead of acting (docs/API.md "Weather pre-fetch",
   when the turn made zero tool calls while tools were offered; the server
   then re-runs the model ONCE with a nudge and keeps the real answer.
 
+* ``detect_workspace_switch_request`` — is this USER message an IMPERATIVE
+  ask to switch workspace/desktop N (or <name>), optionally "on the <screen>
+  screen"? Carries what ``desktop__switch_workspace`` needs: the workspace
+  target and the monitor phrase. The bare "switch to 4" (no workspace/
+  desktop word) counts only when the previous assistant turn in this persona
+  chat called ``switch_workspace``. The hub then performs the switch itself
+  through the client-tool channel BEFORE the model and injects the result
+  (like the weather pre-fetch).
+
 * ``detect_action_request`` + ``claims_completed_action`` — the claimed-
   action twin: the user IMPERATIVELY asked for a tool-backed action (switch
   workspace, open an app, focus a window, toggle a device, set a timer) and
   the reply CLAIMS it is done ("Done — you're on workspace 4 now") with no
   tool call in the turn. Same single re-run, different nudge; the false
-  reply is discarded.
+  reply is discarded. ``detect_action_request_kind`` returns WHICH action
+  kind matched, so the server can check whether a matching tool was offered
+  before firing the refusal twin.
+
+* ``refuses_tool_backed_action`` — does the final reply REFUSE a request
+  the hub could serve with an offered tool ("I can't…", "no way to…",
+  "press Super+4", "you'll have to press…")? Same one re-run, refusal nudge:
+  she has a tool for this and must call it instead of refusing.
 
 All matchers are pure functions over strings (no network, no state) so
 the test tables drive them directly.
@@ -362,42 +378,68 @@ _REQUEST_NEGATIVES = re.compile(
     re.IGNORECASE)
 
 # The tool-backed action kinds (docs/DESKTOP_SENSE.md, docs/TIMERS.md).
-# Each pair (verb-context, object) must both match the message.
+# Each (kind, verb-context, object) entry: both patterns must match the
+# message. The kind feeds the refusal guard's "was a matching tool offered"
+# check (server._refusal_tool_offered).
 _ACTION_CASES = [
-    (r"\b(?:switch(?:es)?|chang\w*|move\w*|go|jump\w*|shift\w*|flick\w*)\b"
+    ("workspace",
+     r"\b(?:switch(?:es)?|chang\w*|move\w*|go|jump\w*|shift\w*|flick\w*)\b"
      r"[^.!?\n]{0,20}\b(?:to|onto|over)\b",
      r"\b(?:workspace|desktop|virtual\s+desktop|ws)\s*#?\d{1,2}\b"),
     # bare "switch to 4" / "go to 3" — the number IS the workspace
-    (r"\b(?:switch(?:es)?|move\w*|go|jump\w*|flick\w*|chang\w*)\b",
+    ("workspace",
+     r"\b(?:switch(?:es)?|move\w*|go|jump\w*|flick\w*|chang\w*)\b",
      r"\b(?:to|onto)\s+(?:number\s+|#|workspace\s+|desktop\s+)?\d{1,2}\b"),
     # named workspace/desktop without a number: "switch to the other desktop"
-    (r"\b(?:switch(?:es)?|move\w*|go|jump\w*|chang\w*)\b"
+    ("workspace",
+     r"\b(?:switch(?:es)?|move\w*|go|jump\w*|chang\w*)\b"
      r"[^.!?\n]{0,16}\b(?:to|onto)\b",
      r"\b(?:workspace|desktop|virtual\s+desktop|ws)\b"),
     # open / launch <app>
-    (r"\b(?:open|opens|launch\w*|fire\s+up)\b(?:\s+up)?\s+(?:the\s+|my\s+|a\s+"
+    ("open",
+     r"\b(?:open|opens|launch\w*|fire\s+up)\b(?:\s+up)?\s+(?:the\s+|my\s+|a\s+"
      r"|an\s+|some\s+)?[a-z]\S*", None),
     # focus / raise / bring up <window>
-    (r"\b(?:focus|raise|unminimize)\b\s+(?:on\s+)?\S", None),
-    (r"\bbring\s+(?:up|back|forward)\b", None),
+    ("focus", r"\b(?:focus|raise|unminimize)\b\s+(?:on\s+)?\S", None),
+    ("focus", r"\bbring\s+(?:up|back|forward)\b", None),
     # "switch to the terminal / the previous window / Firefox"
-    (r"\b(?:switch|move)\s+(?:over\s+|back\s+)?(?:to|onto)\s+(?:the\s+|my\s+)?"
+    ("window",
+     r"\b(?:switch|move)\s+(?:over\s+|back\s+)?(?:to|onto)\s+(?:the\s+|my\s+)?"
      r"(?:previous|last|next|other|first|second|third|window|tab)\b", None),
-    (r"\b(?:switch|move)\s+(?:over\s+|back\s+)?(?:to|onto)\s+(?:the\s+|my\s+)?"
+    ("window",
+     r"\b(?:switch|move)\s+(?:over\s+|back\s+)?(?:to|onto)\s+(?:the\s+|my\s+)?"
      r"(?:firefox|chromium|chrome|browser|terminal|files|thunar|spotify"
      r"|steam|discord|godot|blender|code|vscode|obs|krita)\b", None),
     # turn / switch / toggle a device on or off
-    (r"\b(?:turn|switch|flip|toggle|put|leave)\b[^.!?\n]{0,20}\b(?:on|off)\b",
+    ("device",
+     r"\b(?:turn|switch|flip|toggle|put|leave)\b[^.!?\n]{0,20}\b(?:on|off)\b",
      None),
-    (r"\btoggle\b\s+\S", None),
+    ("device", r"\btoggle\b\s+\S", None),
     # timers / reminders
-    (r"\b(?:set|make|create|start|put|add|give)\b[^.!?\n]{0,20}"
+    ("timer",
+     r"\b(?:set|make|create|start|put|add|give)\b[^.!?\n]{0,20}"
      r"\b(?:timer|reminder|alarm)s?\b", None),
-    (r"\bremind\s+me\b", None),
+    ("timer", r"\bremind\s+me\b", None),
 ]
-_ACTION_CASES = [(re.compile(a, re.IGNORECASE),
+_ACTION_CASES = [(kind, re.compile(a, re.IGNORECASE),
                   re.compile(b, re.IGNORECASE) if b else None)
-                 for a, b in _ACTION_CASES]
+                 for kind, a, b in _ACTION_CASES]
+
+
+def detect_action_request_kind(text: str) -> str | None:
+    """Which tool-backed action kind the message imperatively asks for
+    ('workspace' | 'open' | 'focus' | 'window' | 'device' | 'timer'), or
+    None. Same contract as ``detect_action_request``, plus the identity the
+    refusal guard needs to check whether a matching tool was offered."""
+    raw = str(text or "").strip()
+    if not raw or _REQUEST_NEGATIVES.search(raw):
+        return None
+    if not (_GATE_A.search(raw) or _GATE_B.search(raw) or _GATE_C.search(raw)):
+        return None
+    for kind, verb, obj in _ACTION_CASES:
+        if verb.search(raw) and (obj is None or obj.search(raw)):
+            return kind
+    return None
 
 
 def detect_action_request(text: str) -> bool:
@@ -405,15 +447,7 @@ def detect_action_request(text: str) -> bool:
     (switch workspace/desktop N, open/launch an app, focus/bring up a
     window, turn a device on/off, set a timer / remind me). Questions about
     such an action and past-tense mentions never match."""
-    raw = str(text or "").strip()
-    if not raw or _REQUEST_NEGATIVES.search(raw):
-        return False
-    if not (_GATE_A.search(raw) or _GATE_B.search(raw) or _GATE_C.search(raw)):
-        return False
-    for verb, obj in _ACTION_CASES:
-        if verb.search(raw) and (obj is None or obj.search(raw)):
-            return True
-    return False
+    return detect_action_request_kind(text) is not None
 
 
 _CLAIM_RES = [re.compile(p, re.IGNORECASE) for p in [
@@ -457,3 +491,155 @@ def claims_completed_action(reply: str) -> bool:
     the turn made no tool call while tools were offered."""
     text = str(reply or "")
     return any(p.search(text) for p in _CLAIM_RES)
+
+
+# ── refusal guard ───────────────────────────────────────────────────────────
+#
+# The claimed-action guard above catches the past-tense lie; this one
+# catches the shrug (live case: 'Switch to Workspace 4.' -> "the tool
+# reports the switch, yet your screen clearly isn't following it, and I have
+# no way to actually press Super+4"). A reply that REFUSES a request the hub
+# could serve with an OFFERED tool gets the same single re-run: she has a
+# tool for this and must call it, not ask the owner to press keys.
+# Checking whether a matching tool was actually offered is the server's job
+# (detect_action_request_kind + the offered-name list).
+
+_REFUSAL_RES = [re.compile(p, re.IGNORECASE) for p in [
+    r"\bi\s+(?:can'?t|can\u2019t|cannot|ca(?:n)?['\u2019]t)\b",
+    r"\bi(?:\s*['\u2019]m|\s+am)\s+(?:not\s+able|unable)\b",
+    r"\b(?:there(?:['\u2019]?s|\s+is)\s+|i\s+have\s+|have\s+)no\s+way\s+to\b",
+    # "press Super+4", "press the Super key", "pressing Super 4"
+    r"\bpress(?:es|ing|ed)?\b[^.!?\n]{0,14}\bsuper\b",
+    r"\bsuper\s*(?:key\s*)?\+",
+    r"you(?:'ll|\u2019ll|\s+will)\s+(?:just\s+)?(?:have\s+to|need\s+to)\s+press\b",
+]]
+
+REFUSAL_NUDGE = ("You have a tool for this; call it instead of refusing.")
+
+
+def refuses_tool_backed_action(reply: str) -> bool:
+    """True when a final reply REFUSES to act ('I can't…', 'I'm unable to',
+    'there's no way to', 'press Super+4', 'you'll have to press…'). The
+    server fires only when the user message was an imperative action request
+    AND a matching tool was offered but not called."""
+    text = str(reply or "")
+    return any(p.search(text) for p in _REFUSAL_RES)
+
+
+# ── workspace-switch pre-act matcher ────────────────────────────────────────
+#
+# The weather pre-fetch, but for the owner's most common desktop command.
+# Conservative imperative matcher: "switch to workspace 4", "go to desktop
+# 2", "change to virtual desktop 3", "switch to workspace gaming", "switch
+# to the coding desktop", each with an optional "on|to the <screen> screen"
+# (the desktop tool maps position words / descriptions itself,
+# docs/DESKTOP_SENSE.md). Questions ABOUT switching, past mentions and
+# vague targets ("switch to the other desktop") never match. The bare
+# "switch to 4" counts ONLY when the previous assistant turn in this
+# persona chat called switch_workspace — otherwise the number could be
+# anything. The server performs the switch itself through the client-tool
+# channel and injects the result (server.py, docs/API.md "Workspace
+# pre-act").
+
+_WS_SOFTENER = (r"(?:so|then|now|please|pls|just|quickly|try\s+to"
+                r"|go\s+ahead\s+and|could\s+you\s+please|could\s+you"
+                r"|can\s+you\s+please|can\s+you|would\s+you|will\s+you)")
+_WS_VERBS = (r"(?:switch\w*|change\w*|move\w*|go(?:es)?|jump\w*|shift\w*"
+             r"|flick\w*)")
+_WS_GATE = re.compile(
+    rf"^\s*(?:{_WS_SOFTENER}\s+)?{_WS_VERBS}\b", re.IGNORECASE)
+_WS_GATE_POLITE = re.compile(
+    rf"\b(?:(?:could|can|would|will)\s+you\s+(?:please\s+|just\s+|also\s+)?"
+    rf"|i\s+(?:want|need|would\s+like)\s+you\s+to\s+(?:please\s+|just\s+)?)"
+    rf"{_WS_VERBS}\b", re.IGNORECASE)
+
+# "... on|to the <screen> screen" -> the tool's monitor argument
+_WS_MONITOR = re.compile(
+    r"\b(?:on|to|in)\s+the\s+([a-z][a-z0-9 .'-]{0,30}?)\s+screen\b",
+    re.IGNORECASE)
+# "switch to [the] [virtual] workspace|desktop|ws [#]4|<name>" — target
+# AFTER the keyword
+_WS_KW_VALUE = re.compile(
+    r"\b(?:to|onto|over\s+to)\s+(?:the\s+|my\s+|your\s+)?"
+    r"(?:virtual\s+)?(?:workspace|desktop|ws)\b\s*#?\s*"
+    r"(?P<value>\d{1,2}|[a-z][a-z0-9_-]{0,30})?", re.IGNORECASE)
+# "switch to the coding desktop" — target BEFORE the keyword
+_WS_VALUE_KW = re.compile(
+    r"\b(?:to|onto|over\s+to)\s+(?:the\s+|my\s+|your\s+)"
+    r"(?P<value>[a-z][a-z0-9 -]{1,30}?)\s+(?:virtual\s+)?"
+    r"(?:workspace|desktop)\b", re.IGNORECASE)
+# "switch to #5" — the hash IS the workspace marker, no keyword needed
+_WS_HASH = re.compile(
+    r"\b(?:to|onto|over\s+to)\s+#\s*(?P<num>\d{1,2})\b", re.IGNORECASE)
+# bare "switch to 4" (no keyword anywhere) — only after a switch_workspace
+# turn (prev_switch)
+_WS_BARE = re.compile(
+    r"\b(?:to|onto|over\s+to)\s+(?:the\s+)?(?:number\s+)?(?P<num>\d{1,2})\b",
+    re.IGNORECASE)
+# targets the tool cannot act on by name: deixis, not a workspace name
+_WS_STOP = {"other", "previous", "next", "last", "first", "second", "third",
+            "same", "new", "empty", "current", "here", "there", "top",
+            "bottom", "left", "right", "overview", "own", "main"}
+
+
+def detect_workspace_switch_request(text: str,
+                                    prev_switch: bool = False) -> dict | None:
+    """The workspace switch the USER message imperatively asks for, or None.
+
+    Returns a dict {"workspace": <target for the tool>, "monitor": str or
+    None}: a number ("4") or a workspace name ("gaming"); monitor carries
+    the "on the <screen> screen" phrase verbatim for the tool to resolve.
+    Conservative: questions about switching, past mentions, vague targets
+    ("the other desktop") and the bare "switch to N" WITHOUT a prior
+    switch_workspace turn never match.
+    """
+    raw = str(text or "").strip()
+    if not raw or _REQUEST_NEGATIVES.search(raw):
+        return None
+    if not (_WS_GATE.match(raw) or _WS_GATE_POLITE.search(raw)):
+        return None
+    monitor = None
+    m = _WS_MONITOR.search(raw)
+    if m:
+        monitor = re.sub(r"\s+", " ", m.group(1)).strip(" ,.'\"") or None
+        raw = (raw[:m.start()] + " " + raw[m.end():])
+    m = _WS_KW_VALUE.search(raw)
+    if m:
+        value = (m.group("value") or "").strip()
+        if not value or value.lower() in _WS_STOP:
+            return None
+        return {"workspace": value, "monitor": monitor}
+    m = _WS_VALUE_KW.search(raw)
+    if m:
+        value = re.sub(r"\s+", " ", m.group("value")).strip(" ,.'\"")
+        if not value or value.lower() in _WS_STOP:
+            return None
+        return {"workspace": value, "monitor": monitor}
+    m = _WS_HASH.search(raw)
+    if m:
+        return {"workspace": m.group("num"), "monitor": monitor}
+    if prev_switch:
+        m = _WS_BARE.search(raw)
+        if m:
+            return {"workspace": m.group("num"), "monitor": monitor}
+    return None
+
+
+def workspace_switch_block(workspace: str, monitor: str | None,
+                           payload=None, error: str = "") -> str:
+    """The system-prompt block carrying the hub's own pre-acted switch:
+    the success result, or the error when the client tool failed."""
+    where = f"workspace {workspace}"
+    if monitor:
+        where += f" on the {monitor} screen"
+    if error:
+        return (f"The hub tried to switch the owner's screen to {where} "
+                "via the desktop tool and it failed: " + str(error)
+                + ". Tell the owner what failed, briefly and in character. "
+                  "Do not call switch_workspace again for this request.")
+    return (f"You just switched the owner's screen to {where} via the "
+            "desktop tool. Result: "
+            + json.dumps(payload, ensure_ascii=False, default=str)
+            + ". Confirm briefly in character; if the result is an error, "
+              "say what failed. Do not call switch_workspace again for "
+              "this request.")
