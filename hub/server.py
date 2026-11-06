@@ -182,6 +182,39 @@ def voice_prompt(known_names: list) -> str:
             "comment on the misspelling.")
 
 
+# Refusal guard (docs/API.md "Claimed-action guard" -> refusal twin): the
+# intent kind -> names of tools that can actually perform it. Hub tools
+# match exactly; client/MCP tools by `__`-suffix (desktop__switch_workspace,
+# mcp_homeassistant__turn_on, …). The hub re-nudges a refusal ONLY when the
+# matching tool was offered this turn and not called.
+_REFUSAL_TOOL_HINTS = {
+    "workspace": ("switch_workspace",),
+    "open": ("open_app",),
+    "focus": ("focus_window",),
+    "window": ("focus_window", "open_app"),
+    "timer": ("timer",),
+}
+
+
+def refusal_tool_offered(kind: str | None, offered_names: list) -> bool:
+    """True when the turn offered a tool able to perform the requested
+    action kind (see _REFUSAL_TOOL_HINTS; device kinds ride on the Home
+    Assistant / smart-home tools)."""
+    if not kind:
+        return False
+    names = [str(n).lower() for n in offered_names]
+    if kind == "device":
+        return any("homeassistant" in n or "home_assistant" in n
+                   or n.endswith(("__turn_on", "__turn_off", "__toggle",
+                                  "__call_service", "__set_state",
+                                  "__light", "__scene"))
+                   for n in names)
+    hints = _REFUSAL_TOOL_HINTS.get(kind)
+    if not hints:
+        return False
+    return any(n in hints or n.endswith("__" + h) for n in names for h in hints)
+
+
 def create_app(data_dir, api_key: str | None = None,
                llm_defaults: dict | None = None,
                tts_defaults: dict | None = None,
@@ -1350,6 +1383,66 @@ def create_app(data_dir, api_key: str | None = None,
 
         max_history = int(settings.get("max_history") or 40)
         history = store.recent_messages(pid, max_history)
+
+        # workspace pre-act (docs/API.md "Workspace pre-act"): the message
+        # imperatively asks to switch workspace/desktop N and an online
+        # client offers switch_workspace (permission != never), so the hub
+        # performs the switch ITSELF through the client-tool channel BEFORE
+        # the model — permission is always for it — and injects the result.
+        # She then confirms instead of arguing about keys; a failed switch
+        # injects the real error. The bare "switch to N" counts only when
+        # the last assistant turn in this persona chat called
+        # switch_workspace. Skipped on timer-fired turns (their "user"
+        # message is the timer prompt, never an owner imperative).
+        last_assistant = next((m for m in reversed(history)
+                               if m.get("role") == "assistant"), None)
+        prev_switch = bool(last_assistant) and any(
+            str(t.get("tool") or "").lower().endswith("switch_workspace")
+            for t in (last_assistant or {}).get("tools_used") or []
+            if isinstance(t, dict))
+        ws_ask = (_intents.detect_workspace_switch_request(text, prev_switch)
+                  if timer is None else None)
+        ws_used: dict | None = None
+        if ws_ask:
+            ws_spec = next(
+                (s for s in specs if s.available and s.source == "client"
+                 and s.name.lower().endswith("__switch_workspace")), None)
+            if ws_spec is not None:
+                ws_args = {"workspace": ws_ask["workspace"]}
+                if ws_ask["monitor"]:
+                    ws_args["monitor"] = ws_ask["monitor"]
+                label = f"switching to workspace {ws_ask['workspace']}"
+                if ws_ask["monitor"]:
+                    label += f" on the {ws_ask['monitor']} screen"
+                call_id = f"hub-prefetch-{int(time.time() * 1000) % 1000000}"
+                events.publish("tool_started", call_id=call_id,
+                               tool=ws_spec.name, label=label)
+                t0 = time.monotonic()
+                # same wait semantics as the tool loop's client dispatch
+                ws_deadline = (time.monotonic()
+                               + float(tools_cfg.get("max_seconds") or 120))
+                out_ws = clients_hub.dispatch(
+                    ws_spec, ws_args, needs_approval=False, summary=label,
+                    wait_seconds=max(5.0, ws_deadline - time.monotonic()))
+                ms = int((time.monotonic() - t0) * 1000)
+                ws_ok = bool(out_ws.get("ok"))
+                ws_error = "" if ws_ok else str(
+                    out_ws.get("error") or "client tool failed")
+                events.publish("tool_finished", call_id=call_id,
+                               tool=ws_spec.name, ok=ws_ok, ms=ms)
+                store.log_tool(persona=pid, tool=ws_spec.name,
+                               source="client",
+                               arguments=json.dumps(ws_args), ok=ws_ok,
+                               error=ws_error, ms=ms,
+                               approval="auto (hub pre-act)")
+                ws_used = {"tool": ws_spec.name, "label": label,
+                           "source": "client", "auto": True}
+                system += "\n\n" + _intents.workspace_switch_block(
+                    ws_ask["workspace"], ws_ask["monitor"],
+                    payload=out_ws.get("result"), error=ws_error)
+                log.info("[turn] workspace pre-act persona=%s target=%s "
+                         "ok=%s ms=%d", pid, ws_ask["workspace"], ws_ok, ms)
+
         messages = ([{"role": "system", "content": system}]
                     + [{"role": m["role"], "content": m["content"]} for m in history]
                     + [{"role": "user", "content": text}])
@@ -1377,7 +1470,7 @@ def create_app(data_dir, api_key: str | None = None,
         # prompt, and the deterministic timer fallback already covers it).
         guard_nudge = ""
         guard_why = ""
-        if (not out["tools_used"] and offered_names
+        if (not out["tools_used"] and not ws_used and offered_names
                 and not out.get("tools_rejected")):
             if _intents.promises_action(out["text"]):
                 guard_nudge, guard_why = (
@@ -1389,6 +1482,17 @@ def create_app(data_dir, api_key: str | None = None,
                 guard_nudge, guard_why = (
                     _intents.CLAIM_NUDGE,
                     "claimed a completed action without a tool call")
+            # refusal twin (docs/API.md "Claimed-action guard"): she
+            # REFUSED a request a matching tool could serve ("I can't",
+            # "no way to", "press Super+4") instead of calling the tool.
+            elif (timer is None
+                    and _intents.refuses_tool_backed_action(out["text"])
+                    and refusal_tool_offered(
+                        _intents.detect_action_request_kind(text),
+                        offered_names)):
+                guard_nudge, guard_why = (
+                    _intents.REFUSAL_NUDGE,
+                    "refused a request a tool could serve")
         if guard_nudge:
             log.info("[turn] nudged: %s persona=%s", guard_why, pid)
             retry_msgs = messages + [
@@ -1422,6 +1526,10 @@ def create_app(data_dir, api_key: str | None = None,
             # the hub's own pre-fetched weather counts like a tool call for
             # the chip and the stored trace (auto: nobody had to approve it)
             tools_used.insert(0, wx_used)
+        if ws_used:
+            # same for the hub's own pre-acted workspace switch; last insert
+            # wins position 0, so the switch leads the chip when both ran
+            tools_used.insert(0, ws_used)
 
         # asked-for fallback (docs/TIMERS.md "Reviewer additions"): she
         # answered "remind me in 20 seconds…" as if the timer existed but

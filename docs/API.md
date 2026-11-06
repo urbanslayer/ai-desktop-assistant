@@ -483,6 +483,37 @@ permission is `never` (with tools enabled). If the pre-fetch fails (bad
 place, upstream down, no location saved) the turn falls back to normal tool
 behaviour plus a hint to *call the weather tool* — never an invented answer.
 
+#### Workspace pre-act
+
+When the user message imperatively asks to change workspace (deterministic
+conservative matcher in `hub/intents.py`: `switch to workspace 4`, `go to
+desktop 2`, `change to virtual desktop 3`, `switch to workspace gaming`,
+`switch to the coding desktop`, each with an optional `on|to the <screen>
+screen`, plus the softeners an owner types), **and** an online client offers
+`desktop__switch_workspace` with permission != `never`, the hub performs the
+switch **itself before the LLM**: one `switch_workspace` call down the
+existing client-tool channel (`workspace` = the number or name, `monitor` =
+the screen phrase when one was named), permission **always** for it (owner
+decision 2026-11-05, same as the tool itself), same wait semantics as the
+tool loop. The result is injected into the system prompt:
+
+> `You just switched the owner's screen to workspace 4 via the desktop
+> tool. Result: {…}. Confirm briefly in character; if the result is an
+> error, say what failed. Do not call switch_workspace again for this
+> request.`
+
+If the client tool errors, the block carries the error instead and she
+reports what failed. The call is logged in the tools log
+(`approval: "auto (hub pre-act)"`) and surfaces in `tools_used` as
+`{"tool": "desktop__switch_workspace", "label": "switching to workspace 4",
+"source": "client", "auto": true}`; it also counts as this turn's tool call,
+so the action guards stay silent. Skipped on timer-fired turns, when no
+client offers the tool, or when its permission is `never` — then the normal
+tool path plus the guards apply. The bare `switch to 4` (no workspace/
+desktop word) pre-acts **only** when the previous assistant turn in this
+persona chat called `switch_workspace`; vague targets (`switch to the other
+desktop`) and questions (`what workspace am I on?`) never pre-act.
+
 #### Promised-action guard
 
 If a chat turn ends with **no tool call** while tools were offered, and the
@@ -529,6 +560,18 @@ The tools system-prompt block additionally carries the permanent rule:
 *"Only say you did something after the tool result confirms it; if a tool
 fails, say what failed. Never suggest the owner press keys for you when a
 tool exists for it."*
+
+**Refusal twin.** The same zero-tool-call turn is also checked against
+`refuses_tool_backed_action(final reply)`: a refusal of the requested action
+(`I can't`, `I'm unable to`, `no way to`, `press Super+4`, `you'll have to
+press`, … — live case: `Switch to Workspace 4.` → "…I have no way to
+actually press Super+4"). It fires only when the *matching* tool was offered
+this turn — the kind from `detect_action_request_kind` must map to an
+offered name (`…__switch_workspace`, `…__open_app`, `…__focus_window`,
+Home Assistant / smart-home tools for device asks, `timer`) — and re-runs
+the model once with "You have a tool for this; call it instead of refusing."
+same shared cap, same discard rules; the hub log records
+`[turn] nudged: refused a request a tool could serve persona=<id>`.
 
 
 ### GET /api/geocode
