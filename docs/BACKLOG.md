@@ -142,6 +142,29 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 4. **Optional: Riko as Home Assistant's conversation agent** for HA's own voice devices (Voice PE, phone
    app). Offered, not chosen. Would need an OpenAI-compatible chat endpoint on the hub.
 5. **Optional: "only when I say her name"** filter for always-listen mode.
+6. **She creates her own animations** (owner request), for whichever avatar is active at the time.
+   **Plan only for now.**
+   - **Shape:** she authors a named animation as data: keyframes of VRM humanoid bone rotations,
+     expressions and timing, in the same format as the built-in gestures in `client/js/gestures.js`.
+     She can then play it later through an action tag (`[act:my_bow]`) or a tool, like the built-ins.
+   - **Per avatar:** animations are stored on the hub against the persona *and* the VRM model
+     (by file hash), because proportions and VRM0/VRM1 axes differ (e.g. Furina's garment skinning,
+     docs/BODY.md). Switching model shows only that model's set; she can "adapt" one from another
+     model by retargeting the humanoid bones.
+   - **How she makes them (two tiers):**
+     1. *LLM-authored keyframes*: a `create_animation(name, description)` tool where the model writes
+        compact keyframe JSON (a few poses plus timings). It is checked against joint limits and
+        timing, then smoothed with the existing IK/motion code. This works today with no new models.
+     2. *Text-to-motion on eve* (later): a motion model generates full-body motion from text, which is
+        retargeted to the VRM humanoid and saved as VRMA. Candidate models to evaluate when this starts:
+        MoMask, T2M-GPT, MotionGPT, HY-Motion. It needs GPU time on eve alongside the LLM and TTS.
+   - **Safety and quality:** clamp to joint limits; keep the feet planted unless the animation is a
+     walk; check for limbs passing through her body against the model's colliders. She previews new
+     animations to the owner first, and they're kept only after the owner agrees (or a setting allows
+     auto-keep). She can't overwrite the built-ins. Animations are listed, renamed and deleted in a web
+     page section.
+   - **Hooks that already exist:** the gesture/pose sampler (`samplePose`/`sampleGesture`,
+     `mirrorPose`), `director.js`, action tags (`hub/body.py`), and the persona `appearance` field.
 
 ## Quick wins
 
