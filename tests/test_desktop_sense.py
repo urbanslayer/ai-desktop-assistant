@@ -428,6 +428,62 @@ def test_denylist(tmp_path, monkeypatch):
     assert a.hides("firefox", "MyBank portal")                # app word in title too
 
 
+# ── awareness-gate tools: status + set (the off-state discovery) ──
+def test_status_tool_reports_off_and_how_to_enable(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    from riko import client_tools
+    cfg = {}                                                   # default OFF
+    s = DesktopSense(cfg, None, backend=FakeBackend([]), awareness=Awareness(cfg))
+    ex = client_tools.make_executors(None, s)
+    out = ex["desktop_awareness_status"]()
+    assert out["enabled"] is False
+    assert "Let her see my desktop" in out["how_to_enable"]
+    assert "set_desktop_awareness" in out["how_to_enable"]
+
+
+def test_set_tool_flips_persists_and_re_registers(tmp_path, monkeypatch):
+    """The whole 'turn on desktop awareness' path minus the hub: the tool
+    routes through the app's single toggle (awareness_toggle), the choice
+    persists, the catalogue flips in both directions, and while ON the
+    status tool honestly reports it."""
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    from riko import client_tools
+    cfg = {}
+    s = DesktopSense(cfg, None, backend=FakeBackend([]), awareness=Awareness(cfg))
+    calls = []
+
+    def toggle(enabled):                      # what start_desktop wires
+        new = s.awareness.set(bool(enabled))
+        calls.append(new)
+        return new
+
+    ex = client_tools.make_executors(None, s, awareness_toggle=toggle)
+    out = ex["set_desktop_awareness"](enabled="on")   # models pass strings too
+    assert out["enabled"] is True and calls == [True]
+    assert Awareness({}).enabled is True              # persisted across rebuilds
+    on_names = {t["name"] for t in client_tools.desktop_tools(s)}
+    assert {"desktop_windows", "switch_workspace", "desktop_awareness_status"} <= on_names
+    assert ex["desktop_awareness_status"]()["enabled"] is True
+    out = ex["set_desktop_awareness"](enabled=False)
+    assert out["enabled"] is False and calls == [True, False]
+    assert Awareness({}).enabled is False
+    off_names = {t["name"] for t in client_tools.desktop_tools(s)}
+    assert "switch_workspace" not in off_names and "desktop_awareness_status" in off_names
+    with pytest.raises(ToolError, match="true or false"):
+        ex["set_desktop_awareness"](enabled="maybe")
+
+
+def test_set_tool_without_toggle_still_flips_and_persists(tmp_path, monkeypatch):
+    """Headless runtime (no desktop app wired): the set tool flips the
+    setting anyway; the hub gets the new catalogue at the next re-register."""
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    from riko import client_tools
+    s = DesktopSense({}, None, backend=FakeBackend([]), awareness=Awareness({}))
+    ex = client_tools.make_executors(None, s)          # no awareness_toggle
+    assert ex["set_desktop_awareness"](enabled=True)["enabled"] is True
+    assert Awareness({}).enabled is True
+
+
 # ── DesktopSense: privacy gating + focused-tab wiring ────────
 class FakeBridge:
     def __init__(self, answers):
@@ -550,8 +606,22 @@ def test_toggle_off_hides_tools_and_backend_not_queried(tmp_path, monkeypatch):
 
     s = DesktopSense(cfg, None, backend=SpyBackend([]), awareness=a)
     assert not s.awareness.enabled
-    assert not any(t["name"].startswith("desktop_")
-                   for t in __import__("riko.client_tools", fromlist=["x"]).desktop_tools(s))
+    from riko import client_tools
+    off_tools = client_tools.desktop_tools(s)
+    off_names = {t["name"] for t in off_tools}
+    # OFF: the desktop_* sense set is absent, but the two awareness-gate
+    # tools stay so she can report the state and offer to switch it on.
+    assert "desktop_awareness_status" in off_names
+    assert "set_desktop_awareness" in off_names
+    assert not off_names & {t["name"] for t in sense_tools()}
+    status = next(t for t in off_tools if t["name"] == "desktop_awareness_status")
+    assert "switched OFF" in status["description"]
+    assert "Let her see my desktop" in status["description"]
+    gate = next(t for t in off_tools if t["name"] == "set_desktop_awareness")
+    assert gate["risk"] == "act" and "permission_default" not in gate  # ASK
+    none_names = {t["name"] for t in client_tools.desktop_tools(None)}
+    assert "desktop_awareness_status" not in none_names  # no sense: no gate tools
+    assert not {t["name"] for t in client_tools.awareness_gate_tools(None)}
     assert s.desktop_windows.__func__ is not None  # tool exists in code but…
     # …with awareness on it registers, and names/risks follow the contract
     names = {t["name"]: t for t in sense_tools()}
@@ -750,17 +820,63 @@ def test_session_env_is_stripped_from_the_test_run():
     assert detect_backend(env={}) is None
 
 
-# ── the tray checkbox wiring (main(); source-checked, no window) ──
+# ── the tray checkbox wiring (offscreen Qt, never the owner's display) ──
 def test_tray_toggle_consumes_checked_and_persists():
     """'Let her see my desktop' must swallow QAction's checked bool (skill
-    pitfall), persist via awareness.set, and re-register the tool list."""
+    pitfall), route through the app's single toggle path (flip + persist +
+    live re-register), and main() must wire the tray tick for tool-made
+    toggles plus print the awareness-off hint at start."""
     import inspect
     import desktop
-    src = inspect.getsource(desktop)
-    assert "def toggle_desktop_sense(checked=None):" in src
-    assert "sense.awareness.set(want)" in src
-    assert "client_tools.apply_awareness(runtime, cfg, browser, sense)" in src
+    src = inspect.getsource(desktop.build_sense_action)
+    assert "def toggle(checked=None):" in src
+    assert "apply_toggle(want)" in src
     assert 'QAction("Let her see my desktop"' in src
+    main_src = inspect.getsource(desktop.main)
+    assert "runtime.awareness_toggle" in main_src
+    assert "awareness-ui:" in main_src          # Qt-queued tick for tool toggles
+    assert "[desktop] awareness off" in main_src  # the one startup hint line
+
+
+def test_tray_checkbox_flips_persists_and_re_ticks(tmp_path, monkeypatch):
+    """The real QAction offscreen: trigger() hands the slot the checked
+    bool, the applied state (not Qt's click tick) decides the check mark,
+    and the setting persists — the tray half of the live-toggle story."""
+    import sys
+    for var in ("DISPLAY", "WAYLAND_DISPLAY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    from PySide6.QtWidgets import QApplication, QMenu
+    import desktop
+    app = QApplication.instance() or QApplication([sys.argv[0]])
+    cfg = {}
+    s = DesktopSense(cfg, None, backend=FakeBackend([]), awareness=Awareness(cfg))
+    applied = []
+
+    def apply_toggle(enabled):                  # what desktop.py passes in
+        new = s.awareness.set(bool(enabled))
+        applied.append(new)
+        return new
+
+    menu = QMenu()   # keep the parent alive: PySide6 deletes orphaned children
+    action = desktop.build_sense_action(menu, s, apply_toggle)
+    assert action.isEnabled() and action.text() == "Let her see my desktop"
+    assert action.isChecked() is False          # tracks the persisted state
+    action.trigger()                            # checked=True lands in the slot
+    assert applied == [True] and s.awareness.enabled
+    assert Awareness({}).enabled is True        # persisted
+    assert action.isChecked() is True
+    action.trigger()
+    assert applied == [True, False] and not s.awareness.enabled
+    assert action.isChecked() is False
+    # no desktop on this PC: the item is disabled and a forced trigger is safe
+    dead_menu = QMenu()
+    dead = desktop.build_sense_action(dead_menu, None, apply_toggle)
+    assert not dead.isEnabled()
+    dead.trigger()
+    assert applied == [True, False]
+    assert app is not None
 
 
 # ── hub prompt line ───────────────────────────────────────────
@@ -770,6 +886,21 @@ def test_prompt_line_appears_only_with_desktop_tools():
     assert "open windows" in with_line and "which screen" in with_line
     plain = tools_prompt(["pc__browser_tabs"])
     assert "open windows" not in plain
+    assert "switched OFF" not in plain
+
+
+def test_prompt_line_while_awareness_is_off():
+    """The gate tools alone mean awareness is OFF: the prompt must tell her
+    the tools exist and how to enable them, not leave 'out of my reach'
+    as the only story (the owner's 'switch to workspace 6' miss)."""
+    from hub.tools.registry import tools_prompt
+    off = tools_prompt(["pc__desktop_awareness_status",
+                        "pc__set_desktop_awareness", "pc__open_url"])
+    assert "switched OFF" in off
+    assert "Let her see my desktop" in off
+    assert "set_desktop_awareness" in off
+    on = tools_prompt(["pc__desktop_windows"])
+    assert "switched OFF" not in on             # the on-line stays unchanged
 
 
 # ── multi-window Firefox: compositor is the truth (owner 2026-11-05) ─

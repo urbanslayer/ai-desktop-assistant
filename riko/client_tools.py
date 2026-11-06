@@ -357,12 +357,64 @@ def browser_tools():
     ]
 
 
+AWARENESS_HOW_TO_ENABLE = (
+    "Tick 'Let her see my desktop' in Riko's tray menu, or ask the owner "
+    "and call set_desktop_awareness(enabled=true) — they confirm it through "
+    "the approval bubble.")
+
+
+def awareness_gate_tools(sense):
+    """The two tools that exist even while the privacy toggle is off, so she
+    never tells the owner desktops/workspaces are 'out of my reach'
+    (docs/DESKTOP_SENSE.md): a read-only status probe and the toggle itself
+    (risk `act` -> the hub asks the owner, the same privacy gate as the tray).
+    Needs a DesktopSense; without one there is nothing to report or flip."""
+    if sense is None:
+        return []
+    obj = {"type": "object", "additionalProperties": False}
+    on = bool(sense.awareness.enabled)
+    status_desc = (
+        "Check Riko's desktop awareness (the privacy toggle behind the tray "
+        "item 'Let her see my desktop'). "
+        + ("It is ON: the desktop_* tools (open windows, screens, open apps, "
+           "workspaces) are registered right now."
+           if on else
+           "The desktop tools (windows, screens, open apps, workspaces) "
+           "exist on this PC but are switched OFF, so she sees nothing yet. "
+           "The owner can tick 'Let her see my desktop' in Riko's tray menu, "
+           "or ask her to call set_desktop_awareness(enabled=true) and "
+           "approve it. Returns {enabled, how_to_enable}.")
+    )
+    return [
+        {"name": "desktop_awareness_status", "risk": "read",
+         "description": status_desc,
+         "parameters": dict(obj, properties={})},
+        {"name": "set_desktop_awareness", "risk": "act",
+         "description": "Turn desktop awareness on or off for this PC — the "
+                        "owner's privacy master toggle, the same one as the "
+                        "tray item 'Let her see my desktop'. On: you gain the "
+                        "desktop_* tools (open windows, screens, browser "
+                        "tabs, open apps, focus windows, switch "
+                        "workspaces/virtual desktops — no keystrokes needed). "
+                        "Off: they vanish. The owner is shown an approval "
+                        "prompt first; if they deny, nothing changes.",
+         "parameters": dict(obj, properties={
+             "enabled": {"type": "boolean",
+                         "description": "true = she may see the desktop, "
+                                        "false = privacy off"}},
+             required=["enabled"])},
+    ]
+
+
 def desktop_tools(sense=None):
     """Everything the desktop app offers the model (browser tools included —
     they answer 'the Firefox helper is not connected' until it is). With a
     DesktopSense whose awareness toggle is on, the desktop_* tools join the
     catalogue (docs/DESKTOP_SENSE.md: absent entirely while awareness is
-    off — the privacy toggle is the registration gate)."""
+    off — the privacy toggle is the registration gate). The two
+    awareness-gate tools (status + the toggle) are always offered when a
+    DesktopSense exists, so she can report the state and turn it on by
+    request instead of claiming the desktop is out of reach."""
     obj = {"type": "object", "additionalProperties": False}
     tools = [
         {"name": "open_url", "risk": "read",
@@ -380,6 +432,7 @@ def desktop_tools(sense=None):
                                              "title": {"type": "string"}},
                             required=["text"])},
         *browser_tools(),
+        *awareness_gate_tools(sense),
     ]
     if sense is not None and sense.awareness.enabled:
         from riko.desktop_sense.sense import sense_tools
@@ -632,6 +685,9 @@ class ClientRuntime:
         # desktop.py installs these (riko-ctl approve / deny entry points)
         self.approve_hook = lambda: {"ok": False, "error": "no approval UI"}
         self.deny_hook = lambda: {"ok": False, "error": "no approval UI"}
+        # awareness wiring (start_desktop / desktop.py install these)
+        self.awareness_toggle = None   # fn(enabled) -> bool
+        self.awareness_tray = None     # fn(enabled), Qt-queued tray tick
 
     # ── lifecycle ────────────────────────────────────────────
     def start(self):
@@ -854,11 +910,15 @@ class ClientRuntime:
         post(ok=True, approved=True, result=result, error="")
 
 
-def make_executors(bridge, sense=None):
+def make_executors(bridge, sense=None, awareness_toggle=None):
     """The name -> callable map a ClientRuntime runs (browser_* relay to
     `bridge`). `sense` (a DesktopSense) owns browser_tabs — listTabs with
     old-extension fallback — and adds the desktop_* executors when the
-    awareness toggle is on."""
+    awareness toggle is on. `awareness_toggle(enabled) -> bool` is the
+    desktop app's single toggle path (flip + persist + live re-register +
+    tray tick); without it the set tool only flips the setting, which is
+    still correct for a headless runtime — the hub gets the new catalogue
+    at the next re-register."""
 
     def relay(method, params):
         if bridge is None:
@@ -890,6 +950,32 @@ def make_executors(bridge, sense=None):
             return sense.browser_tabs()
         return relay("tabs", {})
 
+    def _awareness_status(**_kw):
+        if sense is None:
+            raise ToolError("desktop awareness is unavailable on this PC")
+        on = bool(sense.awareness.enabled)
+        return {"enabled": on,
+                "how_to_enable": AWARENESS_HOW_TO_ENABLE if not on else
+                "already on: the desktop_* tools are registered"}
+
+    def _awareness_set(enabled=True, **_kw):
+        if sense is None:
+            raise ToolError("desktop awareness is unavailable on this PC")
+        from riko.desktop_sense.awareness import _as_bool
+        want = _as_bool(enabled, None)
+        if want is None:
+            raise ToolError("set_desktop_awareness: enabled must be true or "
+                            f"false, got {enabled!r}")
+        if awareness_toggle is not None:
+            new = bool(awareness_toggle(want))
+        else:
+            new = bool(sense.awareness.set(want))
+        return {"enabled": new,
+                "note": ("desktop_* tools registered (windows, screens, "
+                         "apps, workspaces)" if new else
+                         "desktop_* tools removed; the owner can turn them "
+                         "back on via the tray or this tool")}
+
     ex = {
         "open_url": open_url,
         "clipboard_read": clipboard_read,
@@ -905,6 +991,8 @@ def make_executors(bridge, sense=None):
         "browser_back": _mk("back", ("tab",)),
         "browser_screenshot": _mk("screenshot", ("tab",)),
         "browser_close": _mk("close", ("tab",)),
+        "desktop_awareness_status": _awareness_status,
+        "set_desktop_awareness": _awareness_set,
     }
     if sense is not None and sense.awareness.enabled:
         ex.update(sense.executors())
@@ -928,9 +1016,13 @@ def build_sense(cfg, bridge):
 
 def apply_awareness(runtime, cfg, bridge, sense):
     """(Re)build the offered tool catalogue from the awareness toggle; the
-    tray checkbox calls this after flipping. Returns whether sense is on."""
+    tray checkbox calls this after flipping. Returns whether sense is on.
+    Keeps the set-tool executor wired to the runtime's full toggle path
+    (flip + persist + re-register + tray tick) when one exists."""
     on = bool(sense is not None and sense.awareness.enabled)
-    runtime.set_tools(desktop_tools(sense), make_executors(bridge, sense))
+    toggle = getattr(runtime, "awareness_toggle", None)
+    runtime.set_tools(desktop_tools(sense),
+                      make_executors(bridge, sense, toggle))
     return on
 
 
@@ -980,14 +1072,40 @@ def start_desktop(cfg, hub, viewer_module=None):
         respond(ok)
         viewer.emit("approval_done")
 
+    # The single awareness-toggle path: the set_desktop_awareness tool, the
+    # tray checkbox and `riko-ctl desktop-sense` all land here, so any of
+    # them flips the setting, re-registers the catalogue with the hub RIGHT
+    # AWAY (no restart), and keeps the tray tick honest (via
+    # runtime.awareness_tray, which desktop.py wires to a Qt-queued signal).
+    _refs = {}
+
+    def toggle_awareness(enabled):
+        new = bool(sense.awareness.set(bool(enabled)))
+        rt = _refs.get("rt")
+        if rt is not None:
+            rt.set_tools(desktop_tools(sense),
+                         make_executors(bridge, sense, toggle_awareness))
+            tray_cb = getattr(rt, "awareness_tray", None)
+            if tray_cb:
+                try:
+                    tray_cb(new)
+                except Exception as e:
+                    print(f"[client] tray awareness tick failed: {e}")
+        print(f"[client] desktop awareness {'on' if new else 'off'} "
+              f"(tools re-registered)", flush=True)
+        return new
+
     runtime = ClientRuntime(
-        hub, desktop_tools(sense), make_executors(bridge, sense),
+        hub, desktop_tools(sense), make_executors(bridge, sense, toggle_awareness),
         client_id=str(cc.get("id") or "").strip() or client_id(),
         name=str(cc.get("name") or "Riko desktop"),
         on_approval=lambda summary, respond, timeout: show_approval(
             summary, lambda ok: finish_approval(respond, ok), timeout),
         on_event=on_event,
         approval_timeout=float(cc.get("approval_timeout") or DEFAULT_APPROVAL_TIMEOUT))
+    _refs["rt"] = runtime
+    runtime.awareness_toggle = toggle_awareness if sense is not None else None
+    runtime.awareness_tray = None  # desktop.py installs the Qt-queued tick
 
     def approve(_args=None):
         ok = runtime.resolve_approval(True)

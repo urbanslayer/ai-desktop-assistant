@@ -642,6 +642,33 @@ def build_persona_menu(parent_menu, session):
     return persona_menu
 
 
+def build_sense_action(menu, sense, apply_toggle):
+    """The tray's 'Let her see my desktop' checkbox (docs/DESKTOP_SENSE.md),
+    built apart from main() so an offscreen Qt test can pull the real slot.
+    `apply_toggle(enabled) -> applied state` is the app's single awareness
+    path: it flips + persists + re-registers the tools with the hub live.
+    The slot swallows QAction.triggered's checked bool as its FIRST
+    parameter (skill pitfall: it must not land in an id/argument slot) and
+    re-ticks from the applied state, since Qt moves the tick before the
+    toggle lands."""
+
+    def toggle(checked=None):
+        if sense is None:
+            return
+        want = (not sense.awareness.enabled) if checked is None else bool(checked)
+        action.setChecked(bool(apply_toggle(want)))
+
+    action = QAction("Let her see my desktop", menu)
+    action.setCheckable(True)
+    action.setToolTip("desktop awareness: your open windows, browser tabs "
+                      "and screens, opening apps, and switching workspaces")
+    action.setEnabled(sense is not None)
+    action.triggered.connect(toggle)
+    if sense is not None:
+        action.setChecked(sense.awareness.enabled)
+    return action
+
+
 def main():
     parser = argparse.ArgumentParser(description="Riko as a floating desktop avatar.")
     parser.add_argument("--asr", choices=["remote", "local", "groq"], help="speech to text (overrides the config)")
@@ -685,6 +712,10 @@ def main():
     # tools it asks for, show approvals, and serve the Riko Helper Firefox
     # extension over a local token-authenticated WebSocket.
     runtime, browser, sense = client_tools.start_desktop(cfg, hub_client.get())
+    if sense is not None and not sense.awareness.enabled:
+        print('[desktop] awareness off — tick "Let her see my desktop" in the '
+              "tray to let her see windows/screens and switch workspaces",
+              flush=True)
     hub_client.start_state_poller()  # notice switches made from the web page or another PC
     session.follow_hub_events()  # hub-fired timer replies reach her like normal turns (docs/TIMERS.md D)
     session.greet_on_start()  # she says hello once when the page is ready (desktop.greet_on_start)
@@ -761,6 +792,10 @@ def main():
             always = cmd.partition(":")[2] == "always"
             listen_action.setChecked(always)
             tray.setToolTip("Riko — always listening (L switches back)" if always else "Riko")
+        elif cmd.startswith("awareness-ui:"):  # reflect an awareness toggle
+            # made by the set_desktop_awareness tool (worker thread) onto the
+            # Qt thread, exactly like listen-ui above
+            sense_action.setChecked(cmd.partition(":")[2] == "on")
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
 
@@ -822,19 +857,19 @@ def main():
         elif cmd == "approval-pending":
             return {"ok": True, "pending": runtime.pending_approval() if runtime else None}
         elif cmd in ("desktop-sense", "desktop-awareness"):
-            # docs/DESKTOP_SENSE.md: the privacy master toggle (same toggle
-            # as the tray checkbox; riko-ctl desktop-sense [on|off])
+            # docs/DESKTOP_SENSE.md: the privacy master toggle (the same
+            # single path as the tray checkbox and the set_desktop_awareness
+            # tool: flip + persist + re-register live + tray tick;
+            # riko-ctl desktop-sense [on|off])
             if sense is None:
                 return {"ok": False, "error": "desktop awareness is unavailable on this PC"}
             want = str(args.get("enabled", "")).strip().lower()
             if want in ("on", "true", "1", "yes"):
-                sense.awareness.set(True)
+                return {"ok": True, "enabled": _awareness_apply(True)}
             elif want in ("off", "false", "0", "no"):
-                sense.awareness.set(False)
+                return {"ok": True, "enabled": _awareness_apply(False)}
             elif want:
                 return {"ok": False, "error": "desktop-sense: on | off"}
-            if runtime is not None:
-                client_tools.apply_awareness(runtime, cfg, browser, sense)
             return {"ok": True, "enabled": sense.awareness.enabled}
         elif cmd == "browser-status":
             on = bool(browser and browser.connected())
@@ -917,23 +952,26 @@ def main():
     listen_action.triggered.connect(lambda checked=None: session.toggle_listen_mode())
 
     # Desktop awareness (docs/DESKTOP_SENSE.md): "Let her see my desktop" —
-    # the privacy master toggle. Off (the default) she has no desktop_*
-    # tools at all; turning it on registers them with the hub right away.
-    sense_action = QAction("Let her see my desktop", menu)
-    sense_action.setCheckable(True)
-    sense_action.setToolTip("desktop awareness: your open windows, browser tabs "
-                            "and screens, and opening apps for you")
-    sense_action.setEnabled(sense is not None)
-
-    def toggle_desktop_sense(checked=None):
-        want = (not sense.awareness.enabled) if checked is None else bool(checked)
-        new = sense.awareness.set(want)
-        if runtime is not None:
-            client_tools.apply_awareness(runtime, cfg, browser, sense)
-        sense_action.setChecked(new)
+    # the privacy master toggle. Off (the default) she only has the
+    # awareness status/toggle tools; any toggle (tray, tool, riko-ctl) goes
+    # through runtime.awareness_toggle, which re-registers the catalogue with
+    # the hub right away — no restart.
+    def _awareness_apply(enabled):
+        """Single toggle path for tray/tool/ctl; returns the applied state."""
+        if runtime is not None and getattr(runtime, "awareness_toggle", None):
+            return bool(runtime.awareness_toggle(bool(enabled)))
+        if sense is None:
+            return False
+        new = sense.awareness.set(bool(enabled))  # client tools off: persist only
         print(f"[desktop] desktop awareness {'on' if new else 'off'}", flush=True)
+        return new
 
-    sense_action.triggered.connect(toggle_desktop_sense)
+    sense_action = build_sense_action(menu, sense, _awareness_apply)
+    if runtime is not None:
+        # tool/ctl toggles run on worker threads: the tick lands on the Qt
+        # thread through the same queued bridge as listen-ui
+        runtime.awareness_tray = lambda new: bridge.command.emit(
+            f"awareness-ui:{'on' if new else 'off'}")
 
     for label, fn in ((f"Type to her{hint('type')}", lambda: on_command("type")),
                       (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle)):

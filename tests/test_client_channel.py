@@ -345,19 +345,33 @@ def test_start_desktop_glue(fake_hub, hub_connected, tmp_path, monkeypatch):
         assert {"open_url", "clipboard_read", "clipboard_write", "notify",
                 "browser_read", "browser_click"} <= set(tools)
         # docs/DESKTOP_SENSE.md: awareness is off by default, so the
-        # desktop_* tools are absent from the catalogue entirely
+        # desktop_* sense tools are absent; only the two gate tools remain
         assert sense is not None and not sense.awareness.enabled
-        assert not {t for t in tools if t.startswith("desktop_")}
-        # and flipping the toggle registers them (tray checkbox path)
+        assert {"desktop_awareness_status", "set_desktop_awareness"} <= set(tools)
+        assert not ({t for t in tools if t.startswith("desktop_")}
+                    - {"desktop_awareness_status"})
+        # the status tool answers while off: {enabled: false, how_to_enable}
+        req0 = fake_hub.push_request(rt.client_id, "desktop_awareness_status", {})
+        res0 = fake_hub.wait_for_result(req0["request_id"])
+        assert res0 and res0["ok"] and res0["result"]["enabled"] is False
+        assert "Let her see my desktop" in res0["result"]["how_to_enable"]
+        # and flipping the toggle registers the full set (tray checkbox path)
         sense.awareness.set(True)
         client_tools.apply_awareness(rt, cfg, br, sense)
         tools2 = [t["name"] for t in fake_hub.registered[rt.client_id]["tools"]]
         assert {"desktop_windows", "desktop_focused", "desktop_monitors",
                 "desktop_apps", "open_app", "focus_window"} <= set(tools2)
-        sense.awareness.set(False)
-        client_tools.apply_awareness(rt, cfg, br, sense)
+        assert {"desktop_awareness_status", "set_desktop_awareness"} <= set(tools2)
+        # the runtime's single toggle path (what the tray checkbox and the
+        # set_desktop_awareness tool both call) re-registers live too
+        ticks = []
+        rt.awareness_tray = ticks.append
+        assert rt.awareness_toggle(False) is False  # returns the applied state
         tools3 = [t["name"] for t in fake_hub.registered[rt.client_id]["tools"]]
-        assert not {t for t in tools3 if t.startswith("desktop_")}
+        assert not {t for t in tools3 if t.startswith("desktop_")
+                    and t != "desktop_awareness_status"}
+        assert ticks == [False] and not sense.awareness.enabled
+        assert (tmp_path / "state" / "desktop_awareness.json").exists()  # persisted
         # the per-install token file is there and readable only by us
         token_file = tmp_path / "cfg" / "browser_token"
         assert token_file.exists() and oct(token_file.stat().st_mode & 0o777) == "0o600"
@@ -371,6 +385,82 @@ def test_start_desktop_glue(fake_hub, hub_connected, tmp_path, monkeypatch):
         res = fake_hub.wait_for_result(req["request_id"])
         assert res and res["ok"] and res["approved"] is True
         assert any(k == "approval_done" for k, _ in events)
+    finally:
+        rt.stop()
+        br.stop()
+
+
+def test_awareness_set_tool_turns_it_on_by_request(fake_hub, hub_connected,
+                                                  tmp_path, monkeypatch):
+    """The owner's 'turn on desktop awareness' end-to-end (the tool half;
+    the tray half is tests/test_desktop_sense.py): the request must pass the
+    approval bubble (privacy toggle = ASK), then the desktop_* tools appear
+    on the hub WITHOUT a restart, the tray tick callback fires, the choice
+    persists, and a later deny changes nothing. Off again the same way."""
+    class StubViewer:
+        @staticmethod
+        def emit(kind, **data):
+            pass
+
+    monkeypatch.setenv("RIKO_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path / "state"))
+    cfg = {"desktop": {"client": {"browser_port": free_port(),
+                                  "approval_timeout": 5}}}
+    rt, br, sense = client_tools.start_desktop(cfg, hub_connected, viewer_module=StubViewer)
+    ticks = []
+    rt.awareness_tray = ticks.append
+    try:
+        from riko.desktop_sense.awareness import Awareness
+
+        def approve_pending():
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and rt.pending_approval() is None:
+                time.sleep(0.05)
+            assert rt.pending_approval() is not None, "set tool ran without asking"
+            assert rt.approve_hook()["answered"] is True
+
+        # ON through the tool, approval faked through the real bubble path
+        req = fake_hub.push_request(rt.client_id, "set_desktop_awareness",
+                                   {"enabled": True}, needs_approval=True,
+                                   summary="turn on desktop awareness")
+        approve_pending()
+        res = fake_hub.wait_for_result(req["request_id"])
+        assert res and res["ok"] and res["result"]["enabled"] is True
+        tools = [t["name"] for t in fake_hub.registered[rt.client_id]["tools"]]
+        assert {"desktop_windows", "switch_workspace"} <= set(tools)  # live, no restart
+        assert ticks == [True]
+        assert Awareness({}).enabled is True          # persisted for the next start
+        assert sense.awareness.enabled
+
+        # OFF through the tool again
+        req2 = fake_hub.push_request(rt.client_id, "set_desktop_awareness",
+                                     {"enabled": False}, needs_approval=True)
+        approve_pending()
+        res2 = fake_hub.wait_for_result(req2["request_id"])
+        assert res2 and res2["ok"] and res2["result"]["enabled"] is False
+        tools2 = [t["name"] for t in fake_hub.registered[rt.client_id]["tools"]]
+        assert "switch_workspace" not in tools2
+        assert "desktop_awareness_status" in tools2   # gate tools stay forever
+        assert ticks == [True, False]
+
+        # denied: nothing changes
+        req3 = fake_hub.push_request(rt.client_id, "set_desktop_awareness",
+                                     {"enabled": True}, needs_approval=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and rt.pending_approval() is None:
+            time.sleep(0.05)
+        assert rt.deny_hook()["answered"] is True
+        res3 = fake_hub.wait_for_result(req3["request_id"])
+        assert res3 and not res3["ok"] and res3["approved"] is False
+        assert not sense.awareness.enabled and ticks == [True, False]
+
+        # bad argument: ToolError, hub sees the refusal, nothing flips
+        req4 = fake_hub.push_request(rt.client_id, "set_desktop_awareness",
+                                     {"enabled": "maybe"}, needs_approval=True)
+        approve_pending()
+        res4 = fake_hub.wait_for_result(req4["request_id"])
+        assert res4 and not res4["ok"] and "true or false" in res4["error"]
+        assert not sense.awareness.enabled
     finally:
         rt.stop()
         br.stop()
