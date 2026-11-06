@@ -498,6 +498,38 @@ tool ran, when the reply announces nothing, when tools are off, or when the
 server rejected tools. The hub log records
 `[turn] nudged: promised action without a tool call persona=<id>`.
 
+#### Claimed-action guard
+
+The past-tense twin of the guard above: the owner *asks* for a tool-backed
+action and the reply **claims it is already done** without any tool call in
+the turn (live case: `Try to switch to 4.` → `Done — Hyprland confirms
+you're on workspace 4 now`, tools log empty). Two conservative matchers in
+`hub/intents.py` must both hit on a turn with **no tool call** while tools
+were offered (and the server did not reject them):
+
+* `detect_action_request(user text)` — an **imperative** request for one of
+  the tool-backed action kinds: switch/go to workspace|desktop N (incl. bare
+  `switch to 4`), open/launch an app, focus/bring up a window, turn/toggle a
+  device on/off, set a timer / `remind me`. Questions *about* such an action
+  (`what workspace am I on?`, `did you open Firefox?`), past mentions and
+  plain chat never match.
+* `claims_completed_action(final reply)` — the reply claims completion
+  (`done`, `switched`, `opened`, `launched`, `you're on workspace …`, `it's
+  up`, `turned on`, `timer set`, `there you go`, …).
+
+On a hit the hub re-runs the model **once** in the same turn with the nudge
+"You claimed to do it but called no tool. Call the right tool now; never
+claim an action you didn't perform." and replaces the false reply, which is
+never stored and never spoken. The two guards **share the one-retry-per-turn
+cap** (the promise check runs first). Skipped on timer-fired turns — their
+"user" message is the timer prompt and the deterministic timer fallback
+already covers timer claims. The hub log records
+`[turn] nudged: claimed a completed action without a tool call persona=<id>`.
+The tools system-prompt block additionally carries the permanent rule:
+*"Only say you did something after the tool result confirms it; if a tool
+fails, say what failed. Never suggest the owner press keys for you when a
+tool exists for it."*
+
 
 ### GET /api/geocode
 

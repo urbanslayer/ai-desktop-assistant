@@ -1369,14 +1369,31 @@ def create_app(data_dir, api_key: str | None = None,
         # announces one ("Let me check…"). Re-run the model ONCE this turn
         # with a nudge and keep that answer; the announced-only reply is
         # discarded (never stored, never spoken). Cap: one retry per turn.
+        # The claimed-action twin (docs/API.md "Claimed-action guard"): an
+        # imperative action request ("Try to switch to 4.") answered with a
+        # completion claim ("Done — you're on workspace 4 now") and no tool
+        # call — same retry machinery, different nudge, same shared cap.
+        # Skipped on timer-fired turns (their "user" message is the timer
+        # prompt, and the deterministic timer fallback already covers it).
+        guard_nudge = ""
+        guard_why = ""
         if (not out["tools_used"] and offered_names
-                and not out.get("tools_rejected")
-                and _intents.promises_action(out["text"])):
-            log.info("[turn] nudged: promised action without a tool call "
-                     "persona=%s", pid)
+                and not out.get("tools_rejected")):
+            if _intents.promises_action(out["text"]):
+                guard_nudge, guard_why = (
+                    _intents.PROMISE_NUDGE,
+                    "promised action without a tool call")
+            elif (timer is None
+                    and _intents.detect_action_request(text)
+                    and _intents.claims_completed_action(out["text"])):
+                guard_nudge, guard_why = (
+                    _intents.CLAIM_NUDGE,
+                    "claimed a completed action without a tool call")
+        if guard_nudge:
+            log.info("[turn] nudged: %s persona=%s", guard_why, pid)
             retry_msgs = messages + [
                 {"role": "assistant", "content": out["text"]},
-                {"role": "system", "content": _intents.PROMISE_NUDGE}]
+                {"role": "system", "content": guard_nudge}]
             try:
                 retry_out = run_turn(brain, settings, tools_cfg, specs,
                                      retry_msgs, ctx)

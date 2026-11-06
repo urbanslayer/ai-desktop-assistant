@@ -1,9 +1,9 @@
-"""Hub-side intent matchers: the weather pre-fetch + the promised-action guard.
+"""Hub-side intent matchers: the weather pre-fetch + the action guards.
 
-Two deterministic matchers the chat turn consults so answers are grounded
+Three deterministic matchers the chat turn consults so answers are grounded
 and promises are kept, even when the model (owner temperature 1.0) talks
-about acting instead of acting (docs/API.md "Weather pre-fetch" +
-"Promised-action guard"):
+about acting instead of acting (docs/API.md "Weather pre-fetch",
+"Promised-action guard", "Claimed-action guard"):
 
 * ``detect_weather_request`` — is this USER message a question about the
   weather? Conservative like ``timers.detect_timer_request``: only direct
@@ -20,7 +20,14 @@ about acting instead of acting (docs/API.md "Weather pre-fetch" +
   when the turn made zero tool calls while tools were offered; the server
   then re-runs the model ONCE with a nudge and keeps the real answer.
 
-Both matchers are pure functions over strings (no network, no state) so
+* ``detect_action_request`` + ``claims_completed_action`` — the claimed-
+  action twin: the user IMPERATIVELY asked for a tool-backed action (switch
+  workspace, open an app, focus a window, toggle a device, set a timer) and
+  the reply CLAIMS it is done ("Done — you're on workspace 4 now") with no
+  tool call in the turn. Same single re-run, different nudge; the false
+  reply is discarded.
+
+All matchers are pure functions over strings (no network, no state) so
 the test tables drive them directly.
 """
 from __future__ import annotations
@@ -303,3 +310,150 @@ def promises_action(reply: str) -> bool:
     server only on turns that made no tool call while tools were offered."""
     text = str(reply or "")
     return any(p.search(text) for p in _PROMISE_RES)
+
+
+# ── claimed-action guard ────────────────────────────────────────────────────
+#
+# The promised-action guard above catches FUTURE-tense announcements. This
+# one catches the past-tense lie: the owner says "Try to switch to 4." and
+# the reply answers "Done — you're on workspace 4 now" with NO tool call in
+# the turn (the tools log shows none). Two conservative matchers pair up:
+#
+# * ``detect_action_request`` — is the USER message an imperative action
+#   request of the tool-backed kinds (switch workspace/desktop N, open /
+#   launch <app>, focus / bring up <window>, turn on/off <device>, set a
+#   timer / remind me)? Questions ABOUT such an action ("what workspace am
+#   I on?", "did you open Firefox?") and past-tense mentions never match.
+#
+# * ``claims_completed_action`` — does the final reply CLAIM the action
+#   happened ("done", "switched to workspace", "opened", "it's up",
+#   "turned on", "timer set", …)?
+#
+# When BOTH match on a zero-tool-call turn (tools were offered), the server
+# re-runs the model once with CLAIM_NUDGE; the false reply is discarded
+# (never stored, never spoken). Shares the one-retry-per-turn cap with the
+# promised-action guard.
+
+# Request context: the ask must lead the message (bare imperative, with the
+# softeners an owner actually types) or carry an explicit modal/polite ask.
+_GATE_VERBS = (r"(?:switch|change|move|go|jump|shift|flick|open|launch"
+               r"|start|fire|focus|raise|unminimize|bring|turn|toggle|put"
+               r"|set|make|create|remind|add)")
+_GATE_A = re.compile(
+    r"^\s*(?:(?:so|then|now|please|pls|just|quickly|try\s+to"
+    r"|go\s+ahead\s+and|could\s+you\s+please|could\s+you|can\s+you\s+please"
+    r"|can\s+you|would\s+you|will\s+you)\s+)?" + _GATE_VERBS + r"\b",
+    re.IGNORECASE)
+_GATE_B = re.compile(
+    r"\b(?:can|could|will|would)\s+you\s+(?:please\s+|just\s+|also\s+|simply\s+)?"
+    + _GATE_VERBS + r"\b", re.IGNORECASE)
+_GATE_C = re.compile(
+    r"\bi\s+(?:want|need|would\s+like|ask)\s+you\s+to\s+(?:please\s+|just\s+)?"
+    + _GATE_VERBS + r"\b", re.IGNORECASE)
+
+# Never an action request: a question ABOUT the action (interrogatives,
+# aspect auxiliaries, plain "to be") anywhere in the message, or a past
+# mention of it. Conservative direction: misses cost nothing, false alarms
+# cost a wasted retry.
+_REQUEST_NEGATIVES = re.compile(
+    r"\b(?:what|which|when|why|who|where|how|whose|whether"
+    r"|did|does|do|have|has|had|been|was|were|am|is|are"
+    r"|yesterday|earlier|already|myself|forgot|used\s+to)\b",
+    re.IGNORECASE)
+
+# The tool-backed action kinds (docs/DESKTOP_SENSE.md, docs/TIMERS.md).
+# Each pair (verb-context, object) must both match the message.
+_ACTION_CASES = [
+    (r"\b(?:switch(?:es)?|chang\w*|move\w*|go|jump\w*|shift\w*|flick\w*)\b"
+     r"[^.!?\n]{0,20}\b(?:to|onto|over)\b",
+     r"\b(?:workspace|desktop|virtual\s+desktop|ws)\s*#?\d{1,2}\b"),
+    # bare "switch to 4" / "go to 3" — the number IS the workspace
+    (r"\b(?:switch(?:es)?|move\w*|go|jump\w*|flick\w*|chang\w*)\b",
+     r"\b(?:to|onto)\s+(?:number\s+|#|workspace\s+|desktop\s+)?\d{1,2}\b"),
+    # named workspace/desktop without a number: "switch to the other desktop"
+    (r"\b(?:switch(?:es)?|move\w*|go|jump\w*|chang\w*)\b"
+     r"[^.!?\n]{0,16}\b(?:to|onto)\b",
+     r"\b(?:workspace|desktop|virtual\s+desktop|ws)\b"),
+    # open / launch <app>
+    (r"\b(?:open|opens|launch\w*|fire\s+up)\b(?:\s+up)?\s+(?:the\s+|my\s+|a\s+"
+     r"|an\s+|some\s+)?[a-z]\S*", None),
+    # focus / raise / bring up <window>
+    (r"\b(?:focus|raise|unminimize)\b\s+(?:on\s+)?\S", None),
+    (r"\bbring\s+(?:up|back|forward)\b", None),
+    # "switch to the terminal / the previous window / Firefox"
+    (r"\b(?:switch|move)\s+(?:over\s+|back\s+)?(?:to|onto)\s+(?:the\s+|my\s+)?"
+     r"(?:previous|last|next|other|first|second|third|window|tab)\b", None),
+    (r"\b(?:switch|move)\s+(?:over\s+|back\s+)?(?:to|onto)\s+(?:the\s+|my\s+)?"
+     r"(?:firefox|chromium|chrome|browser|terminal|files|thunar|spotify"
+     r"|steam|discord|godot|blender|code|vscode|obs|krita)\b", None),
+    # turn / switch / toggle a device on or off
+    (r"\b(?:turn|switch|flip|toggle|put|leave)\b[^.!?\n]{0,20}\b(?:on|off)\b",
+     None),
+    (r"\btoggle\b\s+\S", None),
+    # timers / reminders
+    (r"\b(?:set|make|create|start|put|add|give)\b[^.!?\n]{0,20}"
+     r"\b(?:timer|reminder|alarm)s?\b", None),
+    (r"\bremind\s+me\b", None),
+]
+_ACTION_CASES = [(re.compile(a, re.IGNORECASE),
+                  re.compile(b, re.IGNORECASE) if b else None)
+                 for a, b in _ACTION_CASES]
+
+
+def detect_action_request(text: str) -> bool:
+    """True when the USER message imperatively asks for a tool-backed action
+    (switch workspace/desktop N, open/launch an app, focus/bring up a
+    window, turn a device on/off, set a timer / remind me). Questions about
+    such an action and past-tense mentions never match."""
+    raw = str(text or "").strip()
+    if not raw or _REQUEST_NEGATIVES.search(raw):
+        return False
+    if not (_GATE_A.search(raw) or _GATE_B.search(raw) or _GATE_C.search(raw)):
+        return False
+    for verb, obj in _ACTION_CASES:
+        if verb.search(raw) and (obj is None or obj.search(raw)):
+            return True
+    return False
+
+
+_CLAIM_RES = [re.compile(p, re.IGNORECASE) for p in [
+    r"\bdone\b",
+    r"\ball\s+set\b",
+    r"\bthere\s+you\s+go\b",
+    # "I've switched / I just opened / I turned it on"
+    r"\bi(?:'|\u2019)?(?:ve|\b(?:have|had|just))?\s+(?:just\s+|now\s+)?"
+    r"(?:switched|changed|opened|launched|started|focused|moved|turned"
+    r"|toggled|brought|set|created|closed)\b",
+    # "switched/moved to workspace 4", "switched over"
+    r"\b(?:switched|moved)\b[^.!?\n]{0,24}\b(?:to|over|workspace|desktop)\b",
+    # "you're on workspace 4 (now)", "you are now on desktop 2"
+    r"\byou(?:'re|\u2019re|\s+are)\b[^.!?\n]{0,16}\b(?:workspace|desktop)\b",
+    r"\b(?:now|back)\s+on\b[^.!?\n]{0,16}\b(?:workspace|desktop)\b",
+    # "opened Firefox for you", "launched it", "fired it up"
+    r"\b(?:opened|launched)\b",
+    r"\bfired\b[^.!?\n]{0,12}\bup\b",
+    # "it's up", "it is running", "that's open", "the TV is off"
+    r"\bit(?:'s|\u2019s|\s+is)\s+(?:now\s+|all\s+)?(?:up|open|running|on"
+    r"|off|ready)\b",
+    # "turned on the lights", "switched the fan off"
+    r"\b(?:turned|switched|flipped|put)\b[^.!?\n]{0,16}\b(?:on|off)\b",
+    # "brought it up", "brought the terminal up"
+    r"\bbrought\b[^.!?\n]{0,16}\bup\b",
+    # "timer set", "reminder is running", "alarm created"
+    r"\b(?:timer|reminder|alarm)\b[^.!?\n]{0,24}"
+    r"\b(?:set|running|started|created|going)\b",
+    r"\b(?:lights?|heater|kettle|fan|tv|speaker|lamp|air\s*con|ac)\b"
+    r"[^.!?\n]{0,16}\b(?:on|off)\b",
+]]
+
+CLAIM_NUDGE = ("You claimed to do it but called no tool. Call the right "
+               "tool now; never claim an action you didn't perform.")
+
+
+def claims_completed_action(reply: str) -> bool:
+    """True when a final reply CLAIMS an action already happened ('Done —
+    you're on workspace 4 now', 'Opened it', 'Timer set'…). Checked by the
+    server only when ``detect_action_request`` matched the user message and
+    the turn made no tool call while tools were offered."""
+    text = str(reply or "")
+    return any(p.search(text) for p in _CLAIM_RES)
