@@ -340,8 +340,10 @@ def test_chat_tool_roundtrip_log_and_events(tmp_path, searxng, wx_offline):
     res = client.post("/api/chat", json={"text": "weather in tokyo?"}).json()
     assert res["reply"] == "It is 21 C and sunny in Tokyo today!"
     assert res["emotion"] == "happy"
-    assert res["tools_used"] == [{"tool": "web_search",
-                                  "label": "searching the web for \u201ctokyo weather\u201d"}]
+    assert res["tools_used"] == [
+        {"tool": "web_search",
+         "label": "searching the web for \u201ctokyo weather\u201d",
+         "args": {"query": "tokyo weather"}}]
     # second model call saw an untrusted-wrapped tool result with the snippets
     second = llm.chat_requests[1]["messages"]
     tool_msgs = [m for m in second if m["role"] == "tool"]
@@ -449,7 +451,8 @@ def test_time_budget_forces_final():
     msgs = [{"role": "user", "content": "hi"}]
     out = toolloop.run_turn(FakeBrain(), {}, cfg, [spec], msgs, ctx)
     assert out["text"] == "answered from budget"
-    assert out["tools_used"] == [{"tool": "slow", "label": "being slow"}]
+    assert out["tools_used"] == [{"tool": "slow", "label": "being slow",
+                                   "args": {}}]
     assert "out of tool steps or time" in FakeBrain.final_messages[-1]["content"]
     assert msgs == [{"role": "user", "content": "hi"}]  # input list never mutated
     # deadline already blown before the first call -> straight to a plain answer

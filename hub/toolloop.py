@@ -53,7 +53,7 @@ def run_turn(brain, llm_settings: dict, tools_cfg: dict, specs: list,
     `ctx`       {"persona", "events", "log", "status", "clients", "deadline"}
                 deadline is a time.monotonic() value; `clients` may be None.
 
-    Returns {"text": str, "tools_used": [{"tool","label"}, …],
+    Returns {"text": str, "tools_used": [{"tool","label","args"}, …],
              "steps": int, "tools_rejected": bool}. Raises whatever brain.chat
     raises for transport/model failures (the caller maps those to 502s)."""
     events, log = ctx["events"], ctx["log"]
@@ -186,7 +186,9 @@ def execute_call(call: dict, by_name: dict, permissions: dict, cap: int,
     events.publish("tool_finished", call_id=call_id, tool=name, ok=ok, ms=ms)
     log(persona=ctx["persona"], tool=name, source=source, arguments=raw_args,
         ok=ok, error=error or "", ms=ms, approval=approval)
-    ctx["tools_used"].append({"tool": name, "label": label})
+    ctx["tools_used"].append({"tool": name, "label": label,
+                              "args": args if isinstance(args, dict)
+                              else {}})
     return {"role": "tool", "tool_call_id": call_id, "name": name,
             "content": _tool_content(name, source, payload, error, cap)}
 

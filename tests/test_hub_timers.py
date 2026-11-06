@@ -323,7 +323,10 @@ def test_timer_tool_sets_lists_and_fires(tmp_path):
     client, llm, app = timer_client(tmp_path, steps)
 
     res = client.post("/api/chat", json={"text": "tea timer for 20 seconds"}).json()
-    assert res["tools_used"] == [{"tool": "timer", "label": "setting a timer: tea"}]
+    assert res["tools_used"] == [
+        {"tool": "timer", "label": "setting a timer: tea",
+         "args": {"prompt": "tell the owner the tea is ready",
+                  "time": "20 seconds", "label": "tea"}}]
     timers = client.get("/api/timers").json()["timers"]
     assert len(timers) == 1 and timers[0]["status"] == "pending"
     row = timers[0]

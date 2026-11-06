@@ -201,7 +201,8 @@ def test_chat_calls_mcp_tool_end_to_end(tmp_path):
     res = client.post("/api/chat", json={"text": "say hi to mcp"}).json()
     assert res["reply"] == "it echoed back"
     assert res["tools_used"] == [{"tool": "mcp_echo__echo",
-                                  "label": "using echo: echo"}]
+                                  "label": "using echo: echo",
+                                  "args": {"text": "hello mcp"}}]
     # the model saw the result, wrapped as untrusted
     tool_msgs = [m for m in client._mcp_llm.chat_requests[1]["messages"]
                  if m["role"] == "tool"]

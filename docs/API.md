@@ -103,7 +103,8 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   "emotion": "teasing",            // assistant messages only, else null
   "actions": [{"name": "wave", "at": 0.0}],  // assistant messages; [] unless the turn acted
   "tools_used": [                  // [] unless the turn ran tools
-    {"tool": "web_search", "label": "searching the web for “tokyo weather”"}
+    {"tool": "web_search", "label": "searching the web for “tokyo weather”",
+     "args": {"query": "tokyo weather"}}
   ],
   "memory_writes": [               // [] unless the turn saved facts (memory round M)
     {"id": 7, "text": "User's cat is called Miso"}
@@ -122,7 +123,9 @@ and `content` **never contains the raw tag**; `actions` is the parsed
 body-action list (see *Body actions*, where an action may carry the additive
 `"asked": true` flag) and `content` never contains the raw
 action tags either; `tools_used` is the compact trace of which tools the turn
-called (full history in `/api/tools/log`); `memory_writes` lists the long-term
+called — `{tool, label, args}` (`args` = the arguments the tool was called
+with, so a later "try that again" can replay them; full history in
+`/api/tools/log`); `memory_writes` lists the long-term
 facts the turn saved via `remember` — render it as a "remembered" chip (see
 *Memory*).
 
@@ -502,17 +505,51 @@ tool loop. The result is injected into the system prompt:
 > error, say what failed. Do not call switch_workspace again for this
 > request.`
 
+Speech-aware targets (`normalize_workspace_text`, shared with the action
+guard below): number words `one`..`twenty`, ordinals (`the first workspace`
+-> `1`), and the Whisper homophones `won/to/too/for/ate` **only directly
+after** the workspace/desktop keyword at the end of the ask (`switch to
+workspace won` -> `1`); leading fillers/conjunctions (`and`, `now`, `ok`,
+`right`, `so`, `then`, `please`, `could you`…), a leading vocative (any
+`Name,` prefix or the active persona's name) and trailing `please/now/for
+me` are stripped, so `And switch to workspace one.` pre-acts workspace `1`.
+
 If the client tool errors, the block carries the error instead and she
 reports what failed. The call is logged in the tools log
 (`approval: "auto (hub pre-act)"`) and surfaces in `tools_used` as
 `{"tool": "desktop__switch_workspace", "label": "switching to workspace 4",
-"source": "client", "auto": true}`; it also counts as this turn's tool call,
-so the action guards stay silent. Skipped on timer-fired turns, when no
-client offers the tool, or when its permission is `never` — then the normal
-tool path plus the guards apply. The bare `switch to 4` (no workspace/
-desktop word) pre-acts **only** when the previous assistant turn in this
-persona chat called `switch_workspace`; vague targets (`switch to the other
-desktop`) and questions (`what workspace am I on?`) never pre-act.
+"source": "client", "auto": true, "args": {"workspace": "4"}}`; the `args`
+(also present on model-called entries) are what a later repeat replays. The
+pre-act counts as this turn's tool call, so the action guards stay silent.
+Skipped on timer-fired turns, when no client offers the tool, or when its
+permission is `never` — then the normal tool path plus the guards apply. The
+bare `switch to 4` (no workspace/desktop word) pre-acts **only** when the
+previous assistant turn in this persona chat called `switch_workspace`;
+vague targets (`switch to the other desktop`) and questions (`what workspace
+am I on?`) never pre-act.
+
+**Repeat.** When the previous assistant turn switched a workspace, a bare
+repeat ask (`try that again`, `again`, `do it again`, `once more`, `retry`,
+`one more time`, …) re-runs the **same** `switch_workspace` pre-act with the
+**same args** (monitor included) from that turn's `tools_used` entry. A
+repeat without a prior switch turn is ordinary chat; `say that again` and
+messages carrying their own target never match.
+
+**Complaint read.** When the previous assistant turn switched a workspace
+and the owner says it did not show (`it isn't`, `it didn't`, `nothing
+happened`, `it's not showing`, `still on`, `didn't switch`, `no it didn't`,
+…), the hub pre-acts a **READ** instead: one `desktop_monitors` call (or
+`desktop_focused` when no client offers monitors, read/always) down the
+client-tool channel, logged like the pre-act (`auto (hub pre-act)`,
+`tools_used` label `checking the desktop state`), and injects:
+
+> `The owner says the switch didn't show. Current state from the desktop:
+> {…compact JSON…}. Report this honestly; if it differs from what you
+> claimed, apologise and offer to retry. Never claim a tool result you
+> didn't receive.`
+
+The hub never re-switches behind his back here; a failed read injects the
+error and tells her to say she could not check.
 
 #### Promised-action guard
 
@@ -540,10 +577,13 @@ were offered (and the server did not reject them):
 
 * `detect_action_request(user text)` — an **imperative** request for one of
   the tool-backed action kinds: switch/go to workspace|desktop N (incl. bare
-  `switch to 4`), open/launch an app, focus/bring up a window, turn/toggle a
-  device on/off, set a timer / `remind me`. Questions *about* such an action
-  (`what workspace am I on?`, `did you open Firefox?`), past mentions and
-  plain chat never match.
+  `switch to 4`, number words and ordinals: `And switch to workspace one.`),
+  open/launch an app, focus/bring up a window, turn/toggle a device on/off,
+  set a timer / `remind me`. The message goes through the same
+  `normalize_workspace_text` as the pre-act, so filler-prefixed and
+  word-number asks the pre-act catches, the guard catches too. Questions
+  *about* such an action (`what workspace am I on?`, `did you open Firefox?`),
+  past mentions and plain chat never match.
 * `claims_completed_action(final reply)` — the reply claims completion
   (`done`, `switched`, `opened`, `launched`, `you're on workspace …`, `it's
   up`, `turned on`, `timer set`, `there you go`, …).
@@ -572,6 +612,17 @@ Home Assistant / smart-home tools for device asks, `timer`) — and re-runs
 the model once with "You have a tool for this; call it instead of refusing."
 same shared cap, same discard rules; the hub log records
 `[turn] nudged: refused a request a tool could serve persona=<id>`.
+
+**Hallucinated-tool-talk twin.** The same zero-tool-call turn is also
+checked against `claims_tool_evidence(final reply)`: a reply that CITES
+tool results the turn never got (`my tools…`, `the tool says/insists/
+confirms`, `Hyprland confirms`, `it confirms`, `according to the desktop`
+— live case: `Unfortunately, it isn't.` → "my tools insist workspace 1 is
+showing", tools log empty). It re-runs the model once with "You called no
+tool this turn; don't cite tool results you didn't get. Call the tool or
+say you don't know." — same shared cap (promise → claim → refusal →
+tool-talk, first hit wins), same discard rules; the hub log records
+`[turn] nudged: cited tool results without a tool call persona=<id>`.
 
 
 ### GET /api/geocode

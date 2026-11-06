@@ -43,6 +43,28 @@ pre-act", "Promised-action guard", "Claimed-action guard"):
   "press Super+4", "you'll have to press…")? Same one re-run, refusal nudge:
   she has a tool for this and must call it instead of refusing.
 
+* ``detect_repeat_request`` — "try that again", "once more", "retry"… The
+  server re-runs the LAST workspace pre-act with the SAME args (stored as
+  ``args`` in the assistant turn's ``tools_used`` entry) when the previous
+  assistant turn switched a workspace.
+
+* ``detect_workspace_complaint`` — the owner says the switch did not show
+  ("it isn't", "nothing happened", "still on"…). When the previous
+  assistant turn switched a workspace the hub pre-acts a READ
+  (``desktop_monitors`` / ``desktop_focused``) and injects the real state
+  (``workspace_state_block``) instead of re-switching behind his back.
+
+* ``claims_tool_evidence`` — a zero-tool-call reply citing tool evidence it
+  never got ("my tools insist…", "Hyprland confirms"…). Same one-retry
+  machinery with the tool-talk nudge, shared cap.
+
+Workspace targets understand what Whisper actually hears: number words
+(one..twenty), ordinals (first..twentieth), the homophones "won/to/too/
+for/ate" directly after the workspace/desktop keyword, leading fillers and
+vocatives ("And switch…", "Furina, switch…") and trailing "please/now/for
+me". ``normalize_workspace_text`` applies the same normalisation the
+claimed-action guard matches on.
+
 All matchers are pure functions over strings (no network, no state) so
 the test tables drive them directly.
 """
@@ -426,28 +448,36 @@ _ACTION_CASES = [(kind, re.compile(a, re.IGNORECASE),
                  for kind, a, b in _ACTION_CASES]
 
 
-def detect_action_request_kind(text: str) -> str | None:
+def detect_action_request_kind(text: str, vocative_names=()) -> str | None:
     """Which tool-backed action kind the message imperatively asks for
     ('workspace' | 'open' | 'focus' | 'window' | 'device' | 'timer'), or
     None. Same contract as ``detect_action_request``, plus the identity the
-    refusal guard needs to check whether a matching tool was offered."""
+    refusal guard needs to check whether a matching tool was offered. The
+    text goes through ``normalize_workspace_text`` first, so the guard sees
+    exactly what the workspace pre-act sees ('And switch to workspace one.'
+    -> 'switch to workspace 1')."""
     raw = str(text or "").strip()
     if not raw or _REQUEST_NEGATIVES.search(raw):
         return None
-    if not (_GATE_A.search(raw) or _GATE_B.search(raw) or _GATE_C.search(raw)):
+    norm = normalize_workspace_text(raw, vocative_names)
+    if not norm or _REQUEST_NEGATIVES.search(norm):
+        return None
+    gated = any(g.search(s) for g in (_GATE_A, _GATE_B, _GATE_C)
+                for s in (raw, norm))
+    if not gated:
         return None
     for kind, verb, obj in _ACTION_CASES:
-        if verb.search(raw) and (obj is None or obj.search(raw)):
+        if verb.search(norm) and (obj is None or obj.search(norm)):
             return kind
     return None
 
 
-def detect_action_request(text: str) -> bool:
+def detect_action_request(text: str, vocative_names=()) -> bool:
     """True when the USER message imperatively asks for a tool-backed action
     (switch workspace/desktop N, open/launch an app, focus/bring up a
     window, turn a device on/off, set a timer / remind me). Questions about
     such an action and past-tense mentions never match."""
-    return detect_action_request_kind(text) is not None
+    return detect_action_request_kind(text, vocative_names) is not None
 
 
 _CLAIM_RES = [re.compile(p, re.IGNORECASE) for p in [
@@ -571,58 +601,263 @@ _WS_VALUE_KW = re.compile(
 # "switch to #5" — the hash IS the workspace marker, no keyword needed
 _WS_HASH = re.compile(
     r"\b(?:to|onto|over\s+to)\s+#\s*(?P<num>\d{1,2})\b", re.IGNORECASE)
+# "switch workspace to 4" — keyword BEFORE the verb phrase, number after it
+_WS_KW_TO = re.compile(
+    r"\b(?:workspace|desktop)\b[^.!?\n]{0,10}?\b(?:to|onto)\s+#?"
+    r"(?P<num>\d{1,2})\b", re.IGNORECASE)
 # bare "switch to 4" (no keyword anywhere) — only after a switch_workspace
 # turn (prev_switch)
 _WS_BARE = re.compile(
     r"\b(?:to|onto|over\s+to)\s+(?:the\s+)?(?:number\s+)?(?P<num>\d{1,2})\b",
     re.IGNORECASE)
 # targets the tool cannot act on by name: deixis, not a workspace name
-_WS_STOP = {"other", "previous", "next", "last", "first", "second", "third",
-            "same", "new", "empty", "current", "here", "there", "top",
-            "bottom", "left", "right", "overview", "own", "main"}
+_WS_STOP = {"other", "previous", "next", "last", "same", "new", "empty",
+            "current", "here", "there", "top", "bottom", "left", "right",
+            "overview", "own", "main",
+            # Whisper homophones are numbers after the keyword, never names
+            "won", "too", "for", "ate"}
+
+# ── what Whisper actually hears: words for workspace numbers ───────────────
+#
+# The live bug: 'And switch to workspace one.' matched nothing — the gate
+# wanted the verb at position 0 and the target wanted digits. One shared
+# normalisation feeds BOTH the pre-act matcher and the claimed-action guard
+# (detect_action_request_kind), so a phrasing can never slip through one and
+# not the other.
+
+_WS_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+             "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+             "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+             "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+             "twenty": 20}
+_WS_ORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+            "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+            "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
+            "fifteenth": 15, "sixteenth": 16, "seventeenth": 17,
+            "eighteenth": 18, "nineteenth": 19, "twentieth": 20}
+# Whisper homophones count ONLY directly after the workspace/desktop keyword
+# and only at the END of the ask ("switch to desktop to" = desktop 2);
+# elsewhere "to"/"for" are ordinary prepositions.
+_WS_HOMOPHONES = {"won": 1, "to": 2, "too": 2, "for": 4, "ate": 8}
+
+# leading fillers/conjunctions the owner (and Whisper) put before the ask
+_WS_FILLER = re.compile(
+    r"^(?:and|but|also|so|then|now|ok|okay|alright|right|yeah|yes|anyway"
+    r"|basically|anyhow|please|pls|just|hey|hi|hello|um|uh|erm|look|listen)"
+    r"[,\s]+", re.IGNORECASE)
+# polite openers when they lead (the gates handle them mid-message)
+_WS_POLITE = re.compile(
+    r"^(?:could|can|would|will)\s+you\s+(?:please\s+|just\s+|also\s+)?",
+    re.IGNORECASE)
+# one-word vocative ("Furina, switch…"); multi-word names ride on the
+# vocative_names parameter below
+_WS_VOCATIVE = re.compile(r"^[\w'-]+\s*[!,]\s+")
+# trailing softeners after the target
+_WS_TAIL = re.compile(
+    r"[,\s]+(?:please|pls|now|for\s+me|thanks|thank\s+you|cheers|ta)"
+    r"[,\s]*[?!.]*\s*$", re.IGNORECASE)
+
+# "<keyword> <number word>" -> "<keyword> <digit>" ("workspace one" -> 1)
+_WS_KW_WORD = re.compile(
+    r"\b(?P<kw>workspace|desktop|ws)\b(?P<sep>\s*(?:number\s+)?#?\s*)"
+    r"(?P<w>[a-zA-Z]+)\b")
+# same for a Whisper homophone, but only when it ENDS the ask
+_WS_KW_HOMO = re.compile(
+    r"\b(?P<kw>workspace|desktop|ws)(?P<sep>\s*(?:number\s+)?#?\s*)"
+    r"(?P<w>won|to|too|for|ate)\b[\s]*[!?.]*\s*$", re.IGNORECASE)
+# "switch to the first workspace" -> "switch to workspace 1"
+_WS_ORD_BEFORE = re.compile(
+    r"\b(?P<pre>to|onto|over\s+to)\s+(?:the\s+|my\s+|our\s+|your\s+)?"
+    r"(?P<w>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth"
+    r"|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth"
+    r"|seventeenth|eighteenth|nineteenth|twentieth)\s+"
+    r"(?P<kw>virtual\s+workspace|virtual\s+desktop|workspace|desktop)\b",
+    re.IGNORECASE)
+
+
+def _kw_word_sub(word_map):
+    def sub(m):
+        n = word_map.get(m.group("w").lower())
+        return f"{m.group('kw')}{m.group('sep')}{n}" if n else m.group(0)
+    return sub
+
+
+def normalize_workspace_text(text: str,
+                             vocative_names=()) -> str:
+    """Strip leading fillers/conjunctions/polite openers/vocatives and
+    trailing softeners, then rewrite word-form workspace targets to digits
+    ('workspace one' -> 'workspace 1', 'the third desktop' -> 'desktop 3',
+    the Whisper homophones 'won/to/too/for/ate' directly after the keyword
+    and only at the end of the ask). Shared by the workspace pre-act and
+    the action-request guard so both see the same normalised ask.
+    `vocative_names` strips a leading persona-name vocative ('Furina …')."""
+    t = str(text or "").strip()
+    names = [re.escape(str(n).strip()) for n in vocative_names or ()
+             if str(n).strip()]
+    name_re = (re.compile(r"^(?:hey\s+|hi\s+|ok\s+|so\s+)?"
+                          r"(?:" + "|".join(names) + r")\s*[!,]?\s+",
+                          re.IGNORECASE) if names else None)
+    for _ in range(8):
+        t2 = _WS_FILLER.sub("", t, count=1)
+        t2 = _WS_POLITE.sub("", t2, count=1)
+        if name_re is not None:
+            t2 = name_re.sub("", t2, count=1)
+        t2 = _WS_VOCATIVE.sub("", t2, count=1)
+        t2 = _WS_TAIL.sub("", t2)
+        if t2 == t:
+            break
+        t = t2.strip()
+    t = _WS_KW_HOMO.sub(_kw_word_sub(_WS_HOMOPHONES), t)
+    t = _WS_KW_WORD.sub(_kw_word_sub(_WS_WORDS | _WS_ORDS), t)
+    t = _WS_ORD_BEFORE.sub(
+        lambda m: (f"{m.group('pre')} {m.group('kw')} "
+                   f"{_WS_ORDS[m.group('w').lower()]}"), t)
+    return t
+
 
 
 def detect_workspace_switch_request(text: str,
-                                    prev_switch: bool = False) -> dict | None:
+                                    prev_switch: bool = False,
+                                    vocative_names=()) -> dict | None:
     """The workspace switch the USER message imperatively asks for, or None.
 
     Returns a dict {"workspace": <target for the tool>, "monitor": str or
-    None}: a number ("4") or a workspace name ("gaming"); monitor carries
-    the "on the <screen> screen" phrase verbatim for the tool to resolve.
-    Conservative: questions about switching, past mentions, vague targets
-    ("the other desktop") and the bare "switch to N" WITHOUT a prior
-    switch_workspace turn never match.
+    None}: a number ("4"; number words, ordinals and the Whisper homophones
+    are normalised to digits) or a workspace name ("gaming"); monitor
+    carries the "on the <screen> screen" phrase verbatim for the tool to
+    resolve. Leading fillers/conjunctions ("And switch…"), polite openers
+    and vocatives (`vocative_names`, plus any "Name," prefix) and trailing
+    "please/now/for me" are normalised away first. Conservative: questions
+    about switching, past mentions, vague targets ("the other desktop") and
+    the bare "switch to N" WITHOUT a prior switch_workspace turn never
+    match.
     """
     raw = str(text or "").strip()
     if not raw or _REQUEST_NEGATIVES.search(raw):
         return None
-    if not (_WS_GATE.match(raw) or _WS_GATE_POLITE.search(raw)):
+    norm = normalize_workspace_text(raw, vocative_names)
+    if not norm or _REQUEST_NEGATIVES.search(norm):
+        return None
+    if not (_WS_GATE.match(norm) or _WS_GATE.match(raw)
+            or _WS_GATE_POLITE.search(norm)):
         return None
     monitor = None
-    m = _WS_MONITOR.search(raw)
+    m = _WS_MONITOR.search(norm)
     if m:
         monitor = re.sub(r"\s+", " ", m.group(1)).strip(" ,.'\"") or None
-        raw = (raw[:m.start()] + " " + raw[m.end():])
-    m = _WS_KW_VALUE.search(raw)
+        norm = (norm[:m.start()] + " " + norm[m.end():])
+    m = _WS_KW_VALUE.search(norm)
     if m:
         value = (m.group("value") or "").strip()
         if not value or value.lower() in _WS_STOP:
             return None
         return {"workspace": value, "monitor": monitor}
-    m = _WS_VALUE_KW.search(raw)
+    m = _WS_VALUE_KW.search(norm)
     if m:
         value = re.sub(r"\s+", " ", m.group("value")).strip(" ,.'\"")
         if not value or value.lower() in _WS_STOP:
             return None
         return {"workspace": value, "monitor": monitor}
-    m = _WS_HASH.search(raw)
+    m = _WS_HASH.search(norm)
+    if m:
+        return {"workspace": m.group("num"), "monitor": monitor}
+    m = _WS_KW_TO.search(norm)
     if m:
         return {"workspace": m.group("num"), "monitor": monitor}
     if prev_switch:
-        m = _WS_BARE.search(raw)
+        m = _WS_BARE.search(norm)
         if m:
             return {"workspace": m.group("num"), "monitor": monitor}
     return None
+
+
+# ── repeat-request matcher ─────────────────────────────────────────────────
+#
+# "Try that again." after a workspace switch means: run the SAME switch
+# again. The whole message must be the repeat ask (optionally with leading
+# fillers and trailing punctuation), so "say that again" (text) or "open
+# firefox again" never match; the server additionally requires that the
+# previous assistant turn actually switched a workspace, and replays the
+# args stored in that turn's tools_used entry.
+
+_WS_REPEAT = re.compile(
+    r"^(?:(?:and|so|then|now|ok|okay|just|please|pls)[,\s]+)*"
+    r"(?:tr(?:y|ied)\s+(?:to\s+)?(?:do\s+|run\s+|switch\s+)?"
+    r"(?:that|this|it)?\s*again"
+    r"|again|(?:do|run|switch|move)\s+(?:that|this|it)\s+again"
+    r"|once\s+more(?:\s+please)?|one\s+more\s+time"
+    r"|redo(?:\s+(?:that|this|it))?|re[\s-]?try(?:\s+(?:that|this|it))?)"
+    r"(?:\s+(?:please|pls))?[,.!\s]*$", re.IGNORECASE)
+
+
+def detect_repeat_request(text: str) -> bool:
+    """True when the WHOLE message is a bare repeat ask ('try that again',
+    'again', 'do it again', 'once more', 'try again', 'retry', 'one more
+    time', …). The server re-runs the last workspace pre-act with the same
+    args only when the previous assistant turn switched a workspace."""
+    return bool(_WS_REPEAT.match(str(text or "").strip()))
+
+
+# ── workspace-complaint matcher ────────────────────────────────────────────
+#
+# The owner says the switch did not show ("Unfortunately, it isn't."). The
+# hub then READS the real desktop state (desktop_monitors / desktop_focused)
+# and injects it — it never re-switches behind his back, and she must report
+# what the read actually says. The server fires this only when the previous
+# assistant turn switched a workspace, which keeps the phrasing list safe.
+
+_COMPLAINT_RES = [re.compile(p, re.IGNORECASE) for p in [
+    r"\bit(?:'s|\u2019s|\s+is|\s+was)?\s*(?:really\s+|actually\s+)?"
+    r"(?:not|n[\u2019']?t)\b",
+    r"\bit\s+did(?:n[\u2019']?t|\s+not)\b",
+    r"\bnothing\s+(?:happened|changed|moved|showed|appeared)",
+    r"\bstill\s+(?:on|in|at|seeing|showing|looking\s+like)\b",
+    r"\b(?:didn[\u2019']?t|didn\s+not|never|hasn[\u2019']?t|has\s+not)"
+    r"\s+(?:switch|change|move|work|show|help)\b",
+    r"\bno[,.\s]+(?:it\s+)?did(?:n[\u2019']?t|\s+not)\b",
+    r"\bnot\s+(?:showing|visible|working|up)\b",
+    r"\b(?:looks?|seems?)\s+(?:the\s+same|no\s+different|unchanged)\b",
+]]
+
+
+def detect_workspace_complaint(text: str) -> bool:
+    """True when the message says the last action did not happen ('it
+    isn't', 'it didn't', 'nothing happened', "it's not showing", 'still
+    on', "didn't switch", 'no it didn't', …). Checked by the server only
+    when the previous assistant turn switched a workspace."""
+    t = str(text or "").strip()
+    return bool(t) and any(p.search(t) for p in _COMPLAINT_RES)
+
+
+# ── hallucinated-tool-talk guard ───────────────────────────────────────────
+#
+# Live case: no tool ran, yet "my tools insist workspace 1 is showing".
+# A zero-tool-call reply that CITES tool evidence gets the same single
+# re-run as the promise/claim/refusal guards (shared cap): either call the
+# tool or say she doesn't know.
+
+_TOOL_TALK_RES = [re.compile(p, re.IGNORECASE) for p in [
+    r"\bmy\s+tools?\b",
+    r"\b(?:the|this|your|all\s+my)\s+tools?\b[^.!?\n]{0,20}"
+    r"\b(?:says?|said|insists?|confirms?|reports?|tells?)\b",
+    r"\b(?:hyprland|hyprctl|swaymsg|kwin|the\s+compositor|the\s+desktop"
+    r"|the\s+monitor)\b[^.!?\n]{0,20}\b(?:says?|said|insists?|confirms?"
+    r"|reports?)\b",
+    r"\bit\s+confirms?\b",
+    r"\baccording\s+to\s+the\s+(?:desktop|tool|tools|compositor|hyprland)\b",
+]]
+
+TOOL_TALK_NUDGE = ("You called no tool this turn; don't cite tool results "
+                   "you didn't get. Call the tool or say you don't know.")
+
+
+def claims_tool_evidence(reply: str) -> bool:
+    """True when a final reply cites tool evidence ('my tools insist…',
+    'the tool says…', 'Hyprland confirms', 'it confirms', 'according to the
+    desktop'…). Checked by the server only on turns that made no tool call
+    while tools were offered."""
+    text = str(reply or "")
+    return any(p.search(text) for p in _TOOL_TALK_RES)
 
 
 def workspace_switch_block(workspace: str, monitor: str | None,
@@ -643,3 +878,22 @@ def workspace_switch_block(workspace: str, monitor: str | None,
             + ". Confirm briefly in character; if the result is an error, "
               "say what failed. Do not call switch_workspace again for "
               "this request.")
+
+
+def workspace_state_block(payload, error: str = "") -> str:
+    """The system-prompt block for a complaint-driven state read: the owner
+    says the last switch did not show, so the hub read the live desktop
+    state. She reports the read honestly; the hub never re-switches here."""
+    if error:
+        return ("The owner says the workspace switch did not show, and the "
+                "hub could not read the desktop state: " + str(error)
+                + ". Say plainly that you could not check the screen right "
+                  "now; do not claim any result, and offer to retry. Never "
+                  "claim a tool result you didn't receive.")
+    return ("The owner says the switch didn't show. Current state from the "
+            "desktop: "
+            + json.dumps(payload, ensure_ascii=False, default=str,
+                         separators=(",", ":"))
+            + ". Report this honestly; if it differs from what you claimed, "
+              "apologise and offer to retry. Never claim a tool result you "
+              "didn't receive.")

@@ -184,7 +184,8 @@ def test_chat_runs_client_tool(tmp_path, hub_desktop):
     res = r.json()
     assert res["reply"] == "Opening the Godot docs for you!"
     assert res["tools_used"] == [{"tool": "desktop__open_url",
-                                  "label": 'open_url {"url": "https://docs.godotengine.org"}'}]
+                                  "label": 'open_url {"url": "https://docs.godotengine.org"}',
+                                  "args": {"url": "https://docs.godotengine.org"}}]
     # the desktop really received and ran the request
     assert [q["tool"] for q in desk.seen] == ["open_url"]
     assert desk.seen[0]["arguments"] == {"url": "https://docs.godotengine.org"}

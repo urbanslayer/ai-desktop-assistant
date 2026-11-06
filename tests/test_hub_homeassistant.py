@@ -352,7 +352,8 @@ def test_preset_connects_prompts_and_labels(tmp_path, monkeypatch):
         assert res["reply"] == "the kitchen is bright"
         # readable progress label built from the tool args
         assert res["tools_used"] == [{"tool": "mcp_homeassistant__intent__HassTurnOn",
-                                      "label": "turning on Kitchen light"}]
+                                      "label": "turning on Kitchen light",
+                                      "args": {"name": "Kitchen light"}}]
         evs = client.get("/api/events?after=0&wait=0").json()["events"]
         started = next(e for e in evs if e["type"] == "tool_started")
         assert started["label"] == "turning on Kitchen light"

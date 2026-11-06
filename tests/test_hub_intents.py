@@ -357,7 +357,8 @@ def test_guard_retry_that_calls_a_tool_replaces_the_reply(tmp_path, wx):
     res = client.post("/api/chat", json={"text": NON_WEATHER})
     assert res.json()["reply"] == "It is 15:30 in London."
     assert res.json()["tools_used"] == [
-        {"tool": "get_time", "label": "checking the date and time"}]
+        {"tool": "get_time", "label": "checking the date and time",
+         "args": {}}]
     assert len(llm.chat_requests) == 3
 
 
@@ -538,6 +539,10 @@ def test_claims_completed_action_spares(reply):
 
 OWNER_ASK = "Try to switch to 4."
 FALSE_DONE = "Done — Hyprland confirms you're on workspace 4 now."
+# the same completion claim WITHOUT citing a tool: the claimed-action guard
+# alone is under test here ('Hyprland confirms' now also trips the
+# hallucinated-tool-talk twin, tested in tests/test_hub_workspace.py)
+NO_CITE = "Done — you're on workspace 4 now."
 
 
 def test_claimed_action_reruns_once_with_the_claim_nudge(tmp_path, wx):
@@ -548,7 +553,8 @@ def test_claimed_action_reruns_once_with_the_claim_nudge(tmp_path, wx):
     res = client.post("/api/chat", json={"text": OWNER_ASK})
     assert res.json()["reply"] == "On workspace 4 now, senpai."
     assert res.json()["tools_used"] == [
-        {"tool": "get_time", "label": "checking the date and time"}]
+        {"tool": "get_time", "label": "checking the date and time",
+         "args": {}}]
     # the retry carries the CLAIM nudge, not the promise one
     nudge = llm.chat_requests[1]["messages"][-1]
     assert nudge["role"] == "system"
@@ -561,16 +567,16 @@ def test_claimed_action_reruns_once_with_the_claim_nudge(tmp_path, wx):
 
 
 def test_claimed_action_question_does_not_rerun(tmp_path, wx):
-    client, llm = make_client(tmp_path, [{"content": FALSE_DONE}])
+    client, llm = make_client(tmp_path, [{"content": NO_CITE}])
     res = client.post("/api/chat", json={"text": "what workspace am I on?"})
-    assert res.json()["reply"] == FALSE_DONE   # a question: no retry
+    assert res.json()["reply"] == NO_CITE   # a question: no retry
     assert len(llm.chat_requests) == 1
 
 
 def test_claimed_action_plain_chat_does_not_rerun(tmp_path, wx):
-    client, llm = make_client(tmp_path, [{"content": FALSE_DONE}])
+    client, llm = make_client(tmp_path, [{"content": NO_CITE}])
     res = client.post("/api/chat", json={"text": "hello"})
-    assert res.json()["reply"] == FALSE_DONE   # no action was asked for
+    assert res.json()["reply"] == NO_CITE   # no action was asked for
     assert len(llm.chat_requests) == 1
 
 

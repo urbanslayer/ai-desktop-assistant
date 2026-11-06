@@ -189,7 +189,8 @@ def test_remember_stores_fact_and_chips_the_reply(tmp_path):
     # the fact rides on the assistant message (the 🧠 chip data) and history
     h = client.get("/api/history", params={"persona": "riko", "limit": 10}).json()
     assert h["messages"][-1]["memory_writes"] == [{"id": 1, "text": "My cat is called Miso"}]
-    assert {"tool": "remember", "label": "remembering: My cat is called Miso"} \
+    assert {"tool": "remember", "label": "remembering: My cat is called Miso",
+            "args": {"text": "My cat is called Miso"}} \
         in res["tools_used"]
     offered = [t["function"]["name"] for t in llm.chat_requests[0].get("tools", [])]
     assert {"remember", "recall", "forget_fact"} <= set(offered)

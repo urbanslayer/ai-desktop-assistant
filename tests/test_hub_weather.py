@@ -504,7 +504,8 @@ def test_chat_weather_roundtrip_and_prompt(tmp_path, wx):
     assert out["tools_used"] == [
         {"tool": "weather", "label": "checking the weather in London",
          "source": "hub", "auto": True},
-        {"tool": "weather", "label": "checking the weather in London"}]
+        {"tool": "weather", "label": "checking the weather in London",
+         "args": {"days": 2}}]
     log = client.get("/api/tools/log", params={"limit": 5}).json()["entries"]
     assert log[0]["tool"] == "weather" and log[0]["ok"] is True
 
