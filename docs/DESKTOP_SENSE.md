@@ -14,8 +14,8 @@ as the browser tools).
 | `browser_tabs()` | read / always | `{windows, tabs}`: `windows` is the same per-Firefox-window list (most recently focused first — THE current tab is `windows[0]`; screens/workspaces only while desktop awareness is on), `tabs` is every tab (title, URL, active, window, pinned, audible) via the Riko Helper extension, which already has the `tabs` permission. |
 | `desktop_monitors()` | read / always | Monitors: name, description/make/model, size, position, scale, focused, active workspace. On Hyprland, also the **configured** layout from the Lua config (see below). |
 | `desktop_apps(query?)` | read / always | Installed launchable apps from XDG `.desktop` files (Name, GenericName, Keywords, Exec id, NoDisplay/Hidden respected), fuzzy-searched. |
-| `open_app(app, monitor?, workspace?, follow?)` | act / **always** (owner decision 2026-11-05: no confirmation) | Launch an installed app (by desktop id or fuzzy name). It can go to a given monitor (by name, description or position words like "left/middle/right", "the Dell on the right", "the portable screen") or workspace where the compositor allows it. `follow` (default true when a workspace was asked for — the user said "switch to X and open …") ALSO switches the view there; on Hyprland that's `hyprctl dispatch exec "[workspace N] <cmd>"` (no `silent` when following), on Sway move-container + focus, on KDE/GNOME switch-to-the-desktop-then-launch. |
-| `switch_workspace(workspace, monitor?)` | act / **always** (owner decision 2026-11-05, same as open_app) | Show a workspace / virtual desktop: accepts `2`, `desktop 2`, `virtual desktop two` or a workspace name. Hyprland `hyprctl dispatch workspace <n|name>` (with a monitor: `moveworkspacetomonitor` first — that is the dispatch that shows workspace 2 on the left screen), Sway `swaymsg workspace <n>` (`move workspace to output` first with a monitor), KDE via the KWin script (`workspace.currentDesktop = desktops[n-1]`, "virtual desktop" wording), GNOME via the extension's `ActivateWorkspace(index)`. |
+| `open_app(app, monitor?, workspace?, follow?)` | act / **always** (owner decision 2026-11-05: no confirmation) | Launch an installed app (by desktop id or fuzzy name). It can go to a given monitor (by name, description or position words like "left/middle/right", "the Dell on the right", "the portable screen") or workspace where the compositor allows it. `follow` (default true when a workspace was asked for — the user said "switch to X and open …") ALSO switches the view there; on Hyprland that's `hyprctl dispatch exec "[workspace N] <cmd>"` (no `silent` when following) on hyprlang configs or `hl.dsp.exec_cmd` + `hl.dsp.window.move` on Lua configs (0.55+, see Backends), on Sway move-container + focus, on KDE/GNOME switch-to-the-desktop-then-launch. |
+| `switch_workspace(workspace, monitor?)` | act / **always** (owner decision 2026-11-05, same as open_app) | Show a workspace / virtual desktop: accepts `2`, `desktop 2`, `virtual desktop two` or a workspace name. Hyprland `hyprctl dispatch workspace <n|name>` on hyprlang configs or `hl.dsp.focus({ workspace = N })` on Lua configs (0.55+, see Backends; the reply is checked and the view re-read, so "done" means it actually moved) (with a monitor: `moveworkspacetomonitor` first — `hl.dsp.workspace.move` on Lua — that is the dispatch that shows workspace 2 on the left screen), Sway `swaymsg workspace <n>` (`move workspace to output` first with a monitor), KDE via the KWin script (`workspace.currentDesktop = desktops[n-1]`, "virtual desktop" wording), GNOME via the extension's `ActivateWorkspace(index)`. |
 | `focus_window(window)` | act / always | Bring an open window to the front (where the compositor allows it). |
 
 Not in scope: keystrokes or mouse control of other apps, closing or killing windows, reading window
@@ -42,8 +42,27 @@ action (`switch_workspace`), so "switch to desktop 2" never needs key synthesis.
      supported; drop `silent` when `follow` is set so the view switches with the app); focus with
      `hyprctl dispatch focuswindow address:<addr>`; switch workspaces with
      `hyprctl dispatch workspace <n|name>` (`moveworkspacetomonitor <n> <monitor>` first when the user
-     named a screen). Windows carry `focusHistoryID` (`hyprctl -j clients`) — 0 is the currently focused
+     named a screen). These classic strings are for **hyprlang configs only** — see the Lua note below.
+     Windows carry `focusHistoryID` (`hyprctl -j clients`) — 0 is the currently focused
      window, larger is less recent — which decides which Firefox window owns "the current tab".
+   - **Lua configs (Hyprland 0.55+, the owner's setup): dispatch is a Lua expression, not a command
+     string.** `hyprctl dispatch <x>` runs `eval("return hl.dispatch(<x>)")`
+     (src/debug/HyprCtl.cpp `dispatchRequest`, v0.56.2), so classic strings are invalid Lua:
+     the reply is an error plus "dispatch in lua is a shorthand for hl.dispatch(...)"
+     and hyprctl can still exit 0. Actions therefore check the config style once (a probe
+     dispatch of `hl.dsp.no_op()` answers `ok` on Lua, `Invalid dispatcher` on hyprlang) and send
+     hl.dsp.* expressions as ONE argv element (never a shell): switch workspace (creates an empty
+     one, like the Super+N binds) `hl.dsp.focus({ workspace = 6 })` (numbers unquoted, names
+     quoted); focus a window `hl.dsp.focus({ window = "address:0x..." })`; move a window
+     `hl.dsp.window.move({ workspace = 2, window = "address:0x...", follow = true|false })`
+     (`follow = false` = the old `movetoworkspacesilent`); move a workspace to a screen
+     `hl.dsp.workspace.move({ workspace = 2, monitor = "DP-1" })`; launch
+     `hl.dsp.exec_cmd("dolphin", { workspace = "2" })` — the table is a window rule for the
+     spawned process (NOT `exec_raw`, which spawns a raw process instead of dispatching).
+     Success is ONLY the exact reply `ok`; any other text is raised as the tool error verbatim
+     (so she can repeat the real reason), and every action re-reads
+     `hyprctl -j activeworkspace|activewindow` afterwards — an accepted command that left the
+     view unchanged errors with "the view did not change" instead of reporting done.
    - **Config awareness (owner instruction):** read `~/.config/hypr/hyprland.lua` FIRST, then follow its
      `require("…")` / `dofile` / `loadfile` lines. Module names resolve relative to `~/.config/hypr/`,
      e.g. `require("monitors")` → `monitors.lua`, and likewise `keybinds.lua` and `windowrules.lua`.
