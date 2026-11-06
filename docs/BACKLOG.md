@@ -165,6 +165,27 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
      page section.
    - **Hooks that already exist:** the gesture/pose sampler (`samplePose`/`sampleGesture`,
      `mirrorPose`), `director.js`, action tags (`hub/body.py`), and the persona `appearance` field.
+7. **Touch and posing: interacting with her body, not just moving her** (owner request). **Plan only;
+   feasibility looks good.**
+   - **Sit on the screen edge:** drag her down so her legs go past the bottom of the screen, and she
+     sits on the edge with her legs dangling off-screen. Lift her back up and she stands again.
+     Detection: during a window drag, if the hips come within a small margin of the bottom of the
+     screen, blend into a sitting pose with the hips pinned to the edge. The same could work later for
+     sitting on top of a window, using the window rectangles from desktop awareness.
+   - **Grab and move a limb:** click and hold her hand (or foot or head), drag to move it, and let go
+     for it to spring back. Picking works by casting a ray from the cursor against the model to find
+     the nearest humanoid bone (hand, lower arm, foot, head). While held, two-bone IK (`client/js/ik.js`,
+     already used for gestures) follows the cursor within joint limits; on release it eases back
+     through the director.
+   - **Reactions:** head pats, pokes and grabs are sent to the hub as small events (e.g.
+     `touch {part:'head', kind:'pat'}`), so she can react in character with an expression, a line or
+     a little move. Owner-tunable, including off, and rate-limited so it doesn't spam the LLM.
+   - **Click versus drag:** a short press-and-move on her body stays a window drag (the current
+     behaviour). A press held still for about 250 ms on a limb grabs the limb. A modifier key (not
+     Super) could force one or the other.
+   - **Constraints:** works in the roam strip (she's clickable there; everything else is click-through).
+     Poses must respect Furina-style garment skinning (docs/BODY.md): move limbs by their own bones,
+     never the neck/chest for "look" motions. Mobile and web clients could get touch versions later.
 
 ## Quick wins
 
