@@ -66,7 +66,10 @@ def hypr():
         r"hyprctl clients": Done(clients),
         r"hyprctl activewindow": Done(act),
         r"hyprctl workspaces": Done(ws),
+        r"dispatch hl\.dsp\.no_op": Done("Invalid dispatcher"),   # classic hyprlang
         r"hyprctl dispatch": Done("ok"),
+        r"hyprctl activeworkspace": Done(json.dumps(
+            {"id": 1, "name": "1", "monitor": 1})),
     })
     lua = type("L", (), {"preferred": {"terminal": "kitty"},
                          "configured_monitors": lambda s: [
@@ -111,21 +114,31 @@ def test_hyprland_launch_to_monitor(hypr):
     foot = {"address": "0x999", "class": "foot", "title": "foot",
             "workspace": {"id": 1, "name": "1"}, "monitor": 1, "pid": 9,
             "fullscreen": False, "floating": False}
-    state = {"after_exec": False}
+    state = {"after_exec": False, "after_move": False}
     mons = json.dumps(fix("hypr_monitors.json"))
 
     def clients_reply(argv):
-        return Done(json.dumps(base + ([foot] if state["after_exec"] else [])))
+        if not state["after_exec"]:
+            return Done(json.dumps(base))
+        f = dict(foot)
+        if state["after_move"]:                  # the move took effect
+            f["workspace"] = {"id": 8, "name": "8"}
+            f["monitor"] = 2
+        return Done(json.dumps(base + [f]))
 
     def dispatch(argv):
-        if "exec" in " ".join(argv):
+        j = " ".join(argv)
+        if "exec" in j:
             state["after_exec"] = True
+        if "movetoworkspace" in j:
+            state["after_move"] = True
         return Done("ok")
 
     runner = recording_runner({
         r"hyprctl monitors": Done(mons), r"hyprctl clients": clients_reply,
         r"hyprctl activewindow": Done("{}"), r"hyprctl workspaces":
             Done(json.dumps(fix("hypr_workspaces.json"))),
+        r"dispatch hl\.dsp\.no_op": Done("Invalid dispatcher"),   # classic hyprlang
         r"hyprctl dispatch": dispatch})
     b = hyprland_mod.HyprlandBackend(runner=runner, lua=None)
     out = b.launch(["foot"], monitor="HDMI-A-1")
@@ -841,12 +854,24 @@ def test_match_windows_no_compositor_keeps_extension_order():
 
 # ── hyprland backend: focusHistoryID + workspace dispatch ───────────
 def hypr_ff(act="hypr_activewindow_firefox.json"):
+    # classic hyprlang config; stateful active workspace so the post-dispatch
+    # verification (activeworkspace) sees the switch happen
+    ws_state = {"cur": {"id": 1, "name": "1", "monitor": 1}}
+
+    def dispatch(argv):
+        if argv[-1] == "workspace 2":
+            ws_state["cur"] = {"id": 2, "name": "2", "monitor": 0}
+        return Done("ok")
+
     runner = recording_runner({
         r"hyprctl monitors": Done(json.dumps(fix("hypr_monitors.json"))),
         r"hyprctl clients": Done(json.dumps(fix("hypr_clients_ffwindows.json"))),
         r"hyprctl activewindow": Done(json.dumps(fix(act))),
         r"hyprctl workspaces": Done(json.dumps(fix("hypr_workspaces.json"))),
-        r"hyprctl dispatch": Done("ok")})
+        r"dispatch hl\.dsp\.no_op": Done("Invalid dispatcher"),   # classic hyprlang
+        r"hyprctl dispatch": dispatch,
+        r"hyprctl activeworkspace": lambda a: Done(json.dumps(ws_state["cur"])),
+    })
     return hyprland_mod.HyprlandBackend(runner=runner, lua=None)
 
 
@@ -865,7 +890,8 @@ def test_hyprland_switch_workspace_dispatch():
     out = b.switch_workspace("2")
     joined = [" ".join(c) for c in b.runner.calls]
     assert any(c == "hyprctl dispatch workspace 2" for c in joined)
-    assert out == {"workspace": "2", "monitor": ""}
+    # the observed state is reported, not the requested string
+    assert out == {"workspace": "2", "monitor": "DP-1"}
     # 'show workspace 2 on the left screen': moveworkspacetomonitor FIRST
     b.switch_workspace("2", monitor="DP-1")
     joined = [" ".join(c) for c in b.runner.calls]
@@ -895,6 +921,7 @@ def test_hyprland_launch_follow_vs_quiet():
             r"hyprctl clients": clients_reply,
             r"hyprctl activewindow": Done(json.dumps(fix("hypr_activewindow.json"))),
             r"hyprctl workspaces": Done(json.dumps(fix("hypr_workspaces.json"))),
+            r"dispatch hl\.dsp\.no_op": Done("Invalid dispatcher"),   # classic hyprlang
             r"hyprctl dispatch": dispatch})
         return hyprland_mod.HyprlandBackend(runner=runner, lua=None)
 
@@ -910,6 +937,244 @@ def test_hyprland_launch_follow_vs_quiet():
     joined = [" ".join(c) for c in b.runner.calls]
     assert any('exec "[workspace 2 silent] dolphin"' in c for c in joined)
     assert any("movetoworkspacesilent 2,address:0x999" in c for c in joined)
+
+
+# ── hyprland on a Lua config: hl.dispatch expressions ───────────────
+# Hyprland >=0.55 with a Lua config runs `hyprctl dispatch <x>` as
+# eval("return hl.dispatch(<x>)") (src/debug/HyprCtl.cpp dispatchRequest):
+# classic strings are invalid Lua, the error comes back in the OUTPUT while
+# hyprctl still exits 0, and the actions are hl.dsp.* expressions.
+
+_LUA_ERR_REPLY = ('error: [string "return hl.dispatch(workspace 6)"]:1: '
+                  "syntax error: [string \"return hl.dispatch(workspace 6)\"]:"
+                  "1: unexpected symbol near '6'"
+                  "\n\n → Note: dispatch in lua is a shorthand for "
+                  "hl.dispatch(...), your syntax might need to be updated.")
+
+
+def _lua_hypr(ws=None, act=None, extra=None, clients=None, exprs=None,
+              flip_ws=None, flip_addr=None, spawn=None, moved=None,
+              dispatch=None):
+    """Backend facing a Lua-config fixture: the style probe answers 'ok'.
+    Exact dispatch expressions land in `exprs` (the style probe excepted).
+    flip_ws=(expr, ws) / flip_addr=(expr, addr) make the fake view follow
+    that exact expression; spawn=(prefix, window) makes a window appear
+    once a dispatch starts with prefix, moved=(prefix, ws_name, mon_id)
+    relocates it \u2014 the fake compositor behaves like 0.56.2."""
+    state = {"ws": dict(ws or {"id": 1, "name": "1", "monitor": 1}),
+             "addr": act or "0x222", "spawned": False, "moved": False}
+    if exprs is None:
+        exprs = []
+
+    def default_dispatch(argv):
+        expr = argv[-1]
+        if expr != "hl.dsp.no_op()":
+            exprs.append(expr)
+        if flip_ws and expr == flip_ws[0]:
+            state["ws"] = dict(flip_ws[1])
+        if flip_addr and expr == flip_addr[0]:
+            state["addr"] = flip_addr[1]
+        if spawn and expr.startswith(spawn[0]):
+            state["spawned"] = True
+        if moved and expr.startswith(moved[0]):
+            state["moved"] = True
+        return Done("ok")
+
+    def act_reply(argv):
+        a = dict(fix("hypr_activewindow.json"))
+        a["address"] = state["addr"]
+        if state["addr"] == "0x503":
+            a["workspace"] = {"id": 8, "name": "8"}
+        return Done(json.dumps(a))
+
+    base_clients = clients or fix("hypr_clients_ffwindows.json")
+
+    def clients_reply(argv):
+        out = list(base_clients)
+        if spawn and state["spawned"]:
+            w = dict(spawn[1])
+            if moved and state["moved"]:
+                name = str(moved[1])
+                w["workspace"] = {"id": int(name) if name.isdigit() else -1,
+                                  "name": name}
+                w["monitor"] = moved[2]
+            out.append(w)
+        return Done(json.dumps(out))
+
+    replies = {
+        r"hyprctl monitors": Done(json.dumps(fix("hypr_monitors.json"))),
+        r"hyprctl clients": clients_reply,
+        r"hyprctl activewindow": act_reply,
+        r"hyprctl workspaces": Done(json.dumps(fix("hypr_workspaces.json"))),
+        r"dispatch hl\.dsp\.no_op": Done("ok"),        # Lua config!
+        r"hyprctl activeworkspace":
+            lambda a: Done(json.dumps(state["ws"])),
+        r"hyprctl dispatch": dispatch or default_dispatch,
+    }
+    if extra:
+        replies.update(extra)
+    runner = recording_runner(replies)
+    return hyprland_mod.HyprlandBackend(runner=runner, lua=None), state
+
+
+def test_hyprland_config_style_detection(tmp_path):
+    def mk(reply):
+        r = recording_runner({r"dispatch hl\.dsp\.no_op\(\)": reply})
+        return hyprland_mod.HyprlandBackend(runner=r, lua=None,
+                                            config_dir=str(tmp_path)), r
+    b, r = mk(Done("ok"))
+    assert b.config_style() == "lua"
+    # the probe itself goes as ONE argv element, never through a shell
+    assert r.calls[0] == ["hyprctl", "dispatch", "hl.dsp.no_op()"]
+    assert mk(Done("Invalid dispatcher"))[0].config_style() == "legacy"
+    assert mk(Done(_LUA_ERR_REPLY))[0].config_style() == "lua"
+    # hyprctl unreachable: the file layout decides
+    dead = recording_runner({r".": Done("", 1, "could not connect")})
+    assert hyprland_mod.HyprlandBackend(
+        runner=dead, lua=None, config_dir=str(tmp_path)).config_style() == "legacy"
+    (tmp_path / "hyprland.lua").write_text("-- owner's lua config\n")
+    assert hyprland_mod.HyprlandBackend(
+        runner=recording_runner({r".": Done("", 1, "no")}),
+        lua=None, config_dir=str(tmp_path)).config_style() == "lua"
+
+
+def test_hyprland_lua_switch_to_empty_workspace_6():
+    # 'switch to workspace 6' when 6 does not exist yet: the same expression
+    # the owner's Super+6 binds use; the compositor creates it
+    # (resolveWorkspaceForChange creates missing workspaces, 0.56.2).
+    exprs = []
+    flip = ("hl.dsp.focus({ workspace = 6 })",
+            {"id": 6, "name": "6", "monitor": 1})
+    b, _ = _lua_hypr(exprs=exprs, flip_ws=flip)
+    assert b.config_style() == "lua"
+    out = b.switch_workspace("6")
+    assert exprs == ["hl.dsp.focus({ workspace = 6 })"]   # number unquoted
+    assert out == {"workspace": "6", "monitor": "DP-2"}   # observed state
+    # the classic string that silently failed on the owner's setup is gone
+    assert "workspace 6" not in exprs
+
+
+def test_hyprland_lua_switch_to_occupied_and_verify():
+    exprs = []
+    flip = ("hl.dsp.focus({ workspace = 4 })",
+            {"id": 4, "name": "4", "monitor": 0})
+    b, _ = _lua_hypr(exprs=exprs, flip_ws=flip)
+    out = b.switch_workspace("4")
+    assert exprs == ["hl.dsp.focus({ workspace = 4 })"]
+    assert out == {"workspace": "4", "monitor": "DP-1"}
+
+
+def test_hyprland_lua_named_workspace_quoted():
+    exprs = []
+    flip = ('hl.dsp.focus({ workspace = "code" })',
+            {"id": 3, "name": "code", "monitor": 1})
+    b, _ = _lua_hypr(exprs=exprs, flip_ws=flip)
+    out = b.switch_workspace("code")
+    assert exprs == ['hl.dsp.focus({ workspace = "code" })']
+    assert out["workspace"] == "code"
+
+
+def test_hyprland_lua_view_did_not_change_is_an_error():
+    # dispatch answers 'ok' but the view stays put (the owner's 'switch to
+    # 4 said done but nothing changed')
+    b, _ = _lua_hypr()
+    with pytest.raises(ToolError, match="did not change"):
+        b.switch_workspace("4")
+
+
+def test_hyprland_lua_exit_0_but_error_text_surfaces():
+    # hyprctl exits 0 while the reply carries the Lua error + note: the
+    # real reason must reach her, not 'hyprctl workspace switch failed'
+    b, _ = _lua_hypr(dispatch=lambda argv: Done(_LUA_ERR_REPLY))
+    with pytest.raises(ToolError) as ei:
+        b.switch_workspace("6")
+    assert "syntax error" in str(ei.value)
+    assert "shorthand for hl.dispatch" in str(ei.value)
+
+
+def test_hyprland_lua_focus_window_drags_the_view():
+    exprs = []
+    flip = ('hl.dsp.focus({ window = "address:0x503" })', "0x503")
+    b, _ = _lua_hypr(act="0x502", exprs=exprs, flip_addr=flip)
+    out = b.focus_window("0x503")
+    assert exprs == ['hl.dsp.focus({ window = "address:0x503" })']
+    assert out["focused"] == "firefox" and out["address"] == "0x503"
+    assert out["workspace"] == "8"        # the view followed the window
+    # focus that stays put is an error, not 'done'
+    b2, _ = _lua_hypr(act="0x502")
+    with pytest.raises(ToolError, match="did not change"):
+        b2.focus_window("0x503")
+
+
+def test_hyprland_lua_workspace_to_monitor_left_screen(tmp_path, monkeypatch):
+    # sense level: 'show workspace 2 on the left screen' resolves the phrase
+    # to the live name, then Lua dispatchers move + focus
+    exprs = []
+    flip = ("hl.dsp.focus({ workspace = 2 })",
+            {"id": 2, "name": "2", "monitor": 0})
+    b, _ = _lua_hypr(exprs=exprs, flip_ws=flip)
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    cfg = {"desktop": {"awareness": "on"}}
+    s = DesktopSense(cfg, None, awareness=Awareness(cfg), runner=b.runner,
+                     backend=b, app_dirs=[])
+    out = s.switch_workspace("desktop 2", monitor="the left screen")
+    assert exprs == ['hl.dsp.workspace.move({ workspace = 2, monitor = "DP-1" })',
+                     "hl.dsp.focus({ workspace = 2 })"]
+    assert out["workspace"] == "2" and out["monitor"] == "DP-1"
+
+
+def test_hyprland_lua_open_dolphin_on_workspace_2_with_follow():
+    dol = {"address": "0x999", "class": "org.kde.dolphin", "title": "Dolphin",
+           "workspace": {"id": 2, "name": "2"}, "monitor": 0, "pid": 9,
+           "fullscreen": False, "floating": False, "focusHistoryID": 5}
+    exprs = []
+    b, _ = _lua_hypr(exprs=exprs, spawn=("hl.dsp.exec_cmd", dol),
+                     moved=("hl.dsp.window.move", "2", 0))
+    out = b.launch(["dolphin"], workspace="2", follow=True)
+    assert out == {"workspace": "2"}      # verified against the re-read list
+    assert 'hl.dsp.exec_cmd("dolphin", { workspace = "2" })' in exprs
+    assert ('hl.dsp.window.move({ workspace = 2, window = "address:0x999", '
+            "follow = true })") in exprs
+    assert not any("silent" in e for e in exprs)
+    # quiet placement = follow = false (the movetoworkspacesilent equivalent)
+    exprs2 = []
+    b2, _ = _lua_hypr(exprs=exprs2, spawn=("hl.dsp.exec_cmd", dol),
+                      moved=("hl.dsp.window.move", "2", 0))
+    b2.launch(["dolphin"], workspace="2")
+    assert ('hl.dsp.window.move({ workspace = 2, window = "address:0x999", '
+            "follow = false })") in exprs2
+
+
+def test_hyprland_lua_exec_is_one_argv_element_and_escaped():
+    term = {"address": "0x777", "class": "foot", "title": "foot",
+            "workspace": {"id": 1, "name": "1"}, "monitor": 1, "pid": 8,
+            "fullscreen": False, "floating": False}
+    exprs = []
+    b, _ = _lua_hypr(exprs=exprs, spawn=("hl.dsp.exec_cmd", term))
+    out = b.launch(["sh", "-c", 'echo "hi"'])
+    assert out == {"launched": True}
+    # one argv element, no shell; quotes cannot break out of the Lua literal
+    exec_calls = [c for c in b.runner.calls
+                  if c[:2] == ["hyprctl", "dispatch"]
+                  and c[-1].startswith("hl.dsp.exec_cmd")]
+    assert exec_calls == [["hyprctl", "dispatch",
+                           'hl.dsp.exec_cmd("sh -c echo \\"hi\\"")']]
+
+
+def test_hyprland_lua_monitor_placement_launch_moves_and_pins():
+    dol = {"address": "0x999", "class": "org.kde.dolphin", "title": "Dolphin",
+           "workspace": {"id": 1, "name": "1"}, "monitor": 1, "pid": 9,
+           "fullscreen": False, "floating": False}
+    exprs = []
+    b, _ = _lua_hypr(exprs=exprs, spawn=("hl.dsp.exec_cmd", dol),
+                     moved=("hl.dsp.window.move", "2", 0))
+    out = b.launch(["dolphin"], monitor="DP-1")   # no follow: quiet placement
+    assert out == {"workspace": "2", "monitor": "DP-1"}
+    assert 'hl.dsp.exec_cmd("dolphin")' in exprs
+    assert ('hl.dsp.window.move({ workspace = 2, window = "address:0x999", '
+            "follow = false })") in exprs
+    assert ('hl.dsp.workspace.move({ workspace = 2, monitor = "DP-1" })'
+            in exprs)
 
 
 # ── sway / KDE / GNOME workspace switching ───────────────────────────
@@ -1117,13 +1382,17 @@ def test_dolphin_flow_switch_and_open_on_desktop_2(tmp_path, monkeypatch, app_di
            "workspace": {"id": 2, "name": "2"}, "monitor": 0, "pid": 9,
            "fullscreen": False, "floating": False, "focusHistoryID": 5}
     state = {"after_exec": False}
+    ws_state = {"cur": {"id": 1, "name": "1", "monitor": 1}}
 
     def clients_reply(argv):
         return Done(json.dumps(base + ([dol] if state["after_exec"] else [])))
 
     def dispatch(argv):
-        if "exec" in " ".join(argv):
+        j = " ".join(argv)
+        if "exec" in j:
             state["after_exec"] = True
+        if argv[-1] == "workspace 2":
+            ws_state["cur"] = {"id": 2, "name": "2", "monitor": 0}
         return Done("ok")
 
     runner = recording_runner({
@@ -1131,7 +1400,10 @@ def test_dolphin_flow_switch_and_open_on_desktop_2(tmp_path, monkeypatch, app_di
         r"hyprctl clients": clients_reply,
         r"hyprctl activewindow": Done(json.dumps(fix("hypr_activewindow.json"))),
         r"hyprctl workspaces": Done(json.dumps(fix("hypr_workspaces.json"))),
-        r"hyprctl dispatch": dispatch})
+        r"dispatch hl\.dsp\.no_op": Done("Invalid dispatcher"),   # classic hyprlang
+        r"hyprctl dispatch": dispatch,
+        r"hyprctl activeworkspace": lambda a: Done(json.dumps(ws_state["cur"])),
+    })
     monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
     cfg = {"desktop": {"awareness": "on"}}
     s = DesktopSense(cfg, None, awareness=Awareness(cfg), runner=runner,

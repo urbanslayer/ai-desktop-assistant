@@ -1,14 +1,85 @@
 """Hyprland backend: hyprctl -j for state, `hyprctl dispatch` for actions,
-plus the read-only Lua config reader (hyprlua)."""
+plus the read-only Lua config reader (hyprlua).
+
+Two config styles (verified in the Hyprland v0.56.2 source):
+
+* **Lua config** (owner's setup): `hyprctl dispatch <x>` is literally
+  `eval("return hl.dispatch(<x>)")` (src/debug/HyprCtl.cpp, dispatchRequest
+  ~lines 1126-1141). Classic dispatcher strings ('workspace 6', 'focuswindow
+  address:0x..') are invalid Lua: hyprctl prints an error plus the note
+  "dispatch in lua is a shorthand for hl.dispatch(...)" — and can still exit
+  0. Actions must therefore be hl.dsp.* expressions and success is ONLY the
+  exact reply 'ok'.
+* **Legacy hyprlang config**: classic dispatcher strings; reply 'ok' on
+  success.
+
+Lua action expressions used here (src/config/lua/bindings/):
+
+* workspace switch (creates empty workspaces exactly like the owner's
+  Super+N binds): ``hl.dsp.focus({ workspace = 6 })`` — numbers unquoted,
+  names quoted (hlFocus → dsp_changeWorkspace →
+  Actions::changeWorkspace → resolveWorkspaceForChange CREATES the workspace
+  when it does not exist yet, ConfigActions.cpp ~1040-1044).
+* focus window: ``hl.dsp.focus({ window = "address:0x..." })`` — the view
+  selector understands address:/class:/title: (src/desktop/state/
+  ViewQuery.cpp bySelector ~line 140).
+* move window to workspace: ``hl.dsp.window.move({ workspace = 2,
+  window = "address:0x...", follow = true|false })`` (hlWindowMove: the
+  optional `window` key is the same selector, `follow = false` = silent,
+  i.e. movetoworkspacesilent).
+* move workspace to monitor: ``hl.dsp.workspace.move({ workspace = 2,
+  monitor = "DP-1" })`` (hlWorkspaceMove); focus a monitor:
+  ``hl.dsp.focus({ monitor = "DP-1" })``.
+* launch: ``hl.dsp.exec_cmd("dolphin", { workspace = "2" })`` — the table is
+  a window rule applied to the spawned process (buildRuleFromTable; the
+  `workspace`/`monitor` effect names are in WINDOW_RULE_EFFECT_DESCS,
+  LuaBindingsInternal.hpp). NOT exec_raw: dsp_execRaw spawns a raw process
+  (executor()->spawnRaw), it does not run classic dispatchers.
+"""
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
 import time
+from pathlib import Path
 
 from .api_errors import ToolError
 from .hyprlua import HyprLua
 from .util import clean_title, run_json
+
+# probe dispatch: a valid Lua dispatcher call, and the one string hyprlang
+# can only ever answer with 'Invalid dispatcher' (hl.dsp.no_op exists in
+# registerDispatcherBindings, LuaBindingsDispatchers.cpp)
+_LUA_PROBE = "hl.dsp.no_op()"
+_LUA_NOTE = "hl.dispatch"      # marker of the Lua-config error note
+_WS_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 :._+\-]*")
+_ADDR_RE = re.compile(r"0x[0-9a-fA-F]+")
+
+
+def lua_string(value) -> str:
+    """A Lua string literal. Values are sanitized upstream (desktop Exec,
+    validated workspace refs, hyprctl addresses), but a stray quote or
+    backslash must never break out of the dispatch expression."""
+    out = ['"']
+    for ch in str(value):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append("\\%d" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
 
 
 def _env_ready(env=None):
@@ -20,17 +91,47 @@ class HyprlandBackend:
     name = "hyprland"
     supports_launch = True
 
-    def __init__(self, runner=None, config_dir=None, env=None, lua=None):
+    def __init__(self, runner=None, config_dir=None, env=None, lua=None,
+                 config_style=None):
         self.runner = runner
         self.env = env if env is not None else os.environ
         self._lua = lua  # HyprLua or None (lazily read from the real dir)
         self._lua_tried = lua is not None
         self._config_dir = config_dir
+        # 'lua' | 'legacy' | None (None = detect on first action, then cache)
+        self._config_style = config_style
 
     # ── raw hyprctl ────────────────────────────────────────────
     def _hyprctl(self, *args, error="hyprctl failed"):
         return run_json(["hyprctl", *args], timeout=10, runner=self.runner,
                         error=error)
+
+    # ── config style (Lua vs classic hyprlang), cached ─────────
+    def config_style(self, runner=None) -> str:
+        if self._config_style is None:
+            self._config_style = self._detect_config_style(runner)
+        return self._config_style
+
+    def _detect_config_style(self, runner=None) -> str:
+        """Probe once: on a Lua config `hyprctl dispatch hl.dsp.no_op()`
+        evals to a real dispatcher and answers 'ok'; hyprlang knows no
+        dispatcher called that and answers 'Invalid dispatcher'. If hyprctl
+        itself is unreachable fall back to the config file layout
+        (hyprland.lua without hyprland.conf)."""
+        try:
+            reply = self._dispatch_raw(_LUA_PROBE, runner)
+        except ToolError:
+            reply = ""
+        if reply == "ok":
+            return "lua"
+        if _LUA_NOTE in reply:                    # 'shorthand for hl.dispatch'
+            return "lua"
+        if "invalid dispatcher" in reply.lower():
+            return "legacy"
+        base = Path(self._config_dir or (Path.home() / ".config" / "hypr"))
+        if (base / "hyprland.lua").exists() and not (base / "hyprland.conf").exists():
+            return "lua"
+        return "legacy"
 
     # ── Lua config (read-only; owner instruction) ──────────────
     def lua(self):
@@ -142,12 +243,102 @@ class HyprlandBackend:
             "pid": w.get("pid"),
         }
 
+    def _active_workspace(self):
+        try:
+            w = self._hyprctl("activeworkspace", "-j",
+                              error="activeworkspace failed")
+        except ToolError:
+            return None
+        return w if isinstance(w, dict) and w else None
+
+    def _observed_state(self):
+        """The workspace the view actually shows: {id, name, monitor(name)},
+        or None when it cannot be read (then the dispatch reply is the only
+        evidence we have)."""
+        w = self._active_workspace()
+        if w is None:
+            return None
+        mon = w.get("monitor")
+        mon_name = ""
+        if mon is not None:
+            try:
+                mon_name = {m["id"]: m["name"] for m in self.monitors()}.get(mon, str(mon))
+            except ToolError:
+                mon_name = str(mon)
+        return {"id": w.get("id"), "name": str(w.get("name") or ""),
+                "monitor": mon_name}
+
+    @staticmethod
+    def _ws_matches(obs, ref) -> bool:
+        """Does the observed active workspace satisfy the requested ref
+        ('6', 'code', 'name:code', '2:code')? Unobservable state counts as a
+        match — the accepted 'ok' reply stands on its own."""
+        if obs is None:
+            return True
+        s = str(ref).strip()
+        if s.lower().startswith("name:"):
+            tid, tname = None, s[5:]
+        elif ":" in s:
+            head, _, tname = s.partition(":")
+            tid = int(head) if head.isdigit() else None
+        else:
+            tid, tname = (int(s), None) if s.isdigit() else (None, s)
+        if tid is not None and obs.get("id") == tid:
+            return True
+        obs_name = str(obs.get("name") or "")
+        return bool(tname) and (obs_name == tname
+                                or obs_name.rsplit(":", 1)[-1] == tname)
+
+    # ── Lua expression helpers ─────────────────────────────────
+    @staticmethod
+    def _lua_ws(ref) -> str:
+        s = str(ref).strip()
+        if s.isdigit():
+            # unquoted number: the same selector the owner's Super+N binds
+            # use; the switch creates the workspace when it does not exist
+            return s
+        if _WS_REF_RE.fullmatch(s):
+            return lua_string(s)
+        raise ToolError(f"unsupported workspace reference: {s!r}")
+
+    @staticmethod
+    def _lua_win(win_id) -> str:
+        s = str(win_id).strip()
+        if not _ADDR_RE.fullmatch(s):
+            raise ToolError(f"invalid window address: {s!r}")
+        return lua_string(f"address:{s}")
+
     # ── actions ────────────────────────────────────────────────
-    def dispatch(self, expr, runner=None):
+    def _dispatch_raw(self, expr, runner=None) -> str:
+        """Run `hyprctl dispatch <expr>` (one argv element — the expression
+        never goes through a shell) and return the stripped reply text."""
         from .util import run
-        done = run(["hyprctl", "dispatch", expr], timeout=10,
-                   runner=runner if runner is not None else self.runner)
-        return getattr(done, "returncode", 0) == 0
+        try:
+            done = run(["hyprctl", "dispatch", expr], timeout=10,
+                       runner=runner if runner is not None else self.runner)
+        except FileNotFoundError:
+            raise ToolError("hyprctl is not installed") from None
+        except subprocess.TimeoutExpired:
+            raise ToolError("hyprctl dispatch timed out") from None
+        rc = getattr(done, "returncode", 0)
+        text = (getattr(done, "stdout", "") or "").strip()
+        if rc != 0:
+            reason = (getattr(done, "stderr", "") or "").strip() or text \
+                or f"exit code {rc}"
+            raise ToolError(f"hyprctl dispatch failed: {reason[:300]}")
+        return text
+
+    def dispatch(self, expr, runner=None, what="dispatch") -> str:
+        """Dispatch and return the reply on success.
+
+        Exit code 0 is NOT success: with a Lua config the reply carries the
+        Lua error text (plus the 'shorthand for hl.dispatch' note) while
+        hyprctl still exits 0. Success is exactly 'ok'; anything else is
+        raised as a ToolError with the real reason."""
+        text = self._dispatch_raw(expr, runner)
+        if text == "ok":
+            return text
+        raise ToolError(f"hyprland {what} failed: {text or 'empty reply'}"[:400])
 
     def _find_new_window(self, before_ids, hint_app, timeout=4.0):
         """Poll clients for a window that appeared after `before_ids`."""
@@ -176,24 +367,38 @@ class HyprlandBackend:
 
     def launch(self, argv, monitor=None, workspace=None, runner=None, env=None,
                follow=False):
-        """`hyprctl dispatch exec <cmd>`; when a target monitor/workspace is
-        asked for, move the new window afterwards (silent, no focus steal
-        unless we moved it at all). `follow=True` (open_app's follow flag)
-        switches to where the app lands: no `silent` in the workspace tag
-        and movetoworkspace instead of movetoworkspacesilent."""
-        cmd = " ".join(str(a) for a in argv)          # hyprctl exec takes one string
-        ws_tag = ""
-        if workspace not in (None, ""):
-            ws_tag = (f"[workspace {workspace}] " if follow
-                      else f"[workspace {workspace} silent] ")
+        """Launch a command; when a target monitor/workspace is asked for,
+        move the new window afterwards (silent unless `follow=True`, in which
+        case the view follows the app). Lua configs use
+        `hl.dsp.exec_cmd(cmd[, { workspace = "N" }])` — the table is a window
+        rule for the spawned process — plus
+        `hl.dsp.window.move({ workspace = N, window = "address:..",
+        follow = true|false })`; legacy configs keep the classic
+        `exec "[workspace N silent] cmd"` / `movetoworkspace*` strings.
+        The move is verified against the re-read window list."""
+        cmd = " ".join(str(a) for a in argv)
+        lua = self.config_style(runner) == "lua"
+        has_ws = workspace not in (None, "")
+        if lua:
+            if has_ws:
+                expr = (f"hl.dsp.exec_cmd({lua_string(cmd)}, "
+                        f"{{ workspace = {lua_string(str(workspace))} }})")
+            else:
+                expr = f"hl.dsp.exec_cmd({lua_string(cmd)})"
+        else:
+            ws_tag = ""
+            if has_ws:
+                ws_tag = (f"[workspace {workspace}] " if follow
+                          else f"[workspace {workspace} silent] ")
+            expr = f'exec "{ws_tag}{cmd}"'
         before = {w["id"] for w in self.windows()}
-        if not self.dispatch(f'exec "{ws_tag}{cmd}"', runner=runner):
-            raise ToolError("hyprctl dispatch exec failed")
+        self.dispatch(expr, runner, what="launch")
         moved = {}
+        target_ws = None
         hint = str(argv[0]).rsplit("/", 1)[-1]
         new_win = self._find_new_window(before, hint)
-        if new_win and (monitor or workspace not in (None, "")):
-            target_ws = str(workspace) if workspace not in (None, "") else None
+        if new_win and (monitor or has_ws):
+            target_ws = str(workspace) if has_ws else None
             if monitor:
                 # land on the monitor's current workspace (rules move it there)
                 mons = {m["name"]: m for m in self.monitors()}
@@ -202,34 +407,98 @@ class HyprlandBackend:
                     raise ToolError(f"no such monitor: {monitor}")
                 target_ws = target_ws or str(m.get("active_workspace") or "")
             if target_ws:
-                mover = "movetoworkspace" if follow else "movetoworkspacesilent"
-                if self.dispatch(f"{mover} {target_ws},address:{new_win['id']}",
-                                 runner=runner):
+                try:
+                    if lua:
+                        self.dispatch(
+                            f"hl.dsp.window.move({{ workspace = "
+                            f"{self._lua_ws(target_ws)}, window = "
+                            f"{self._lua_win(new_win['id'])}, "
+                            f"follow = {'true' if follow else 'false'} }})",
+                            runner, what="movetoworkspace")
+                    else:
+                        mover = "movetoworkspace" if follow else "movetoworkspacesilent"
+                        self.dispatch(f"{mover} {target_ws},address:{new_win['id']}",
+                                      runner, what=mover)
                     moved = {"workspace": target_ws}
-                else:
+                except ToolError:
                     moved = {"note": "launched but could not move it to the screen"}
             if monitor and not moved.get("note"):
                 # keep that workspace ON the requested screen (owner:
                 # 'show workspace 2 on the left screen')
-                self.dispatch(f"moveworkspacetomonitor {target_ws} {monitor}",
-                              runner=runner)
-                moved["monitor"] = monitor
+                try:
+                    if lua:
+                        wsel = (f"workspace = {self._lua_ws(target_ws)}, "
+                                if target_ws else "")
+                        self.dispatch(
+                            f"hl.dsp.workspace.move({{ {wsel}"
+                            f"monitor = {lua_string(monitor)} }})",
+                            runner, what="moveworkspacetomonitor")
+                    else:
+                        self.dispatch(f"moveworkspacetomonitor {target_ws} {monitor}",
+                                      runner, what="moveworkspacetomonitor")
+                    moved["monitor"] = monitor
+                except ToolError:
+                    moved["note"] = ("moved it, but that workspace could not "
+                                     "be kept on that screen")
+        if moved.get("workspace") and new_win:
+            # verify the window actually landed where we said
+            try:
+                cur = {w["id"]: w for w in self.windows()}.get(new_win["id"])
+            except ToolError:
+                cur = None
+            if cur is not None:
+                obs = str(cur.get("workspace") or "")
+                want = str(target_ws or "")
+                if obs and obs != want and obs.rsplit(":", 1)[-1] != want:
+                    moved["note"] = (moved.get("note", "") +
+                                     f" window ended on workspace {obs}, "
+                                     f"not {want}").strip()
         return moved or {"launched": True}
 
     def switch_workspace(self, workspace, monitor=None, runner=None) -> dict:
         """Show a workspace/virtual desktop (number or name). With a
-        monitor: moveworkspacetomonitor first — that is the dispatch that
-        matches 'show workspace 2 on the left screen'."""
+        monitor: move the workspace onto that screen first — the dispatch
+        that matches 'show workspace 2 on the left screen'. Lua configs get
+        `hl.dsp.workspace.move({ workspace = N, monitor = "M" })` +
+        `hl.dsp.focus({ workspace = N })`; the switch creates an empty
+        workspace exactly like the owner's Super+N keybinds. The reply is
+        checked and the view is re-read: an accepted command that left the
+        view on the old workspace is an error, not 'done'."""
         ref = str(workspace or "").strip()
         if not ref:
             raise ToolError("switch_workspace: give a workspace number or name")
+        lua = self.config_style(runner) == "lua"
+        before = self._observed_state()
         if monitor:
-            if not self.dispatch(f"moveworkspacetomonitor {ref} {monitor}",
-                                 runner=runner):
-                raise ToolError("hyprctl moveworkspacetomonitor failed")
-        if not self.dispatch(f"workspace {ref}", runner=runner):
-            raise ToolError("hyprctl workspace switch failed")
-        return {"workspace": ref, "monitor": monitor or ""}
+            if lua:
+                self.dispatch(f"hl.dsp.workspace.move({{ workspace = "
+                              f"{self._lua_ws(ref)}, "
+                              f"monitor = {lua_string(monitor)} }})",
+                              runner, what="moveworkspacetomonitor")
+            else:
+                self.dispatch(f"moveworkspacetomonitor {ref} {monitor}",
+                              runner, what="moveworkspacetomonitor")
+        if lua:
+            self.dispatch(f"hl.dsp.focus({{ workspace = {self._lua_ws(ref)} }})",
+                          runner, what="workspace switch")
+        else:
+            self.dispatch(f"workspace {ref}", runner, what="workspace switch")
+        after = self._observed_state()
+        note = ""
+        if not self._ws_matches(after, ref):
+            ident = str((after or {}).get("name") or (after or {}).get("id") or "")
+            if before is not None and after is not None and before == after:
+                raise ToolError(
+                    "Hyprland accepted the command but the view did not change"
+                    f" (still workspace {ident})")
+            note = f"switched to workspace {ident}, not {ref}" if ident else ""
+        obs_name = (after or {}).get("name") or ""
+        obs_id = (after or {}).get("id")
+        return {
+            "workspace": obs_name or (str(obs_id) if obs_id is not None else ref),
+            "monitor": (after or {}).get("monitor") or (monitor or ""),
+            **({"note": note} if note else {}),
+        }
 
     def focus_window(self, ref: str) -> dict:
         ref = str(ref or "").strip()
@@ -237,9 +506,25 @@ class HyprlandBackend:
         if win is None:
             raise ToolError(f"no open window matches {ref!r} "
                             "(use a window id, app class or title from desktop_windows)")
-        if not self.dispatch(f"focuswindow address:{win['id']}"):
-            raise ToolError("hyprctl focuswindow failed")
-        return {"focused": win.get("app") or ref, "title": win.get("title", "")}
+        lua = self.config_style() == "lua"
+        before = self.focused()
+        if lua:
+            expr = f"hl.dsp.focus({{ window = {self._lua_win(win['id'])} }})"
+        else:
+            expr = f"focuswindow address:{win['id']}"
+        self.dispatch(expr, what="focuswindow")
+        after = self.focused()
+        out = {"focused": win.get("app") or ref, "title": win.get("title", "")}
+        if after:
+            out["address"] = after.get("id", "")
+            out["workspace"] = after.get("workspace", "")
+            if after.get("id") != win.get("id"):
+                if before and after.get("id") == before.get("id"):
+                    raise ToolError("Hyprland accepted the command but the view "
+                                    "did not change (focus stayed where it was)")
+                out["note"] = ("focus moved to "
+                               f"{after.get('app') or after.get('id') or '?'} instead")
+        return out
 
     def _find_window(self, ref):
         ref_l = ref.lower().removeprefix("address:")
