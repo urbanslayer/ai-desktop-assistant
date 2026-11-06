@@ -1,8 +1,55 @@
 """Small shared helpers: subprocess running, JSON parsing, title hygiene."""
 import json
 import subprocess
+import time
 
 TITLE_MAX = 120            # docs/DESKTOP_SENSE.md: titles capped at 120 chars
+
+
+def tlog(msg):
+    """One line on the desktop terminal (desktop.py owns this stdout)."""
+    print(msg, flush=True)
+
+
+class Steps:
+    """Wall-clock timing for one desktop_sense call. Marks named steps and
+    prints ONE line when finished:
+
+        [desktop] switch_workspace 2: probe 2ms, dispatch 3ms, total 15ms -> ok
+
+    Owner decision 2026-11-06: every desktop_sense action logs one such line
+    (the 14 s workspace switch was untraceable without them)."""
+
+    def __init__(self, label):
+        self.label = str(label)
+        self._t0 = self._t = time.monotonic()
+        self._done = False
+        self.parts = []
+
+    def mark(self, name):
+        """Close the current step: '<name> <ms>ms'."""
+        now = time.monotonic()
+        self.parts.append(f"{name} {round((now - self._t) * 1000)}ms")
+        self._t = now
+
+    def note(self, text):
+        """A non-timed part of the line (e.g. 'style cached')."""
+        self.parts.append(str(text))
+
+    def finish(self, outcome="ok"):
+        """Print the single summary line and return the total ms.
+        Idempotent: whoever owns the line prints it, nobody prints twice."""
+        if self._done:
+            return 0
+        self._done = True
+        total = round((time.monotonic() - self._t0) * 1000)
+        line = ", ".join(self.parts + [f"total {total}ms"])
+        tlog(f"[desktop] {self.label}: {line} -> {outcome}")
+        return total
+
+    @property
+    def finished(self):
+        return self._done
 
 
 def clean_title(title):

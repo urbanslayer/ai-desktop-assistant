@@ -22,7 +22,7 @@ from .awareness import Awareness
 from .browser_windows import (FF_CLASS_RE, match_windows, parse_workspace_ref,
                                split_firefox_title)
 from .monitors import monitor_phrase, resolve_monitor_phrase
-from .util import clean_title
+from .util import clean_title, Steps
 
 FIREFOX_CLASSES = re.compile(r"firefox|thunderbird", re.I)
 
@@ -69,7 +69,10 @@ def sense_tools():
         {"name": "desktop_windows", "risk": "read",
          "description": "The owner's open windows: app id/class, title, "
                         "workspace, monitor, focused, fullscreen/floating, pid. "
-                        "Denylisted apps show as '<hidden>'.",
+                        "Denylisted apps show as '<hidden>'. current_workspaces "
+                        "maps each screen phrase to the workspace it shows now "
+                        "(e.g. {'middle Dell': '2'}); a workspace with no "
+                        "windows simply contributes no rows — that is normal.",
          "parameters": _obj({})},
         {"name": "desktop_focused", "risk": "read",
          "description": "The focused window (same shape as desktop_windows rows) "
@@ -121,7 +124,12 @@ def sense_tools():
          "description": "Show a workspace / virtual desktop: '2', 'desktop 2', "
                         "'virtual desktop two' or a workspace name. No "
                         "keystrokes needed — this IS the way. monitor: show it "
-                        "on that screen too ('left', 'the portable screen').",
+                        "on that screen too ('left', 'the portable screen'). "
+                        "On success the result says exactly what changed: "
+                        "now_showing {workspace, screen, windows_on_it} and a "
+                        "message like 'Now showing workspace 2 on the middle "
+                        "Dell (empty).'. An empty workspace has no focused "
+                        "window; that is success, not a failure.",
          "parameters": _obj({"workspace": {"type": "string"},
                              "monitor": {"type": "string",
                                          "description": "name or phrase; "
@@ -435,7 +443,22 @@ class DesktopSense:
     def desktop_windows(self) -> dict:
         b = self._need_backend()
         wins = [self._filter_window(w) for w in b.windows()]
-        return {"backend": b.name, "windows": wins}
+        out = {"backend": b.name, "windows": wins}
+        # What each screen shows RIGHT NOW (2026-11-06: after a switch the
+        # model re-reads windows and mistook an empty workspace for failure;
+        # this top-level map shows the change without any interpretation).
+        try:
+            mons = b.monitors()
+        except ToolError:
+            mons = []
+        current = {}
+        for m in mons:
+            aw = str(m.get("active_workspace") or "")
+            if aw:
+                current[monitor_phrase(m, mons) or str(m.get("name") or "?")] = aw
+        if current:
+            out["current_workspaces"] = current
+        return out
 
     def desktop_focused(self) -> dict:
         b = self._need_backend()
@@ -444,6 +467,9 @@ class DesktopSense:
         if shown is not None and shown.get("app") == "<hidden>":
             shown = None      # denylisted: dropped from the focused answer
         out = {"backend": b.name, "window": shown}
+        if shown is None:
+            out["note"] = ("no window is focused right now — normal on an "
+                           "empty workspace, not a failed switch")
         if self.bridge is None or not self.bridge.connected():
             return out
         ff_shown = bool(shown and FIREFOX_CLASSES.search(shown.get("app") or ""))
@@ -502,22 +528,37 @@ class DesktopSense:
             runner=self.runner,
             resolve_monitor=lambda: (b.monitors() if b else []))
 
-    def switch_workspace(self, workspace: str, monitor=None) -> dict:
-        b = self._need_backend()
-        if not hasattr(b, "switch_workspace"):
-            raise ToolError(f"this desktop ({b.name}) cannot switch workspaces")
-        ref = parse_workspace_ref(workspace)
-        if ref is None:
-            raise ToolError("switch_workspace: give a workspace number, name or "
-                            "phrase ('2', 'desktop 2', 'virtual desktop two')")
-        mon_name = None
-        if monitor:
-            resolved, err = resolve_monitor_phrase(monitor, self._monitors_safe(),
-                                                   backend_name=b.name)
-            if err:
-                raise ToolError(err)
-            mon_name = str(resolved.get("name") or "")
-        return b.switch_workspace(ref, monitor=mon_name)
+    def switch_workspace(self, workspace: str, monitor=None, steps=None) -> dict:
+        own = steps is None
+        if own:
+            steps = Steps(f"switch_workspace {str(workspace or '').strip()}")
+        ok = False
+        try:
+            b = self._need_backend()
+            if not hasattr(b, "switch_workspace"):
+                raise ToolError(f"this desktop ({b.name}) cannot switch workspaces")
+            ref = parse_workspace_ref(workspace)
+            if ref is None:
+                raise ToolError("switch_workspace: give a workspace number, name or "
+                                "phrase ('2', 'desktop 2', 'virtual desktop two')")
+            mon_name = None
+            if monitor:
+                resolved, err = resolve_monitor_phrase(monitor, self._monitors_safe(),
+                                                       backend_name=b.name)
+                if err:
+                    raise ToolError(err)
+                mon_name = str(resolved.get("name") or "")
+                steps.mark("monitor-phrase")
+            import inspect
+            if "steps" in inspect.signature(b.switch_workspace).parameters:
+                out = b.switch_workspace(ref, monitor=mon_name, steps=steps)
+            else:
+                out = b.switch_workspace(ref, monitor=mon_name)
+            ok = True
+            return out
+        finally:
+            if own:
+                steps.finish("ok" if ok else "ERROR (see raised error)")
 
     def focus_window(self, window: str) -> dict:
         b = self._need_backend()
@@ -526,7 +567,7 @@ class DesktopSense:
         return b.focus_window(window)
 
     def executors(self) -> dict:
-        return {
+        raw = {
             "desktop_windows": self.desktop_windows,
             "desktop_focused": self.desktop_focused,
             "desktop_monitors": self.desktop_monitors,
@@ -536,6 +577,26 @@ class DesktopSense:
             "focus_window": self.focus_window,
             "browser_tabs": self.browser_tabs,
         }
+        return {name: self._timed(name, fn) for name, fn in raw.items()}
+
+    def _timed(self, name, fn):
+        """ONE '[desktop] <action>: ... -> ok' timing line per call (the
+        14 s switch of 2026-11-06 was untraceable without these). Executors
+        that accept `steps` decorate their line with named sub-steps."""
+        import inspect
+        takes_steps = "steps" in inspect.signature(fn).parameters
+
+        def call(**kw):
+            st = Steps(name)
+            try:
+                out = fn(steps=st, **kw) if takes_steps else fn(**kw)
+            except Exception as e:
+                st.finish("ERROR: " + " ".join(str(e).split())[:160])
+                raise
+            st.finish("ok")
+            return out
+        call.__name__ = str(name)
+        return call
 
 
 def _unknown_method(answer: dict) -> bool:

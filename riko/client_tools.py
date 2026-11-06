@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time as _time
 from urllib.parse import urlparse
 
 from riko import hub_client
@@ -861,6 +862,20 @@ class ClientRuntime:
             print(f"[client] {type(e).__name__}: {e}")
 
     def _run_request(self, req, approval_timeout_s):
+        # One wall-clock line per tool call (2026-11-06: desktop__switch_workspace
+        # reported ok at 14254 ms and nothing said where the time went). This
+        # splits local exec + result post from hub-side queueing/network;
+        # desktop_sense actions additionally print their own [desktop] step line.
+        tool = str(req.get("tool") or "")
+        t0 = _time.monotonic()
+        try:
+            self._dispatch_request(req, approval_timeout_s)
+        finally:
+            if tool != "__approval__":
+                ms = round((_time.monotonic() - t0) * 1000)
+                print(f"[client] {tool}: exec+post {ms}ms")
+
+    def _dispatch_request(self, req, approval_timeout_s):
         rid = str(req.get("request_id") or "")
         tool = str(req.get("tool") or "")
         args = req.get("arguments") if isinstance(req.get("arguments"), dict) else {}

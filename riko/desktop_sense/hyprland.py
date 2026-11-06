@@ -47,7 +47,8 @@ from pathlib import Path
 
 from .api_errors import ToolError
 from .hyprlua import HyprLua
-from .util import clean_title, run_json
+from .monitors import monitor_phrase
+from .util import clean_title, run_json, Steps
 
 # probe dispatch: a valid Lua dispatcher call, and the one string hyprlang
 # can only ever answer with 'Invalid dispatcher' (hl.dsp.no_op exists in
@@ -100,6 +101,8 @@ class HyprlandBackend:
         self._config_dir = config_dir
         # 'lua' | 'legacy' | None (None = detect on first action, then cache)
         self._config_style = config_style
+        # how the style was decided ('file' | 'probe' | ''), for the timing line
+        self._style_source = "file" if config_style else ""
 
     # ── raw hyprctl ────────────────────────────────────────────
     def _hyprctl(self, *args, error="hyprctl failed"):
@@ -107,17 +110,41 @@ class HyprlandBackend:
                         error=error)
 
     # ── config style (Lua vs classic hyprlang), cached ─────────
-    def config_style(self, runner=None) -> str:
+    def config_style(self, runner=None, steps=None) -> str:
         if self._config_style is None:
             self._config_style = self._detect_config_style(runner)
+            # 'file' costs zero round trips; only 'probe' can ever be the
+            # slow hop (one full hyprctl dispatch through the compositor).
+            if steps is not None:
+                steps.note(f"style {self._config_style} via {self._style_source}")
+        elif steps is not None:
+            steps.note("style cached")
         return self._config_style
 
     def _detect_config_style(self, runner=None) -> str:
-        """Probe once: on a Lua config `hyprctl dispatch hl.dsp.no_op()`
-        evals to a real dispatcher and answers 'ok'; hyprlang knows no
-        dispatcher called that and answers 'Invalid dispatcher'. If hyprctl
-        itself is unreachable fall back to the config file layout
-        (hyprland.lua without hyprland.conf)."""
+        """Decide without the compositor when the config file layout already
+        says: 0.55+ uses `hyprland.lua` as the entrypoint, so that file alone
+        means a Lua config and plain `hyprland.conf` alone means hyprlang.
+        Only when BOTH files exist (or the layout is unreadable) do we pay
+        one probe dispatch: `hyprctl dispatch hl.dsp.no_op()` evals to a real
+        dispatcher and answers 'ok' on Lua; hyprlang answers
+        'Invalid dispatcher'. The probe dispatch can stall seconds behind
+        the compositor's main loop, so the file layout wins whenever it is
+        unambiguous (2026-11-06: a probe + the real dispatch on the first
+        switch after restart were the front half of a 14 s tool call)."""
+        try:
+            base = Path(self._config_dir or (Path.home() / ".config" / "hypr"))
+            lua_file = (base / "hyprland.lua").is_file()
+            conf_file = (base / "hyprland.conf").is_file()
+        except OSError:
+            lua_file = conf_file = False
+        if lua_file and not conf_file:
+            self._style_source = "file"
+            return "lua"
+        if conf_file and not lua_file:
+            self._style_source = "file"
+            return "legacy"
+        self._style_source = "probe"
         try:
             reply = self._dispatch_raw(_LUA_PROBE, runner)
         except ToolError:
@@ -128,10 +155,7 @@ class HyprlandBackend:
             return "lua"
         if "invalid dispatcher" in reply.lower():
             return "legacy"
-        base = Path(self._config_dir or (Path.home() / ".config" / "hypr"))
-        if (base / "hyprland.lua").exists() and not (base / "hyprland.conf").exists():
-            return "lua"
-        return "legacy"
+        return "legacy" if not lua_file else "lua"
 
     # ── Lua config (read-only; owner instruction) ──────────────
     def lua(self):
@@ -455,7 +479,8 @@ class HyprlandBackend:
                                      f"not {want}").strip()
         return moved or {"launched": True}
 
-    def switch_workspace(self, workspace, monitor=None, runner=None) -> dict:
+    def switch_workspace(self, workspace, monitor=None, runner=None,
+                         steps=None) -> dict:
         """Show a workspace/virtual desktop (number or name). With a
         monitor: move the workspace onto that screen first — the dispatch
         that matches 'show workspace 2 on the left screen'. Lua configs get
@@ -463,42 +488,118 @@ class HyprlandBackend:
         `hl.dsp.focus({ workspace = N })`; the switch creates an empty
         workspace exactly like the owner's Super+N keybinds. The reply is
         checked and the view is re-read: an accepted command that left the
-        view on the old workspace is an error, not 'done'."""
+        view on the old workspace is an error, not 'done'.
+
+        `steps` (util.Steps) collects per-step timings; when omitted the
+        call logs its own one-line timing entry. Exactly ONE dispatch goes
+        to the compositor per switch (plus one move when a monitor was
+        named): every dispatch is a synchronous Lua eval on Hyprland's main
+        loop and the only step that can stall, so the timing line names it.
+        An EMPTY destination workspace is success — no focused window is
+        expected there and nothing in the result says otherwise."""
         ref = str(workspace or "").strip()
         if not ref:
             raise ToolError("switch_workspace: give a workspace number or name")
-        lua = self.config_style(runner) == "lua"
-        before = self._observed_state()
-        if monitor:
+        own_steps = steps is None
+        if own_steps:
+            steps = Steps(f"switch_workspace {ref}"
+                          + (f" on {monitor}" if monitor else ""))
+        ok = False
+        try:
+            lua = self.config_style(runner, steps=steps) == "lua"
+            before = self._active_workspace()
+            steps.mark("pre-state")
+            if monitor:
+                if lua:
+                    self.dispatch(f"hl.dsp.workspace.move({{ workspace = "
+                                  f"{self._lua_ws(ref)}, "
+                                  f"monitor = {lua_string(monitor)} }})",
+                                  runner, what="moveworkspacetomonitor")
+                else:
+                    self.dispatch(f"moveworkspacetomonitor {ref} {monitor}",
+                                  runner, what="moveworkspacetomonitor")
+                steps.mark("move")
             if lua:
-                self.dispatch(f"hl.dsp.workspace.move({{ workspace = "
-                              f"{self._lua_ws(ref)}, "
-                              f"monitor = {lua_string(monitor)} }})",
-                              runner, what="moveworkspacetomonitor")
+                self.dispatch(f"hl.dsp.focus({{ workspace = {self._lua_ws(ref)} }})",
+                              runner, what="workspace switch")
             else:
-                self.dispatch(f"moveworkspacetomonitor {ref} {monitor}",
-                              runner, what="moveworkspacetomonitor")
-        if lua:
-            self.dispatch(f"hl.dsp.focus({{ workspace = {self._lua_ws(ref)} }})",
-                          runner, what="workspace switch")
-        else:
-            self.dispatch(f"workspace {ref}", runner, what="workspace switch")
-        after = self._observed_state()
-        note = ""
-        if not self._ws_matches(after, ref):
-            ident = str((after or {}).get("name") or (after or {}).get("id") or "")
-            if before is not None and after is not None and before == after:
-                raise ToolError(
-                    "Hyprland accepted the command but the view did not change"
-                    f" (still workspace {ident})")
-            note = f"switched to workspace {ident}, not {ref}" if ident else ""
-        obs_name = (after or {}).get("name") or ""
-        obs_id = (after or {}).get("id")
-        return {
-            "workspace": obs_name or (str(obs_id) if obs_id is not None else ref),
-            "monitor": (after or {}).get("monitor") or (monitor or ""),
-            **({"note": note} if note else {}),
-        }
+                self.dispatch(f"workspace {ref}", runner, what="workspace switch")
+            steps.mark("dispatch")
+            after_w = self._active_workspace()
+            try:
+                mons = self.monitors()
+            except ToolError:
+                mons = []
+            after = self._observed_from(after_w, mons)
+            steps.mark("verify")
+            note = ""
+            if not self._ws_matches(after, ref):
+                ident = str((after or {}).get("name") or (after or {}).get("id") or "")
+                same = (before is not None and after_w is not None
+                        and (before.get("id"), str(before.get("name") or ""))
+                        == (after_w.get("id"), str(after_w.get("name") or "")))
+                if same:
+                    raise ToolError(
+                        "Hyprland accepted the command but the view did not change"
+                        f" (still workspace {ident})")
+                note = f"switched to workspace {ident}, not {ref}" if ident else ""
+            obs_name = (after or {}).get("name") or ""
+            obs_id = (after or {}).get("id")
+            obs_ws = obs_name or (str(obs_id) if obs_id is not None else ref)
+            mon_name = (after or {}).get("monitor") or (monitor or "")
+            mon_row = next((m for m in mons if m.get("name") == mon_name), None)
+            screen = monitor_phrase(mon_row, mons) if mon_row else mon_name
+            n_win = self._windows_on(obs_ws, obs_id)
+            if n_win is None:
+                tail = ""
+            elif n_win == 0:
+                tail = " (empty)"
+            else:
+                tail = f" ({n_win} window{'s' if n_win != 1 else ''})"
+            where = f"on the {screen}" if screen else "on the current screen"
+            out = {
+                "workspace": obs_ws,
+                "monitor": mon_name,
+                "now_showing": {"workspace": obs_ws, "screen": screen,
+                                "windows_on_it": n_win},
+                "message": f"Now showing workspace {obs_ws} {where}{tail}.",
+                **({"note": note} if note else {}),
+            }
+            ok = True
+            return out
+        finally:
+            if own_steps:
+                steps.finish("ok" if ok else "ERROR (view did not change)")
+
+    def _windows_on(self, ws_name, ws_id):
+        """Windows living on the workspace (None when clients cannot be
+        read). One hyprctl call; an empty workspace legitimately returns 0."""
+        try:
+            clients = self._hyprctl("clients", "-j", error="hyprctl clients failed")
+        except ToolError:
+            return None
+        n = 0
+        for c in clients if isinstance(clients, list) else []:
+            cw = c.get("workspace") or {}
+            name = str(cw.get("name") or "")
+            if (ws_id is not None and cw.get("id") == ws_id) or (
+                    name and (name == str(ws_name)
+                              or name.rsplit(":", 1)[-1] == str(ws_name))):
+                n += 1
+        return n
+
+    @staticmethod
+    def _observed_from(w, mons):
+        """Map a raw activeworkspace reply (+ monitors rows) to the observed
+        view {id, name, monitor(name)}; None when unreadable."""
+        if not w:
+            return None
+        mon = w.get("monitor")
+        mon_name = ""
+        if mon is not None:
+            mon_name = {m["id"]: m["name"] for m in mons}.get(mon, str(mon))
+        return {"id": w.get("id"), "name": str(w.get("name") or ""),
+                "monitor": mon_name}
 
     def focus_window(self, ref: str) -> dict:
         ref = str(ref or "").strip()

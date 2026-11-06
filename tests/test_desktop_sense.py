@@ -6,6 +6,7 @@ output), and the launcher tests only record what WOULD run."""
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,8 @@ def hypr():
                              {"output": "desc:GWD ARZOPA 2022110200001",
                               "mode": "2560x1440@140", "position": "5120x0",
                               "scale": 1.25}]})()
-    return hyprland_mod.HyprlandBackend(runner=runner, lua=lua)
+    return hyprland_mod.HyprlandBackend(runner=runner, lua=lua,
+                                config_dir="/nonexistent-riko-hypr-test")
 
 
 def test_hyprland_monitors(hypr):
@@ -140,7 +142,8 @@ def test_hyprland_launch_to_monitor(hypr):
             Done(json.dumps(fix("hypr_workspaces.json"))),
         r"dispatch hl\.dsp\.no_op": Done("Invalid dispatcher"),   # classic hyprlang
         r"hyprctl dispatch": dispatch})
-    b = hyprland_mod.HyprlandBackend(runner=runner, lua=None)
+    b = hyprland_mod.HyprlandBackend(runner=runner, lua=None,
+                          config_dir="/nonexistent-riko-hypr-test")
     out = b.launch(["foot"], monitor="HDMI-A-1")
     assert out == {"workspace": "8", "monitor": "HDMI-A-1"}
     joined = [" ".join(c) for c in runner.calls]
@@ -1003,7 +1006,8 @@ def hypr_ff(act="hypr_activewindow_firefox.json"):
         r"hyprctl dispatch": dispatch,
         r"hyprctl activeworkspace": lambda a: Done(json.dumps(ws_state["cur"])),
     })
-    return hyprland_mod.HyprlandBackend(runner=runner, lua=None)
+    return hyprland_mod.HyprlandBackend(runner=runner, lua=None,
+                               config_dir="/nonexistent-riko-hypr-test")
 
 
 def test_hyprland_focus_recency_rows():
@@ -1022,7 +1026,7 @@ def test_hyprland_switch_workspace_dispatch():
     joined = [" ".join(c) for c in b.runner.calls]
     assert any(c == "hyprctl dispatch workspace 2" for c in joined)
     # the observed state is reported, not the requested string
-    assert out == {"workspace": "2", "monitor": "DP-1"}
+    assert out["workspace"] == "2" and out["monitor"] == "DP-1"
     # 'show workspace 2 on the left screen': moveworkspacetomonitor FIRST
     b.switch_workspace("2", monitor="DP-1")
     joined = [" ".join(c) for c in b.runner.calls]
@@ -1054,7 +1058,8 @@ def test_hyprland_launch_follow_vs_quiet():
             r"hyprctl workspaces": Done(json.dumps(fix("hypr_workspaces.json"))),
             r"dispatch hl\.dsp\.no_op": Done("Invalid dispatcher"),   # classic hyprlang
             r"hyprctl dispatch": dispatch})
-        return hyprland_mod.HyprlandBackend(runner=runner, lua=None)
+        return hyprland_mod.HyprlandBackend(runner=runner, lua=None,
+                               config_dir="/nonexistent-riko-hypr-test")
 
     b = mk()                                   # follow: no 'silent' tag
     b.launch(["dolphin"], workspace="2", follow=True)
@@ -1145,7 +1150,8 @@ def _lua_hypr(ws=None, act=None, extra=None, clients=None, exprs=None,
     if extra:
         replies.update(extra)
     runner = recording_runner(replies)
-    return hyprland_mod.HyprlandBackend(runner=runner, lua=None), state
+    return hyprland_mod.HyprlandBackend(runner=runner, lua=None,
+                               config_dir="/nonexistent-riko-hypr-test"), state
 
 
 def test_hyprland_config_style_detection(tmp_path):
@@ -1180,7 +1186,7 @@ def test_hyprland_lua_switch_to_empty_workspace_6():
     assert b.config_style() == "lua"
     out = b.switch_workspace("6")
     assert exprs == ["hl.dsp.focus({ workspace = 6 })"]   # number unquoted
-    assert out == {"workspace": "6", "monitor": "DP-2"}   # observed state
+    assert out["workspace"] == "6" and out["monitor"] == "DP-2"  # observed state
     # the classic string that silently failed on the owner's setup is gone
     assert "workspace 6" not in exprs
 
@@ -1192,7 +1198,7 @@ def test_hyprland_lua_switch_to_occupied_and_verify():
     b, _ = _lua_hypr(exprs=exprs, flip_ws=flip)
     out = b.switch_workspace("4")
     assert exprs == ["hl.dsp.focus({ workspace = 4 })"]
-    assert out == {"workspace": "4", "monitor": "DP-1"}
+    assert out["workspace"] == "4" and out["monitor"] == "DP-1"
 
 
 def test_hyprland_lua_named_workspace_quoted():
@@ -1211,6 +1217,139 @@ def test_hyprland_lua_view_did_not_change_is_an_error():
     b, _ = _lua_hypr()
     with pytest.raises(ToolError, match="did not change"):
         b.switch_workspace("4")
+
+
+# ── fast + unambiguous switching (2026-11-06: hub logged desktop__switch_workspace
+# ok=True at 14254 ms while an adjacent read took 22 ms; the model then read the
+# empty workspace 2 as a failure) ────────────────────────────────────────────
+
+def test_hyprland_lua_empty_workspace_is_unambiguous_success():
+    # 'switch to workspace 2' when 2 is empty: the switch IS the success;
+    # the result must say what the screen now shows, never imply failure
+    # because no window is focused.
+    exprs = []
+    flip = ("hl.dsp.focus({ workspace = 6 })",
+            {"id": 6, "name": "6", "monitor": 1})
+    b, _ = _lua_hypr(exprs=exprs, flip_ws=flip)
+    out = b.switch_workspace("6")
+    assert out["now_showing"] == {"workspace": "6", "screen": "middle Dell",
+                                  "windows_on_it": 0}
+    assert out["message"] == "Now showing workspace 6 on the middle Dell (empty)."
+    blob = json.dumps(out).lower()
+    for bad in ("fail", "no window", "not focused", "error"):
+        assert bad not in blob
+
+
+def test_hyprland_lua_occupied_workspace_counts_windows():
+    exprs = []
+    flip = ("hl.dsp.focus({ workspace = 2 })",
+            {"id": 2, "name": "2", "monitor": 0})
+    b, _ = _lua_hypr(exprs=exprs, flip_ws=flip)   # fixture ws 2 has 0x502
+    out = b.switch_workspace("2")
+    assert out["now_showing"]["windows_on_it"] == 1
+    assert out["message"] == "Now showing workspace 2 on the left Dell (1 window)."
+
+
+def test_hyprland_switch_no_view_change_logs_error_line(capsys):
+    b, _ = _lua_hypr()
+    with pytest.raises(ToolError, match="did not change"):
+        b.switch_workspace("4")
+    line = capsys.readouterr().out
+    assert "[desktop] switch_workspace 4:" in line and "-> ERROR" in line
+
+
+def test_hyprland_config_style_file_layout_never_dispatches(tmp_path):
+    # the probe used to be a dispatch round trip on EVERY first action;
+    # 0.55+ entrypoint files decide alone, at zero compositor cost
+    only_lua = tmp_path / "a"; only_lua.mkdir()
+    (only_lua / "hyprland.lua").write_text("-- owner's lua config\n")
+    r1 = recording_runner({r".": Done("", 1, "must not be called")})
+    b1 = hyprland_mod.HyprlandBackend(runner=r1, lua=None, config_dir=str(only_lua))
+    assert b1.config_style() == "lua"
+    assert r1.calls == []                       # no probe dispatch at all
+    only_conf = tmp_path / "b"; only_conf.mkdir()
+    (only_conf / "hyprland.conf").write_text("misc { }\n")
+    r2 = recording_runner({r".": Done("", 1, "must not be called")})
+    b2 = hyprland_mod.HyprlandBackend(runner=r2, lua=None, config_dir=str(only_conf))
+    assert b2.config_style() == "legacy"
+    assert r2.calls == []
+
+
+def test_switch_workspace_timing_under_300ms(tmp_path, capsys):
+    # realistic hyprctl latency measured live 2026-11-06: 2-3 ms per call.
+    # With those numbers the whole switch must finish < 300 ms: one dispatch,
+    # no probe, no polling for a focused window on an empty workspace.
+    state = {"ws": {"id": 1, "name": "1", "monitor": 1}}
+    calls = []
+    cfgdir = tmp_path / "hypr"; cfgdir.mkdir()
+    (cfgdir / "hyprland.lua").write_text("-- lua config\n")
+
+    def runner(argv, timeout=None, **kw):
+        calls.append(list(argv))
+        time.sleep(0.003)                      # realistic per-call latency
+        j = " ".join(argv)
+        if "activeworkspace" in j:
+            return Done(json.dumps(state["ws"]))
+        if j == "hyprctl dispatch hl.dsp.focus({ workspace = 2 })":
+            state["ws"] = {"id": 2, "name": "2", "monitor": 0}
+            return Done("ok")
+        if "monitors" in j:
+            return Done(json.dumps(fix("hypr_monitors.json")))
+        if "clients" in j:
+            return Done(json.dumps(fix("hypr_clients_ffwindows.json")))
+        if "dispatch" in j:
+            return Done("ok")
+        return Done("", 1, "unexpected: " + j)
+
+    b = hyprland_mod.HyprlandBackend(runner=runner, lua=None,
+                                     config_dir=str(cfgdir))
+    t0 = time.monotonic()
+    out = b.switch_workspace("2")
+    elapsed = time.monotonic() - t0
+    assert out["workspace"] == "2" and out["now_showing"]["windows_on_it"] == 1
+    assert elapsed < 0.300, f"switch_workspace took {elapsed * 1000:.0f} ms"
+    joined = [" ".join(c) for c in calls]
+    assert sum(1 for c in joined if "dispatch" in c) == 1   # the switch itself
+    assert not any("no_op" in c for c in joined)            # no style probe
+    line = capsys.readouterr().out
+    assert "[desktop] switch_workspace 2:" in line
+    assert "style lua via file" in line and "dispatch " in line and "-> ok" in line
+
+
+def test_desktop_windows_reports_current_workspaces(tmp_path, monkeypatch):
+    # after a switch the model re-reads desktop_windows; the top-level map
+    # shows the view change even when the workspace is empty (its 'windows'
+    # list contributes no rows — that is normal)
+    b, _ = _lua_hypr()
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    cfg = {"desktop": {"awareness": "on"}}
+    s = DesktopSense(cfg, None, backend=b, awareness=Awareness(cfg))
+    out = s.desktop_windows()
+    assert out["current_workspaces"] == {"left Dell": "2", "middle Dell": "1",
+                                         "portable screen": "8"}
+
+
+def test_desktop_focused_empty_workspace_is_normal(tmp_path, monkeypatch):
+    s = sense_on(tmp_path, monkeypatch, backend=FakeBackend([]))
+    out = s.desktop_focused()
+    assert out["window"] is None
+    assert "normal" in out["note"] and "not a failed switch" in out["note"]
+
+
+def test_executors_print_exactly_one_timing_line(tmp_path, monkeypatch, capsys):
+    b, _ = _lua_hypr()
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
+    cfg = {"desktop": {"awareness": "on"}}
+    s = DesktopSense(cfg, None, backend=b, awareness=Awareness(cfg))
+    ex = s.executors()
+    # 6 does not exist in this fixture view (no flip): the ERROR line still
+    # prints exactly once and says what stalled
+    with pytest.raises(ToolError, match="did not change"):
+        ex["switch_workspace"](workspace="6")
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.startswith("[desktop]")]
+    assert len(lines) == 1 and lines[0].startswith("[desktop] switch_workspace")
+    assert "dispatch " in lines[0] and "total " in lines[0]
 
 
 def test_hyprland_lua_exit_0_but_error_text_surfaces():
@@ -1538,7 +1677,9 @@ def test_dolphin_flow_switch_and_open_on_desktop_2(tmp_path, monkeypatch, app_di
     monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path))
     cfg = {"desktop": {"awareness": "on"}}
     s = DesktopSense(cfg, None, awareness=Awareness(cfg), runner=runner,
-                     backend=hyprland_mod.HyprlandBackend(runner=runner, lua=None),
+                     backend=hyprland_mod.HyprlandBackend(
+                         runner=runner, lua=None,
+                         config_dir="/nonexistent-riko-hypr-test"),
                      app_dirs=[str(app_dir)])
     s.switch_workspace("virtual desktop 2")
     out = s.open_app("dolphin", workspace="desktop 2")
