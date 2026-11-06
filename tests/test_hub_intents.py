@@ -417,3 +417,224 @@ def test_guard_still_honours_emotion_on_the_final_reply(tmp_path, wx):
     res = client.post("/api/chat", json={"text": NON_WEATHER})
     assert res.json()["reply"] == "4.5, senpai!"
     assert res.json()["emotion"] == "happy"
+
+
+# ── claimed-action guard: matchers (the contract) ───────────────────────────
+# The live bug: owner "Try to switch to 4." -> Furina "Done — Hyprland
+# confirms you're on workspace 4 now" with NO tool call in the turn.
+
+ACTION_REQUEST_HITS = [
+    "Try to switch to 4.",
+    "switch to workspace 3",
+    "Go to desktop 2",
+    "move to 7",
+    "change to workspace 5",
+    "switch to the other desktop",
+    "open firefox",
+    "Launch Godot",
+    "please open a terminal",
+    "could you open firefox",
+    "just open spotify",
+    "go ahead and open firefox",
+    "I want you to open Blender",
+    "focus the terminal",
+    "bring up the editor",
+    "switch to the previous window",
+    "switch to firefox",
+    "turn on the lights",
+    "switch the fan off",
+    "toggle the lamp",
+    "put the heating on",
+    "set a timer for 10 minutes",
+    "remind me to stretch at 6",
+]
+
+# questions ABOUT such an action, past mentions, plain chat: never a request
+ACTION_REQUEST_MISSES = [
+    "what workspace am I on?",
+    "did you switch to workspace 4?",
+    "am I on workspace 4?",
+    "how do I switch workspaces?",
+    "what apps are open?",
+    "is firefox open?",
+    "have you opened firefox",
+    "was I on workspace 2",
+    "which workspace has the terminal",
+    "where did the window go",
+    "can you see my windows?",
+    "tell me a joke",
+    "I switched to workspace 3 earlier",
+    "thanks for opening firefox",
+    "what is the weather",
+    "hello",
+    "what timers do I have",
+    "can you check my timers",
+    "wave at me",
+    "do you like firefox",
+    "open",
+    "what time is it",
+    "check the oven timer",
+    "will you marry me",
+]
+
+CLAIM_HITS = [
+    "Done — Hyprland confirms you're on workspace 4 now",
+    "Done!",
+    "Switched to workspace 2.",
+    "I've opened Firefox for you.",
+    "It's up now.",
+    "I just launched Godot.",
+    "Lights are on — turned them on.",
+    "I turned it off.",
+    "All set — timer running.",
+    "Timer set for 10 minutes.",
+    "There you go!",
+    "I've switched you over.",
+    "You are now on workspace 4.",
+    "Brought the terminal up.",
+    "Moved to desktop 3.",
+    "I created the reminder.",
+    "Fired it up!",
+    "The TV is off now.",
+]
+
+# offers, questions and plain chatter claim nothing
+CLAIM_MISSES = [
+    "I can switch whenever you like.",
+    "Which workspace should I open?",
+    "Let me check.",
+    "Nice to meet you, senpai!",
+    "It was beautiful yesterday.",
+    "Opening the app needs a launcher name — which one?",
+    "Sure — which app should I open?",
+    "What shall I open first?",
+    "workspace 4 has your terminal open",
+    "I could turn on the heater if you like.",
+    "The lights in the photo are lovely.",
+]
+
+
+@pytest.mark.parametrize("text", ACTION_REQUEST_HITS)
+def test_detect_action_request_hits(text):
+    assert intents.detect_action_request(text)
+
+
+@pytest.mark.parametrize("text", ACTION_REQUEST_MISSES)
+def test_detect_action_request_misses(text):
+    assert not intents.detect_action_request(text)
+
+
+@pytest.mark.parametrize("reply", CLAIM_HITS)
+def test_claims_completed_action_hits(reply):
+    assert intents.claims_completed_action(reply)
+
+
+@pytest.mark.parametrize("reply", CLAIM_MISSES)
+def test_claims_completed_action_spares(reply):
+    assert not intents.claims_completed_action(reply)
+
+
+# ── the claimed-action guard through /api/chat ──────────────────────────────
+
+OWNER_ASK = "Try to switch to 4."
+FALSE_DONE = "Done — Hyprland confirms you're on workspace 4 now."
+
+
+def test_claimed_action_reruns_once_with_the_claim_nudge(tmp_path, wx):
+    client, llm = make_client(tmp_path, [
+        {"content": FALSE_DONE},
+        call_step("get_time", {}),
+        {"content": "On workspace 4 now, senpai."}])
+    res = client.post("/api/chat", json={"text": OWNER_ASK})
+    assert res.json()["reply"] == "On workspace 4 now, senpai."
+    assert res.json()["tools_used"] == [
+        {"tool": "get_time", "label": "checking the date and time"}]
+    # the retry carries the CLAIM nudge, not the promise one
+    nudge = llm.chat_requests[1]["messages"][-1]
+    assert nudge["role"] == "system"
+    assert "never claim an action you didn't perform" in nudge["content"]
+    assert "You said you would check" not in nudge["content"]
+    # the false reply is discarded: never stored, never spoken
+    hist = client.get("/api/history").json()["messages"]
+    assert [m["content"] for m in hist if m["role"] == "assistant"] == \
+        ["On workspace 4 now, senpai."]
+
+
+def test_claimed_action_question_does_not_rerun(tmp_path, wx):
+    client, llm = make_client(tmp_path, [{"content": FALSE_DONE}])
+    res = client.post("/api/chat", json={"text": "what workspace am I on?"})
+    assert res.json()["reply"] == FALSE_DONE   # a question: no retry
+    assert len(llm.chat_requests) == 1
+
+
+def test_claimed_action_plain_chat_does_not_rerun(tmp_path, wx):
+    client, llm = make_client(tmp_path, [{"content": FALSE_DONE}])
+    res = client.post("/api/chat", json={"text": "hello"})
+    assert res.json()["reply"] == FALSE_DONE   # no action was asked for
+    assert len(llm.chat_requests) == 1
+
+
+def test_claimed_action_reply_that_called_a_tool_does_not_rerun(tmp_path, wx):
+    client, llm = make_client(tmp_path, [
+        call_step("get_time", {}),
+        {"content": FALSE_DONE}])
+    res = client.post("/api/chat", json={"text": OWNER_ASK})
+    # a tool ran this turn: the claim stands, no second chance
+    assert res.json()["reply"] == FALSE_DONE
+    assert len(llm.chat_requests) == 2
+    assert all("never claim an action" not in json.dumps(r["messages"])
+               for r in llm.chat_requests)
+
+
+def test_claimed_action_retries_only_once(tmp_path, wx):
+    client, llm = make_client(tmp_path, [
+        {"content": FALSE_DONE},
+        {"content": "Still done — you're on workspace 4."},
+        {"content": "NEVER REACHED"}])
+    res = client.post("/api/chat", json={"text": OWNER_ASK})
+    # cap: one retry per turn — the second claim stands, no third call
+    assert res.json()["reply"] == "Still done — you're on workspace 4."
+    assert len(llm.chat_requests) == 2
+
+
+def test_claimed_action_skipped_when_tools_are_off(tmp_path, wx):
+    client, llm = make_client(tmp_path, [{"content": FALSE_DONE}],
+                              tools_defaults={"enabled": False})
+    res = client.post("/api/chat", json={"text": OWNER_ASK})
+    assert res.json()["reply"] == FALSE_DONE   # no tools to call: no retry
+    assert len(llm.chat_requests) == 1
+
+
+def test_promise_guard_wins_when_a_reply_matches_both(tmp_path, wx):
+    client, llm = make_client(tmp_path, [
+        {"content": "Let me check — done, you're on workspace 4!"},
+        {"content": "On workspace 4."}])
+    res = client.post("/api/chat", json={"text": OWNER_ASK})
+    assert res.json()["reply"] == "On workspace 4."
+    assert len(llm.chat_requests) == 2   # the shared cap: one retry total
+    nudge = llm.chat_requests[1]["messages"][-1]["content"]
+    assert "didn't call a tool" in nudge   # the promise nudge, checked first
+
+
+def test_claimed_timer_claim_retries_then_fallback_still_creates(tmp_path, wx):
+    # "set a timer" asked, false claim -> one nudge retry; the retry keeps
+    # claiming, so the deterministic timer fallback creates it anyway
+    client, llm = make_client(tmp_path, [
+        {"content": "Done — timer set, senpai."},
+        {"content": "I set it!"}])
+    res = client.post("/api/chat", json={"text": "set a timer for 5 minutes"})
+    assert len(llm.chat_requests) == 2
+    assert res.status_code == 200
+    timers = res.json()["timers_set"]
+    assert len(timers) == 1 and timers[0]["asked"] is True
+
+
+def test_tools_prompt_carries_the_confirmation_rule(tmp_path, wx):
+    client, llm = make_client(tmp_path, [{"content": "ok"}])
+    client.post("/api/chat", json={"text": "hello"})
+    sysmsg = llm.chat_requests[0]["messages"][0]["content"]
+    assert ("Only say you did something after the tool result confirms it"
+            in sysmsg)
+    assert "if a tool fails, say what failed" in sysmsg
+    assert ("Never suggest the owner press keys for you when a tool exists"
+            in sysmsg)
