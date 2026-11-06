@@ -222,10 +222,16 @@ def tools_prompt(spec_names: list[str], now_local: str = "",
 
 def _desktop_sense_line(spec_names) -> str:
     """One line while the desktop-awareness tools are offered
-    (docs/DESKTOP_SENSE.md 'Prompt')."""
-    if any(str(n).endswith(("desktop_windows", "desktop_monitors")) or
-           "__desktop_windows" in str(n) or "__desktop_monitors" in str(n)
-           for n in (spec_names or [])):
+    (docs/DESKTOP_SENSE.md 'Prompt'), and one for the awareness-off case:
+    the status/toggle tools are registered even while the desktop_* set is
+    switched off, so she must offer to enable it instead of claiming the
+    desktop (workspaces included) is out of her reach."""
+    names = [str(n) for n in (spec_names or [])]
+
+    def has(frag):
+        return any(n.endswith(frag) or f"__{frag}" in n for n in names)
+
+    if has("desktop_windows") or has("desktop_monitors"):
         return ("You can see the owner's open windows, browser tabs and "
                 "screens, and open apps on a given screen, with the "
                 "desktop_* and browser_tabs tools; look before guessing, "
@@ -236,6 +242,13 @@ def _desktop_sense_line(spec_names) -> str:
                 "You can switch workspaces/virtual desktops and open apps "
                 "on a given workspace or screen; you don't need keystrokes "
                 "for that. ")
+    if has("desktop_awareness_status"):
+        return ("Desktop awareness (windows, screens, open apps, workspaces) "
+                "exists on this PC but is switched OFF right now: check "
+                "desktop_awareness_status and offer set_desktop_awareness"
+                "(enabled=true) — the owner approves it, or they tick 'Let "
+                "her see my desktop' in the tray. Never say the desktop or "
+                "its workspaces are out of your reach. ")
     return ""
 
 

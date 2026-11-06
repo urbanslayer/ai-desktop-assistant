@@ -494,6 +494,8 @@ gnome-extensions enable riko-windows@riko   # then log out/in (or Alt-F2 r on X1
 
 Without it she keeps the app list and launcher and says why the window list is empty.
 
+While the tick is off she still has two small tools so she never claims the desktop is out of reach: `desktop_awareness_status` (read-only: is awareness on, and how to turn it on) and `set_desktop_awareness` (she can flip the same toggle when you ask — you get the approval bubble first, and denying changes nothing). Every toggle — tray tick, her tool, or `riko-ctl desktop-sense on` — re-registers her tools with the hub right away; no restart needed. At start-up the terminal reminds you once while awareness is off.
+
 <a id="three-ways"></a>
 ## 💎 Three ways to have Riko
 
