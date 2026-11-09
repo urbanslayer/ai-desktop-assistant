@@ -740,6 +740,40 @@ def build_dictation_action(menu, typing_svc, apply_toggle):
     return action
 
 
+def sync_name_gate_action(action, session):
+    """Keep the 'Only when I say her name' tick honest: checked from the
+    session's state, enabled only while always-listen runs (the name gate
+    never bites push-to-talk, so the box is greyed out there). Called at
+    startup and on every listen-ui / namegate-ui bridge event."""
+    action.blockSignals(True)
+    action.setChecked(bool(session.name_gate))
+    action.setEnabled(session.listen_mode == "always")
+    action.blockSignals(False)
+
+
+def build_name_gate_action(menu, session):
+    """The tray's 'Only when I say her name' checkbox (docs/BACKLOG.md
+    Planned 5): the always-listen name gate. Built apart from main() so an
+    offscreen Qt test can pull the real slot; same checked-bool care as
+    build_sense_action. The toggle goes through session.set_name_gate
+    (persist + notify), so the tray, riko-ctl and the L-key redraw share
+    one path — the tick lands via the namegate-ui bridge event."""
+
+    def toggle(checked=None):
+        want = (not session.name_gate) if checked is None else bool(checked)
+        session.set_name_gate(want)
+
+    action = QAction("Only when I say her name", menu)
+    action.setCheckable(True)
+    action.setToolTip("always-listen only: utterances that don't say the active "
+                      "persona's name, a keyword or an alias are ignored "
+                      "(push-to-talk is never gated; follow-ups right after a "
+                      "reply pass without the name)")
+    action.triggered.connect(toggle)
+    sync_name_gate_action(action, session)
+    return action
+
+
 def build_stop_typing_action(menu, typing_svc):
     """'Stop typing' (docs/TYPING.md §5): aborts the keystroke batch in
     progress at the next chunk; dictation mode itself is untouched."""
@@ -902,6 +936,11 @@ def main():
             always = cmd.partition(":")[2] == "always"
             listen_action.setChecked(always)
             tray.setToolTip("Riko — always listening (L switches back)" if always else "Riko")
+            # the name gate only bites in always mode: re-tick + re-enable
+            sync_name_gate_action(name_gate_action, session)
+        elif cmd.startswith("namegate-ui:"):  # the name-gate tick changed
+            # (tray click, riko-ctl or a control phrase): same Qt thread rule
+            sync_name_gate_action(name_gate_action, session)
         elif cmd.startswith("awareness-ui:"):  # reflect an awareness toggle
             # made by the set_desktop_awareness tool (worker thread) onto the
             # Qt thread, exactly like listen-ui above
@@ -956,7 +995,22 @@ def main():
         elif cmd == "status":
             return {"ok": True, "recording": session.recorder.recording,
                     "visible": win.isVisible(), "listen_mode": session.listen_mode,
+                    "name_gate": session.name_gate,
                     "dictation": typing_svc.dictation.status() if typing_svc else None}
+        elif cmd == "name-gate":
+            # riko-ctl name-gate on|off (and the `riko-ctl listen name-gate`
+            # spelling): always-listen only — the gate never bites
+            # push-to-talk, but the setting persists for when always returns
+            want = str(args.get("enabled", "")).strip().lower()
+            if want in ("on", "true", "1", "yes"):
+                session.set_name_gate(True)
+            elif want in ("off", "false", "0", "no"):
+                session.set_name_gate(False)
+            elif want:
+                return {"ok": False, "error": "name-gate: on | off"}
+            bridge.command.emit(f"namegate-ui:{'on' if session.name_gate else 'off'}")
+            return {"ok": True, "name_gate": session.name_gate,
+                    "listen_mode": session.listen_mode}
         elif cmd == "listen-mode":
             want = str(args.get("mode", "")).strip().lower()
             if want:
@@ -1102,6 +1156,11 @@ def main():
                              "pauses while she speaks")
     listen_action.triggered.connect(lambda checked=None: session.toggle_listen_mode())
 
+    # Name gate: with always-listen on, ignore utterances that don't say the
+    # active persona's name (its hub name/keywords plus listen.name_aliases).
+    # Lives right under the ears switch; greyed out in push-to-talk.
+    name_gate_action = build_name_gate_action(menu, session)
+
     # Desktop awareness (docs/DESKTOP_SENSE.md): "Let her see my desktop" —
     # the privacy master toggle. Off (the default) she only has the
     # awareness status/toggle tools; any toggle (tray, tool, riko-ctl) goes
@@ -1155,6 +1214,7 @@ def main():
         action.triggered.connect(fn)
         menu.addAction(action)
     menu.addAction(listen_action)
+    menu.addAction(name_gate_action)
     menu.addAction(sense_action)
     menu.addAction(dictation_action)
     menu.addAction(stop_typing_action)
@@ -1171,6 +1231,8 @@ def main():
         tray.setToolTip("Riko — always listening (L switches back)")
     # keep the tray honest when the mode changes elsewhere (L key, riko-ctl)
     session.on_listen_mode = lambda mode: bridge.command.emit(f"listen-ui:{mode}")
+    session.on_name_gate = lambda on: bridge.command.emit(
+        f"namegate-ui:{'on' if on else 'off'}")
 
     # A timer that fired for ANOTHER persona: one quiet tray line, no switch
     # (docs/TIMERS.md D). Active-persona timers are spoken, not shown here.

@@ -15,6 +15,9 @@ a compositor keybind or a script, without focusing her first.
     riko-ctl persona NAME switch who she is (id, name or keyword; case doesn't matter)
     riko-ctl persona-next switch to the next persona on the hub (cycles around)
     riko-ctl listen-mode  flip push_to_talk <-> always listen (or: listen-mode always / push_to_talk)
+    riko-ctl name-gate    always-listen only: she answers just when the active
+                        persona's name / keyword / alias is said (name-gate on | off;
+                        also spelled: riko-ctl listen name-gate on|off)
     riko-ctl desktop-sense  flip "let her see my desktop" (or: desktop-sense on / off)
     riko-ctl dictation    flip dictation mode (or: dictation on / off) — what she
                         hears is typed into the focused window (docs/TYPING.md)
@@ -46,6 +49,7 @@ APP_ID = "riko"
 COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide", "forget",
             "personas", "persona", "persona-next", "quit", "status",
             "approve", "deny", "browser-status", "browser-token", "wave", "listen-mode",
+            "name-gate", "listen",
             "desktop-sense", "dictation", "stop-typing", "obsidian-key"}
 
 
@@ -69,6 +73,14 @@ def main():
         sys.exit(__doc__)
     cmd = sys.argv[1]
     body = {}
+    if cmd == "listen":
+        # grouped spelling for the always-listen settings:
+        # `riko-ctl listen name-gate on|off` == `riko-ctl name-gate on|off`
+        if len(sys.argv) > 2 and sys.argv[2] == "name-gate":
+            cmd = "name-gate"
+            sys.argv = [sys.argv[0], "name-gate", *sys.argv[3:]]
+        else:
+            sys.exit("riko-ctl listen name-gate on|off")
     if cmd == "persona":
         name = " ".join(sys.argv[2:]).strip()
         if not name:
@@ -76,6 +88,8 @@ def main():
         body = {"name": name}
     if cmd == "listen-mode" and len(sys.argv) > 2:
         body = {"mode": sys.argv[2].strip().lower()}
+    if cmd == "name-gate" and len(sys.argv) > 2:
+        body = {"enabled": sys.argv[2].strip().lower()}
     if cmd == "desktop-sense" and len(sys.argv) > 2:
         body = {"enabled": sys.argv[2].strip().lower()}
     if cmd == "dictation" and len(sys.argv) > 2:
@@ -118,7 +132,8 @@ def main():
                   "or the tray Obsidian…")
         sys.exit(0)
     if cmd in ("status", "personas", "persona", "persona-next", "browser-status",
-               "listen-mode", "desktop-sense", "dictation", "stop-typing") or not reply.get("ok", True):
+               "listen-mode", "name-gate", "desktop-sense", "dictation",
+               "stop-typing") or not reply.get("ok", True):
         print(json.dumps(reply))
     sys.exit(0 if reply.get("ok", True) else 1)
 

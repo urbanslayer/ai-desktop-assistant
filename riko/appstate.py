@@ -45,3 +45,27 @@ def save_mode(mode: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def load_name_gate() -> bool | None:
+    """The persisted always-listen name gate (riko/name_gate.py), or None
+    when never chosen (never raises)."""
+    try:
+        data = json.loads(state_path("listen_name_gate").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    on = data.get("on") if isinstance(data, dict) else None
+    return on if isinstance(on, bool) else None
+
+
+def save_name_gate(on: bool) -> bool:
+    """Persist the name-gate choice. Non-bools are ignored, not written."""
+    if not isinstance(on, bool):
+        return False
+    try:
+        path = state_path("listen_name_gate")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"on": on}), encoding="utf-8")
+        return True
+    except OSError:
+        return False

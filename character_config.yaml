@@ -200,3 +200,23 @@ typing:
   # target and confirms the focus before injecting keys. Lower it only if
   # your desktop settles faster; 0 is not recommended.
   settle_ms: 350
+
+# Always-listen name gate (riko/name_gate.py; tray "Only when I say her name",
+# riko-ctl listen name-gate on|off). Only ever bites in always mode:
+# push-to-talk and typed text are intent and always pass.
+listen:
+  name_gate: off              # off | name — 'name': VAD utterances are ignored
+                              # (terminal line only: '[asr] ignored (no name): ...')
+                              # unless they say the ACTIVE persona's hub name, one
+                              # of its keywords, or an alias below. The runtime
+                              # choice is remembered in
+                              # ~/.config/riko/listen_name_gate.json and wins on
+                              # the next start ($RIKO_NAME_GATE overrides both).
+  name_aliases: {}            # extra spellings/nicknames per persona id, e.g.
+                              # {furina: ["Furi", "La Furia"]}
+  name_gate_any_persona: true # an utterance addressed to a DIFFERENT persona by
+                              # name switches to her (same POST /api/active path as
+                              # the tray) before the text is sent
+  follow_up_seconds: 12       # after she answers, nameless follow-ups pass for
+                              # this long (0 disables); every accepted utterance
+                              # restarts it; a persona switch closes it
