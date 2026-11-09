@@ -9,6 +9,20 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
   (`RIKO_HA_URL`/`RIKO_HA_TOKEN` on eve; this replaced the old "HA uses Riko's ASR via
   wyoming_openai" idea, which the owner chose not to pursue).
 
+## Done (2026-11-09)
+
+- **"Only when I say her name" — the always-listen name gate** (was Planned 5; owner request: "when
+  Furina is set to always listen, can she only respond if I say her name?"). Tray checkbox under
+  *Always listen* / `riko-ctl listen name-gate on|off`, off by default and remembered across starts.
+  Matches the **active persona's** hub name + keywords plus `listen.name_aliases` on the final
+  transcript (after the Farina→Furina corrections), case/punctuation-insensitive, whole-word, fuzzy,
+  name anywhere, `hey <name>` included — never one hard-coded name. `listen.name_gate_any_persona`
+  (default on): addressing a DIFFERENT persona by name switches to her through the hub's own
+  `/api/active` path first, then sends the sentence. Follow-up window (`listen.follow_up_seconds`,
+  12 s) keeps nameless follow-ups flowing right after a reply; persona switches close it.
+  Push-to-talk, typed text, dictation and fired timers are never gated. README "Only when I say her
+  name" section; `riko/name_gate.py`, tests `tests/test_listen_name_gate.py`.
+
 ## Planned
 
 1. **Android app** (owner request). A native client against docs/API.md: chat, voice (push-to-talk and
@@ -141,7 +155,8 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
    implement until the owner says go.**
 4. **Optional: Riko as Home Assistant's conversation agent** for HA's own voice devices (Voice PE, phone
    app). Offered, not chosen. Would need an OpenAI-compatible chat endpoint on the hub.
-5. **Optional: "only when I say her name"** filter for always-listen mode.
+5. ~~**Optional: "only when I say her name"** filter for always-listen mode~~ — **DONE 2026-11-09**,
+   see Done (2026-11-09) above.
 6. **She creates her own animations** (owner request), for whichever avatar is active at the time.
    **Plan only for now.**
    - **Shape:** she authors a named animation as data: keyframes of VRM humanoid bone rotations,
@@ -186,6 +201,14 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
    - **Constraints:** works in the roam strip (she's clickable there; everything else is click-through).
      Poses must respect Furina-style garment skinning (docs/BODY.md): move limbs by their own bones,
      never the neck/chest for "look" motions. Mobile and web clients could get touch versions later.
+8. **True on-device wake word** (follow-on from the name gate, done 2026-11-09). The name gate today
+   is a TEXT filter: every VAD utterance is still sent to eve's ASR and gated on the finished
+   transcript, so TV chatter costs a transcription round-trip even when she ignores it. A real wake
+   word would decide on-device before any audio leaves the PC — candidate: **openWakeWord**
+   (small ONNX models, custom persona-word training from a handful of spoken samples, runs on CPU
+   next to the existing Silero VAD on the reader thread). Decide per-persona wake models vs one
+   shared "hey riko", and how it composes with `listen.name_gate` (the wake word could replace the
+   text gate entirely, or arm it).
 
 ## Quick wins
 

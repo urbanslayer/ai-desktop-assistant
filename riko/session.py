@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from riko import appstate, asr, client_tools, hub_client, tts, viewer
+from riko import appstate, asr, client_tools, hub_client, name_gate, tts, viewer
 
 ECHO_TAIL_MS_DEFAULT = 200  # VAD stays paused this long after her voice ends
                             # (echo guard); override: desktop.always_listen.echo_tail_ms
@@ -40,6 +40,19 @@ class Session:
         mode = appstate.load_mode() or cfg_mode
         self.listen_mode = mode if mode in LISTEN_MODES else "push_to_talk"
         self.on_listen_mode: Optional[Callable[[str], None]] = None  # desktop.py: refreshes the tray
+        # ── name gate for always mode (riko/name_gate.py) ───────────────
+        # On, VAD utterances only pass when they address the active persona
+        # (hub name + keywords + listen.name_aliases) — or another persona,
+        # which routes through the hub switch. Push-to-talk and typed text
+        # are intent and never gated. The choice is persisted next to the
+        # mode (~/.config/riko/listen_name_gate.json); $RIKO_NAME_GATE and
+        # listen.name_gate in the yaml seed it.
+        self.name_gate = name_gate.resolve_initial_gate(cfg)
+        self.on_name_gate: Optional[Callable[[bool], None]] = None  # desktop.py: tray tick
+        self._gate_window = name_gate.FollowWindow(name_gate.follow_up_seconds(cfg))
+        self._gate_any = name_gate.any_persona_enabled(cfg)
+        self._gate_cache = None  # (fresh_until, active_id, entries): personas + aliases
+        self._gate_seen_active = None  # last active persona id seen at a gate check
         self._vad = None             # asr.AlwaysListener while always mode runs
         self._vad_holds = 0          # >0 = VAD paused (thinking/speaking/Space held)
         self._vad_lock = threading.Lock()
@@ -137,6 +150,81 @@ class Session:
         self.set_listen_mode("always" if self.listen_mode == "push_to_talk"
                              else "push_to_talk")
 
+    # ── Name gate (always mode only) ─────────────────────────
+    def set_name_gate(self, on, persist=True):
+        """The tray's 'Only when I say her name' / riko-ctl name-gate. The
+        gate only bites in always mode: push-to-talk is already intent."""
+        on = bool(on)
+        if on != self.name_gate:
+            self.name_gate = on
+            print(f"[listen] name gate {'on — only when you say her name' if on else 'off'}")
+            if persist:
+                appstate.save_name_gate(on)
+        if self.on_name_gate:  # keep the tray honest even for no-op sets
+            self.on_name_gate(self.name_gate)
+
+    def _gate_entries(self):
+        """The personas that can be addressed: hub name + keywords + the
+        configured aliases, active one flagged. Refreshed on persona
+        switches and whenever this cache goes stale (name_gate TTL)."""
+        active = hub_client.active_persona() or {}
+        active_id = active.get("id")
+        now = time.monotonic()
+        cache = self._gate_cache
+        if cache and cache[1] == active_id and now < cache[0]:
+            return cache[2]
+        try:
+            listed = self.hub.personas()
+        except Exception:  # hub hiccup: the active persona can still answer
+            listed = None
+        if not listed:
+            listed = [active] if active else []
+        entries = name_gate.build_entries(self.cfg, listed, active_id)
+        if active_id and not any(e["id"] == active_id for e in entries):
+            entries.insert(0, {"id": active_id,
+                               "name": active.get("name") or active_id,
+                               "names": name_gate.persona_names(
+                                   active, name_gate.alias_map(self.cfg).get(active_id)),
+                               "active": True})
+        self._gate_cache = (now + name_gate.PERSONA_CACHE_TTL, active_id, entries)
+        return entries
+
+    def _gate_refresh(self):
+        self._gate_cache = None
+
+    def _gate_switch(self, entry):
+        """Addressed a DIFFERENT persona by name: switch through the hub's
+        own path (POST /api/active — the same call the tray menu makes), then
+        the utterance goes on to the newly active persona."""
+        print(f"[asr] addressed {entry['name']}: switching")
+        self._gate_window.close()  # a persona switch always resets the window
+        try:
+            state = self.hub.set_active(entry["id"])
+        except Exception as e:
+            print(f"[listen] switch to {entry['name']} failed: {e}")
+            return
+        hub_client.announce_persona(state)
+        self._gate_refresh()
+
+    def _gate_accept(self, text) -> bool:
+        """Worker-thread gate decision for one VAD utterance (already
+        corrected). True = send it; the follow-up window restarts."""
+        active_id = (hub_client.active_persona() or {}).get("id")
+        if (self._gate_seen_active is not None and active_id
+                and active_id != self._gate_seen_active):
+            # a switch made elsewhere (web page, another PC, the poller):
+            # new persona, new name to say — the window is over
+            self._gate_window.close()
+        self._gate_seen_active = active_id
+        active_hit, other = name_gate.find_mention(text, self._gate_entries())
+        if other is not None and self._gate_any:
+            self._gate_switch(other)
+        elif active_hit is None and not self._gate_window.open():
+            print(f"[asr] ignored (no name): {text[:40]}")
+            return False
+        self._gate_window.restart()
+        return True
+
     def _vad_hold(self, on):
         """Pause (drop frames, reset state) or resume the VAD."""
         if self._vad is None:
@@ -217,6 +305,10 @@ class Session:
         hub_client.announce_persona(state)
         active = state["active"]
         print(f"[persona] {active['name']} is in now")
+        # New persona, new name to say: the follow-up window closes and the
+        # gate's persona snapshot is rebuilt on the next utterance.
+        self._gate_window.close()
+        self._gate_refresh()
         self._turns.put(("greet", active))
         return active
 
@@ -408,7 +500,10 @@ class Session:
             # fix words Whisper misheard (Farina -> Furina): the corrected
             # text is what the bubble shows and what the hub ever sees
             text = asr.apply_corrections(text, self.cfg).strip()
-            viewer.emit("heard", text=text)
+            # Dictation runs FIRST (docs/TYPING.md §8): it types everything
+            # into the pinned window and must never see the name gate. The
+            # 'heard' bubble lands after the router so a dictated line shows
+            # in the order the owner experiences it.
             if self.dictation_filter is not None:
                 try:
                     handled, replacement = self.dictation_filter(text)
@@ -416,6 +511,7 @@ class Session:
                     print(f"[dictation] router failed: {type(e).__name__}: {e}")
                 else:
                     if handled:
+                        viewer.emit("heard", text=text)
                         viewer.emit("status", state="idle")
                         return
                     if isinstance(replacement, str):
@@ -423,6 +519,15 @@ class Session:
                         if not text:
                             viewer.emit("status", state="idle")
                             return
+            # The name gate (after the corrections and the dictation router):
+            # VAD segments only; push-to-talk and typed text are intent.
+            # An ignored utterance never reaches the hub, the bubble or the
+            # pill — one terminal line is all the owner sees.
+            if (source == "vad" and self.name_gate
+                    and self.listen_mode == "always"
+                    and not self._gate_accept(text)):
+                return
+            viewer.emit("heard", text=text)
         else:
             text = payload
         print(f"You:  {text}")
@@ -432,7 +537,8 @@ class Session:
         result = self.hub.chat(text, source=self.source, voice=kind == "audio")
         # 'switch to asuka' and bare keywords come back as switched, with the
         # greeting as the reply; a persona change also reloads the avatar page.
-        if result.get("switched") or result.get("persona") != self._active_id():
+        switched = bool(result.get("switched")) or result.get("persona") != self._active_id()
+        if switched:
             hub_client.announce_persona(self.hub.state())
         # tts: hub — the hub already made (or will make) the audio; audio_url
         # is null when TTS is off or this persona's voice is, so: bubble only.
@@ -442,6 +548,14 @@ class Session:
                     emotion=result.get("emotion") or "neutral",
                     actions=result.get("actions") or [],
                     speech=result.get("speech"))
+        # Follow-up window: she just answered, so for a moment she keeps
+        # hearing you without the name (0 s disables it). A mid-turn persona
+        # switch closes the window instead — new persona, new name to say.
+        if switched:
+            self._gate_window.close()
+            self._gate_refresh()
+        else:
+            self._gate_window.restart()
 
     def _speak(self, answer, audio_url=None, emotion="neutral", actions=None,
                speech=None):
