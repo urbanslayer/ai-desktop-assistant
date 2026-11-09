@@ -612,21 +612,29 @@ def test_custom_socket_dead_is_reported(tmp_path):
 # ── socket discovery (§2: systemd user service layout) ────────
 class _FakeDaemons:
     """Keeps fake listeners alive for the whole test (GC would close them
-    and leave stale files); large backlog so repeated probes never refill
-    the accept queue."""
+    and leave stale files). Default type is SOCK_DGRAM: ydotoold 1.0 binds
+    a datagram socket, so that is what the probe must find. listen_stream()
+    models a pre-1.0 stream daemon (the fallback path)."""
 
     def __init__(self):
         self.srvs = []
 
-    def listen(self, dirpath, name=".ydotool_socket"):
+    def _bind(self, dirpath, name, kind):
         dirpath = Path(dirpath)
         dirpath.mkdir(parents=True, exist_ok=True)
         path = dirpath / name
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv = socket.socket(socket.AF_UNIX, kind)
         srv.bind(str(path))
-        srv.listen(128)
+        if kind == socket.SOCK_STREAM:
+            srv.listen(128)              # dgram needs no backlog; connect-only probes
         self.srvs.append(srv)
         return str(path)
+
+    def listen(self, dirpath, name=".ydotool_socket"):
+        return self._bind(dirpath, name, socket.SOCK_DGRAM)
+
+    def listen_stream(self, dirpath, name=".ydotool_socket"):
+        return self._bind(dirpath, name, socket.SOCK_STREAM)
 
 
 @pytest.fixture()
@@ -718,9 +726,8 @@ def test_stale_socket_skipped_live_one_used(sock_root, fake_bins, fake_daemons,
     stale_dir = sock_root / "rt"
     stale_dir.mkdir()
     stale = stale_dir / ".ydotool_socket"
-    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     dead.bind(str(stale))
-    dead.listen(1)
     dead.close()                                         # file stays → ECONNREFUSED
     monkeypatch.setattr(ydotool_mod, "_TMP_SOCKET",
                         str(sock_root / "legacy" / ".ydotool_socket"))
@@ -729,6 +736,43 @@ def test_stale_socket_skipped_live_one_used(sock_root, fake_bins, fake_daemons,
     yd = YdotoolBackend(runner=lambda *a, **k: Done(""),
                         env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(stale_dir)})
     assert yd.socket_path() == live
+
+
+# ── probe_socket: datagram-first (§2, ydotoold 1.0) ───────────
+def test_probe_accepts_datagram_daemon(sock_root):
+    """ydotoold 1.0 binds SOCK_DGRAM: a stream-only probe used to get
+    EPROTOTYPE there and report the live daemon as [dead]."""
+    from riko.typing.ydotool import ALIVE, probe_socket
+    daemons = _FakeDaemons()                 # keep alive: GC would close the socket
+    sock = daemons.listen(sock_root)
+    assert probe_socket(sock) == ALIVE
+
+
+def test_probe_still_accepts_stream_listener(sock_root):
+    """Documented fallback: a pre-1.0 (stream) daemon answers EPROTOTYPE to
+    the datagram probe and must still be found alive via the stream retry."""
+    from riko.typing.ydotool import ALIVE, probe_socket
+    daemons = _FakeDaemons()                 # keep alive: GC would close the socket
+    sock = daemons.listen_stream(sock_root)
+    assert probe_socket(sock) == ALIVE
+
+
+def test_probe_stale_socket_files_are_dead(sock_root):
+    """Bind-then-close leaves the file; ECONNREFUSED on the connect = dead,
+    for either socket type."""
+    from riko.typing.ydotool import DEAD, probe_socket
+    for kind, name in ((socket.SOCK_DGRAM, "dgram-stale.sock"),
+                       (socket.SOCK_STREAM, "stream-stale.sock")):
+        path = sock_root / name
+        s = socket.socket(socket.AF_UNIX, kind)
+        s.bind(str(path))
+        s.close()
+        assert probe_socket(str(path)) == DEAD
+
+
+def test_probe_missing_path(sock_root):
+    from riko.typing.ydotool import MISSING, probe_socket
+    assert probe_socket(str(sock_root / "nope.sock")) == MISSING
 
 
 def test_missing_paths_error_lists_what_was_tried(sock_root, fake_bins, monkeypatch):
@@ -897,15 +941,20 @@ def test_guard_blocks_real_binaries_and_obsidian():
 
 
 def test_guard_blocks_real_ydotool_sockets():
-    """The live systemd user service socket must be untouchable in tests."""
+    """The live systemd user service socket must be untouchable in tests —
+    with either socket type (ydotoold 1.0 is SOCK_DGRAM) and via sendto,
+    which dials an unconnected datagram socket without calling connect()."""
     uid = os.getuid()
     for path in (f"/run/user/{uid}/.ydotool_socket", "/run/user/0/.ydotool_socket",
                  "/tmp/.ydotool_socket", "/run/.ydotool_socket"):
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            with pytest.raises(RuntimeError):
-                s.connect(path)
-        finally:
-            s.close()
+        for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+            s = socket.socket(socket.AF_UNIX, kind)
+            try:
+                with pytest.raises(RuntimeError):
+                    s.connect(path)
+                with pytest.raises(RuntimeError):
+                    s.sendto(b"\x00probe", path)         # datagram dial+send
+            finally:
+                s.close()
         with pytest.raises(RuntimeError):
             socket.create_connection(path, timeout=0.2)  # type: ignore[arg-type]  # AF_UNIX str address

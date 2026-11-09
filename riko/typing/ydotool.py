@@ -5,6 +5,7 @@ NEVER run ydotool/ydotoold for real in tests — the conftest guard raises if
 a test tries. Availability is checked before anything is sent; a missing
 binary, daemon or socket fails with the owner's setup text, never with a
 half-typed sentence."""
+import errno
 import os
 import shutil
 import socket
@@ -50,6 +51,9 @@ _TMP_SOCKET = "/tmp/.ydotool_socket"
 
 # probe_socket() outcomes
 ALIVE, MISSING, DENIED, DEAD = "alive", "missing", "denied", "dead"
+# internal-only outcome: the socket file exists but answers a DIFFERENT
+# socket type (EPROTOTYPE); probe_socket() retries with the other type.
+PROTO_MISMATCH = "_proto_mismatch"
 
 
 def socket_candidates(env):
@@ -68,13 +72,14 @@ def socket_candidates(env):
     return cands
 
 
-def probe_socket(path):
-    """AF_UNIX connect probe (1 s timeout) → ALIVE / MISSING / DENIED / DEAD.
+def _connect(kind, path):
+    """One AF_UNIX connect probe (1 s timeout) → an outcome constant.
 
-    DEAD means the file exists but no one accepts (a stale socket left by a
-    stopped ydotoold); DENIED means it exists but we may not open it."""
+    Connect only: nothing is ever sent, so the daemon sees a probe, not a
+    command. EPROTOTYPE means the socket file exists but was made with the
+    other type — reported as PROTO_MISMATCH so probe_socket() can retry."""
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s = socket.socket(socket.AF_UNIX, kind)
     except OSError:
         return DEAD
     try:
@@ -85,10 +90,33 @@ def probe_socket(path):
         return MISSING
     except PermissionError:
         return DENIED
-    except OSError:                       # refused / not a socket / timeout
+    except ConnectionRefusedError:          # stale socket: file, no daemon
+        return DEAD
+    except OSError as exc:                  # not a socket / timeout / …
+        if exc.errno == errno.EPROTOTYPE:
+            return PROTO_MISMATCH
         return DEAD
     finally:
         s.close()
+
+
+def probe_socket(path):
+    """AF_UNIX connect probe → ALIVE / MISSING / DENIED / DEAD.
+
+    SOCK_DGRAM is tried first because ydotoold 1.0 binds a datagram socket:
+    a SOCK_STREAM connect against it fails with EPROTOTYPE ([Errno 91]
+    'Protocol wrong type for socket'), which used to report the live daemon
+    as dead. ECONNREFUSED on the datagram connect is a stale socket left by
+    a stopped ydotoold. EPROTOTYPE on the datagram probe means the socket
+    was made with the old stream type (pre-1.0 ydotoold or a hand-rolled
+    daemon), so the probe retries with SOCK_STREAM — stream-only listeners
+    stay accepted."""
+    status = _connect(socket.SOCK_DGRAM, path)
+    if status == PROTO_MISMATCH:
+        status = _connect(socket.SOCK_STREAM, path)
+        if status == PROTO_MISMATCH:        # cannot happen; be conservative
+            status = DEAD
+    return status
 
 
 def resolve_socket(env):

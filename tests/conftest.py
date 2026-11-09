@@ -194,7 +194,10 @@ def _is_obsidian_addr(addr):
 # Same story for AF_UNIX: the live ydotool user service owns
 # /run/user/<uid>/.ydotool_socket (and legacy /run or /tmp sockets). Tests
 # must probe fake listeners bound under tmp_path instead. The pattern is
-# deliberately narrow so pytest tmp sockets keep working.
+# deliberately narrow so pytest tmp sockets keep working. The guard covers
+# SOCK_DGRAM too (connect/connect_ex are the same methods for either type)
+# plus sendto/send: on a datagram socket those dial an unconnected path and
+# put BYTES on the daemon without ever calling connect().
 _YDOTOOL_SOCK_RE = re.compile(r"^(/run/user/\d+|/run|/tmp)/\.ydotool_socket$")
 
 
@@ -245,6 +248,19 @@ def _no_obsidian_create_connection(address, *args, **kwargs):
 socket.socket.connect = _no_obsidian_connect
 socket.socket.connect_ex = _no_obsidian_connect_ex
 socket.create_connection = _no_obsidian_create_connection
+# sendto(data, addr) on an unconnected (datagram) socket dials the path and
+# puts bytes on the wire without ever calling socket.connect — guard it too.
+_REAL_SOCKET_SENDTO = socket.socket.sendto
+
+
+def _no_ydotool_sendto(self, data, *args, **kwargs):
+    addr = kwargs.get("address", args[-1] if args else None)
+    if _is_ydotool_socket_path(addr):
+        raise _ydotool_socket_error(addr)
+    return _REAL_SOCKET_SENDTO(self, data, *args, **kwargs)
+
+
+socket.socket.sendto = _no_ydotool_sendto
 # ssl.create_connection dials through socket.create_connection (guarded
 # above), so it needs no separate wrapper.
 import ssl as _ssl  # noqa: E402
