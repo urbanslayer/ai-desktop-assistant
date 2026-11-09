@@ -217,6 +217,7 @@ def tools_prompt(spec_names: list[str], now_local: str = "",
         "instead (\"the Godot docs\"). "
         + _desktop_sense_line(spec_names)
         + _typing_line(spec_names)
+        + _appedit_line(spec_names)
         + f"Current date/time: {now} (UTC)." + local
     )
 
@@ -267,6 +268,22 @@ def _typing_line(spec_names) -> str:
             "exact command, and password managers, auth prompts and private "
             "windows are refused. Dictation mode lives in set_dictation / "
             "dictation_status / stop_typing. ")
+
+
+def _appedit_line(spec_names) -> str:
+    """One line while the app-editing tools are offered (docs/TYPING.md):
+    Obsidian notes, Kate files and find_file, with diff approvals."""
+    names = [str(n) for n in (spec_names or [])]
+    if not any(n.endswith("obsidian_edit") or "__obsidian_edit" in n
+               or n.endswith("kate_edit") or "__kate_edit" in n
+               or n.endswith("find_file") or "__find_file" in n
+               for n in names):
+        return ""
+    return ("You can also edit the owner's notes and files: Obsidian notes "
+            "over the Local REST API (obsidian_*), files on disk with Kate "
+            "reloading them (kate_*), and find_file locates files under "
+            "$HOME; obsidian_edit and kate_edit show the owner a real diff "
+            "for approval before anything is written. ")
 
 
 def now_iso_static() -> str:

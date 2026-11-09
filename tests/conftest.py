@@ -163,38 +163,103 @@ _subprocess.run = _guarded_typing(_subprocess.run)
 _subprocess.Popen = _guarded_typing(_subprocess.Popen)
 
 # ...and no Obsidian Local REST API either: any TCP connect to the plugin's
-# ports (127.0.0.1:27123/27124) raises; tests use a fake HTTP server.
+# ports (127.0.0.1:27123/27124) raises; tests use a fake HTTP server on an
+# ephemeral port. The bare socket.connect guard leaks past the dial paths
+# that do NOT go through it: socket.create_connection dials via its own
+# code path, http.client/urllib reach the socket through HTTPConnection,
+# and ssl.SSLSocket overrides connect/connect_ex for the TLS handshake —
+# so every one of those entry points gets its own guard. All filters key
+# on loopback host + 27123/27124, so the fake servers on ephemeral ports
+# keep working.
 _OBSIDIAN_PORTS = {27123, 27124}
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"}
 _REAL_SOCKET_CONNECT = socket.socket.connect
 _REAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+_REAL_CREATE_CONNECTION = socket.create_connection
+
+
+def _obsidian_error(port):
+    return RuntimeError(
+        f"tests must not contact Obsidian Local REST API "
+        f"(127.0.0.1:{port}): use a fake HTTP server "
+        f"(docs/TYPING.md testing rules).")
 
 
 def _is_obsidian_addr(addr):
     return (isinstance(addr, tuple) and len(addr) >= 2
-            and str(addr[0]) in ("127.0.0.1", "localhost", "::1",
-                                 "::ffff:127.0.0.1")
+            and str(addr[0]) in _LOOPBACK_HOSTS
             and addr[1] in _OBSIDIAN_PORTS)
+
+
+def _is_obsidian_hostport(host, port):
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    return str(host or "").strip() in _LOOPBACK_HOSTS \
+        and port in _OBSIDIAN_PORTS
 
 
 def _no_obsidian_connect(self, addr):
     if _is_obsidian_addr(addr):
-        raise RuntimeError(
-            f"tests must not contact Obsidian Local REST API "
-            f"(127.0.0.1:{addr[1]}): use a fake HTTP server "
-            f"(docs/TYPING.md testing rules).")
+        raise _obsidian_error(addr[1])
     return _REAL_SOCKET_CONNECT(self, addr)
 
 
 def _no_obsidian_connect_ex(self, addr):
     if _is_obsidian_addr(addr):
-        raise RuntimeError(
-            f"tests must not contact Obsidian Local REST API "
-            f"(127.0.0.1:{addr[1]}): use a fake HTTP server.")
+        raise _obsidian_error(addr[1])
     return _REAL_SOCKET_CONNECT_EX(self, addr)
+
+
+def _no_obsidian_create_connection(address, *args, **kwargs):
+    if _is_obsidian_addr(address):
+        raise _obsidian_error(address[1])
+    return _REAL_CREATE_CONNECTION(address, *args, **kwargs)
 
 
 socket.socket.connect = _no_obsidian_connect
 socket.socket.connect_ex = _no_obsidian_connect_ex
+socket.create_connection = _no_obsidian_create_connection
+# ssl.create_connection dials through socket.create_connection (guarded
+# above), so it needs no separate wrapper.
+import ssl as _ssl  # noqa: E402
+
+import http.client as _http_client  # noqa: E402
+
+_REAL_HTTP_CONN_INIT = _http_client.HTTPConnection.__init__
+
+
+def _guarded_http_conn_init(self, host, port=None, *args, **kwargs):
+    # HTTPSConnection subclasses HTTPConnection, so https:// too.
+    if _is_obsidian_hostport(host, port):
+        raise _obsidian_error(port)
+    return _REAL_HTTP_CONN_INIT(self, host, port, *args, **kwargs)
+
+
+_http_client.HTTPConnection.__init__ = _guarded_http_conn_init
+
+# SSLSocket.connect/connect_ex are overrides (TLS handshake wrapping) that
+# reach the wire without passing the patched socket.socket methods on every
+# Python version — guard the class itself.
+_REAL_SSL_CONNECT = _ssl.SSLSocket.connect
+_REAL_SSL_CONNECT_EX = _ssl.SSLSocket.connect_ex
+
+
+def _no_obsidian_ssl_connect(self, addr):
+    if _is_obsidian_addr(addr):
+        raise _obsidian_error(addr[1])
+    return _REAL_SSL_CONNECT(self, addr)
+
+
+def _no_obsidian_ssl_connect_ex(self, addr):
+    if _is_obsidian_addr(addr):
+        raise _obsidian_error(addr[1])
+    return _REAL_SSL_CONNECT_EX(self, addr)
+
+
+_ssl.SSLSocket.connect = _no_obsidian_ssl_connect
+_ssl.SSLSocket.connect_ex = _no_obsidian_ssl_connect_ex
 
 # An ambient YDOTOOL_SOCKET from the owner's session must not steer tests
 # into probing their real daemon.

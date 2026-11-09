@@ -766,6 +766,17 @@ def main():
             session.dictation_filter = typing_svc.route
         except Exception as e:  # noqa: BLE001 — typing off must not kill the app
             print(f"[desktop] typing/dictation unavailable ({e})", flush=True)
+    # App editing (docs/TYPING.md): Obsidian Local REST API + Kate tools.
+    # Registered through the same client_tools.register_extra hook, so
+    # obsidian_* / kate_* / find_file ride the awareness gate too. The
+    # diff approvals run through the client-side confirmation path
+    # (riko/appedit raises client_tools.NeedConfirmation).
+    if sense is not None and runtime is not None:
+        try:
+            from riko import appedit
+            appedit.install(sense, runtime=runtime, bridge=browser)
+        except Exception as e:  # noqa: BLE001 — app edit off must not kill the app
+            print(f"[desktop] app-editing tools unavailable ({e})", flush=True)
     hub_client.start_state_poller()  # notice switches made from the web page or another PC
     session.follow_hub_events()  # hub-fired timer replies reach her like normal turns (docs/TIMERS.md D)
     session.greet_on_start()  # she says hello once when the page is ready (desktop.greet_on_start)
