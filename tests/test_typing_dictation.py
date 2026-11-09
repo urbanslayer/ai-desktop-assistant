@@ -132,6 +132,62 @@ def test_dictation_enter_in_terminal_asks_with_command():
     assert any("declined" in n for n in notes)
 
 
+def test_dictation_enter_ask_shows_exact_or_unknown_command():
+    summaries = []
+    engine, sense, yd, ctl, notes = make_service(
+        window=KITTY, ask=lambda s, t: summaries.append(s) or True)
+    ctl.start()
+    ctl.route("rm -rf build")
+    ctl.route("new line")
+    assert any("command: `rm -rf build`" in s for s in summaries)
+    # the line ran; the next break sits on a fresh prompt Riko did not type
+    ctl.route("new paragraph")
+    assert any("unknown command — Riko did not type this line" in s
+               for s in summaries)
+
+
+def test_dictation_no_ask_callback_refuses_terminal_enter():
+    """No approval bubble wired → NO Enter into the terminal, ever: the
+    old code defaulted to ok=True and ran the line unasked."""
+    engine, sense, yd, ctl, notes = make_service(window=KITTY)   # ask=None
+    ctl.start()
+    ctl.route("rm -rf /")
+    before = len(yd.batches)
+    assert ctl.route("new line")[0]                      # handled locally…
+    assert len(yd.batches) == before                     # …but NO Enter sent
+    assert not any(c == 28 for b in yd.batches for (c, d) in b)
+    assert any("Enter not sent" in n for n in notes)
+
+
+def test_dictation_non_terminal_enter_stays_free():
+    """§7: the pinned non-terminal window never pays for the terminal rule."""
+    engine, sense, yd, ctl, notes = make_service(window=KATE)    # ask=None
+    ctl.start()
+    ctl.route("a paragraph")
+    before = len(yd.batches)
+    assert ctl.route("new paragraph")[0]
+    assert len(yd.batches) > before                      # \n went out, no ask
+    assert (28, True) in yd.batches[-1]
+    assert notes and not any("not sent" in n for n in notes)
+
+
+def test_executors_press_keys_in_pinned_terminal_still_asks():
+    """§6 over §7: even while the terminal is the pinned dictation window,
+    the press_keys executor cannot bypass the run gate."""
+    engine, sense, yd, ctl, notes = make_service(window=KITTY,
+                                                 ask=lambda s, t: True)
+    ex = typing_executors(engine, ctl)
+    ctl.start()
+    ex["type_text"](text="df -h")                        # pinned: types free
+    with pytest.raises(HubStyleConfirm) as e:
+        ex["press_keys"](keys="enter")                   # dictation ON, pinned
+    assert "df -h" in e.value.reason
+    # approving through the engine's own round trip runs it
+    out = ex["press_keys"](keys="enter", confirmed=True,
+                           run_token=e.value.params["run_token"])
+    assert out["pressed"] == 1
+
+
 def test_denylist_cannot_be_pinned():
     sense = FakeSense({"id": "0x300", "app": "keepassxc", "title": "Passwords"},
                       hide={"keepassxc"})

@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 
 from ..client_tools import ToolError
+from .engine import _preview
+from .terminals import is_terminal
 
 _STOP = {"stop dictating", "stop dictation", "end dictation",
          "quit dictating", "quit dictation", "stop listening to me"}
@@ -172,17 +174,22 @@ class DictationController:
 
     def _send_line_break(self, n):
         w = self.engine.focused()
-        from .terminals import is_terminal
         if is_terminal(str(w.get("app") or ""), str(w.get("title") or "")):
-            # Enter in a terminal ALWAYS asks, even mid-dictation (§6)
+            # Enter in a terminal ALWAYS asks, even mid-dictation (§6), and
+            # the ask must show the exact command line. With no approval
+            # bubble wired there is no way to ask — so no Enter: a silent
+            # unasked Enter into a shell is exactly what §6 forbids.
             cmd = (self.engine._last_line.get(str(w.get("id"))) or "").strip()
-            ok = True
-            if self.ask is not None:
-                summary = (f"press Enter in terminal "
-                           f"{w.get('app')} — dictation line break"
-                           + (f": `{cmd}`" if cmd else " (line end)"))
-                ok = bool(self.ask(summary, 120))
-            if ok:
+            if self.ask is None:
+                self.notice("dictation: no approval bubble wired — "
+                            "Enter not sent to the terminal")
+                self._last_chunk = ""
+                return
+            summary = (f"press Enter in terminal {w.get('app')} "
+                       f"\"{w.get('title') or ''}\" — dictation line break — "
+                       + (f"command: `{_preview(cmd, 200)}`" if cmd
+                          else "unknown command — Riko did not type this line"))
+            if bool(self.ask(summary, 120)):
                 self.engine._send_combo("enter")
                 self.engine._last_line.pop(str(w.get("id")), None)
             else:

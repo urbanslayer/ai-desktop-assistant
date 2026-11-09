@@ -17,7 +17,16 @@ window contents stay out of scope.
   typing outside dictation mode asks first (approval bubble showing the target window and the text).
 - **Terminals**: she may type a command, but **Enter is never sent without an explicit approval** for that
   exact command, even in dictation mode. Text typed into a terminal is single-line: newlines are stripped,
-  and any control/escape sequences are refused.
+  and any control/escape sequences are refused. "Enter" covers every key that executes the line: Enter,
+  KP Enter, Ctrl+M (CR), Ctrl+J (LF), and Shift/Alt/Ctrl+Enter (many terminals pass them as Enter). Paste
+  into a terminal never carries a trailing newline (text is stripped first, bracketed paste is relied on).
+  The approval runs on a **run token** the typing engine issues with its own confirmation: it is one-time,
+  bound to the focused window id + the exact pending command line + a 120 s expiry, and only that token
+  grants the key — a generic hub approval of the tool call (whose bubble shows only the args, e.g.
+  `keys="enter"`) and the dictation pin never do. If Riko did not type the line, the approval says
+  "unknown command — Riko did not type this line". Ctrl+C / Ctrl+D / Ctrl+Z / Ctrl+\\ interrupt or kill
+  what the shell is running and get their own approval with the target window shown. A dictation line
+  break with no approval bubble wired is refused (no silent Enter).
 - **Obsidian**: through the owner-installed community plugin **Local REST API** (coddingtonbear,
   `https://127.0.0.1:27124`, self-signed cert, `Authorization: Bearer <key>`). The key lives in the desktop
   config (`~/.config/riko/obsidian.json`, mode 0600), never in the hub or chat.
@@ -51,7 +60,7 @@ window contents stay out of scope.
 | tool | risk / default | what |
 |---|---|---|
 | `type_text(text, target?)` | act / ASK (ALWAYS inside dictation for the pinned window) | types at the cursor of the focused window (or `target` window ref, focused first via `focus_window`) |
-| `press_keys(keys, target?)` | act / ASK | key combos like `ctrl+s`, `ctrl+shift+t`, `enter`, `backspace*3`; Enter into a terminal always ASKs with the command shown |
+| `press_keys(keys, target?)` | act / ASK | key combos like `ctrl+s`, `ctrl+shift+t`, `enter`, `backspace*3`; terminal run keys (Enter/KP Enter/Ctrl+M/Ctrl+J/Shift-Alt-Ctrl+Enter) always ASK via an engine run token with the command shown; Ctrl+C/D/Z/\\ ask separately with the target |
 | `set_dictation(on, target?)` | act / ASK | start or stop dictation mode; pins the focused (or named) window |
 | `dictation_status()` | read / ALWAYS | `{on, target:{app,title}, paused_reason}` |
 | `stop_typing()` | act / ALWAYS | aborts the current batch |

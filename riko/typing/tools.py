@@ -47,8 +47,11 @@ def typing_tools():
              "Press key combos: 'ctrl+s', 'ctrl+shift+t', 'enter', "
              "'backspace*3' (space/comma separated, max 32). Super/Meta "
              "combos and Ctrl+Alt+Del / Ctrl+Alt+F1-F12 / Ctrl+Alt+Backspace "
-             "are refused. Enter into a terminal ALWAYS asks with the exact "
-             "command shown."),
+             "are refused. In a terminal the run keys (Enter, KP Enter, "
+             "Ctrl+M, Ctrl+J, Shift/Alt/Ctrl+Enter) ALWAYS ask with the "
+             "exact command line shown first — even in dictation or after a "
+             "hub approval — and Ctrl+C/D/Z/\\ interrupt keys ask with the "
+             "target window shown."),
          "parameters": dict(obj, properties={
              "keys": {"type": "string"},
              "target": {"type": "string"}}, required=["keys"])},
@@ -106,10 +109,24 @@ def typing_executors(engine, dictation):
             text=text, target=target or None, confirmed=bool(confirmed),
             dictation_pinned=_pinned_now(target))
 
-    def press_keys(keys=None, target=None, confirmed=False, **_kw):
-        return _ask_or_run(
-            "press_keys", engine.press_keys,
-            keys=keys, target=target or None, confirmed=bool(confirmed))
+    def press_keys(keys=None, target=None, confirmed=False, run_token=None,
+                   **_kw):
+        """Run/interrupt keys into a terminal carry their own one-time
+        run_token through the confirmation params: a generic hub approval
+        (confirmed=True) or the dictation pin never grants them — the engine
+        only accepts the token it issued with the ask that showed the
+        command."""
+        kwargs = {"keys": keys, "target": target or None,
+                  "confirmed": bool(confirmed)}
+        if run_token:
+            kwargs["run_token"] = str(run_token)
+        try:
+            return engine.press_keys(**kwargs)
+        except EngineAsk as c:
+            params = dict(kwargs)
+            if getattr(c, "run_token", None):
+                params["run_token"] = c.run_token
+            raise HubStyleConfirm(c.reason, "press_keys", params) from None
 
     def set_dictation(on=True, target=None, confirmed=False, **_kw):
         want = bool(on)

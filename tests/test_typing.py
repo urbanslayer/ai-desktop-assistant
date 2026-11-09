@@ -315,6 +315,18 @@ def test_terminal_text_single_line_no_control():
         eng.type_text("ls \x1b[31mred", confirmed=True)   # control chars refused
 
 
+def _approve(eng, keys, window_id=None, kind_first=True):
+    """Run the engine's own approval round trip once: capture the token the
+    NeedConfirmation issued and re-call press_keys with it (what the runtime
+    does after the owner OKs the bubble)."""
+    with pytest.raises(NeedConfirmation) as e:
+        eng.press_keys(keys)
+    tok = e.value.run_token
+    assert tok, "terminal run/interrupt asks must carry a run_token"
+    out = eng.press_keys(keys, confirmed=True, run_token=tok)
+    return out
+
+
 def test_terminal_enter_always_asks_with_the_command():
     eng, _, yd = make_engine(window=KITTY)
     eng.type_text("rm -rf / --no-preserve-root", confirmed=True)
@@ -322,14 +334,183 @@ def test_terminal_enter_always_asks_with_the_command():
         eng.press_keys("enter")
     assert "rm -rf / --no-preserve-root" in e.value.reason
     assert len(yd.batches) == 1                           # only the typing so far
-    out = eng.press_keys("enter", confirmed=True)         # approved: now it runs
+    # a generic confirmed=True (hub-approved tool call) must NOT run it:
+    # that bubble showed only the args keys='enter', never the command
+    with pytest.raises(NeedConfirmation) as e2:
+        eng.press_keys("enter", confirmed=True)
+    assert "rm -rf / --no-preserve-root" in e2.value.reason
+    assert len(yd.batches) == 1
+    # the engine's own round trip: token from the ask that showed the
+    # command is what grants Enter
+    tok = e2.value.run_token
+    out = eng.press_keys("enter", confirmed=True, run_token=tok)
     assert out["pressed"] == 1
     assert (28, 1) in yd.batches[-1]
-    # after Enter the remembered command line is gone (it ran)
+    # replay of a spent token does not re-run anything
+    with pytest.raises(NeedConfirmation) as e3:
+        eng.press_keys("enter", confirmed=True, run_token=tok)
+    assert len(yd.batches) == 2                           # nothing extra sent
+    # after Enter the remembered command line is gone (it ran); keys typed
+    # via press_keys are tracked too
     eng.press_keys("l", confirmed=True)
+    with pytest.raises(NeedConfirmation) as e4:
+        eng.press_keys("enter")
+    assert "command: `l`" in e4.value.reason
+
+
+def test_enter_summary_says_unknown_when_riko_did_not_type_it():
+    eng, _, yd = make_engine(window=KITTY)                 # fresh prompt
+    with pytest.raises(NeedConfirmation) as e:
+        eng.press_keys("enter")
+    assert "unknown command — Riko did not type this line" in e.value.reason
+    assert yd.batches == []
+
+
+def test_dictation_pin_never_grants_terminal_enter():
+    eng, _, yd = make_engine(window=KITTY)
+    eng.type_text("sudo reboot", confirmed=True)
+    with pytest.raises(NeedConfirmation) as e:
+        eng.press_keys("enter", dictation_pinned=True)
+    assert "sudo reboot" in e.value.reason
+    assert len(yd.batches) == 1                           # Enter NOT sent
+
+
+def test_run_token_expiry_and_wrong_window_refused():
+    import time as _t
+    eng, sense, yd = make_engine(window=KITTY)
+    eng.type_text("git push", confirmed=True)
+    with pytest.raises(NeedConfirmation) as e:
+        eng.press_keys("enter")
+    tok = e.value.run_token
+    # expiry: age the grant out, then it buys nothing
+    eng._run_tokens[tok]["expires"] = _t.monotonic() - 1
+    with pytest.raises(NeedConfirmation):
+        eng.press_keys("enter", confirmed=True, run_token=tok)
+    # wrong window: a token issued for one terminal must not run another
     with pytest.raises(NeedConfirmation) as e2:
         eng.press_keys("enter")
-    assert "l" in e2.value.reason
+    tok2 = e2.value.run_token
+    sense.backend.window = {"id": "0x201", "app": "kitty", "title": "user@arch: /tmp"}
+    with pytest.raises(NeedConfirmation) as e2b:         # token is window-bound
+        eng.press_keys("enter", confirmed=True, run_token=tok2)
+    assert "unknown command" in e2b.value.reason          # other prompt, not run
+    # command changed under the approval: re-ask, never run blind
+    sense.backend.window = dict(KITTY)
+    with pytest.raises(NeedConfirmation) as e3:
+        eng.press_keys("enter")
+    tok3 = e3.value.run_token
+    eng.type_text(" --force", confirmed=True)              # line changed
+    with pytest.raises(NeedConfirmation) as e4:
+        eng.press_keys("enter", confirmed=True, run_token=tok3)
+    assert "--force" in e4.value.reason                    # fresh ask shows it
+    # a blank/garbage token is simply no grant
+    with pytest.raises(NeedConfirmation):
+        eng.press_keys("enter", confirmed=True, run_token="nonsense")
+
+
+@pytest.mark.parametrize("combo,codes", [
+    ("enter", [(28, 1)]),
+    ("kp_enter", [(96, 1)]),
+    ("ctrl+m", [(29, 1), (50, 1)]),        # CR
+    ("ctrl+j", [(29, 1), (36, 1)]),        # LF
+    ("shift+enter", [(42, 1), (28, 1)]),
+    ("alt+enter", [(56, 1), (28, 1)]),
+    ("ctrl+enter", [(29, 1), (28, 1)]),
+])
+def test_every_terminal_run_key_asks_then_needs_token(combo, codes):
+    eng, _, yd = make_engine(window=KITTY)
+    eng.type_text("echo hi", confirmed=True)
+    n0 = len(yd.batches)
+    for kw in ({"confirmed": True}, {"dictation_pinned": True}):
+        with pytest.raises(NeedConfirmation) as e:
+            eng.press_keys(combo, **kw)
+        assert "echo hi" in e.value.reason
+        assert "press Enter in terminal" in e.value.reason
+        assert len(yd.batches) == n0
+    out = _approve(eng, combo)
+    assert out["pressed"] == 1
+    batch = yd.batches[-1]
+    for c, d in codes:
+        assert (c, d) in batch
+    # the line ran: next Enter is a fresh prompt, unknown command
+    with pytest.raises(NeedConfirmation) as e2:
+        eng.press_keys("enter")
+    assert "unknown command" in e2.value.reason
+
+
+@pytest.mark.parametrize("combo,code", [
+    ("ctrl+c", 46), ("ctrl+d", 32), ("ctrl+z", 44), ("ctrl+\\", 43),
+])
+def test_terminal_interrupt_keys_get_their_own_ask(combo, code):
+    eng, _, yd = make_engine(window=KITTY)
+    eng.type_text("sleep 100", confirmed=True)
+    with pytest.raises(NeedConfirmation) as e:
+        eng.press_keys(combo, confirmed=True)              # hub approval ≠ grant
+    assert "interrupt" in e.value.reason
+    assert "kitty" in e.value.reason                       # target shown
+    assert "sleep 100" in e.value.reason
+    assert len(yd.batches) == 1
+    out = _approve(eng, combo)
+    assert out["pressed"] == 1
+    assert (29, 1) in yd.batches[-1] and (code, 1) in yd.batches[-1]
+
+
+def test_non_terminal_keys_unchanged():
+    eng, _, yd = make_engine(window=KATE)
+    # outside terminals the generic approval still works for everything
+    assert eng.press_keys("ctrl+c", confirmed=True)["pressed"] == 1
+    assert eng.press_keys("enter", confirmed=True)["pressed"] == 1
+    assert eng.press_keys("shift+enter", dictation_pinned=True)["pressed"] == 1
+    assert (28, 1) in yd.batches[-1]
+
+
+def test_hub_approved_press_keys_round_trips_run_token():
+    """End to end through the runtime: a hub-approved press_keys('enter')
+    (whose bubble shows only the args) STILL asks a second time with the
+    exact command, and only that approval runs it."""
+    from types import SimpleNamespace
+    from riko import client_tools as ct
+    from riko.typing.tools import typing_executors
+
+    eng, sense, yd = make_engine(window=KITTY)
+    eng.type_text("sudo reboot now", confirmed=True)
+    ctl = SimpleNamespace(on=False, pinned=None, paused_reason="")
+    ex = typing_executors(eng, ctl)
+
+    seen = {}
+
+    class HubC:
+        def client_result(self, cid, rid, **kw):
+            seen["result"] = kw
+
+    asked = []
+    rt = object.__new__(ct.ClientRuntime)
+    rt.executors = {"press_keys": ex["press_keys"]}
+    rt.hub = HubC()
+    rt.client_id = "c"
+    rt.approval_timeout = 10.0
+    rt.ask_approval = lambda summary=None, timeout=None: asked.append(summary) or True
+    ct.ClientRuntime._dispatch_request(
+        rt, {"request_id": "r1", "tool": "press_keys",
+             "arguments": {"keys": "enter"}, "needs_approval": True,
+             "summary": "run press_keys on pc"}, 10.0)
+    # first ask: the generic hub summary; second: the command itself
+    assert asked[0] == "run press_keys on pc"
+    assert any("sudo reboot now" in a for a in asked[1:])
+    assert seen["result"]["ok"] is True
+    assert (28, 1) in yd.batches[-1]
+    n_batches = len(yd.batches)
+    # denying the command-level ask sends NOTHING into the terminal
+    eng.type_text("ls", confirmed=True)
+    rt.ask_approval = (lambda summary=None, timeout=None:
+                       asked.append(summary)
+                       or "press Enter in terminal" not in str(summary))
+    ct.ClientRuntime._dispatch_request(
+        rt, {"request_id": "r2", "tool": "press_keys",
+             "arguments": {"keys": "enter"}, "needs_approval": True,
+             "summary": "run press_keys on pc"}, 10.0)
+    assert seen["result"]["ok"] is False
+    assert len(yd.batches) == n_batches + 1                # only the ls typing
 
 
 def test_non_terminal_enter_needs_no_command_summary():

@@ -10,6 +10,38 @@ from ..client_tools import ToolError
 
 ENTER_CODES = {28, 96}   # KEY_ENTER + KP_ENTER — the "run it" keys
 
+# docs/TYPING.md §6: everything that acts like Enter *inside a terminal*.
+# Keypad Enter is Enter; Ctrl+M is CR, Ctrl+J is LF; many terminals also
+# pass Shift+Enter / Alt+Enter / Ctrl+Enter straight through as an
+# Enter/newline. All of these execute the command line, so the terminal
+# gate treats them exactly like plain Enter.
+_TERMINAL_RUN_KEYS = {
+    (frozenset(), 28), (frozenset(), 96),           # Enter / KP_Enter
+    (frozenset({"ctrl"}), 50),                      # Ctrl+M  = CR
+    (frozenset({"ctrl"}), 36),                      # Ctrl+J  = LF
+    (frozenset({"shift"}), 28),                     # Shift+Enter (many terms)
+    (frozenset({"alt"}), 28),                       # Alt+Enter
+    (frozenset({"ctrl"}), 28),                      # Ctrl+Enter
+}
+# Ctrl+C/D/Z/\ interrupt or kill whatever the shell is running (§6): they
+# get their own approval with the target window shown.
+_TERMINAL_INTERRUPT_KEYS = {
+    (frozenset({"ctrl"}), 46),                      # Ctrl+C
+    (frozenset({"ctrl"}), 32),                      # Ctrl+D
+    (frozenset({"ctrl"}), 44),                      # Ctrl+Z
+    (frozenset({"ctrl"}), 43),                      # Ctrl+\
+}
+
+
+def terminal_key_kind(mods, base, code):
+    """'run' | 'interrupt' | None for one parsed combo (see the tables)."""
+    key = (frozenset(mods), code)
+    if key in _TERMINAL_RUN_KEYS:
+        return "run"
+    if key in _TERMINAL_INTERRUPT_KEYS:
+        return "interrupt"
+    return None
+
 
 def parse_combo(text):
     """'ctrl+shift+s' -> (mods, base_name, keycode). ToolError on anything
