@@ -130,6 +130,76 @@ def _guarded(fn):
 _subprocess.run = _guarded(_subprocess.run)
 _subprocess.Popen = _guarded(_subprocess.Popen)
 
+# ── No real keystrokes / clipboard writes (docs/TYPING.md testing rules) ──
+# The typing pack takes runner= fakes for ydotool and wl-clipboard alike, so
+# reaching a real ydotool/ydotoold/wl-copy/wl-paste/kate from a test is a
+# bug: hard-fail it the same way as the compositor guard above.
+_TYPING_ARGV0 = re.compile(
+    r"^(ydotool|ydotoold|wl-copy|wl-paste|wl-run|xclip|xsel|kate[-\w]*)$", re.I)
+
+
+def _guarded_typing(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args") or kwargs.get("program")
+        if isinstance(argv, (list, tuple)) and argv:
+            first = str(argv[0])
+        elif isinstance(argv, str):
+            first = argv.strip().split(" ")[0] if argv.strip() else ""
+        else:
+            first = ""
+        if first and _TYPING_ARGV0.match(os.path.basename(first)):
+            raise RuntimeError(
+                f"tests must not run {first!r} for real (docs/TYPING.md "
+                f"testing rules): no real keystrokes, clipboard writes or "
+                f"Kate — inject a fake runner.")
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+_subprocess.run = _guarded_typing(_subprocess.run)
+_subprocess.Popen = _guarded_typing(_subprocess.Popen)
+
+# ...and no Obsidian Local REST API either: any TCP connect to the plugin's
+# ports (127.0.0.1:27123/27124) raises; tests use a fake HTTP server.
+_OBSIDIAN_PORTS = {27123, 27124}
+_REAL_SOCKET_CONNECT = socket.socket.connect
+_REAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+
+
+def _is_obsidian_addr(addr):
+    return (isinstance(addr, tuple) and len(addr) >= 2
+            and str(addr[0]) in ("127.0.0.1", "localhost", "::1",
+                                 "::ffff:127.0.0.1")
+            and addr[1] in _OBSIDIAN_PORTS)
+
+
+def _no_obsidian_connect(self, addr):
+    if _is_obsidian_addr(addr):
+        raise RuntimeError(
+            f"tests must not contact Obsidian Local REST API "
+            f"(127.0.0.1:{addr[1]}): use a fake HTTP server "
+            f"(docs/TYPING.md testing rules).")
+    return _REAL_SOCKET_CONNECT(self, addr)
+
+
+def _no_obsidian_connect_ex(self, addr):
+    if _is_obsidian_addr(addr):
+        raise RuntimeError(
+            f"tests must not contact Obsidian Local REST API "
+            f"(127.0.0.1:{addr[1]}): use a fake HTTP server.")
+    return _REAL_SOCKET_CONNECT_EX(self, addr)
+
+
+socket.socket.connect = _no_obsidian_connect
+socket.socket.connect_ex = _no_obsidian_connect_ex
+
+# An ambient YDOTOOL_SOCKET from the owner's session must not steer tests
+# into probing their real daemon.
+os.environ.pop("YDOTOOL_SOCKET", None)
+
 
 @pytest.fixture(autouse=True)
 def _clean_session_env():
@@ -138,12 +208,12 @@ def _clean_session_env():
     what conftest popped is gone for good)."""
     for _v in ("HYPRLAND_INSTANCE_SIGNATURE", "HYPRLAND_CMD",
                "WAYLAND_DISPLAY", "DISPLAY", "SWAYSOCK",
-               "DBUS_SESSION_BUS_ADDRESS"):
+               "DBUS_SESSION_BUS_ADDRESS", "YDOTOOL_SOCKET"):
         os.environ.pop(_v, None)
     yield
     for _v in ("HYPRLAND_INSTANCE_SIGNATURE", "HYPRLAND_CMD",
                "WAYLAND_DISPLAY", "DISPLAY", "SWAYSOCK",
-               "DBUS_SESSION_BUS_ADDRESS"):
+               "DBUS_SESSION_BUS_ADDRESS", "YDOTOOL_SOCKET"):
         os.environ.pop(_v, None)
 
 

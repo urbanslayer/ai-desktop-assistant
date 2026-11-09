@@ -669,6 +669,42 @@ def build_sense_action(menu, sense, apply_toggle):
     return action
 
 
+def build_dictation_action(menu, typing_svc, apply_toggle):
+    """The tray's 'Dictation' checkbox (docs/TYPING.md §8): start/stop the
+    mode that types her speech into the pinned window. Built apart from
+    main() so an offscreen Qt test can pull the real slot; same checked-bool
+    care as build_sense_action. `apply_toggle(enabled) -> applied state`."""
+
+    def toggle(checked=None):
+        if typing_svc is None:
+            return
+        want = (not typing_svc.dictation.on) if checked is None else bool(checked)
+        action.setChecked(bool(apply_toggle(want)))
+
+    action = QAction("Dictation", menu)
+    action.setCheckable(True)
+    action.setToolTip("dictation mode: what she hears is typed into the "
+                      "window focused now (focus away = pause). Control "
+                      "phrases: stop dictating / new line / new paragraph / "
+                      "delete that")
+    action.setEnabled(typing_svc is not None)
+    action.triggered.connect(toggle)
+    if typing_svc is not None:
+        action.setChecked(typing_svc.dictation.on)
+    return action
+
+
+def build_stop_typing_action(menu, typing_svc):
+    """'Stop typing' (docs/TYPING.md §5): aborts the keystroke batch in
+    progress at the next chunk; dictation mode itself is untouched."""
+    action = QAction("Stop typing", menu)
+    action.setToolTip("abort the keystroke batch in progress right away")
+    action.setEnabled(typing_svc is not None)
+    action.triggered.connect(
+        lambda checked=None: typing_svc.engine.stop() if typing_svc else None)
+    return action
+
+
 def main():
     parser = argparse.ArgumentParser(description="Riko as a floating desktop avatar.")
     parser.add_argument("--asr", choices=["remote", "local", "groq"], help="speech to text (overrides the config)")
@@ -716,6 +752,19 @@ def main():
         print('[desktop] awareness off — tick "Let her see my desktop" in the '
               "tray to let her see windows/screens and switch workspaces",
               flush=True)
+    # Typing + dictation (docs/TYPING.md): ydotool keystroke tools plus the
+    # dictation mode that types her speech into a pinned window. Registered
+    # through client_tools.register_extra, so it appears with the awareness
+    # toggle and vanishes with it. Needs both sense and the client runtime.
+    typing_svc = None
+    if sense is not None and runtime is not None:
+        try:
+            from riko import typing as typing_pack
+            typing_svc = typing_pack.install(sense, cfg=cfg, bridge=browser,
+                                             runtime=runtime)
+            session.dictation_filter = typing_svc.route
+        except Exception as e:  # noqa: BLE001 — typing off must not kill the app
+            print(f"[desktop] typing/dictation unavailable ({e})", flush=True)
     hub_client.start_state_poller()  # notice switches made from the web page or another PC
     session.follow_hub_events()  # hub-fired timer replies reach her like normal turns (docs/TIMERS.md D)
     session.greet_on_start()  # she says hello once when the page is ready (desktop.greet_on_start)
@@ -796,6 +845,11 @@ def main():
             # made by the set_desktop_awareness tool (worker thread) onto the
             # Qt thread, exactly like listen-ui above
             sense_action.setChecked(cmd.partition(":")[2] == "on")
+        elif cmd.startswith("dictation-ui:"):  # reflect a dictation toggle
+            # made by the set_dictation tool, riko-ctl or the speech router
+            on = cmd.partition(":")[2] == "on"
+            dictation_action.setChecked(on)
+            tray.setToolTip("Riko — dictating" if on else "Riko")
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
 
@@ -840,7 +894,8 @@ def main():
             print("[ctl] input closed", flush=True)
         elif cmd == "status":
             return {"ok": True, "recording": session.recorder.recording,
-                    "visible": win.isVisible(), "listen_mode": session.listen_mode}
+                    "visible": win.isVisible(), "listen_mode": session.listen_mode,
+                    "dictation": typing_svc.dictation.status() if typing_svc else None}
         elif cmd == "listen-mode":
             want = str(args.get("mode", "")).strip().lower()
             if want:
@@ -871,6 +926,28 @@ def main():
             elif want:
                 return {"ok": False, "error": "desktop-sense: on | off"}
             return {"ok": True, "enabled": sense.awareness.enabled}
+        elif cmd in ("dictation", "dictation-mode"):
+            # docs/TYPING.md §8: riko-ctl dictation on|off (the same path as
+            # the tray checkbox; the pin is whatever window is focused now)
+            if typing_svc is None:
+                return {"ok": False, "error": "dictation needs desktop "
+                         "awareness + client tools (desktop awareness off?)"}
+            want = str(args.get("enabled", "")).strip().lower()
+            try:
+                if want in ("on", "true", "1", "yes"):
+                    _dictation_apply(True)
+                elif want in ("off", "false", "0", "no"):
+                    _dictation_apply(False)
+                elif want:
+                    return {"ok": False, "error": "dictation: on | off"}
+            except Exception as e:  # ToolError etc. from the engine
+                return {"ok": False, "error": str(e)}
+            bridge.command.emit(f"dictation-ui:{'on' if typing_svc.dictation.on else 'off'}")
+            return {"ok": True, **typing_svc.dictation.status()}
+        elif cmd == "stop-typing":
+            if typing_svc is None:
+                return {"ok": False, "error": "typing tools are off"}
+            return {"ok": True, "note": typing_svc.engine.stop()}
         elif cmd == "browser-status":
             on = bool(browser and browser.connected())
             return {"ok": True, "enabled": runtime is not None, "connected": on,
@@ -973,6 +1050,31 @@ def main():
         runtime.awareness_tray = lambda new: bridge.command.emit(
             f"awareness-ui:{'on' if new else 'off'}")
 
+    # Dictation (docs/TYPING.md §8): the tray checkbox + 'Stop typing'.
+    # The mode itself lives in riko/typing; the checkbox follows toggles
+    # made by the tool / riko-ctl / control phrases through dictation-ui.
+    def _dictation_apply(enabled):
+        """Single dictation toggle path (tray/ctl): returns applied state."""
+        if typing_svc is None:
+            return False
+        (typing_svc.dictation.start() if enabled
+         else typing_svc.dictation.stop())
+        return bool(typing_svc.dictation.on)
+
+    def _dictation_notice(msg):
+        """The small local notice beside her (no hub turn): a HUD line +
+        terminal + honest checkbox/tooltip state."""
+        print(f"[dictation] {msg}", flush=True)
+        viewer.emit("heard", text=f"🎤 {msg}")
+        if typing_svc is not None:
+            bridge.command.emit(
+                f"dictation-ui:{'on' if typing_svc.dictation.on else 'off'}")
+
+    if typing_svc is not None:
+        typing_svc.dictation.notice = _dictation_notice
+    dictation_action = build_dictation_action(menu, typing_svc, _dictation_apply)
+    stop_typing_action = build_stop_typing_action(menu, typing_svc)
+
     for label, fn in ((f"Type to her{hint('type')}", lambda: on_command("type")),
                       (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle)):
         action = QAction(label, menu)
@@ -980,6 +1082,8 @@ def main():
         menu.addAction(action)
     menu.addAction(listen_action)
     menu.addAction(sense_action)
+    menu.addAction(dictation_action)
+    menu.addAction(stop_typing_action)
     for label, fn in ((f"Show / hide{hint('hide')}", toggle_window),
                       (f"Forget the chat{hint('forget')}", session.forget),
                       (f"Quit{hint('quit')}", app.quit)):

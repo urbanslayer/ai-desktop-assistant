@@ -216,6 +216,7 @@ def tools_prompt(spec_names: list[str], now_local: str = "",
         "say out loud, never write a URL or website address; name the site "
         "instead (\"the Godot docs\"). "
         + _desktop_sense_line(spec_names)
+        + _typing_line(spec_names)
         + f"Current date/time: {now} (UTC)." + local
     )
 
@@ -250,6 +251,22 @@ def _desktop_sense_line(spec_names) -> str:
                 "her see my desktop' in the tray. Never say the desktop or "
                 "its workspaces are out of your reach. ")
     return ""
+
+
+def _typing_line(spec_names) -> str:
+    """One line while the typing tools are offered (docs/TYPING.md): she
+    approves typing outside dictation, terminal Enter never runs without an
+    approval naming the exact command."""
+    names = [str(n) for n in (spec_names or [])]
+    if not any(n.endswith("type_text") or "__type_text" in n for n in names):
+        return ""
+    return ("You can type at the cursor of a window (type_text) and press "
+            "key combos (press_keys): outside dictation every typing call "
+            "passes an approval bubble showing the window and the text, "
+            "Enter in a terminal is NEVER pressed without approval of that "
+            "exact command, and password managers, auth prompts and private "
+            "windows are refused. Dictation mode lives in set_dictation / "
+            "dictation_status / stop_typing. ")
 
 
 def now_iso_static() -> str:

@@ -14,8 +14,11 @@ a compositor keybind or a script, without focusing her first.
     riko-ctl personas     list personas and which one is active
     riko-ctl persona NAME switch who she is (id, name or keyword; case doesn't matter)
     riko-ctl persona-next switch to the next persona on the hub (cycles around)
-    riko-ctl listen-mode  flip push-to-talk <-> always listen (or: listen-mode always / push_to_talk)
+    riko-ctl listen-mode  flip push_to_talk <-> always listen (or: listen-mode always / push_to_talk)
     riko-ctl desktop-sense  flip "let her see my desktop" (or: desktop-sense on / off)
+    riko-ctl dictation    flip dictation mode (or: dictation on / off) — what she
+                        hears is typed into the focused window (docs/TYPING.md)
+    riko-ctl stop-typing  abort the keystroke batch in progress
     riko-ctl approve        say yes to the action she is asking about (Enter in her window also works)
     riko-ctl deny           say no (Esc in her window also works; a timeout denies by itself)
     riko-ctl browser-status is the Riko Helper Firefox extension connected?
@@ -38,7 +41,7 @@ APP_ID = "riko"
 COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide", "forget",
             "personas", "persona", "persona-next", "quit", "status",
             "approve", "deny", "browser-status", "browser-token", "wave", "listen-mode",
-            "desktop-sense"}
+            "desktop-sense", "dictation", "stop-typing"}
 
 
 def focus_window():
@@ -70,6 +73,8 @@ def main():
         body = {"mode": sys.argv[2].strip().lower()}
     if cmd == "desktop-sense" and len(sys.argv) > 2:
         body = {"enabled": sys.argv[2].strip().lower()}
+    if cmd == "dictation" and len(sys.argv) > 2:
+        body = {"enabled": sys.argv[2].strip().lower()}
     if cmd in ("type", "show"):
         focus_window()
     request = urllib.request.Request(f"{URL}/control/{cmd}", data=json.dumps(body).encode(),
@@ -92,7 +97,7 @@ def main():
         print(f"firefox extension connected: {'yes' if reply.get('connected') else 'no'}")
         sys.exit(0)
     if cmd in ("status", "personas", "persona", "persona-next", "browser-status",
-               "listen-mode", "desktop-sense") or not reply.get("ok", True):
+               "listen-mode", "desktop-sense", "dictation", "stop-typing") or not reply.get("ok", True):
         print(json.dumps(reply))
     sys.exit(0 if reply.get("ok", True) else 1)
 

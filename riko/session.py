@@ -46,6 +46,12 @@ class Session:
         self._spoke_last_turn = False  # worker-only: did the last turn make sound?
         # ── hub live events (docs/TIMERS.md D) ──────────────────────────
         self.on_timer_notice: Optional[Callable[[str, str], None]] = None  # desktop.py: tray
+        # Dictation router (docs/TYPING.md §8), wired by desktop.py:
+        # fn(text) -> (handled, replacement). handled=True consumes the
+        # utterance client-side (typed into the pinned window / control
+        # phrase): no hub turn, no reply. Otherwise `replacement` (when a
+        # str) replaces the text for the normal chat turn (vocative strip).
+        self.dictation_filter: Optional[Callable[[str], tuple]] = None
         self._events_stop = None     # stop Event of the events follower thread
         self._timer_lock = threading.Lock()
         self._timer_played = collections.deque(maxlen=512)   # message_ids already queued to speak
@@ -403,6 +409,20 @@ class Session:
             # text is what the bubble shows and what the hub ever sees
             text = asr.apply_corrections(text, self.cfg).strip()
             viewer.emit("heard", text=text)
+            if self.dictation_filter is not None:
+                try:
+                    handled, replacement = self.dictation_filter(text)
+                except Exception as e:  # noqa: BLE001 — never eat her turn
+                    print(f"[dictation] router failed: {type(e).__name__}: {e}")
+                else:
+                    if handled:
+                        viewer.emit("status", state="idle")
+                        return
+                    if isinstance(replacement, str):
+                        text = replacement.strip()
+                        if not text:
+                            viewer.emit("status", state="idle")
+                            return
         else:
             text = payload
         print(f"You:  {text}")

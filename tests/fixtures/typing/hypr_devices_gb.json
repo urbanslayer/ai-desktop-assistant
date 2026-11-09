@@ -1,0 +1,8 @@
+{
+  "keyboards": [
+    {"name": "at-translated-set-2-keyboard", "main": true, "layout": "gb",
+     "active_keymap": "British English", "layout_index": 0},
+    {"name": "video-cup-Headset-Consumer-Control", "main": false, "layout": "us",
+     "active_keymap": "English (US)", "layout_index": 0}
+  ]
+}

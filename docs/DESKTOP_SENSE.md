@@ -19,9 +19,12 @@ as the browser tools).
 | `switch_workspace(workspace, monitor?)` | act / **always** (owner decision 2026-11-05, same as open_app) | Show a workspace / virtual desktop: accepts `2`, `desktop 2`, `virtual desktop two` or a workspace name. Hyprland `hyprctl dispatch workspace <n|name>` on hyprlang configs or `hl.dsp.focus({ workspace = N })` on Lua configs (0.55+, see Backends; the reply is checked and the view re-read, so "done" means it actually moved) (with a monitor: `moveworkspacetomonitor` first — `hl.dsp.workspace.move` on Lua — that is the dispatch that shows workspace 2 on the left screen), Sway `swaymsg workspace <n>` (`move workspace to output` first with a monitor), KDE via the KWin script (`workspace.currentDesktop = desktops[n-1]`, "virtual desktop" wording), GNOME via the extension's `ActivateWorkspace(index)`. On success the result is unambiguous: `now_showing {workspace, screen, windows_on_it}` plus a message like "Now showing workspace 2 on the middle Dell (empty)." — an EMPTY workspace has no focused window and that IS success. Exactly one dispatch goes to the compositor per switch; the Lua-vs-hyprlang style is decided from the config file layout when unambiguous (never a probe dispatch in front of the user's switch). |
 | `focus_window(window)` | act / always | Bring an open window to the front (where the compositor allows it). |
 
-Not in scope: keystrokes or mouse control of other apps, closing or killing windows, reading window
-*contents*, and screenshots. Workspace switching is NOT a keystroke: it is a first-class compositor
-action (`switch_workspace`), so "switch to desktop 2" never needs key synthesis. Screenshots ("look at my screen") are an optional later step, below.
+Not in scope: mouse control of other apps, closing or killing windows, reading window
+*contents*, and screenshots. Keystrokes entered the scope with docs/TYPING.md (typing +
+dictation tools, ydotool backend); everything else about other apps stays out. Workspace
+switching is NOT a keystroke: it is a first-class compositor action (`switch_workspace`),
+so "switch to desktop 2" never needs key synthesis. Screenshots ("look at my screen") are
+an optional later step, below.
 
 ## Privacy rules
 

@@ -407,6 +407,42 @@ def awareness_gate_tools(sense):
     ]
 
 
+# ── Extra tool packs (typing, app editing) ───────────────────
+# A provider is `provider(sense=...) -> (tools: list[dict],
+# executors: dict[str, callable])`. Registered packs ride the awareness
+# gate: their tools appear with desktop_* and vanish with it, and the
+# hub re-registration in toggle_awareness picks them up automatically.
+_EXTRA_PROVIDERS: list = []
+
+
+def register_extra(provider):
+    """Register an extra tool pack (idempotent). Call AFTER start_desktop:
+    re-register the catalogue (runtime.set_tools(desktop_tools(sense),
+    make_executors(...))) to publish it right away."""
+    if provider not in _EXTRA_PROVIDERS:
+        _EXTRA_PROVIDERS.append(provider)
+
+
+def unregister_extra(provider):
+    if provider in _EXTRA_PROVIDERS:
+        _EXTRA_PROVIDERS.remove(provider)
+
+
+def _collect_extra(sense):
+    """(tools, executors) from every registered pack; a broken pack is
+    loud but never sinks the catalogue."""
+    tools, ex = [], {}
+    for provider in list(_EXTRA_PROVIDERS):
+        try:
+            t, e = provider(sense=sense) or ([], {})
+            tools.extend(list(t))
+            ex.update(dict(e))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[client] extra tool provider failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+    return tools, ex
+
+
 def desktop_tools(sense=None):
     """Everything the desktop app offers the model (browser tools included —
     they answer 'the Firefox helper is not connected' until it is). With a
@@ -438,6 +474,8 @@ def desktop_tools(sense=None):
     if sense is not None and sense.awareness.enabled:
         from riko.desktop_sense.sense import sense_tools
         tools += sense_tools()
+        extra, _ = _collect_extra(sense)
+        tools += extra
     return tools
 
 
@@ -893,7 +931,8 @@ class ClientRuntime:
                  error="" if ok else "the user denied this action")
             return
 
-        if req.get("needs_approval") and not self.ask_approval(summary, gate):
+        hub_approved = bool(req.get("needs_approval"))
+        if hub_approved and not self.ask_approval(summary, gate):
             post(ok=False, approved=False, error="the user denied this action")
             return
 
@@ -902,7 +941,18 @@ class ClientRuntime:
             post(ok=False, approved=True, error=f"this client has no tool '{tool}'")
             return
         try:
-            result = fn(**args)
+            call_kwargs = dict(args)
+            if hub_approved and call_kwargs.get("confirmed") is None:
+                # The hub's permission already asked the owner: tell the
+                # executor so it must not ask a second time (typing tools
+                # gate client-side by default).
+                import inspect
+                try:
+                    if "confirmed" in inspect.signature(fn).parameters:
+                        call_kwargs["confirmed"] = True
+                except (TypeError, ValueError):
+                    pass
+            result = fn(**call_kwargs)
         except NeedConfirmation as c:
             # The extension upgraded this to danger — always ask, per policy.
             if not self.ask_approval(c.reason, gate):
@@ -1011,6 +1061,8 @@ def make_executors(bridge, sense=None, awareness_toggle=None):
     }
     if sense is not None and sense.awareness.enabled:
         ex.update(sense.executors())
+        _, extra = _collect_extra(sense)
+        ex.update(extra)
     return ex
 
 
