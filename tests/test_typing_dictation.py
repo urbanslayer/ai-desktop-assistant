@@ -27,7 +27,8 @@ def make_service(window=None, persona=("Riko",), ask=None, lines=None):
     notes = []
     engine = TypingEngine(sense, yd=yd, clipboard=FakeClip(), layout="gb",
                           printer=(lines.append if lines is not None
-                                   else (lambda m: None)))
+                                   else (lambda m: None)),
+                          sleeper=lambda s: None)     # no real settle sleeps
     ctl = DictationController(engine, notice=notes.append,
                               persona_names=lambda: list(persona), ask=ask,
                               printer=lambda m: None)
@@ -142,7 +143,7 @@ def test_dictation_enter_ask_shows_exact_or_unknown_command():
     assert any("command: `rm -rf build`" in s for s in summaries)
     # the line ran; the next break sits on a fresh prompt Riko did not type
     ctl.route("new paragraph")
-    assert any("unknown command — Riko did not type this line" in s
+    assert any("unknown command — I can't see what's on that line" in s
                for s in summaries)
 
 

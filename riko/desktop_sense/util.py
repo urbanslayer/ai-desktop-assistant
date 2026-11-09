@@ -1,9 +1,30 @@
 """Small shared helpers: subprocess running, JSON parsing, title hygiene."""
 import json
+import re
 import subprocess
 import time
 
 TITLE_MAX = 120            # docs/DESKTOP_SENSE.md: titles capped at 120 chars
+
+# A Hyprland window address: lowercase hex with the 0x prefix. The same
+# window reaches Riko through several paths (hyprctl clients, activewindow,
+# an id the model echoes back from desktop_windows, dictation pins), and
+# those differ in case and in carrying the 0x prefix — one canonical form
+# keeps per-window state (typing's _last_line, run tokens) keyed correctly.
+_HEX_ONLY_RE = re.compile(r"[0-9a-f]{10,}")
+
+
+def norm_window_id(value) -> str:
+    """Canonical window id: stripped, lowercase, hex addresses with '0x'.
+
+    Hyprland addresses arrive as '0x5642C7991580', '0x5642c7991580' or
+    '5642c7991580' (models strip the prefix) depending on the path. Anything
+    that is not a hex address (numeric KDE ids, app classes used as refs)
+    passes through stripped + lowercase only, so non-hex ids are untouched."""
+    s = str(value or "").strip().lower().removeprefix("address:")
+    if s and not s.startswith("0x") and _HEX_ONLY_RE.fullmatch(s):
+        s = "0x" + s
+    return s
 
 
 def tlog(msg):

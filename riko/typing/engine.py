@@ -21,6 +21,7 @@ import threading
 import time
 
 from ..client_tools import ToolError
+from ..desktop_sense.util import norm_window_id
 from . import keys as keys_mod
 from .clipboard import Clipboard, ClipboardUnavailable, paste_text
 from .keycodes import NAMED_KEYS
@@ -32,6 +33,17 @@ MAX_CHARS = 4000
 CHUNK_CHARS = 64           # abort/target granularity while a batch runs
 _KEYS_MAX_CHARS = 200      # beyond this, paste regardless of mapping
 RUN_TOKEN_TTL = 120.0      # s: an approval bubble that stale is worthless
+
+# Post-approval settle (the 2026-11-09 "Enter ran but the shell never saw
+# it" failure). The owner answers the bubble with the physical Enter in
+# her own window; the Wayland seat tracks pressed keycodes across ALL
+# keyboards, so a virtual 28:1 injected while that physical Enter is still
+# held is merged away and the terminal only gets "focus + Enter already
+# down". We wait for the release, re-issue the focus, and only then type.
+DEFAULT_SETTLE_MS = 350.0    # typing.settle_ms overrides
+FOCUS_POLL_MS = 50.0         # focused() re-read cadence while settling
+FOCUS_WAIT_MS = 1500.0       # give up after this → ToolError
+ENTER_HOLD_MS = 30.0         # Enter down … 30 ms … up (ydotool --key-delay)
 
 # §2: auth prompts and lock screens are typing targets too dangerous to
 # name, beyond what the DesktopSense denylist covers by default.
@@ -64,7 +76,10 @@ def _preview(text: str, n: int = 120) -> str:
 
 class TypingEngine:
     def __init__(self, sense, *, yd=None, clipboard=None, runner=None,
-                 env=None, layout=None, max_chars=MAX_CHARS, printer=print):
+                 env=None, layout=None, max_chars=MAX_CHARS, printer=print,
+                 settle_ms=DEFAULT_SETTLE_MS, focus_poll_ms=FOCUS_POLL_MS,
+                 focus_wait_ms=FOCUS_WAIT_MS, enter_hold_ms=ENTER_HOLD_MS,
+                 sleeper=time.sleep, clock=time.monotonic):
         self.sense = sense
         self.runner = runner
         self.yd = yd or YdotoolBackend(runner=runner, env=env)
@@ -73,6 +88,14 @@ class TypingEngine:
         self._layout_src = "configured" if layout else None
         self.max_chars = int(max_chars)
         self.printer = printer
+        self.settle_ms = max(0.0, float(settle_ms))
+        self.focus_poll_ms = max(1.0, float(focus_poll_ms))
+        self.focus_wait_ms = max(self.focus_poll_ms, float(focus_wait_ms))
+        self.enter_hold_ms = max(1, int(enter_hold_ms))
+        # sleeper/clock are injectable so tests run the settle on a fake
+        # clock instead of wall time
+        self.sleeper = sleeper
+        self.clock = clock
         self._lock = threading.Lock()
         self.abort = threading.Event()
         self._last_line: dict[str, str] = {}     # window id → typed, for Enter summary
@@ -126,7 +149,7 @@ class TypingEngine:
     def resolve_target(self, target=None) -> dict:
         if isinstance(target, dict):             # a pinned dictation target
             w = self.focused()
-            if str(w.get("id")) != str(target.get("id")):
+            if self._wid(target) != self._wid(w):
                 raise ToolError(
                     f"the pinned window is not focused ({w.get('app') or '?'} "
                     "has focus) — nothing was typed")
@@ -136,16 +159,24 @@ class TypingEngine:
         return self.focused()
 
     @staticmethod
+    def _wid(w) -> str:
+        """Canonical window id: hyprctl prints the same address with/without
+        the 0x prefix and in different hex case depending on the path
+        (clients vs activewindow vs a model-echoed ref), and _last_line /
+        run tokens are keyed per window."""
+        return norm_window_id((w or {}).get("id"))
+
+    @staticmethod
     def same_window(a, b) -> bool:
         try:
-            return bool(a) and bool(b) and str(a.get("id")) == str(b.get("id"))
+            return bool(a) and bool(b) and TypingEngine._wid(a) == TypingEngine._wid(b)
         except Exception:                        # noqa: BLE001
             return False
 
     # ── sending ────────────────────────────────────────────────
-    def _send(self, events):
+    def _send(self, events, hold_ms=None):
         try:
-            self.yd.send_events(events)
+            self.yd.send_events(events, hold_ms=hold_ms)
         except YdotoolUnavailable as exc:
             raise ToolError(str(exc)) from None
 
@@ -154,6 +185,58 @@ class TypingEngine:
         ev = keys_mod.combo_events(mods, code)
         for _ in range(count):
             self._send(ev)
+
+    # ── post-approval settle ───────────────────────────────────
+    def _settle_after_approval(self, wid: str) -> str:
+        """Wait out the physical approval key and give the target window its
+        focus back before any keystroke goes out.
+
+        The owner approves in HER window (Enter = yes). Her window had
+        keyboard focus until a moment ago, and the physical Enter is very
+        likely still held: the Wayland seat tracks pressed keycodes across
+        all keyboards, so a virtual Enter injected now is merged with the
+        held one and the terminal sees only 'focus entered with Enter down'
+        — the command never runs. So: release wait (settle_ms), re-issue
+        focus_window, then poll focused() until the target holds the focus
+        in 2 consecutive reads (a single read can catch a mid-switch state).
+        Returns the audit fragment logged on the [typing] line."""
+        t0 = self.clock()
+        self.sleeper(self.settle_ms / 1000.0)
+        if not wid:
+            # nothing to re-focus by id (id-less backend): release wait only
+            return f"settle {self.clock() - t0:.2f}s focus n/a"
+        try:
+            self.sense.focus_window(wid)
+        except ToolError:
+            raise ToolError(f"could not give the terminal focus back: "
+                            f"{wid} is gone") from None
+        except Exception as exc:                 # noqa: BLE001
+            raise ToolError("could not give the terminal focus back: "
+                            f"{exc}") from None
+        settle_s = self.clock() - t0
+        t1 = self.clock()
+        streak, thief = 0, ""
+        while self.clock() - t1 < self.focus_wait_ms / 1000.0:
+            self.sleeper(self.focus_poll_ms / 1000.0)
+            try:
+                now = self._wid(self.focused())
+            except ToolError:
+                now = ""
+            if now == wid:
+                streak += 1
+                if streak >= 2:
+                    break
+            else:
+                streak, thief = 0, now
+        else:
+            raise ToolError(
+                "could not give the terminal focus back — "
+                + (f"{thief} still has focus after "
+                   f"{self.focus_wait_ms / 1000.0:.1f}s" if thief
+                   else f"no window answered in "
+                         f"{self.focus_wait_ms / 1000.0:.1f}s")
+                + " — nothing was typed")
+        return f"settle {settle_s:.2f}s focus {self.clock() - t1:.2f}s"
 
     # ── type_text ──────────────────────────────────────────────
     def type_text(self, text, target=None, confirmed=False,
@@ -179,8 +262,13 @@ class TypingEngine:
                                 "type (escape sequences are refused)")
         if not (confirmed or dictation_pinned):
             raise NeedConfirmation(self._summary_text(w, text, terminal))
+        settle = ""
+        if confirmed and not dictation_pinned:
+            # the approval was answered in her window: physical keys up,
+            # target refocused, or nothing goes out
+            settle = self._settle_after_approval(self._wid(w))
         return self._batch(text, w, terminal, mode_hint=None,
-                           dictation=bool(dictation_pinned))
+                           dictation=bool(dictation_pinned), settle=settle)
 
     def _summary_text(self, w, text, terminal):
         where = f"{w.get('app') or '?'} \"{w.get('title') or ''}\""
@@ -198,7 +286,7 @@ class TypingEngine:
         self._run_tokens = {t: r for t, r in self._run_tokens.items()
                             if r["expires"] > now}
         self._run_tokens[tok] = {
-            "win": str(w.get("id") or ""),
+            "win": self._wid(w),
             "cmd": cmd,
             "kind": kind,
             "expires": now + RUN_TOKEN_TTL,
@@ -215,18 +303,18 @@ class TypingEngine:
             return False
         if time.monotonic() > rec["expires"]:
             return False
-        if rec["win"] != str(w.get("id") or ""):
+        if rec["win"] != self._wid(w):
             return False
         if rec["kind"] != kind:
             return False
         # command must still be exactly what the owner saw in the bubble
-        cur = (self._last_line.get(str(w.get("id"))) or "").strip()
+        cur = (self._last_line.get(self._wid(w)) or "").strip()
         return cur == rec["cmd"]
 
     def _summary_run(self, w, cmd, kind):
         where = f"{w.get('app')} \"{w.get('title') or ''}\""
         cmd_disp = (f"command: `{_preview(cmd, 200)}`" if cmd
-                    else "unknown command — Riko did not type this line")
+                    else "unknown command — I can't see what's on that line")
         if kind == "interrupt":
             return (f"send Ctrl+C (interrupt) to terminal {where} — "
                     f"{cmd_disp}")
@@ -250,7 +338,7 @@ class TypingEngine:
         # `confirmed=True` from the hub bubble (which shows only the tool
         # args, not the command) and the dictation pin can NEVER substitute.
         if needs_run_gate:
-            cmd = (self._last_line.get(str(w.get("id"))) or "").strip()
+            cmd = (self._last_line.get(self._wid(w)) or "").strip()
             first_kind = next(k for k in kinds if k)   # 'run' or 'interrupt'
             if not self._consume_run_token(run_token, w, first_kind):
                 raise NeedConfirmation(self._summary_run(w, cmd, first_kind),
@@ -260,20 +348,32 @@ class TypingEngine:
             where = f"{w.get('app')} \"{w.get('title') or ''}\""
             raise NeedConfirmation(f"press {_preview(str(keys), 60)} in {where}")
         granted = bool(run_token and needs_run_gate)
+        settle = ""
+        if granted or (confirmed and not dictation_pinned):
+            # this call answers an approval (run token) or a hub/ask OK
+            # (confirmed): the owner may still be holding the physical
+            # Enter in her window, and her window may still hold focus
+            settle = self._settle_after_approval(self._wid(w))
         with self._batch_guard():
             self._recheck(w)
             t0 = time.monotonic()
             sent = 0
             for (mods, base, code, count), kind in zip(combos, kinds):
+                # plain Enter/KP_Enter gets an explicit down-hold-up: an
+                # instant 28:1 28:0 is what the seat dropped after the
+                # focus switch; modifier combos keep the standard tap
+                hold = (self.enter_hold_ms
+                        if kind == "run" and not mods else None)
                 for _ in range(count):
                     if self.abort.is_set():
                         raise ToolError("typing aborted before that key")
-                    self._send(keys_mod.combo_events(mods, code))
+                    self._send(keys_mod.combo_events(mods, code),
+                               hold_ms=hold)
                     sent += 1
                 if terminal and kind:
                     # run executed the line, interrupt discarded it — either
                     # way the shell prompt is fresh
-                    self._last_line.pop(str(w.get("id")), None)
+                    self._last_line.pop(self._wid(w), None)
                 elif terminal:
                     self._track_key(w, mods, base, count)
         sec = (time.monotonic() - t0)
@@ -281,13 +381,14 @@ class TypingEngine:
                      f'{w.get("app")}'
                      + (" (dictation)" if dictation_pinned else "")
                      + (" (run-token)" if granted else "")
+                     + (f" {settle}" if settle else "")
                      + f" {sec:.1f}s")
         return {"pressed": sent, "target": _win_brief(w)}
 
     def _track_key(self, w: dict, mods, base, count) -> None:
         """Update _last_line for a non-run, non-interrupt key sent to a
         terminal so the next Enter summary reflects what was actually typed."""
-        wid = str(w.get("id") or "")
+        wid = self._wid(w)
         if base in ("backspace", "del") and not mods:
             cur = self._last_line.get(wid, "")
             self._last_line[wid] = cur[:-count] if count <= len(cur) else ""
@@ -325,7 +426,7 @@ class TypingEngine:
         return now
 
     def _batch(self, text: str, w: dict, terminal: bool, mode_hint,
-               dictation: bool = False) -> dict:
+               dictation: bool = False, settle: str = "") -> dict:
         layout = self.layout
         if mode_hint is None:
             mode_hint = "keys" if (len(text) <= _KEYS_MAX_CHARS
@@ -343,14 +444,15 @@ class TypingEngine:
             else:
                 typed = self._do_keys(text, w, layout)
         sec = (time.monotonic() - t0)
-        self._last_line[str(w.get("id"))] = (self._last_line.get(str(w.get("id")), "")
-                                             + text)[-400:]
+        self._last_line[self._wid(w)] = (self._last_line.get(self._wid(w), "")
+                                         + text)[-400:]
         # audit line (contract format) — counts and window names only,
         # never the text
         self.printer(f'[typing] {typed} chars → {w.get("app")} '
                      f'"{w.get("title") or ""}"'
                      + (" (dictation)" if dictation else "")
-                     + f" {sec:.1f}s (layout {layout}, {mode_hint})")
+                     + f" {sec:.1f}s (layout {layout}, {mode_hint})"
+                     + (f" {settle}" if settle else ""))
         return {"typed": typed, "method": mode_hint, "target": _win_brief(w)}
 
     def _all_mappable(self, text, layout):
@@ -398,6 +500,19 @@ class TypingEngine:
     def stop(self) -> str:
         self.abort.set()
         return "typing stop requested — the current batch stops at the next chunk"
+
+    # ── dictation's own Enter ask (§6/§8) ──────────────────────
+    def settle_and_enter(self, w: dict) -> None:
+        """The dictation line-break Enter after its own approval bubble:
+        same collision as the tool path (bubble in her window, physical
+        Enter just pressed) — settle, refocus, then one held Enter tap."""
+        extra = self._settle_after_approval(self._wid(w))
+        with self._batch_guard():
+            self._recheck(w)
+            self._send(keys_mod.combo_events((), NAMED_KEYS["enter"]),
+                       hold_ms=self.enter_hold_ms)
+        self.printer(f'[typing] keys "enter" → {w.get("app")} '
+                     f'(dictation-ask) {extra}')
 
 
 def _win_brief(w):

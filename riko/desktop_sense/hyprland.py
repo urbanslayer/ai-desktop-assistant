@@ -48,7 +48,7 @@ from pathlib import Path
 from .api_errors import ToolError
 from .hyprlua import HyprLua
 from .monitors import monitor_phrase
-from .util import clean_title, run_json, Steps
+from .util import clean_title, norm_window_id, run_json, Steps
 
 # probe dispatch: a valid Lua dispatcher call, and the one string hyprlang
 # can only ever answer with 'Invalid dispatcher' (hl.dsp.no_op exists in
@@ -211,8 +211,9 @@ class HyprlandBackend:
         clients = self._hyprctl("clients", "-j", error="hyprctl clients failed")
         focused_addr = ""
         try:
-            focused_addr = (self._hyprctl("activewindow", "-j",
-                                          error="activewindow failed") or {}).get("address", "")
+            focused_addr = norm_window_id((self._hyprctl("activewindow", "-j",
+                                           error="activewindow failed") or {})
+                                          .get("address", ""))
         except ToolError:
             pass
         try:
@@ -230,12 +231,14 @@ class HyprlandBackend:
             mon = mon_names.get(mid, "" if mid is None else str(mid))
             fr = c.get("focusHistoryID")
             out.append({
-                "id": c.get("address", ""),
+                # canonical address (lowercase hex, 0x): typing keys per-window
+                # state off this id and must not lose it over format drift
+                "id": norm_window_id(c.get("address", "")),
                 "app": c.get("class", ""),
                 "title": clean_title(c.get("title", "")),
                 "workspace": ws_name,
                 "monitor": mon or str(mid),
-                "focused": c.get("address") == focused_addr,
+                "focused": norm_window_id(c.get("address", "")) == focused_addr,
                 # 0 = currently focused, larger = less recently focused
                 # (docs/DESKTOP_SENSE.md multi-window 'current tab')
                 "focus_recency": fr if isinstance(fr, int) else None,
@@ -253,7 +256,7 @@ class HyprlandBackend:
         if not isinstance(w, dict) or not w:
             return None
         return {
-            "id": w.get("address", ""),
+            "id": norm_window_id(w.get("address", "")),
             "app": w.get("class", ""),
             "title": clean_title(w.get("title", "")),
             "workspace": (w.get("workspace") or {}).get("name", ""),
@@ -327,7 +330,7 @@ class HyprlandBackend:
 
     @staticmethod
     def _lua_win(win_id) -> str:
-        s = str(win_id).strip()
+        s = norm_window_id(win_id)          # also accepts 0x-less addresses
         if not _ADDR_RE.fullmatch(s):
             raise ToolError(f"invalid window address: {s!r}")
         return lua_string(f"address:{s}")
@@ -628,13 +631,15 @@ class HyprlandBackend:
         return out
 
     def _find_window(self, ref):
-        ref_l = ref.lower().removeprefix("address:")
+        # refs arrive as ids from desktop_windows (canonical already), with
+        # or without the 0x prefix, or as an app class / title fragment
+        ref_l = norm_window_id(ref)
         try:
             wins = self.windows()
         except ToolError:
             return None
         for w in wins:
-            if str(w.get("id", "")).lower() == ref_l:
+            if norm_window_id(w.get("id", "")) == ref_l and ref_l:
                 return w
         matches = [w for w in wins
                    if ref_l in (w.get("title") or "").lower()

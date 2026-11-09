@@ -21,6 +21,7 @@ import os
 from ..client_tools import ToolError
 from ..client_tools import NeedConfirmation as HubStyleConfirm
 from .dictation import DictationController
+from .engine import DEFAULT_SETTLE_MS
 from .engine import NeedConfirmation as EngineAsk
 from .engine import TypingEngine
 
@@ -184,9 +185,15 @@ def install(sense, *, cfg=None, bridge=None, runtime=None, runner=None,
 
     d = (cfg or {}).get("desktop") or {}
     layout = str(d.get("keyboard_layout") or "").strip() or None
+    t = (cfg or {}).get("typing") or {}
+    try:
+        settle_ms = float(t.get("settle_ms", DEFAULT_SETTLE_MS))
+    except (TypeError, ValueError):
+        settle_ms = DEFAULT_SETTLE_MS
     engine = TypingEngine(sense, runner=runner,
                           env=env if env is not None else os.environ,
-                          layout=layout, printer=printer)
+                          layout=layout, printer=printer,
+                          settle_ms=settle_ms)
 
     def _persona_names():
         try:

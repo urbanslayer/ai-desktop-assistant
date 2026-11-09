@@ -58,6 +58,46 @@ class Bridge(QObject):
     command = Signal(str)
 
 
+def make_approval_key_handler(win, runtime):
+    """Answer an open approval from her window on key RELEASE, not press.
+
+    The owner approves with the physical Enter ('Enter = yes, Esc = no').
+    The Wayland seat tracks pressed keycodes across ALL keyboards: if the
+    approval resolves on the press, the typing engine re-focuses the target
+    and injects a virtual Enter within milliseconds — while the physical
+    keycode 28 is still down — and the seat merges them away, so the
+    terminal sees 'focus entered with Enter already down' and the command
+    never runs (owner failure 2026-11-09). Resolving on the RELEASE puts
+    the physical key up before the engine's settle even starts, and the
+    engine waits a further settle delay before it types.
+
+    The raw Qt events reach us through the eventFilter the window already
+    installs on the render widget; swallowing the press here means the page
+    never sees these keys while an approval is open (its keydown Enter→yes
+    fallback stays for the no-Qt/web case). Returns True = event consumed.
+    """
+    def handler(event) -> bool:
+        if runtime is None or getattr(win, "input_open", False):
+            return False            # the text box owns its own keys
+        key = event.key()
+        if key not in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+            return False
+        if event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                | Qt.KeyboardModifier.AltModifier
+                                | Qt.KeyboardModifier.MetaModifier):
+            return False
+        if runtime.pending_approval() is None:
+            return False
+        if event.type() == QEvent.Type.KeyPress:
+            return True             # swallow: the answer waits for the release
+        if key == Qt.Key.Key_Escape:
+            runtime.deny_hook()
+        else:
+            runtime.approve_hook()
+        return True
+    return handler
+
+
 class AvatarPage(QWebEnginePage):
     """Repeats the page's console in our terminal, so a broken script here is visible there."""
 
@@ -77,6 +117,7 @@ class AvatarWindow(QWebEngineView):
         self.setPage(AvatarPage(self))
         d = cfg.get("desktop") or {}
         self.input_open = False
+        self.approval_keys: Optional[Callable[[object], bool]] = None  # set by main(): answer approvals on RELEASE
         self._drag_target = None
         self.on_focus: Optional[Callable[[], None]] = None  # chat.read report on focus (docs/TIMERS.md D)
 
@@ -107,6 +148,10 @@ class AvatarWindow(QWebEngineView):
             self._drag_target = target
 
     def eventFilter(self, obj, event):
+        if (event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+                and self.approval_keys is not None
+                and self.approval_keys(event)):
+            return True   # approval answered on key RELEASE (seat collision)
         if (event.type() == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton
                 and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
@@ -814,6 +859,10 @@ def main():
     ruled = False if _roam_wanted else _hyprland_rule(int(d.get("width", 420)), int(d.get("height", 680)))
     win = AvatarWindow(cfg)
     win.on_focus = hub_client.note_chat_read  # focus = her chat was seen (docs/TIMERS.md D)
+    # Approvals answered by a physical key in her window resolve on key
+    # RELEASE (the injected Enter must not collide with the held approval
+    # Enter on the Wayland seat — see make_approval_key_handler).
+    win.approval_keys = make_approval_key_handler(win, runtime)
     bridge = Bridge()
     roamc = RoamController(win, cfg)
     win.roam_strip = False

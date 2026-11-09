@@ -192,3 +192,11 @@ desktop:
     listen_mode: "L"                # push-to-talk <-> always listen
     forget: "Ctrl+Shift+Backspace"  # forget the chat (press again within 3 s to confirm)
     quit: "Ctrl+Q"                  # quit (also in the tray menu)
+
+# Typing and dictation (docs/TYPING.md): the ydotool keystroke engine.
+typing:
+  # After you approve a type/Enter with a physical key in her window, she
+  # waits this long (the key release + focus handoff), re-focuses the
+  # target and confirms the focus before injecting keys. Lower it only if
+  # your desktop settles faster; 0 is not recommended.
+  settle_ms: 350

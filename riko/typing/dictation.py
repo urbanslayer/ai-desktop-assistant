@@ -179,7 +179,8 @@ class DictationController:
             # the ask must show the exact command line. With no approval
             # bubble wired there is no way to ask — so no Enter: a silent
             # unasked Enter into a shell is exactly what §6 forbids.
-            cmd = (self.engine._last_line.get(str(w.get("id"))) or "").strip()
+            cmd = (self.engine._last_line.get(self.engine._wid(w))
+                   or "").strip()
             if self.ask is None:
                 self.notice("dictation: no approval bubble wired — "
                             "Enter not sent to the terminal")
@@ -188,10 +189,14 @@ class DictationController:
             summary = (f"press Enter in terminal {w.get('app')} "
                        f"\"{w.get('title') or ''}\" — dictation line break — "
                        + (f"command: `{_preview(cmd, 200)}`" if cmd
-                          else "unknown command — Riko did not type this line"))
+                          else "unknown command — I can't see what's on "
+                               "that line"))
             if bool(self.ask(summary, 120)):
-                self.engine._send_combo("enter")
-                self.engine._last_line.pop(str(w.get("id")), None)
+                # the OK came through her bubble: the physical Enter may
+                # still be held and her window may still own the focus —
+                # settle, refocus, then one held Enter tap (§6 collision)
+                self.engine.settle_and_enter(w)
+                self.engine._last_line.pop(self.engine._wid(w), None)
             else:
                 self.notice("dictation: line break declined")
         else:

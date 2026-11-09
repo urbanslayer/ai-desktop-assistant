@@ -216,13 +216,15 @@ class YdotoolBackend:
             raise YdotoolUnavailable(f"{OWNER_SETUP}\nWhat Riko found: {reason}.")
 
     # ── sending ────────────────────────────────────────────────
-    def send_events(self, events):
+    def send_events(self, events, hold_ms=None):
         """events: [(keycode, down:bool), …] in press-then-release order.
 
         argv follows ydotool 1.0.4 exactly: `ydotool key --key-delay=<ms>
         <code>:1 <code>:0 …` — 1.0.4 has no global options, so the old
         `ydotool --keydelay N key …` form made every call die on its usage
-        text. Long batches split into several calls; the engine contract
+        text. hold_ms overrides the delay for one call (the terminal Enter
+        tap uses 30 ms so the key is audibly down before it comes up).
+        Long batches split into several calls; the engine contract
         re-checks abort/focus around its own (much smaller) chunks."""
         if not events:
             return
@@ -232,7 +234,8 @@ class YdotoolBackend:
         env = dict(self.env)
         if sock:                          # reason is None ⇒ sock is set
             env["YDOTOOL_SOCKET"] = sock  # explicit; never rely on inheritance
-        head = ["ydotool", "key", f"--key-delay={self.key_delay_ms}"]
+        delay = self.key_delay_ms if hold_ms is None else max(1, int(hold_ms))
+        head = ["ydotool", "key", f"--key-delay={delay}"]
         for i in range(0, len(events), MAX_EVENTS_PER_CALL):
             argv = head + [f"{int(code)}:{1 if down else 0}"
                            for code, down in

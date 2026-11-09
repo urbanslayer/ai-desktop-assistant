@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,22 +72,29 @@ class FakeSense:
         self.backend = FakeBackend(window, runner)
         self.awareness = FakeAwareness(hide)
 
+    def focus_window(self, ref):
+        return self.backend.focus_window(ref)
+
     def executors(self):
         return {}
 
 
 class FakeYD:
-    """Stands in for YdotoolBackend: records every batch, can act mid-send."""
+    """Stands in for YdotoolBackend: records every batch AND the per-call
+    hold_ms (the terminal Enter tap must arrive as a down-hold-up), can act
+    mid-send."""
 
     def __init__(self, on_send=None):
         self.batches = []
+        self.holds = []
         self.on_send = on_send
 
     def require(self):
         return None
 
-    def send_events(self, events):
+    def send_events(self, events, hold_ms=None):
         self.batches.append(list(events))
+        self.holds.append(hold_ms)
         if self.on_send:
             self.on_send(self)
 
@@ -110,12 +118,18 @@ class FakeClip:
         self.ops.append(("clear", None))
 
 
-def make_engine(window=None, hide=(), layout="gb", on_send=None, lines=None):
+def make_engine(window=None, hide=(), layout="gb", on_send=None, lines=None,
+                sleeper=None, clock=None, **engine_kw):
+    """FakeSense + FakeYD engine. The sleeper defaults to a no-op so the
+    post-approval settle costs nothing here; timing tests inject their own
+    fake clock (see test_settle_after_approval_*)."""
     sense = FakeSense(window, hide)
     yd = FakeYD(on_send)
     eng = TypingEngine(sense, yd=yd, clipboard=FakeClip(), layout=layout,
                        printer=(lines.append if lines is not None
-                                else (lambda m: None)))
+                                else (lambda m: None)),
+                       sleeper=sleeper or (lambda s: None),
+                       clock=clock or time.monotonic, **engine_kw)
     return eng, sense, yd
 
 
@@ -363,8 +377,9 @@ def test_enter_summary_says_unknown_when_riko_did_not_type_it():
     eng, _, yd = make_engine(window=KITTY)                 # fresh prompt
     with pytest.raises(NeedConfirmation) as e:
         eng.press_keys("enter")
-    assert "unknown command — Riko did not type this line" in e.value.reason
+    assert "unknown command — I can't see what's on that line" in e.value.reason
     assert yd.batches == []
+    # the ask still happens (the owner may approve a line she typed herself)
 
 
 def test_dictation_pin_never_grants_terminal_enter():
@@ -521,6 +536,168 @@ def test_non_terminal_enter_needs_no_command_summary():
     assert "press enter" in e.value.reason.lower()
     eng.press_keys("enter", confirmed=True)
     assert (28, 1) in yd.batches[-1]
+
+
+# ── post-approval settle (owner failure 2026-11-09) ────────────
+class FakeClock:
+    """sleeper + clock twin: sleep() advances the fake monotonic, so the
+    settle and the focus poll run deterministically without wall time."""
+
+    def __init__(self):
+        self.t = 1000.0
+        self.slept = []
+
+    def sleep(self, s):
+        self.slept.append(s)
+        self.t += s
+
+    def now(self):
+        return self.t
+
+
+def test_approved_call_settles_refocuses_and_logs_timings():
+    clk = FakeClock()
+    lines = []
+    eng, sense, yd = make_engine(window=KITTY, sleeper=clk.sleep,
+                                 clock=clk.now, lines=lines)
+    out = eng.type_text("df -h", confirmed=True)          # post-approval call
+    assert out["typed"] == 5
+    # release wait, then two consecutive focused() reads 50 ms apart
+    assert clk.slept[:3] == pytest.approx([0.35, 0.05, 0.05])
+    assert sense.backend.focus_calls[-1] == "0x200"       # focus re-issued
+    assert any("settle" in ln and "focus" in ln for ln in lines)
+
+
+def test_run_token_enter_settles_before_injection():
+    clk = FakeClock()
+    eng, sense, yd = make_engine(window=KITTY, sleeper=clk.sleep,
+                                 clock=clk.now)
+    eng.type_text("df -h", confirmed=True)                # line on the prompt
+    n_before = len(clk.slept)
+    out = _approve(eng, "enter")                          # engine's own round trip
+    assert out["pressed"] == 1
+    assert clk.slept[n_before] == pytest.approx(0.35)     # settle first…
+    assert sense.backend.focus_calls[-1] == "0x200"       # …then refocus…
+    assert (28, 1) in yd.batches[-1]                      # …only then the keys
+
+
+def test_settle_gives_up_when_focus_never_returns():
+    clk = FakeClock()
+    eng, sense, yd = make_engine(window=KITTY, sleeper=clk.sleep,
+                                 clock=clk.now)
+    with pytest.raises(NeedConfirmation):
+        eng.type_text("df -h")                            # ask first (no settle)
+
+    def steal(ref):                                       # something grabs focus
+        sense.backend.window = dict(OTHER)
+        return dict(OTHER)
+
+    sense.backend.focus_window = steal
+    with pytest.raises(ToolError) as e:
+        eng.type_text("df -h", confirmed=True)
+    assert "could not give the terminal focus back" in str(e.value)
+    assert yd.batches == []                               # nothing was typed
+    # waited the full ~1.5 s focus_wait budget at the 50 ms poll cadence
+    assert clk.slept[0] == pytest.approx(0.35)
+    assert all(s == pytest.approx(0.05) for s in clk.slept[1:])
+    assert 29 <= len(clk.slept) - 1 <= 31
+
+
+def test_focus_poll_needs_two_consecutive_reads():
+    """A single read catching the target mid-switch must not be enough."""
+    clk = FakeClock()
+    eng, sense, yd = make_engine(window=KATE, sleeper=clk.sleep,
+                                 clock=clk.now)
+    seq = [dict(KATE),                       # resolve_target's read
+           dict(OTHER), dict(KATE),          # one good read: not enough
+           dict(KATE)]                       # second consecutive read: go
+    sense.backend.focused = lambda: dict(seq.pop(0)) if seq else dict(KATE)
+    out = eng.type_text("hi", confirmed=True)
+    assert out["typed"] == 2                                # typed after 3 polls
+    # settle wait, then one 50 ms pause per focused() read (sleep-then-read)
+    assert clk.slept == pytest.approx([0.35, 0.05, 0.05, 0.05])
+
+
+def test_dictation_pin_gets_no_settle():
+    """Typing into the pinned window was never an approval in her window:
+    no settle, no re-focus."""
+    eng, sense, yd = make_engine(window=KATE)
+    pin = dict(KATE)
+    eng.type_text("live words", target=pin, dictation_pinned=True)
+    # the pinned route never touched focus at all: no settle, no refocus
+    assert sense.backend.focus_calls == []
+    assert (28, 1) not in yd.batches[-1]
+
+
+# ── the injected Enter is a down-hold-up, not a zero-delay tap ──
+def test_terminal_enter_taps_with_an_explicit_hold():
+    eng, _, yd = make_engine(window=KITTY)
+    eng.type_text("df -h", confirmed=True)
+    _approve(eng, "enter")
+    assert yd.batches[-1] == [(28, True), (28, False)]
+    assert yd.holds[-1] == 30          # --key-delay=30: down … 30 ms … up
+    _approve(eng, "kp_enter")
+    assert yd.batches[-1] == [(96, True), (96, False)]
+    assert yd.holds[-1] == 30
+
+
+def test_other_keys_keep_the_standard_tap():
+    eng, _, yd = make_engine(window=KITTY)
+    eng.type_text("sleep 100", confirmed=True)
+    _approve(eng, "ctrl+c")                                # interrupt combo
+    assert yd.holds[-1] is None
+    _approve(eng, "ctrl+enter")                            # modified run key
+    assert yd.holds[-1] is None
+    eng.press_keys("l", confirmed=True)                    # plain char key
+    assert yd.holds[-1] is None
+    eng2, _, yd2 = make_engine(window=KATE)
+    eng2.press_keys("ctrl+s", confirmed=True)              # non-terminal
+    assert yd2.holds[-1] is None
+
+
+# ── window id formats: one window, one key (bug 2) ─────────────
+def test_window_id_normalisation_keeps_the_typed_line():
+    """hyprctl prints the same address in different shapes depending on the
+    path (clients vs activewindow vs a model-echoed ref); the line typed
+    into that kitty must still be found when the Enter ask fires."""
+    upper = {"id": "0x5642C7991580", "app": "kitty", "title": "user@arch: ~"}
+    bare = {"id": "5642c7991580", "app": "kitty", "title": "user@arch: ~"}
+    lower = {"id": "0x5642c7991580", "app": "kitty", "title": "user@arch: ~"}
+    eng, sense, yd = make_engine(window=upper)
+    eng.type_text("df -h", confirmed=True)
+    assert list(eng._last_line) == ["0x5642c7991580"]      # canonical keys
+    sense.backend.window = dict(bare)                      # 0x stripped
+    with pytest.raises(NeedConfirmation) as e:
+        eng.press_keys("enter")
+    assert "df -h" in e.value.reason                       # line still found
+    # and the token issued for one shape validates under another
+    tok = e.value.run_token
+    sense.backend.window = dict(lower)
+    out = eng.press_keys("enter", confirmed=True, run_token=tok)
+    assert out["pressed"] == 1
+
+
+def test_same_window_and_pins_across_id_shapes():
+    a = {"id": "0x5642C7991580", "app": "kitty"}
+    b = {"id": " address:0x5642c7991580 ", "app": "kitty"}
+    c = {"id": "5642c7991580", "app": "kitty"}
+    assert TypingEngine.same_window(a, b) and TypingEngine.same_window(a, c)
+    eng, sense, _ = make_engine(window=a)
+    eng.type_text("ok", target=c, dictation_pinned=True)   # pinned: no mismatch
+    sense.backend.window = {"id": "0x999", "app": "kitty"}
+    with pytest.raises(ToolError) as e:
+        eng.type_text("x", target=c, dictation_pinned=True)
+    assert "pinned window is not focused" in str(e.value)
+
+
+def test_norm_window_id_passes_non_hex_through():
+    from riko.desktop_sense.util import norm_window_id as n
+    assert n("0x5642C7991580") == "0x5642c7991580"
+    assert n("5642c7991580") == "0x5642c7991580"
+    assert n("address:0x5642C7991580") == "0x5642c7991580"
+    assert n(" kitty ") == "kitty"          # classes/refs stay as-is
+    assert n("12345") == "12345"            # short numeric ids untouched
+    assert n(None) == "" and n("") == ""
 
 
 # ── paste fallback (§3/§4/§5) ─────────────────────────────────
@@ -848,6 +1025,22 @@ def test_key_delay_lands_on_the_key_subcommand(sock_root, fake_bins,
                          key_delay_ms=25)
     yd.send_events([(14, True), (14, False)])
     assert rec.calls[0][0][:3] == ["ydotool", "key", "--key-delay=25"]
+
+
+def test_hold_ms_overrides_the_delay_for_one_tap(sock_root, fake_bins,
+                                                 fake_daemons):
+    """The terminal Enter is a down-HOLD-up: ydotool's --key-delay is the
+    only dwell knob (bare values like 'aaa' also just delay, but a numeric
+    delay token is what the parser documents), so the held tap rides on a
+    per-call --key-delay while the global default stays untouched."""
+    rec = _RecRunner()
+    yd, _ = _kbd_backend(fake_bins, fake_daemons, sock_root, rec)
+    yd.send_events([(28, True), (28, False)], hold_ms=30)
+    assert rec.calls[0][0] == ["ydotool", "key", "--key-delay=30",
+                               "28:1", "28:0"]
+    yd.send_events([(28, True), (28, False)])          # next call: default
+    assert rec.calls[1][0] == ["ydotool", "key", "--key-delay=8",
+                               "28:1", "28:0"]
 
 
 def test_long_batches_split_at_the_event_cap(sock_root, fake_bins,
