@@ -542,4 +542,11 @@ def test_runtime_can_start_with_a_reported_body(runtime, fake_hub, monkeypatch):
                         dict(client_tools._current_body))
     runtime(body={"actions": ["curtsy"], "expressions": ["happy"]})
     assert fake_hub.registered[CID]["body"]["actions"] == ["curtsy"]
+    # _register() calls note_body() on the runtime's own thread right AFTER
+    # the register POST returns — asserting straight after wait_for_register()
+    # raced with it (fails under full-suite load).
+    for _ in range(100):
+        if client_tools.current_body_actions() == ["curtsy"]:
+            break
+        time.sleep(0.02)
     assert client_tools.current_body_actions() == ["curtsy"]  # greeting waves follow it
