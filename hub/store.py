@@ -499,6 +499,27 @@ class Store:
                 "timer_id": (row["timer_id"] if "timer_id" in row.keys() else None),
                 "created_at": row["created_at"]}
 
+    def messages_before(self, persona: str, before: int, limit: int) -> list[dict]:
+        """The LAST `limit` messages with id < `before`, oldest -> newest
+        (the web page's 'load older' paging on top of GET /api/history)."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM messages WHERE persona=? AND id<? ORDER BY id DESC LIMIT ?",
+                (persona, before, limit)).fetchall()
+        return [self._message_dict(r) for r in reversed(rows)]
+
+    def delete_messages(self, ids: list[int]) -> list[int]:
+        """Delete messages by id, any persona. Returns the ids actually gone
+        (the caller removes cached audio and reports the rest as skipped)."""
+        deleted = []
+        with self._lock:
+            for mid in ids:
+                cur = self.db.execute("DELETE FROM messages WHERE id=?", (mid,))
+                if cur.rowcount:
+                    deleted.append(mid)
+            self.db.commit()
+        return deleted
+
     def clear_messages(self, persona: str) -> int:
         with self._lock:
             cur = self.db.execute("DELETE FROM messages WHERE persona=?", (persona,))

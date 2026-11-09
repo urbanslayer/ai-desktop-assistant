@@ -982,10 +982,14 @@ def create_app(data_dir, api_key: str | None = None,
             return err(404, "no such persona")
         try:
             after = max(0, int(request.query_params.get("after") or 0))
+            before = int(request.query_params.get("before") or 0)
             limit = min(500, max(1, int(request.query_params.get("limit") or 50)))
         except ValueError:
-            return err(400, "after and limit must be integers")
-        messages = store.messages_after(pid, after, limit)
+            return err(400, "after, before and limit must be integers")
+        if before > 0:
+            messages = store.messages_before(pid, before, limit)
+        else:
+            messages = store.messages_after(pid, after, limit)
         # rows stored before the spoken-text round have speech ''; fill it so
         # clients doing their own TTS always get clean words, never a URL.
         for m in messages:
@@ -1026,6 +1030,103 @@ def create_app(data_dir, api_key: str | None = None,
         if messages:
             bump_state()
         return {"imported": len(messages)}
+
+    # ── per-message history edits (select + delete / save to memory) ───
+    def publish_history_deleted(pid: str, ids: list[int]) -> None:
+        events.publish("history_changed", persona=pid, ids=ids, op="deleted")
+        bump_state()
+
+    @app.delete("/api/history/{message_id}", status_code=204)
+    def delete_history_message(message_id: int, request: Request):
+        """Delete one stored message. ?persona= (default: the message's own)
+        guards against removing another persona's row: mismatch → 404."""
+        msg = store.get_message(message_id)
+        if not msg:
+            return err(404, f"no message {message_id}")
+        wanted = request.query_params.get("persona")
+        if wanted and wanted != msg["persona"]:
+            return err(404, f"message {message_id} belongs to '{msg['persona']}'")
+        delete_message_audio([message_id])  # cached audio goes with the row
+        store.delete_messages([message_id])
+        publish_history_deleted(msg["persona"], [message_id])
+        return Response(status_code=204)
+
+    @app.post("/api/history/delete")
+    async def post_history_delete(request: Request):
+        """Bulk delete: {persona?, ids: [...]}. persona defaults to the active
+        one; ids of other personas (or already gone) are skipped and reported:
+        {deleted: n, skipped: [ids]}. Takes the messages' cached audio too."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        pid = str(body.get("persona") or "") or store.active()
+        if not store.persona_exists(pid):
+            return err(404, f"no persona '{pid}'")
+        raw_ids = body.get("ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return err(422, "ids must be a non-empty list of message ids")
+        wanted: list[int] = []
+        for raw in raw_ids[:5000]:
+            try:
+                mid = int(raw)
+            except (TypeError, ValueError):
+                return err(422, "ids must be integers")
+            if mid not in wanted:
+                wanted.append(mid)
+        deletable, skipped = [], []
+        for mid in wanted:
+            msg = store.get_message(mid)
+            if not msg or msg["persona"] != pid:
+                skipped.append(mid)  # missing, or another persona's row
+            else:
+                deletable.append(mid)
+        if deletable:
+            delete_message_audio(deletable)
+            store.delete_messages(deletable)
+            publish_history_deleted(pid, deletable)
+        return {"deleted": len(deletable), "skipped": skipped}
+
+    @app.post("/api/history/{message_id}/remember", status_code=201)
+    async def post_history_remember(message_id: int, request: Request):
+        """Save a message to long-term memory (the page's 'Add to memory'):
+        {text?, scope?: 'persona'|'global'}. Default text = the message's own
+        content clamped like any fact; default scope = persona (a private
+        note about who was talking). Same dedup/budget path as POST
+        /api/memory; the fact records source_message_id for provenance."""
+        msg = store.get_message(message_id)
+        if not msg:
+            return err(404, f"no message {message_id}")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        scope_kind = str(body.get("scope") or "persona")
+        if scope_kind == "global":
+            scope = "user"
+        elif scope_kind == "persona":
+            scope = f"persona:{msg['persona']}"
+        else:
+            return err(422, "scope must be 'persona' or 'global'")
+        if not valid_fact_scope(scope):
+            return err(422, f"no persona for scope '{scope}'")
+        text = body.get("text")
+        text = _memory.clamp_fact_text(
+            msg["content"] if text is None or not str(text).strip() else text)
+        if not text:
+            return err(422, "message has no text to remember")
+        fact, updated = store.upsert_fact(text, scope=scope,
+                                          source_message_id=message_id)
+        events.publish("memory_changed", id=fact["id"],
+                       op="updated" if updated else "added")
+        bump_state()
+        return {**fact, "updated": updated}
 
     # ── timers (docs/TIMERS.md H) ───────────────────────────────────────
     # The set-turn captures what the fire-turn must run with: merged LLM

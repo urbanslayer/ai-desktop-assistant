@@ -9,7 +9,9 @@ Event types: turn_started {persona, source}, tool_started {call_id, tool,
 label}, tool_finished {call_id, tool, ok, ms}, approval_needed {request_id,
 client_id, tool, summary}, turn_finished {persona, message_id, emotion,
 actions}, state_changed {version}, memory_changed {id, op} (docs/WALK_MEMORY.md M:
-op added | updated | deleted, fired by the memory tools and the API routes).
+op added | updated | deleted, fired by the memory tools and the API routes),
+history_changed {persona, ids, op} (op deleted — one or many chat-history
+rows removed via the API; open clients refresh their transcript).
 """
 import threading
 import time

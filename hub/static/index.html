@@ -89,6 +89,12 @@
          padding: 1px 6px; margin-left: 6px; }
   .act { font-size: 11px; color: var(--accent); background: var(--chip); border-radius: 6px;
          padding: 1px 6px; margin-left: 6px; }
+  .hmenuwrap { white-space: nowrap; }
+  .hmenuwrap .hopts { display: none; }
+  .hmenuwrap.open .hopts { display: inline; }
+  .hmem-ed { margin-top: 6px; border-top: 1px dashed var(--line); padding-top: 6px; }
+  .hmem-ed textarea { min-height: 60px; }
+  .hsel { width: auto; vertical-align: middle; margin: 0 6px 0 0; }
 </style>
 </head>
 <body>
@@ -204,7 +210,16 @@
         <div><label>&nbsp;</label><label style="margin:0"><input type="checkbox" id="hauto" checked
              style="width:auto"> auto-refresh (state.version <span id="hver">0</span>)</label></div>
       </div>
+      <div class="row" style="align-items:end; margin-top:6px">
+        <div><label>&nbsp;</label><label style="margin:0"><input type="checkbox" id="hselall" style="width:auto"> select all on page</label></div>
+        <div><label>&nbsp;</label><button class="btn danger" id="hdelsel" disabled>Delete selected</button></div>
+        <div><label>&nbsp;</label><label style="margin:0"><input type="checkbox" id="hshort" style="width:auto"> show only empty/short replies</label></div>
+        <div><label>&nbsp;</label><button class="btn" id="holder">Load older</button></div>
+      </div>
       <div class="transcript" id="htx" style="margin-top:10px"></div>
+      <p class="hint">Tick the boxes (or the ⋮ menu on a row) to delete single messages —
+        “Delete selected” removes them all at once. ⋮ → “Add to memory…” saves a message (or an
+        edited version of it) as a long-term memory fact.</p>
       <div class="err" id="herr"></div>
     </div>
   </section>
@@ -781,36 +796,174 @@ function renderPicker() {
     `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
   if (state.personas.some((p) => p.id === want)) sel.value = want;
 }
-async function loadHistory() {
+const HPAGE = 50;             // page size for the transcript + 'load older'
+const HSHORT = 25;            // 'short replies' filter: assistant text < this
+let hMsgs = [];               // loaded messages, oldest -> newest (ids unique)
+let hBefore = 0;              // id cursor for 'load older' (oldest loaded id)
+let hExhausted = false;       // no older messages left to fetch
+const hFullText = {};         // message id -> full content (for show/less)
+
+function hPersonaName(pid) {
+  const p = ((state && state.personas) || []).find((x) => x.id === pid);
+  return p ? p.name : pid;
+}
+async function loadHistory() {   // reset to the newest page (persona/reload/auto-refresh)
   renderPicker();
   const pid = $("hpick").value || (state && state.active.id);
   if (!pid) return;
   try {
-    const h = await api(`/api/history?persona=${encodeURIComponent(pid)}&limit=200`);
-    $("htx").innerHTML = h.messages.map((m) =>
-      `<div class="msg ${m.role === "user" ? "user" : "ai"}">` +
-      `${m.role === "user" ? "you" : esc(h.persona)}: ${esc(m.content)}` +
+    const h = await api(`/api/history?persona=${encodeURIComponent(pid)}&limit=${HPAGE}`);
+    hMsgs = h.messages;
+    hBefore = h.messages.length ? h.messages[0].id : 0;
+    hExhausted = h.messages.length < HPAGE;
+    renderHistory();
+    // opening the chat disarms timers waiting on it (docs/TIMERS.md H)
+    api("/api/chat/read", { method: "POST", json: { persona_id: pid } }).catch(() => {});
+  } catch (e) { $("herr").textContent = e.message; }
+}
+async function loadOlder() {
+  const pid = $("hpick").value || (state && state.active.id);
+  if (!pid || !hBefore) return;
+  try {
+    const h = await api(`/api/history?persona=${encodeURIComponent(pid)}` +
+                        `&before=${hBefore}&limit=${HPAGE}`);
+    const known = new Set(hMsgs.map((m) => m.id));
+    hMsgs = h.messages.filter((m) => !known.has(m.id)).concat(hMsgs);
+    if (h.messages.length) hBefore = h.messages[0].id;
+    if (h.messages.length < HPAGE) hExhausted = true;
+    renderHistory();
+  } catch (e) { $("herr").textContent = e.message; }
+}
+function renderHistory() {
+  const shortOnly = $("hshort").checked;
+  const rows = hMsgs.filter((m) => !shortOnly ||
+    (m.role === "assistant" && m.content.trim().length < HSHORT)).slice().reverse();
+  $("htx").innerHTML = rows.map((m) => {
+    hFullText[m.id] = m.content;
+    const long = m.content.length > 300;
+    const text = `<span class="htext" data-id="${m.id}">` +
+      (long ? esc(m.content.slice(0, 300)) +
+        ` <button class="btn small hmore" data-id="${m.id}">… show all</button>`
+            : esc(m.content) || "<i>(empty)</i>") + `</span>`;
+    return `<div class="msg ${m.role === "user" ? "user" : "ai"}" id="hm-${m.id}">` +
+      `<label style="display:inline;margin:0"><input type="checkbox" class="hsel" ` +
+      `data-id="${m.id}" style="width:auto">` +
+      `${m.role === "user" ? "you" : esc(hPersonaName(m.persona))}:</label> ${text}` +
       (m.role !== "user" && m.emotion && m.emotion !== "neutral"
         ? `<span class="emo">${esc(m.emotion)}</span>` : "") +
       (m.role !== "user" && m.actions && m.actions.length
         ? m.actions.map((a) => `<span class="act">↝ ${esc(a.name)}</span>`).join("") : "") +
       `<div class="meta">#${m.id} · ${esc(m.created_at)} · via ${esc(m.source || "?")}` +
       (m.role === "user" && m.voice ? " · 🎤 speech-recognised" : "") +
-      (m.tools_used && m.tools_used.length ? ` · tools: ${esc(m.tools_used.map((t) => t.tool).join(", "))}` : "") +
-      (m.memory_writes && m.memory_writes.length ? ` · 🧠 ${esc(m.memory_writes.map((w) => w.text).join("; ").slice(0, 80))}` : "") +
-      (m.timer_id ? ` · ⏰ timer #${m.timer_id}` : "") +   // docs/TIMERS.md H chip
-      `</div></div>`
-    ).join("") || `<p class="hint">no history yet</p>`;
-    $("htx").scrollTop = $("htx").scrollHeight;
-    // opening the chat disarms timers waiting on it (docs/TIMERS.md H)
-    api("/api/chat/read", { method: "POST", json: { persona_id: pid } }).catch(() => {});
-  } catch (e) { $("herr").textContent = e.message; }
+      (m.tools_used && m.tools_used.length
+        ? m.tools_used.map((t) => ` <span class="act">🔧 ${esc(t.tool)}</span>`).join("") : "") +
+      (m.memory_writes && m.memory_writes.length
+        ? ` · 🧠 ${esc(m.memory_writes.map((w) => w.text).join("; ").slice(0, 80))}` : "") +
+      (m.timer_id ? ` · ⏰ timer #${m.timer_id}` : "") +    // docs/TIMERS.md H chip
+      ` <span class="hmenuwrap"><button class="btn small hmenu" data-id="${m.id}" ` +
+      `title="actions">⋮</button><span class="hopts">` +
+      `<button class="btn small danger hdelone" data-id="${m.id}">Delete</button> ` +
+      `<button class="btn small hmem" data-id="${m.id}">Add to memory…</button>` +
+      `</span></span></div></div>`;
+  }).join("") + (hMsgs.length && !rows.length
+      ? `<p class="hint">no empty/short replies on the loaded page</p>` : "")
+    || `<p class="hint">no history yet</p>`;
+  $("htx").scrollTop = 0;
+  $("holder").disabled = hExhausted;
+  $("holder").textContent = hExhausted ? "no older messages" : "Load older";
+  $("hselall").checked = false;
+  syncDelSel();
 }
+function hPid() { return $("hpick").value || (state && state.active.id) || ""; }
+function hSelected() {
+  return Array.from($("htx").querySelectorAll(".hsel:checked")).map((c) => +c.dataset.id);
+}
+function syncDelSel() {
+  const n = hSelected().length;
+  $("hdelsel").disabled = !n;
+  $("hdelsel").textContent = n ? `Delete selected (${n})` : "Delete selected";
+}
+function openMemoryEditor(row, id) {
+  if (row.querySelector(".hmem-ed")) return;
+  const m = hMsgs.find((x) => x.id === id);
+  if (!m) return;
+  const ed = document.createElement("div");
+  ed.className = "hmem-ed";
+  ed.innerHTML = `<textarea maxlength="500">${esc(m.content)}</textarea>` +
+    `<div style="display:flex;gap:10px;margin:4px 0;align-items:center;font-size:12px">` +
+    `<label style="display:inline;margin:0"><input type="radio" name="hscope-${id}" value="persona" checked style="width:auto"> ` +
+    `private note · ${esc(hPersonaName(m.persona))}</label>` +
+    `<label style="display:inline;margin:0"><input type="radio" name="hscope-${id}" value="global" style="width:auto"> ` +
+    `about you · shared</label></div>` +
+    `<button class="btn small primary hmemsave">Save to memory</button> ` +
+    `<button class="btn small hmemcancel">Cancel</button> ` +
+    `<span class="hint hmemmsg"></span>`;
+  row.appendChild(ed);
+  ed.querySelector(".hmemcancel").onclick = () => ed.remove();
+  ed.querySelector(".hmemsave").onclick = async () => {
+    const text = ed.querySelector("textarea").value;
+    const scope = ed.querySelector(`input[name="hscope-${id}"]:checked`).value;
+    try {
+      const f = await api(`/api/history/${id}/remember`, { method: "POST", json: { text, scope } });
+      ed.innerHTML = `<span class="hint" style="color:var(--ok)">` +
+        `${f.updated ? "already in memory (updated) ✔" : "Saved to memory ✔"} · fact #${f.id} · ${esc(f.scope)}</span>`;
+      if (!$("tab-memory").hidden) loadMemory();
+    } catch (e) { ed.querySelector(".hmemmsg").textContent = e.message; }
+  };
+}
+$("htx").addEventListener("change", (ev) => {
+  if (ev.target.classList.contains("hsel")) syncDelSel();
+});
+$("htx").onclick = async (ev) => {
+  const id = +(ev.target.dataset && ev.target.dataset.id || 0);
+  if (!id) return;
+  const pid = hPid();
+  const row = $(`hm-${id}`);
+  try {
+    if (ev.target.classList.contains("hmenu")) {
+      ev.target.closest(".hmenuwrap").classList.toggle("open");
+    } else if (ev.target.classList.contains("hmore")) {
+      const span = ev.target.closest(".htext");
+      const open = ev.target.dataset.open === "1";
+      span.innerHTML = open
+        ? `${esc(hFullText[id].slice(0, 300))} <button class="btn small hmore" data-id="${id}">… show all</button>`
+        : `${esc(hFullText[id])} <button class="btn small hmore" data-id="${id}" data-open="1"> show less</button>`;
+    } else if (ev.target.classList.contains("hdelone")) {
+      if (!confirm(`Delete message #${id} (${row.querySelector("label").textContent.trim()})?`)) return;
+      await api(`/api/history/${id}?persona=${encodeURIComponent(pid)}`, { method: "DELETE" });
+      hMsgs = hMsgs.filter((m) => m.id !== id);
+      renderHistory();
+    } else if (ev.target.classList.contains("hmem")) {
+      openMemoryEditor(row, id);
+    }
+  } catch (e) { $("herr").textContent = e.message; }
+};
 $("hclear").onclick = async () => {
   const pid = $("hpick").value;
   if (!confirm(`Clear ALL history of “${pid}”?`)) return;
   try { await api("/api/history?persona=" + encodeURIComponent(pid), { method: "DELETE" }); await poll(); loadHistory(); }
   catch (e) { $("herr").textContent = e.message; }
+};
+$("hselall").onchange = () => {
+  $("htx").querySelectorAll(".hsel").forEach((c) => { c.checked = $("hselall").checked; });
+  syncDelSel();
+};
+$("hshort").onchange = renderHistory;
+$("holder").onclick = loadOlder;
+$("hdelsel").onclick = async () => {
+  const ids = hSelected();
+  if (!ids.length) return;
+  if (!confirm(`Delete ${ids.length} selected message${ids.length === 1 ? "" : "s"} of “${hPid()}”?`)) return;
+  try {
+    const r = await api("/api/history/delete", { method: "POST", json: { persona: hPid(), ids } });
+    const gone = new Set(ids.filter((i) => !r.skipped.includes(i)));
+    hMsgs = hMsgs.filter((m) => !gone.has(m.id));
+    renderHistory();
+    if (r.skipped.length)
+      $("herr").textContent = `${r.deleted} deleted · ${r.skipped.length} skipped (other persona or already gone)`;
+    else
+      $("herr").textContent = "";
+  } catch (e) { $("herr").textContent = e.message; }
 };
 
 /* ── memory (docs/WALK_MEMORY.md M) ───────────────────────────────── */
@@ -1469,6 +1622,9 @@ async function eventsLoop() {
   evRunning = false;
 }
 function applyEvent(e) {
+  if (e.type === "history_changed" && !$("tab-history").hidden) {
+    loadHistory();                       // someone deleted rows: refetch
+  }
   if (e.type === "timer_set" || e.type === "timer_cancelled" ||
       e.type === "timer_fired" || e.type === "timer_retry" || e.type === "timer_failed") {
     if (!$("tab-timers").hidden) loadTimers();   // docs/TIMERS.md H live list
