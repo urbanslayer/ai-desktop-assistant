@@ -816,6 +816,108 @@ def test_send_events_refuses_and_names_dead_explicit_socket(sock_root, fake_bins
     assert rec.calls == []                               # nothing was run
 
 
+# ── argv: ydotool 1.0.4 syntax (§2) ───────────────────────────
+def _kbd_backend(fake_bins, fake_daemons, sock_root, runner, **kw):
+    """Backend wired to a fake daemon socket; `runner` records/replays."""
+    sock = fake_daemons.listen(sock_root / "kbd")
+    yd = YdotoolBackend(runner=runner,
+                        env={"PATH": "/usr/bin:/bin", "YDOTOOL_SOCKET": sock},
+                        **kw)
+    return yd, sock
+
+
+def test_send_events_argv_matches_ydotool_104_syntax(sock_root, fake_bins,
+                                                     fake_daemons):
+    """ydotool 1.0.4 has NO global options: the delay is `--key-delay=N` on
+    the `key` subcommand and events are `<keycode>:<pressed>` tokens. The
+    old `ydotool --keydelay 8 key …` died on the usage text every call."""
+    rec = _RecRunner()
+    yd, sock = _kbd_backend(fake_bins, fake_daemons, sock_root, rec)
+    yd.send_events([(30, True), (30, False), (42, False)])
+    assert len(rec.calls) == 1
+    argv, sent_env = rec.calls[0]
+    assert argv == ["ydotool", "key", "--key-delay=8", "30:1", "30:0", "42:0"]
+    assert "--keydelay" not in argv
+    assert sent_env["YDOTOOL_SOCKET"] == sock            # env injection kept
+
+
+def test_key_delay_lands_on_the_key_subcommand(sock_root, fake_bins,
+                                               fake_daemons):
+    rec = _RecRunner()
+    yd, _ = _kbd_backend(fake_bins, fake_daemons, sock_root, rec,
+                         key_delay_ms=25)
+    yd.send_events([(14, True), (14, False)])
+    assert rec.calls[0][0][:3] == ["ydotool", "key", "--key-delay=25"]
+
+
+def test_long_batches_split_at_the_event_cap(sock_root, fake_bins,
+                                             fake_daemons, monkeypatch):
+    """Over-long batches become several `ydotool key` calls, order kept,
+    every call carrying its own --key-delay header."""
+    monkeypatch.setattr(ydotool_mod, "MAX_EVENTS_PER_CALL", 4)
+    rec = _RecRunner()
+    yd, _ = _kbd_backend(fake_bins, fake_daemons, sock_root, rec)
+    events = [(30, i % 2 == 0) for i in range(10)]
+    yd.send_events(events)
+    assert [c[0] for c in rec.calls] == [
+        ["ydotool", "key", "--key-delay=8"] + [f"30:{1 if i % 2 == 0 else 0}"
+                                               for i in range(4)],
+        ["ydotool", "key", "--key-delay=8"] + [f"30:{1 if i % 2 == 0 else 0}"
+                                               for i in range(4, 8)],
+        ["ydotool", "key", "--key-delay=8"] + [f"30:{1 if i % 2 == 0 else 0}"
+                                               for i in range(8, 10)],
+    ]
+
+
+class Done2:
+    """Done honours every field (the shared Done fixture pins stderr '')."""
+
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def test_failure_reports_stdout_and_exit_code(sock_root, fake_bins,
+                                              fake_daemons):
+    """ydotool 1.0.4 prints its usage text on STDOUT: an empty stderr must
+    not hide the cause — and the message must not blame socket permissions
+    the output never mentioned."""
+    def runner(argv, timeout=None, env=None, **kw):
+        return Done2(returncode=1, stdout=(
+            "Usage: key [OPTION]... [KEYCODES]...\n"
+            "  -d, --key-delay=N  Delay N milliseconds between key events\n"))
+    yd, _ = _kbd_backend(fake_bins, fake_daemons, sock_root, runner)
+    from riko.typing.ydotool import YdotoolUnavailable
+    with pytest.raises(YdotoolUnavailable) as e:
+        yd.send_events([(30, 1), (30, 0)])
+    msg = str(e.value)
+    assert "exit code 1" in msg
+    assert "Usage: key" in msg                           # stdout surfaced
+    assert "permission" not in msg.lower()
+    assert "root" not in msg
+
+
+def test_failure_with_no_output_says_so(sock_root, fake_bins, fake_daemons):
+    yd, _ = _kbd_backend(fake_bins, fake_daemons, sock_root,
+                         lambda *a, **k: Done2(returncode=7))
+    from riko.typing.ydotool import YdotoolUnavailable
+    with pytest.raises(YdotoolUnavailable) as e:
+        yd.send_events([(30, 1)])
+    assert "exit code 7" in str(e.value)
+    assert "no output" in str(e.value)
+
+
+def test_failure_blames_socket_only_when_output_says_so(sock_root, fake_bins,
+                                                        fake_daemons):
+    yd, _ = _kbd_backend(
+        fake_bins, fake_daemons, sock_root,
+        lambda *a, **k: Done2(returncode=1,
+                              stderr="connect: Permission denied"))
+    from riko.typing.ydotool import YdotoolUnavailable
+    with pytest.raises(YdotoolUnavailable) as e:
+        yd.send_events([(30, 1)])
+    assert "socket" in str(e.value) and "root" in str(e.value)
+
+
 # ── audit (§6) ────────────────────────────────────────────────
 def test_audit_line_names_window_not_text():
     lines = []

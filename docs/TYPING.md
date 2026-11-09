@@ -145,6 +145,13 @@ candidate is probed with an AF_UNIX connect (1 s timeout) — the first one that
 always passes the resolved path to the `ydotool` child explicitly as `YDOTOOL_SOCKET` in its environment
 (the child runs with a stripped session env, so it never has to rediscover the socket).
 
+**Invocation syntax (ydotool 1.0.4).** 1.0.4 has no global options: Riko runs
+`ydotool key --key-delay=8 <code>:1 <code>:0 …` — `--key-delay=N` belongs to the `key` subcommand and every
+event is a `<keycode>:<pressed>` token (e.g. `28:1 28:0`). Batches over 2000 events are split into several
+calls (the engine already re-checks focus/abort between its own much smaller chunks). `ydotool` prints usage
+text to **stdout**, so a failed call is reported with its exit code and both streams, and the socket-
+permission advice only appears when the output actually mentions a permission problem.
+
 `/dev/uinput` normally needs no setup: logind grants it to the active local session through the uaccess
 ACL. Only if `ydotoold` logs that it cannot open `/dev/uinput` do the udev/`input`-group steps apply:
 

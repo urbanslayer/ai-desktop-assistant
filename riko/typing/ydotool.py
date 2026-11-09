@@ -150,14 +150,42 @@ class YdotoolUnavailable(RuntimeError):
     """Nothing was sent; OWNER_SETUP explains what the owner must do."""
 
 
+# ydotool 1.0.4 has NO global options (`ydotool --help` lists only the
+# subcommands); the delay belongs to the `key` subcommand as
+# `--key-delay=N`, and event tokens are `<keycode>:<pressed>` (e.g.
+# `28:1 28:0`). `usage: key [OPTION]... [KEYCODES]...`-style text goes to
+# STDOUT, so an empty stderr proves nothing on a failure.
+MAX_EVENTS_PER_CALL = 2000  # keep argv far below ARG_MAX; engine re-checks
+                            # focus/abort between its own chunks
+
+# output snippets that really do mean "the daemon socket refused us"
+_PERMISSION_HINTS = ("permission", "denied", "access", "eacces",
+                     "operation not permitted")
+
+
+def _failure_detail(done):
+    """The first informative lines of a failed ydotool run, stderr and
+    STDOUT alike (ydotool 1.0.4 prints usage errors to stdout)."""
+    parts = []
+    for name in ("stderr", "stdout"):
+        text = str(getattr(done, name, "") or "").strip()
+        if text:
+            parts.append(f"{name}: {'; '.join(text.splitlines()[:3])[:200]}")
+    return "; ".join(parts)
+
+
 class YdotoolBackend:
-    """Sends `ydotool key --keydelay <ms> CODE:1 CODE:0 …` through an
+    """Sends `ydotool key --key-delay=<ms> CODE:1 CODE:0 …` through an
     injectable runner (tests: fake; production: riko.desktop_sense.util.run).
 
     The socket resolve_socket() found is ALWAYS handed to the ydotool child
     explicitly as YDOTOOL_SOCKET in the env passed to the runner: the child
     may run with a stripped session env, so it must never have to rediscover
-    the socket from inherited variables."""
+    the socket from inherited variables.
+
+    Batches longer than MAX_EVENTS_PER_CALL events are split over several
+    `ydotool key` calls (every engine caller chunks far below this anyway;
+    the engine contract re-checks abort/focus between its own chunks)."""
 
     def __init__(self, runner=None, env=None, key_delay_ms=8):
         self.runner = runner or _util_run
@@ -189,7 +217,13 @@ class YdotoolBackend:
 
     # ── sending ────────────────────────────────────────────────
     def send_events(self, events):
-        """events: [(keycode, down:bool), …] in press-then-release order."""
+        """events: [(keycode, down:bool), …] in press-then-release order.
+
+        argv follows ydotool 1.0.4 exactly: `ydotool key --key-delay=<ms>
+        <code>:1 <code>:0 …` — 1.0.4 has no global options, so the old
+        `ydotool --keydelay N key …` form made every call die on its usage
+        text. Long batches split into several calls; the engine contract
+        re-checks abort/focus around its own (much smaller) chunks."""
         if not events:
             return
         sock, reason = self._ready()
@@ -198,13 +232,22 @@ class YdotoolBackend:
         env = dict(self.env)
         if sock:                          # reason is None ⇒ sock is set
             env["YDOTOOL_SOCKET"] = sock  # explicit; never rely on inheritance
-        argv = ["ydotool", "--keydelay", str(self.key_delay_ms), "key"]
-        argv += [f"{int(code)}:{1 if down else 0}" for code, down in events]
-        done = self.runner(argv, timeout=30, env=env)
-        if getattr(done, "returncode", 1) != 0:
-            err = (getattr(done, "stderr", "") or "").strip()
-            raise YdotoolUnavailable(
-                f"ydotool failed to inject keys"
-                + (f": {err[:200]}" if err else " (no stderr)")
-                + "\nIf the daemon runs as root, Riko needs write access to "
-                  "its socket — see the setup notes above.")
+        head = ["ydotool", "key", f"--key-delay={self.key_delay_ms}"]
+        for i in range(0, len(events), MAX_EVENTS_PER_CALL):
+            argv = head + [f"{int(code)}:{1 if down else 0}"
+                           for code, down in
+                           events[i:i + MAX_EVENTS_PER_CALL]]
+            done = self.runner(argv, timeout=30, env=env)
+            if getattr(done, "returncode", 1) != 0:
+                code = getattr(done, "returncode", "?")
+                detail = _failure_detail(done)
+                out = (str(getattr(done, "stderr", "") or "") + " " +
+                       str(getattr(done, "stdout", "") or "")).lower()
+                raise YdotoolUnavailable(
+                    "ydotool failed to inject keys "
+                    f"(exit code {code}"
+                    + (f": {detail})" if detail else "; no output)")
+                    + ("\nThe daemon socket refused Riko — if ydotoold runs "
+                       "as root, Riko needs write access to its socket; see "
+                       "the setup notes above."
+                       if any(h in out for h in _PERMISSION_HINTS) else ""))
