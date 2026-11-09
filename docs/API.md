@@ -166,10 +166,12 @@ if (s.version != last.version) {
 }
 ```
 
-Messages never mutate or are deleted individually — the only bulk operation
-is `DELETE /api/history`, which resets a persona's history (your cursor may
-then jump *backwards*; if `lastMessageId < last.lastMessageId`, refetch the
-transcript with `after=0`).
+Messages never mutate; individual rows can be deleted
+(`DELETE /api/history/{id}`, `POST /api/history/delete`) or saved to
+long-term memory (`POST /api/history/{id}/remember`), and the only whole-
+transcript operation is `DELETE /api/history`, which resets a persona's
+history (your cursor may then jump *backwards*; if
+`lastMessageId < last.lastMessageId`, refetch the transcript with `after=0`).
 
 ## Routes
 
@@ -185,8 +187,11 @@ transcript with `after=0`).
 | `GET /api/personas/{id}/avatar` | download `.vrm` |
 | `PUT /api/personas/{id}/avatar` | upload `.vrm` (multipart) |
 | `POST /api/active` | switch active persona |
-| `GET /api/history` | read transcript (paged by id) |
+| `GET /api/history` | read transcript (paged by id, `after`/`before`) |
 | `DELETE /api/history` | clear a persona's transcript |
+| `DELETE /api/history/{message_id}` | delete one message |
+| `POST /api/history/delete` | bulk-delete messages by id |
+| `POST /api/history/{message_id}/remember` | save a message as a memory fact |
 | `POST /api/history/import` | bulk-import old logs |
 | `POST /api/chat` | the only writing route in daily use |
 | `GET /api/memory` | list/search long-term facts (scope filter) |
@@ -321,15 +326,18 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
 ### GET /api/history
 
 Query params: `persona` (default: active), `after` (message id, default 0),
-`limit` (default 50, max 500 — larger values are clamped).
+`before` (message id, default 0 = off), `limit` (default 50, max 500 —
+larger values are clamped).
 
 ```json
 {"persona": "asuka", "messages": [ …oldest → newest… ]}
 ```
 
 **Semantics:** `after=0` → the **last** `limit` messages (fetch the tail);
-`after=<id>` → messages with `id > after` (fetch a delta). Unknown persona →
-`404`; non-integer `after`/`limit` → `400`.
+`after=<id>` → messages with `id > after` (fetch a delta); `before=<id>` →
+the **last** `limit` messages with `id < before` (page *older* than a cursor,
+used by the web page's "Load older"). Unknown persona →
+`404`; non-integer `after`/`before`/`limit` → `400`.
 
 Messages carry the same `speech` field as ChatResults (assistant rows: the
 cleaned spoken text, never a URL — filled on read for rows stored before the
@@ -343,6 +351,37 @@ curl -s -H "$AUTH" "$HUB/api/history?persona=asuka&after=42"      # everything a
 ### DELETE /api/history → `204`
 
 Clears the transcript of `?persona=` (default active). Bumps `state.version`.
+
+### DELETE /api/history/{message_id} → `204`
+
+Deletes one stored message (its cached audio goes with it). `?persona=`
+(default: the message's own persona) guards the delete: a persona mismatch or
+an unknown id → `404`. Publishes `history_changed` and bumps `state.version`.
+
+### POST /api/history/delete → `{deleted: n, skipped: [ids]}`
+
+Bulk delete: `{"persona": id?, "ids": [...]}`. `persona` defaults to the
+active one; ids belonging to another persona (or already gone) are **not**
+deleted and come back in `skipped`. Non-empty integer `ids` list required
+(`422`), unknown persona `404`. Publishes one `history_changed` with the
+deleted ids and bumps `state.version` (no bump when nothing was deleted).
+
+```bash
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"persona":"riko","ids":[41,42,43]}' $HUB/api/history/delete
+```
+
+### POST /api/history/{message_id}/remember → fact (`201`)
+
+Save a message to long-term memory (the web page's "Add to memory"):
+`{"text"?, "scope"?: "persona"|"global"}`. `text` defaults to the message's
+own content, clamped like any fact (whitespace-collapsed, 500 chars);
+`scope` defaults to `persona` (a private note on the message's persona),
+`global` stores it as a shared `user` fact. Same dedup path as
+`POST /api/memory` — a near-identical fact comes back `"updated": true` with
+the existing id. The fact records `source_message_id` (provenance). Unknown
+message `404`; bad scope or a message with no text to remember `422`.
+Publishes `memory_changed` and bumps `state.version`.
 
 ### POST /api/history/import
 
@@ -1405,11 +1444,12 @@ curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 #   {"seq":15,"time":"…","type":"approval_needed","request_id":"…","client_id":"my-desktop","tool":"desktop__do_thing","summary":"do_thing {}"},
 #   {"seq":16,"time":"…","type":"turn_finished","persona":"riko","message_id":42,"emotion":"happy","actions":[{"name":"wave","at":0.0}]},
 #   {"seq":17,"time":"…","type":"memory_changed","id":7,"op":"added"},
-#   {"seq":18,"time":"…","type":"timer_set","id":3,"label":"tea","persona_id":"riko","due_at":"2026-11-05T12:30:00Z","due_at_local":"2026-11-05T12:30:00+00:00","cancel_on":[],"asked":false},
-#   {"seq":19,"time":"…","type":"timer_fired","id":3,"label":"tea","persona_id":"riko","message_id":42},
-#   {"seq":20,"time":"…","type":"turn_finished","persona":"riko","origin":"timer","persona_id":"riko","timer":{"id":3,"label":"tea"},"message_id":42,"reply":"Your tea is ready!","speech":"Your tea is ready!","emotion":"happy","actions":[],"audio_url":"/api/messages/42/audio"},
-#   {"seq":21,"time":"…","type":"state_changed","version":21}
-# ],"last":21}
+#   {"seq":18,"time":"…","type":"history_changed","persona":"riko","ids":[40,41],"op":"deleted"},
+#   {"seq":19,"time":"…","type":"timer_set","id":3,"label":"tea","persona_id":"riko","due_at":"2026-11-05T12:30:00Z","due_at_local":"2026-11-05T12:30:00+00:00","cancel_on":[],"asked":false},
+#   {"seq":20,"time":"…","type":"timer_fired","id":3,"label":"tea","persona_id":"riko","message_id":42},
+#   {"seq":21,"time":"…","type":"turn_finished","persona":"riko","origin":"timer","persona_id":"riko","timer":{"id":3,"label":"tea"},"message_id":42,"reply":"Your tea is ready!","speech":"Your tea is ready!","emotion":"happy","actions":[],"audio_url":"/api/messages/42/audio"},
+#   {"seq":22,"time":"…","type":"state_changed","version":22}
+# ],"last":22}
 ```
 
 Loop: keep `last`, pass it back as `after`, `wait` ≤ 30 s (default 25). The
@@ -1424,7 +1464,10 @@ part of your state polling with this one connection. `memory_changed`
 (`{id, op}` with `op` = `added` / `updated` / `deleted`) fires whenever a
 fact is saved, edited or forgotten — by the memory tools, the routes, or a
 persona delete that took its private notes with it; refresh your memory view
-on it. Timers (docs/TIMERS.md) publish `timer_set` /
+on it. `history_changed` (`{persona, ids, op}` with `op` = `deleted`) fires
+when messages are removed by `DELETE /api/history/{id}` or
+`POST /api/history/delete` — refresh your transcript on it (clearing a whole
+persona only bumps `state.version`, like before). Timers (docs/TIMERS.md) publish `timer_set` /
 `timer_cancelled` / `timer_fired` (`{id, label, persona_id, …}`; cancelled
 also carries `reason`: `user_message`, `chat_read`, `tool`, `request`,
 `persona_deleted`), plus `timer_retry` / `timer_failed` when

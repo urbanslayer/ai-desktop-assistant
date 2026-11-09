@@ -378,6 +378,109 @@ def test_history_clear(client):
     assert client.delete("/api/history?persona=ghost").status_code == 404
 
 
+def _import_msgs(client, persona, texts, role="user"):
+    client.post("/api/history/import", json={"persona": persona, "messages": [
+        {"role": role, "content": t} for t in texts]})
+    return [m["id"] for m in client.get(f"/api/history?persona={persona}").json()["messages"]]
+
+
+def test_history_before_paging(client):
+    ids = _import_msgs(client, "riko", [f"m{i}" for i in range(10)])
+    h = client.get(f"/api/history?before={ids[-2]}&limit=3").json()
+    assert [m["content"] for m in h["messages"]] == ["m5", "m6", "m7"]  # last 3 ids < before
+    assert client.get(f"/api/history?before={ids[0]}").json()["messages"] == []
+    assert client.get("/api/history?before=abc").status_code == 400
+
+
+def test_history_delete_single(client):
+    add_persona(client)
+    ids = _import_msgs(client, "riko", ["keep", "zap", "keep2"])
+    v0 = client.get("/api/state").json()["version"]
+    assert client.delete(f"/api/history/{ids[1]}?persona=riko").status_code == 204
+    assert [m["content"] for m in client.get("/api/history").json()["messages"]] == ["keep", "keep2"]
+    assert client.get("/api/state").json()["version"] == v0 + 1
+    assert client.delete(f"/api/history/{ids[1]}").status_code == 404   # already gone
+    # persona guard: asuka's row is not riko's to delete, own persona is fine
+    asuka_id = _import_msgs(client, "asuka", ["theirs"])[0]
+    assert client.delete(f"/api/history/{asuka_id}?persona=riko").status_code == 404
+    assert client.delete(f"/api/history/{asuka_id}").status_code == 204  # own persona by default
+    assert client.get("/api/history?persona=asuka").json()["messages"] == []
+
+
+def test_history_delete_bulk(client):
+    add_persona(client)
+    r_ids = _import_msgs(client, "riko", ["r1", "r2"])
+    a_ids = _import_msgs(client, "asuka", ["a1"])
+    v0 = client.get("/api/state").json()["version"]
+    r = client.post("/api/history/delete",
+                    json={"persona": "riko", "ids": [r_ids[0], a_ids[0], 99999]})
+    assert r.json() == {"deleted": 1, "skipped": [a_ids[0], 99999]}
+    assert client.get("/api/state").json()["version"] == v0 + 1
+    # persona omitted -> the active one (riko); r_ids[0] is already gone -> skipped
+    r = client.post("/api/history/delete", json={"ids": r_ids})
+    assert r.json() == {"deleted": 1, "skipped": [r_ids[0]]}
+    assert client.get("/api/history").json()["messages"] == []
+    assert [m["content"] for m in
+            client.get("/api/history?persona=asuka").json()["messages"]] == ["a1"]
+    # nothing deleted -> no version bump
+    v1 = client.get("/api/state").json()["version"]
+    assert client.post("/api/history/delete",
+                       json={"persona": "riko", "ids": [99999]}).json() == {
+        "deleted": 0, "skipped": [99999]}
+    assert client.get("/api/state").json()["version"] == v1
+    # validation
+    assert client.post("/api/history/delete",
+                       json={"persona": "ghost", "ids": [1]}).status_code == 404
+    assert client.post("/api/history/delete", json={"ids": []}).status_code == 422
+    assert client.post("/api/history/delete", json={"ids": "x"}).status_code == 422
+    assert client.post("/api/history/delete", json={"ids": ["abc"]}).status_code == 422
+
+
+def test_history_delete_publishes_history_changed(client):
+    ids = _import_msgs(client, "riko", ["a", "b"])
+    client.delete(f"/api/history/{ids[0]}")
+    client.post("/api/history/delete", json={"persona": "riko", "ids": [ids[1]]})
+    evs = [e for e in client.get("/api/events?after=0&wait=0").json()["events"]
+           if e["type"] == "history_changed"]
+    assert [(e["persona"], e["ids"], e["op"]) for e in evs] == [
+        ("riko", [ids[0]], "deleted"), ("riko", [ids[1]], "deleted")]
+
+
+def test_history_remember(client):
+    add_persona(client)
+    long = "I love sushi. " * 60           # > 500 chars -> clamped like any fact
+    ids = _import_msgs(client, "riko", [long])
+    r = client.post(f"/api/history/{ids[0]}/remember", json={})   # default text + scope
+    assert r.status_code == 201
+    fact = r.json()
+    assert fact["scope"] == "persona:riko" and fact["updated"] is False
+    assert fact["source_message_id"] == ids[0]           # provenance on the fact
+    assert len(fact["text"]) == 500 and fact["text"].startswith("I love sushi")
+    # dedup: the same text again updates the existing fact (same path as POST /api/memory)
+    again = client.post(f"/api/history/{ids[0]}/remember", json={}).json()
+    assert again["id"] == fact["id"] and again["updated"] is True
+    # edited text + global scope -> the shared 'user' scope
+    edited = client.post(f"/api/history/{ids[0]}/remember",
+                         json={"text": "Owner loves sushi.", "scope": "global"}).json()
+    assert edited["text"] == "Owner loves sushi." and edited["scope"] == "user"
+    facts = client.get("/api/memory?scope=user").json()["facts"]
+    assert facts[0]["text"] == "Owner loves sushi."
+    assert facts[0]["source_message_id"] == ids[0]
+    # assistant messages work the same; memory_changed is published
+    aid = _import_msgs(client, "asuka", ["Nice to meet you!"], role="assistant")[0]
+    f2 = client.post(f"/api/history/{aid}/remember", json={}).json()
+    assert f2["text"] == "Nice to meet you!" and f2["scope"] == "persona:asuka"
+    evs = [e for e in client.get("/api/events?after=0&wait=0").json()["events"]
+           if e["type"] == "memory_changed"]
+    assert "added" in {e["op"] for e in evs}   # every fact write published
+    # errors
+    assert client.post("/api/history/99999/remember", json={}).status_code == 404
+    assert client.post(f"/api/history/{ids[0]}/remember",
+                       json={"scope": "wat"}).status_code == 422
+    empty_id = _import_msgs(client, "riko", ["   "])[-1]   # newest = the blank one
+    assert client.post(f"/api/history/{empty_id}/remember", json={}).status_code == 422
+
+
 # ── import ──────────────────────────────────────────────────────────────────
 
 def test_import_append_replace_and_validation(client):

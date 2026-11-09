@@ -174,3 +174,22 @@ def test_voice_preview_is_fetched_with_post():
     preview = {(m, p) for m, p, _ in calls if p.endswith("/voice/preview")}
     assert ("POST", "/api/personas/{p}/voice/preview") in preview
     assert ("GET", "/api/personas/{p}/voice/preview") not in preview
+
+
+def test_history_tab_has_selection_controls():
+    """The select + delete / remember UI exists and wires to the per-message
+    routes (single delete, bulk delete, remember, 'load older' paging)."""
+    html = PAGE.read_text(encoding="utf-8")
+    script = page_script(html)
+    for el in ("hselall", "hdelsel", "hshort", "holder"):
+        assert f'id="{el}"' in html, f"history toolbar control {el} missing"
+    for token in ("hmenu", "hdelone", "hmem", "hsel", "Load older",
+                  "Delete selected", "Add to memory", "show only empty/short"):
+        assert token in html, f"history UI token {token!r} missing"
+    calls, _ = page_calls()
+    pairs = {(m, p) for m, p, _ in calls}
+    assert ("POST", "/api/history/delete") in pairs
+    assert ("DELETE", "/api/history/{p}") in pairs
+    assert ("POST", "/api/history/{p}/remember") in pairs
+    assert "before=" in script          # 'load older' paging param
+    assert "history_changed" in script  # live refresh on deletes
