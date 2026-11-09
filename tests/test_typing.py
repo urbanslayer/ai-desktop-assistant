@@ -4,6 +4,7 @@ the window manager is a FakeSense fed by plain dicts, and the conftest guard
 hard-fails any test that still tries to exec ydotool/ydotoold/wl-copy/wl-paste
 or reach the Obsidian REST ports."""
 import json
+import os
 import socket
 import subprocess
 from pathlib import Path
@@ -608,6 +609,169 @@ def test_custom_socket_dead_is_reported(tmp_path):
     assert reason and "gone.sock" in reason
 
 
+# ── socket discovery (§2: systemd user service layout) ────────
+class _FakeDaemons:
+    """Keeps fake listeners alive for the whole test (GC would close them
+    and leave stale files); large backlog so repeated probes never refill
+    the accept queue."""
+
+    def __init__(self):
+        self.srvs = []
+
+    def listen(self, dirpath, name=".ydotool_socket"):
+        dirpath = Path(dirpath)
+        dirpath.mkdir(parents=True, exist_ok=True)
+        path = dirpath / name
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(path))
+        srv.listen(128)
+        self.srvs.append(srv)
+        return str(path)
+
+
+@pytest.fixture()
+def fake_daemons():
+    return _FakeDaemons()
+
+
+class _RecRunner:
+    """Records argv AND the env handed to the runner (ydotool never runs)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, timeout=None, env=None, **kw):
+        self.calls.append((list(argv), dict(env or {})))
+        return Done("")
+
+
+@pytest.fixture()
+def fake_bins(monkeypatch):
+    """Pretend ydotool/ydotoold are installed (which() never hits the box)."""
+    monkeypatch.setattr(ydotool_mod.shutil, "which",
+                        lambda name, **kw: f"/usr/bin/{name}")
+
+
+@pytest.fixture()
+def sock_root(tmp_path_factory):
+    """Short root for AF_UNIX sockets: tmp_path per-test names can exceed
+    the 108-char sun_path limit under deep TMPDIRs."""
+    return tmp_path_factory.mktemp("y")
+
+
+def test_env_socket_wins_and_is_passed_to_runner(sock_root, fake_bins,
+                                                 fake_daemons):
+    env_sock = fake_daemons.listen(sock_root / "envsock")
+    fake_daemons.listen(sock_root / "rt")
+    env = {"PATH": "/usr/bin:/bin", "YDOTOOL_SOCKET": env_sock,
+           "XDG_RUNTIME_DIR": str(sock_root / "rt")}
+    yd = YdotoolBackend(runner=(_rec := _RecRunner()), env=env)
+    assert yd.check() is None
+    assert yd.socket_path() == env_sock                  # explicit override first
+    yd.send_events([(30, 1), (30, 0)])
+    argv, sent_env = _rec.calls[0]
+    assert argv[0] == "ydotool"
+    assert sent_env["YDOTOOL_SOCKET"] == env_sock        # explicit, never inherited
+
+
+def test_xdg_runtime_dir_socket_found(sock_root, fake_bins, fake_daemons):
+    """The systemd user service layout: socket at $XDG_RUNTIME_DIR/..."""
+    rt_sock = fake_daemons.listen(sock_root / "run")
+    env = {"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(sock_root / "run")}
+    yd = YdotoolBackend(runner=(_rec := _RecRunner()), env=env)
+    assert yd.check() is None
+    assert yd.socket_path() == rt_sock
+    yd.send_events([(30, 1)])
+    assert _rec.calls[0][1]["YDOTOOL_SOCKET"] == rt_sock
+
+
+def test_run_user_uid_fallback_when_xdg_unset(sock_root, fake_bins,
+                                              fake_daemons, monkeypatch):
+    """XDG_RUNTIME_DIR unset → /run/user/<uid>/.ydotool_socket is tried."""
+    monkeypatch.setattr(ydotool_mod, "_RUN_USER_BASE", str(sock_root / "runuser"))
+    monkeypatch.setattr(ydotool_mod.os, "getuid", lambda: 4242)
+    sock = fake_daemons.listen(sock_root / "runuser" / "4242")
+    yd = YdotoolBackend(runner=lambda *a, **k: Done(""),
+                        env={"PATH": "/usr/bin:/bin"})
+    assert yd.check() is None
+    assert yd.socket_path() == sock
+
+
+def test_tmp_socket_is_last_resort(sock_root, fake_bins, fake_daemons,
+                                   monkeypatch):
+    monkeypatch.setattr(ydotool_mod, "_TMP_SOCKET",
+                        str(sock_root / "legacy" / ".ydotool_socket"))
+    sock = fake_daemons.listen(sock_root / "legacy")
+    empty_rt = sock_root / "empty-rt"
+    empty_rt.mkdir()
+    yd = YdotoolBackend(runner=lambda *a, **k: Done(""),
+                        env={"PATH": "/usr/bin:/bin",
+                             "XDG_RUNTIME_DIR": str(empty_rt)})
+    assert yd.check() is None                            # runtime dir missed, /tmp hit
+    assert yd.socket_path() == sock
+
+
+def test_stale_socket_skipped_live_one_used(sock_root, fake_bins, fake_daemons,
+                                            monkeypatch):
+    """A dead (refusing) socket in an earlier slot must not half-type:
+    resolution moves on to the next candidate."""
+    stale_dir = sock_root / "rt"
+    stale_dir.mkdir()
+    stale = stale_dir / ".ydotool_socket"
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(str(stale))
+    dead.listen(1)
+    dead.close()                                         # file stays → ECONNREFUSED
+    monkeypatch.setattr(ydotool_mod, "_TMP_SOCKET",
+                        str(sock_root / "legacy" / ".ydotool_socket"))
+    (sock_root / "legacy").mkdir()
+    live = fake_daemons.listen(sock_root / "legacy")
+    yd = YdotoolBackend(runner=lambda *a, **k: Done(""),
+                        env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(stale_dir)})
+    assert yd.socket_path() == live
+
+
+def test_missing_paths_error_lists_what_was_tried(sock_root, fake_bins, monkeypatch):
+    monkeypatch.setattr(ydotool_mod, "_TMP_SOCKET",
+                        str(sock_root / "nowhere" / ".ydotool_socket"))
+    rt = sock_root / "rt"
+    rt.mkdir()
+    yd = YdotoolBackend(runner=lambda *a, **k: Done(""),
+                        env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(rt)})
+    reason = yd.check()
+    assert reason and str(rt / ".ydotool_socket") in reason
+    assert "nowhere" in reason                           # both tried paths named
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores socket file permissions")
+def test_socket_exists_but_denied(sock_root, fake_bins, fake_daemons):
+    """EACCES gets its own message: enable-the-service advice would be wrong."""
+    sock = fake_daemons.listen(sock_root)
+    os.chmod(sock, 0o000)
+    try:
+        yd = YdotoolBackend(runner=lambda *a, **k: Done(""),
+                            env={"PATH": "/usr/bin:/bin",
+                                 "XDG_RUNTIME_DIR": str(sock_root)})
+        reason = yd.check()
+        assert reason and "permission denied" in reason
+        assert sock in reason
+    finally:
+        os.chmod(sock, 0o600)
+
+
+def test_send_events_refuses_and_names_dead_explicit_socket(sock_root, fake_bins):
+    rec = _RecRunner()
+    yd = YdotoolBackend(runner=rec, env={
+        "PATH": "/usr/bin:/bin",
+        "YDOTOOL_SOCKET": str(sock_root / "nobody-home.sock")})
+    from riko.typing.ydotool import YdotoolUnavailable
+    with pytest.raises(YdotoolUnavailable) as e:
+        yd.send_events([(30, 1)])
+    assert "nobody-home.sock" in str(e.value)
+    assert rec.calls == []                               # nothing was run
+
+
 # ── audit (§6) ────────────────────────────────────────────────
 def test_audit_line_names_window_not_text():
     lines = []
@@ -730,3 +894,18 @@ def test_guard_blocks_real_binaries_and_obsidian():
                 s.connect(("127.0.0.1", port))
         finally:
             s.close()
+
+
+def test_guard_blocks_real_ydotool_sockets():
+    """The live systemd user service socket must be untouchable in tests."""
+    uid = os.getuid()
+    for path in (f"/run/user/{uid}/.ydotool_socket", "/run/user/0/.ydotool_socket",
+                 "/tmp/.ydotool_socket", "/run/.ydotool_socket"):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            with pytest.raises(RuntimeError):
+                s.connect(path)
+        finally:
+            s.close()
+        with pytest.raises(RuntimeError):
+            socket.create_connection(path, timeout=0.2)  # type: ignore[arg-type]  # AF_UNIX str address

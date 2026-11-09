@@ -13,21 +13,109 @@ from ..desktop_sense.util import run as _util_run
 
 OWNER_SETUP = (
     "Keystroke injection is not set up. Riko types with ydotool; the owner\n"
-    "installs and enables it (Riko never installs packages or starts daemons):\n\n"
+    "installs and enables it (Riko never installs packages or starts daemons):\n"
+    "\n"
     "    sudo pacman -S ydotool\n"
-    "    # uinput access for the daemon (one-time):\n"
+    "    systemctl --user enable --now ydotool.service\n"
+    "\n"
+    "The Arch package ships a systemd user service that runs ydotoold and\n"
+    "creates its socket at $XDG_RUNTIME_DIR/.ydotool_socket; Riko finds it\n"
+    "there automatically (a custom path is honoured via YDOTOOL_SOCKET).\n"
+    "The udev/input-group steps are only needed if ydotoold cannot open\n"
+    "/dev/uinput — normally logind's uaccess ACL already grants it to the\n"
+    "active local session:\n"
+    "\n"
     "    echo 'KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\", "
     "OPTIONS+=\"static_node=uinput\"' | sudo tee "
     "/etc/udev/rules.d/80-uinput.rules\n"
     "    sudo udevadm control --reload && sudo udevadm trigger\n"
     "    sudo usermod -aG input $USER   # log out and in again\n"
-    "    systemctl --user enable --now ydotool.service\n\n"
+    "\n"
     "Note: membership of `input` lets any program you run read every input\n"
     "device. The alternative is a root ydotoold with its socket chowned to\n"
     "you; Riko honours YDOTOOL_SOCKET either way.\n"
+    "\n"
+    "Harmless daemon log lines: 'running xinput against an Xwayland server'\n"
+    "and 'unable to find device pointer:ydotoold virtual device' — ydotoold\n"
+    "only tries to tune pointer acceleration via xinput; keyboard injection\n"
+    "is unaffected.\n"
 )
 
-DEFAULT_SOCKET = "/run/.ydotool_socket"
+# Socket resolution order (docs/TYPING.md): YDOTOOL_SOCKET override first,
+# then the runtime dir where the systemd user service puts the socket
+# ($XDG_RUNTIME_DIR, or /run/user/<uid> when it is unset), then ydotool's
+# own default /tmp location. Module-level so tests can redirect them.
+_RUN_USER_BASE = "/run/user"
+_TMP_SOCKET = "/tmp/.ydotool_socket"
+
+# probe_socket() outcomes
+ALIVE, MISSING, DENIED, DEAD = "alive", "missing", "denied", "dead"
+
+
+def socket_candidates(env):
+    """Socket paths to try, in order (see the note above)."""
+    override = (env.get("YDOTOOL_SOCKET") or "").strip()
+    if override:
+        return [override]
+    runtime = (env.get("XDG_RUNTIME_DIR") or "").strip()
+    if not runtime and hasattr(os, "getuid"):
+        runtime = f"{_RUN_USER_BASE}/{os.getuid()}"
+    cands = []
+    if runtime:
+        cands.append(os.path.join(runtime, ".ydotool_socket"))
+    if _TMP_SOCKET not in cands:
+        cands.append(_TMP_SOCKET)
+    return cands
+
+
+def probe_socket(path):
+    """AF_UNIX connect probe (1 s timeout) → ALIVE / MISSING / DENIED / DEAD.
+
+    DEAD means the file exists but no one accepts (a stale socket left by a
+    stopped ydotoold); DENIED means it exists but we may not open it."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError:
+        return DEAD
+    try:
+        s.settimeout(1.0)
+        s.connect(path)
+        return ALIVE
+    except FileNotFoundError:
+        return MISSING
+    except PermissionError:
+        return DENIED
+    except OSError:                       # refused / not a socket / timeout
+        return DEAD
+    finally:
+        s.close()
+
+
+def resolve_socket(env):
+    """(live socket path, None) — or (None, the owner-facing reason)."""
+    override = (env.get("YDOTOOL_SOCKET") or "").strip()
+    tried = []
+    for path in socket_candidates(env):
+        status = probe_socket(path)
+        tried.append((path, status))
+        if status == ALIVE:
+            return path, None
+        if status == DENIED:
+            return None, (f"the ydotool socket {path} exists but Riko may "
+                          f"not connect to it (permission denied) — if "
+                          f"ydotoold runs as root, its socket must be "
+                          f"chowned/chmod'ed for you")
+    if override:
+        if tried and tried[0][1] == MISSING:
+            return None, (f"YDOTOOL_SOCKET={override} does not exist "
+                          f"(is ydotoold running with that socket?)")
+        return None, (f"the ydotool socket {override} is not accepting "
+                      f"connections (stale socket from a stopped daemon?)")
+    detail = ", ".join(f"{p} [{s}]" for p, s in tried)
+    return None, (f"no ydotool daemon socket is answering — tried: {detail} "
+                  f"(enable it with 'systemctl --user enable --now "
+                  f"ydotool.service' or point Riko at the daemon with "
+                  f"YDOTOOL_SOCKET)")
 
 
 class YdotoolUnavailable(RuntimeError):
@@ -36,8 +124,12 @@ class YdotoolUnavailable(RuntimeError):
 
 class YdotoolBackend:
     """Sends `ydotool key --keydelay <ms> CODE:1 CODE:0 …` through an
-    injectable runner (tests: fake; production: riko.desktop_sense.util.run,
-    which already strips the live-session env for us)."""
+    injectable runner (tests: fake; production: riko.desktop_sense.util.run).
+
+    The socket resolve_socket() found is ALWAYS handed to the ydotool child
+    explicitly as YDOTOOL_SOCKET in the env passed to the runner: the child
+    may run with a stripped session env, so it must never have to rediscover
+    the socket from inherited variables."""
 
     def __init__(self, runner=None, env=None, key_delay_ms=8):
         self.runner = runner or _util_run
@@ -46,37 +138,21 @@ class YdotoolBackend:
 
     # ── availability (§2: detect, fail cleanly, tell the owner) ──
     def socket_path(self):
-        return self.env.get("YDOTOOL_SOCKET") or DEFAULT_SOCKET
+        """The socket to use right now, or None when none answers."""
+        return resolve_socket(self.env)[0]
+
+    def _ready(self):
+        """(live socket, None) or (None, the reason). Each is a line of the
+        §2 decision tree."""
+        if shutil.which("ydotool", path=self.env.get("PATH")) is None:
+            return None, "the `ydotool` binary is not installed"
+        if not shutil.which("ydotoold", path=self.env.get("PATH")):
+            return None, "the `ydotoold` daemon binary is not installed"
+        return resolve_socket(self.env)
 
     def check(self):
-        """None when keystrokes can flow, else the exact reason (a line of
-        the §2 decision tree)."""
-        if shutil.which("ydotool", path=self.env.get("PATH")) is None:
-            return "the `ydotool` binary is not installed"
-        if not shutil.which("ydotoold", path=self.env.get("PATH")):
-            return "the `ydotoold` daemon binary is not installed"
-        sock = self.socket_path()
-        if sock != DEFAULT_SOCKET:
-            # an explicit socket: probe it — a dead socket must not half-type
-            if not self._socket_alive(sock):
-                return (f"the ydotool daemon socket {sock} is not accepting "
-                        f"connections (is ydotoold running with it?)")
-        elif not os.path.exists(sock):
-            # default location missing: the service may still serve a session
-            # socket, but without YDOTOOL_SOCKET configured we cannot know
-            return (f"no ydotool socket at {sock} and YDOTOOL_SOCKET is unset "
-                    f"(enable ydotoold.service or point Riko at the daemon)")
-        return None
-
-    def _socket_alive(self, path):
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(1.0)
-            s.connect(path)
-            s.close()
-            return True
-        except OSError:
-            return False
+        """None when keystrokes can flow, else the exact reason."""
+        return self._ready()[1]
 
     def require(self):
         reason = self.check()
@@ -88,10 +164,15 @@ class YdotoolBackend:
         """events: [(keycode, down:bool), …] in press-then-release order."""
         if not events:
             return
-        self.require()
+        sock, reason = self._ready()
+        if reason:
+            raise YdotoolUnavailable(f"{OWNER_SETUP}\nWhat Riko found: {reason}.")
+        env = dict(self.env)
+        if sock:                          # reason is None ⇒ sock is set
+            env["YDOTOOL_SOCKET"] = sock  # explicit; never rely on inheritance
         argv = ["ydotool", "--keydelay", str(self.key_delay_ms), "key"]
         argv += [f"{int(code)}:{1 if down else 0}" for code, down in events]
-        done = self.runner(argv, timeout=30, env=self.env)
+        done = self.runner(argv, timeout=30, env=env)
         if getattr(done, "returncode", 1) != 0:
             err = (getattr(done, "stderr", "") or "").strip()
             raise YdotoolUnavailable(

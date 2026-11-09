@@ -191,6 +191,24 @@ def _is_obsidian_addr(addr):
             and addr[1] in _OBSIDIAN_PORTS)
 
 
+# Same story for AF_UNIX: the live ydotool user service owns
+# /run/user/<uid>/.ydotool_socket (and legacy /run or /tmp sockets). Tests
+# must probe fake listeners bound under tmp_path instead. The pattern is
+# deliberately narrow so pytest tmp sockets keep working.
+_YDOTOOL_SOCK_RE = re.compile(r"^(/run/user/\d+|/run|/tmp)/\.ydotool_socket$")
+
+
+def _is_ydotool_socket_path(addr):
+    return isinstance(addr, str) and bool(_YDOTOOL_SOCK_RE.match(addr))
+
+
+def _ydotool_socket_error(addr):
+    return RuntimeError(
+        f"tests must not contact the real ydotool daemon socket ({addr}): "
+        f"bind a fake AF_UNIX listener under tmp_path instead "
+        f"(docs/TYPING.md testing rules).")
+
+
 def _is_obsidian_hostport(host, port):
     try:
         port = int(port)
@@ -203,18 +221,24 @@ def _is_obsidian_hostport(host, port):
 def _no_obsidian_connect(self, addr):
     if _is_obsidian_addr(addr):
         raise _obsidian_error(addr[1])
+    if _is_ydotool_socket_path(addr):
+        raise _ydotool_socket_error(addr)
     return _REAL_SOCKET_CONNECT(self, addr)
 
 
 def _no_obsidian_connect_ex(self, addr):
     if _is_obsidian_addr(addr):
         raise _obsidian_error(addr[1])
+    if _is_ydotool_socket_path(addr):
+        raise _ydotool_socket_error(addr)
     return _REAL_SOCKET_CONNECT_EX(self, addr)
 
 
 def _no_obsidian_create_connection(address, *args, **kwargs):
     if _is_obsidian_addr(address):
         raise _obsidian_error(address[1])
+    if _is_ydotool_socket_path(address):
+        raise _ydotool_socket_error(address)
     return _REAL_CREATE_CONNECTION(address, *args, **kwargs)
 
 
@@ -262,8 +286,11 @@ _ssl.SSLSocket.connect = _no_obsidian_ssl_connect
 _ssl.SSLSocket.connect_ex = _no_obsidian_ssl_connect_ex
 
 # An ambient YDOTOOL_SOCKET from the owner's session must not steer tests
-# into probing their real daemon.
+# into probing their real daemon. XDG_RUNTIME_DIR likewise: the resolver
+# falls back to $XDG_RUNTIME_DIR/.ydotool_socket, and the owner's value
+# (/run/user/<uid>) points straight at the live socket.
 os.environ.pop("YDOTOOL_SOCKET", None)
+os.environ.pop("XDG_RUNTIME_DIR", None)
 
 
 @pytest.fixture(autouse=True)
@@ -273,12 +300,14 @@ def _clean_session_env():
     what conftest popped is gone for good)."""
     for _v in ("HYPRLAND_INSTANCE_SIGNATURE", "HYPRLAND_CMD",
                "WAYLAND_DISPLAY", "DISPLAY", "SWAYSOCK",
-               "DBUS_SESSION_BUS_ADDRESS", "YDOTOOL_SOCKET"):
+               "DBUS_SESSION_BUS_ADDRESS", "YDOTOOL_SOCKET",
+               "XDG_RUNTIME_DIR"):
         os.environ.pop(_v, None)
     yield
     for _v in ("HYPRLAND_INSTANCE_SIGNATURE", "HYPRLAND_CMD",
                "WAYLAND_DISPLAY", "DISPLAY", "SWAYSOCK",
-               "DBUS_SESSION_BUS_ADDRESS", "YDOTOOL_SOCKET"):
+               "DBUS_SESSION_BUS_ADDRESS", "YDOTOOL_SOCKET",
+               "XDG_RUNTIME_DIR"):
         os.environ.pop(_v, None)
 
 

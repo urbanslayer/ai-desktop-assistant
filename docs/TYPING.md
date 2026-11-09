@@ -129,18 +129,38 @@ File writes (Kate and Obsidian create/overwrite) are limited to $HOME, refuse do
 
 ## Owner setup (shown by the tools when ydotool is missing)
 
+`ydotool` 1.0.4 (Arch) ships a **systemd user service** (`/usr/lib/systemd/user/ydotool.service`,
+`ExecStart=/usr/bin/ydotoold`). Enabling it once is normally all it takes:
+
 ```
 sudo pacman -S ydotool
-# uinput access for the daemon (one-time):
+systemctl --user enable --now ydotool.service
+```
+
+The service creates its socket at **`$XDG_RUNTIME_DIR/.ydotool_socket`** (e.g.
+`/run/user/1000/.ydotool_socket`, mode 0600, owned by the user). Riko finds it automatically: the socket
+search order is `YDOTOOL_SOCKET` → `$XDG_RUNTIME_DIR/.ydotool_socket` (falling back to
+`/run/user/<uid>/.ydotool_socket` when `XDG_RUNTIME_DIR` is unset) → `/tmp/.ydotool_socket`, and each
+candidate is probed with an AF_UNIX connect (1 s timeout) — the first one that answers wins, and Riko
+always passes the resolved path to the `ydotool` child explicitly as `YDOTOOL_SOCKET` in its environment
+(the child runs with a stripped session env, so it never has to rediscover the socket).
+
+`/dev/uinput` normally needs no setup: logind grants it to the active local session through the uaccess
+ACL. Only if `ydotoold` logs that it cannot open `/dev/uinput` do the udev/`input`-group steps apply:
+
+```
 echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/80-uinput.rules
 sudo udevadm control --reload && sudo udevadm trigger
 sudo usermod -aG input $USER   # log out and in again
-systemctl --user enable --now ydotool.service
 ```
 
 Note for the owner: membership of `input` lets any program you run read every input device (e.g. a
 keylogger). The alternative is a system (root) `ydotoold` with its socket chowned to you; Riko supports a
 custom `YDOTOOL_SOCKET` path either way.
+
+Harmless daemon log lines (verified on the owner's machine): `WARNING: running xinput against an Xwayland
+server` and `unable to find device pointer:ydotoold virtual device` — `ydotoold` only tries to tune pointer
+acceleration via xinput; keyboard injection is unaffected.
 
 Obsidian: install community plugin "Local REST API", enable it, copy its API key into Riko's tray
 "Obsidian…" dialog (or `riko-ctl obsidian-key`), which writes `~/.config/riko/obsidian.json` (0600).
@@ -149,4 +169,6 @@ Obsidian: install community plugin "Local REST API", enable it, copy its API key
 
 Tests never send real keystrokes, never contact a real ydotoold socket, Obsidian or Kate, and never touch
 the owner's session (the tests/conftest.py guard must also block `ydotool`, `ydotoold`, `wl-copy`,
-`wl-paste`, `kate` and connections to 127.0.0.1:27124/27123). Fake runners and a fake HTTP server only.
+`wl-paste`, `kate`, connections to 127.0.0.1:27124/27123, and AF_UNIX connects to a real
+`/run/user/<uid>/.ydotool_socket`-style path — socket discovery tests bind fake listeners under tmp_path
+and the guard pops `YDOTOOL_SOCKET`/`XDG_RUNTIME_DIR`). Fake runners and a fake HTTP server only.
