@@ -20,11 +20,16 @@ a compositor keybind or a script, without focusing her first.
     riko-ctl deny           say no (Esc in her window also works; a timeout denies by itself)
     riko-ctl browser-status is the Riko Helper Firefox extension connected?
     riko-ctl browser-token  the pairing token for the Firefox extension (options page)
+    riko-ctl obsidian-key   check/store the Obsidian Local REST API key
+                            (no argument = hidden prompt, blank answer just
+                             checks; `obsidian-key <key>` stores it; saved
+                             0600 in ~/.config/riko/obsidian.json)
     riko-ctl quit
     riko-ctl status
 
 Standard library only, so it starts fast and needs no virtualenv.
 """
+import getpass
 import json
 import os
 import shutil
@@ -38,7 +43,7 @@ APP_ID = "riko"
 COMMANDS = {"type", "talk", "talk-start", "talk-stop", "toggle", "show", "hide", "forget",
             "personas", "persona", "persona-next", "quit", "status",
             "approve", "deny", "browser-status", "browser-token", "wave", "listen-mode",
-            "desktop-sense"}
+            "desktop-sense", "obsidian-key"}
 
 
 def focus_window():
@@ -70,6 +75,13 @@ def main():
         body = {"mode": sys.argv[2].strip().lower()}
     if cmd == "desktop-sense" and len(sys.argv) > 2:
         body = {"enabled": sys.argv[2].strip().lower()}
+    if cmd == "obsidian-key":
+        # the key is a secret: prompt (hidden) when not given, and prefer
+        # the tray dialog when there is no terminal to type into
+        key = " ".join(sys.argv[2:]).strip()
+        if not key and sys.stdin.isatty():
+            key = getpass.getpass("Obsidian Local REST API key (blank = just check): ").strip()
+        body = {"key": key}
     if cmd in ("type", "show"):
         focus_window()
     request = urllib.request.Request(f"{URL}/control/{cmd}", data=json.dumps(body).encode(),
@@ -90,6 +102,15 @@ def main():
         print(f"token: {reply['token']}")
         print(f"port:  {reply.get('port')}")
         print(f"firefox extension connected: {'yes' if reply.get('connected') else 'no'}")
+        sys.exit(0)
+    if cmd == "obsidian-key" and reply.get("ok", True):
+        if body.get("key"):
+            print("Obsidian key saved (~/.config/riko/obsidian.json, 0600)")
+        elif reply.get("set"):
+            print("obsidian key: set")
+        else:
+            print("obsidian key: not set — riko-ctl obsidian-key <key> "
+                  "or the tray Obsidian…")
         sys.exit(0)
     if cmd in ("status", "personas", "persona", "persona-next", "browser-status",
                "listen-mode", "desktop-sense") or not reply.get("ok", True):
