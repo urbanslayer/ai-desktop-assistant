@@ -37,7 +37,8 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, Qt, QTim
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import (QApplication, QInputDialog, QLineEdit, QMenu,
+                               QSystemTrayIcon)
 
 from riko import asr, client_tools, hub_client, shortcuts, tts, viewer
 from riko import roam as roam_state
@@ -959,6 +960,19 @@ def main():
                     "port": (d.get("client") or {}).get("browser_port",
                                                         client_tools.DEFAULT_BROWSER_PORT),
                     "connected": bool(browser and browser.connected())}
+        elif cmd == "obsidian-key":
+            # docs/TYPING.md: the Obsidian Local REST API key lands in
+            # ~/.config/riko/obsidian.json (0600) — tray "Obsidian…" or
+            # `riko-ctl obsidian-key [key]`. Never echoed back, never to the hub.
+            from riko.appedit import obsidian as _ob
+            key = str(args.get("key", "")).strip()
+            if key:
+                try:
+                    _ob.save_key(key)
+                except Exception as e:      # ToolError on an empty/blank key
+                    return {"ok": False, "error": str(e)}
+                return {"ok": True, "set": True}
+            return {"ok": True, "set": _ob.key_is_set()}
         elif cmd == "history-import":
             msgs = args.get("messages")
             if not isinstance(msgs, list) or not msgs:
@@ -1131,6 +1145,34 @@ def main():
     token_action = QAction("Show browser token", menu)
     token_action.triggered.connect(show_browser_token)
     menu.addAction(token_action)
+
+    # Obsidian (docs/TYPING.md): paste the Local REST API plugin's key into
+    # a password dialog -> ~/.config/riko/obsidian.json (0600). The value
+    # is never printed; only 'saved / cleared?' is mirrored in the tray.
+    def obsidian_dialog():
+        from riko.appedit import obsidian as _ob
+        have = "set" if _ob.key_is_set() else "not set yet"
+        key, ok = QInputDialog.getText(
+            None, "Obsidian API key",
+            f"Local REST API key (currently: {have}).\n"
+            "Obsidian → Settings → Community plugins → Local REST API → "
+            "API key.", QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        key = str(key or "").strip()
+        if not key:
+            tray.showMessage("Riko", f"Obsidian key is {have} — type it to save.")
+            return
+        try:
+            _ob.save_key(key)
+            tray.showMessage("Riko", "Obsidian key saved "
+                                     "(~/.config/riko/obsidian.json)")
+        except Exception as e:
+            tray.showMessage("Riko", f"Couldn't save the Obsidian key: {e}")
+
+    obsidian_action = QAction("Obsidian…", menu)
+    obsidian_action.triggered.connect(obsidian_dialog)
+    menu.addAction(obsidian_action)
     tray.setContextMenu(menu)
 
     show_window()

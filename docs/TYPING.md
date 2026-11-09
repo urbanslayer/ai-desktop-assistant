@@ -67,7 +67,7 @@ fix the spelling in the last paragraph"). Speech is not spoken back; a small "di
 
 ### Obsidian (Local REST API)
 
-- `obsidian_status()` read/ALWAYS: plugin reachable, vault name, active file.
+- `obsidian_status()` read/ALWAYS: plugin reachable, key accepted, Obsidian/vault name when the plugin reports one (current plugin versions answer `GET /` with `{status, authenticated, versions}` — no vault name; the active file is read from `GET /active/`'s `Content-Location` header).
 - `obsidian_open(path, new_leaf?)` read/ALWAYS: `POST /open/{path}`.
 - `obsidian_create(path, text)` act/ASK: `PUT /vault/{path}` (refuses to overwrite an existing note unless
   `overwrite=true`, which always ASKs).
@@ -75,20 +75,38 @@ fix the spelling in the last paragraph"). Speech is not spoken back; a small "di
 - `obsidian_append(text, path?)` act/ASK (ALWAYS in dictation targeting Obsidian): `POST /vault/{path}` or
   `POST /active/`.
 - `obsidian_edit(path?, find, replace)` act/ASK: read → exact-match replace (must match exactly once, else
-  error with the count) → `PUT`; the approval shows a small diff. Heading/block insertion via `PATCH` with
-  `Operation`/`Target-Type` headers when asked to add under a heading.
+  error with the count) → `PUT`; the approval shows a small diff. Heading/block insertion goes through the
+  plugin's targeted `PATCH`: current plugin form is the target in the URL (`/vault/{path}/heading/{H}`, one
+  segment per nesting level) plus an `Operation: append|prepend|replace` header and the raw content as the
+  body — the old `Target-Type`/`Target` **header** form is deprecated plugin-side (works only with
+  `Markdown-Patch-Version: 1`, removed in plugin 6.0), so Riko uses the URL form.
 - `obsidian_search(query)` read/ALWAYS: `POST /search/simple/?query=`.
+
+Implementation choices (E): the self-signed cert is handled by **pinning the plugin's CA** — fetched
+once from `/obsidian-local-rest-api.crt` over an unverified connection (host is hard-checked to
+127.0.0.1/localhost), cached at `~/.config/riko/obsidian_ca.pem` (0600) and verified against ever
+after; a rotated cert fails loudly with instructions, and an `"insecure": true` config entry is the
+documented escape hatch (loopback only). Because only the client can build a real diff, the edit tools
+(`obsidian_edit`, `kate_edit`) carry `permission_default: "always"` on the hub and raise their own
+confirmation through the runtime with the diff as the question — one prompt, showing the actual change,
+instead of a hub summary plus a second ask. `kate_new` keeps the hub ASK, and asks a second time with a
+diff only when it would replace existing content (`overwrite=true`).
 
 ### Kate
 
 Kate has no document API over D-Bus, so:
 
-- `kate_open(path, line?)` act/ALWAYS: `kate -b [-l line] path` (reuses the running instance); creating a
-  new file: `kate_new(path?, text?)` act/ASK writes the file (or opens an untitled tab with `kate -b
-  --new`... check the real flags with `kate --help`) and opens it.
-- `kate_tabs()` read/ALWAYS: Kate windows from DesktopSense (title = active document) plus Kate's session
-  file list when readable (`~/.local/share/kate/sessions/*.katesession` / `anonymous.katesession`, read-only)
-  — report what's known honestly.
+- `kate_open(path, line?)` act/ALWAYS: `kate [-l line] path` — flags verified against `kate --help`
+  (2026-11-09): plain `kate <file>` already reuses the running instance; **do not pass `-b/--block`**,
+  which waits until the document closes and would hang the tool call. Line jump is `-l/--line`
+  (column `-c/--column`). Creating a new file: `kate_new(path?, text?)` act/ASK writes the file and
+  opens it; without a path it opens an untitled tab with `kate --tempfile` (an empty temporary
+  document, deleted after use) — `--help` shows there is no "new tab" flag: `-n/--new` starts a whole
+  new *instance*, `--startanon` implies it.
+- `kate_tabs()` read/ALWAYS: Kate windows from DesktopSense (title = active document; a `*`/"modified"
+  marker in the title means unsaved) plus Kate's session file list when readable
+  (`~/.local/share/kate/sessions/*.katesession`, INI-style `[Document N]` sections with `URL=` lines —
+  an empty `URL=` is an untitled document; read-only) — report what's known honestly.
 - `kate_edit(path, find, replace)` act/ASK: edits the file on disk (exact-match, diff in the approval);
   Kate reloads it (warn the owner if the tab has unsaved changes: the window title has `*`/"modified").
 - `find_file(query, under?)` read/ALWAYS: search under the home directory (default roots: ~/Documents,
