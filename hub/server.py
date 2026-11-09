@@ -1591,6 +1591,14 @@ def create_app(data_dir, api_key: str | None = None,
         # (empty set otherwise).
         actions = _body.apply_asked(
             text, actions, body_actions if persona.get("embodied", True) else [])
+        # TTS floor: the store and the audio routes must never see an empty
+        # reply — breeze-tts rejects an empty input (HTTP 400 'input is
+        # required'). A cut-off stream can arrive as '' even after brain's
+        # retry, and emotion/action stripping can empty a tag-only reply
+        # ('[happy]' is all the model left). Fall back to the placeholder.
+        if not answer.strip():
+            log.info("empty reply persona=%s; storing the empty-reply placeholder", pid)
+            answer = _brain.EMPTY_REPLY
         tools_used = out["tools_used"]
         if wx_used:
             # the hub's own pre-fetched weather counts like a tool call for
@@ -1634,6 +1642,11 @@ def create_app(data_dir, api_key: str | None = None,
         # the spoken text is the cleaned reply (hub/speech.py): audio and any
         # client-side TTS use it, the bubble keeps all of it.
         spoken = _speech.speech_text(answer)
+        if not spoken.strip():
+            # nothing speakable survived the cleaner (a wordless reply):
+            # never hand '' to TTS, speak the placeholder instead; the bubble
+            # keeps what the model wrote (e.g. a bare link)
+            spoken = _speech.speech_text(_brain.EMPTY_REPLY)
         assistant_id = store.add_message(pid, "assistant", answer, source,
                                          emotion=emotion, tools=tools_used,
                                          actions=actions, speech=spoken,

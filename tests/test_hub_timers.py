@@ -746,8 +746,8 @@ def test_chaining_enabled_depth_cap(tmp_path):
     # fire 1 asks for a link (depth 1); fire 2 (depth-3 parent) asks again
     # and must hit the chain limit
     link_call = call_step("timer", {"prompt": "next link", "time": "1h"})
-    steps = [link_call, {"content": "queued the next one"},
-             link_call, {"content": "the chain ends here"}]
+    steps = [link_call, {"content": "queued the next one."},
+             link_call, {"content": "the chain ends here."}]
     client, llm, app = timer_client(tmp_path, steps)
     assert client.put("/api/settings",
                       json={"timers": {"allow_chaining": True}}).status_code == 200

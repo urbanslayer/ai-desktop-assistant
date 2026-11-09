@@ -20,6 +20,20 @@ _BLANK_RUN = re.compile(r"\n{3,}")
 
 _MAX_TOKENS_RETRY_CAP = 16384  # the one doubling retry stops here
 
+# Cut-off reply guard (docs/API.md "Cut-off reply guard"): some template
+# builds (live: qwen4exp on vLLM with chat_template_kwargs.enable_thinking
+# = false) end the stream after a couple of words with finish_reason
+# 'stop'. A reply this short without terminal punctuation is the cut-off,
+# not the answer.
+_CUT_OFF_WORDS = 4
+_CUT_OFF_CHARS = 25
+_TERMINAL = ".!?…"
+_CLOSERS = "\"'“”’«»)]}"
+_VARIATION = "\ufe0f\u200d\u20e3"
+# leading [happy]-style tags (emotion + action) are not part of the words
+# we count; a bracket token right before '(' / '[' is a markdown link, keep it
+_LEAD_TAG = re.compile(r"\s*[\[({<][A-Za-z][A-Za-z _-]{0,23}[\])}>](?![\(\[])")
+
 LLM_DEFAULTS = {
     "base_url": "",
     "api_key": "",
@@ -67,6 +81,76 @@ def _finalize_calls(calls: dict) -> list[dict]:
         out.append({"id": slot["id"] or f"call_{i}", "name": slot["name"],
                     "arguments": slot["arguments"] or ""})
     return out
+
+
+def _strip_lead_tags(text: str) -> str:
+    """Drop leading [happy]/[wave]-style tags before judging a reply: the
+    server strips them later anyway, so '[happy]' alone IS an empty reply."""
+    while True:
+        m = _LEAD_TAG.match(text)
+        if not m:
+            return text.strip()
+        text = text[m.end():]
+
+
+def _ends_emoji(text: str) -> bool:
+    t = text.rstrip(_VARIATION)
+    if not t:
+        return False
+    cp = ord(t[-1])
+    return cp >= 0x1F000 or 0x2600 <= cp <= 0x27BF or 0x2B00 <= cp <= 0x2BFF
+
+
+def _ends_complete(text: str) -> bool:
+    """Does the reply end like a finished thought: terminal punctuation
+    (. ! ? …), optionally followed by closing quotes/brackets ('Done!'
+    '"Done!"' '(done!)'), or a closing emoji?"""
+    t = (text or "").rstrip()
+    if not t:
+        return False
+    if _ends_emoji(t):
+        return True
+    core = t.rstrip(_CLOSERS) or t
+    return bool(core) and core[-1] in _TERMINAL
+
+
+def _looks_cut_off(text: str, finish: str | None) -> bool:
+    """Is this final, tool-call-free reply a stream that died mid-sentence?
+    `text` must already be clean()."""
+    probe = _strip_lead_tags(text)
+    if not probe:
+        # empty / whitespace-only, or the reply was nothing but tags; an
+        # empty 'length' reply is the token-doubling retry's territory above
+        return finish != "length"
+    if finish not in ("stop", "length"):
+        return False
+    if _ends_complete(probe):
+        return False
+    if finish == "length":
+        return True  # the token budget died mid-sentence, whatever its size
+    return len(probe.split()) < _CUT_OFF_WORDS or len(probe) < _CUT_OFF_CHARS
+
+
+def _retry_kwargs(kwargs: dict) -> tuple[dict, bool]:
+    """Same kwargs, minus an explicit thinking-off switch: a cut-off stream
+    with enable_thinking=false usually means the template cut into the
+    answer, so the retry lets the model think again. reasoning_effort and
+    every other passthrough key stay. Returns (kwargs, dropped_thinking)."""
+    eb = kwargs.get("extra_body")
+    if not isinstance(eb, dict):
+        return kwargs, False
+    ctk = eb.get("chat_template_kwargs")
+    if not (isinstance(ctk, dict) and ctk.get("enable_thinking") is False):
+        return kwargs, False
+    eb2 = dict(eb)
+    ctk2 = {k: v for k, v in ctk.items() if k != "enable_thinking"}
+    if ctk2:
+        eb2["chat_template_kwargs"] = ctk2
+    else:
+        eb2.pop("chat_template_kwargs", None)
+    kw2 = dict(kwargs)
+    kw2["extra_body"] = eb2
+    return kw2, True
 
 
 def _attempt(client, model, messages, temperature, budget, kwargs, want_tools):
@@ -135,7 +219,10 @@ def _attempt(client, model, messages, temperature, budget, kwargs, want_tools):
 def _run(client, model, messages, temperature, max_tokens,
          reasoning_effort=None, extra_body=None, tools=None):
     """A completion with the reasoning-model token retry: empty reply +
-    finish_reason 'length' -> one retry at double the budget, capped."""
+    finish_reason 'length' -> one retry at double the budget, capped; plus
+    the cut-off reply guard: a final answer (no tool calls) that looks like
+    a stream that died mid-sentence gets ONE retry on the same messages.
+    The two share one retry budget: at most one second attempt per call."""
     kwargs = {}
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
@@ -147,9 +234,11 @@ def _run(client, model, messages, temperature, max_tokens,
 
     text, finish, thought, tool_calls = _attempt(
         client, model, messages, temperature, max_tokens, kwargs, bool(tools))
+    retried = False
     if not text.strip() and not tool_calls and finish == "length":
         retry = min(max_tokens * 2, _MAX_TOKENS_RETRY_CAP)
         if retry > max_tokens:
+            retried = True
             print(f"[hub-brain] ran out of tokens while thinking; retrying with {retry}")
             text, finish, thought, tool_calls = _attempt(
                 client, model, messages, temperature, retry, kwargs, bool(tools))
@@ -159,6 +248,29 @@ def _run(client, model, messages, temperature, max_tokens,
                   "in the hub settings, set llm.reasoning_effort, or disable thinking, "
                   "e.g. llm.extra_body: {chat_template_kwargs: {enable_thinking: false}} "
                   "for Qwen on vLLM/llama.cpp")
+    if not tool_calls and not retried:
+        probe = clean(text)
+        if _looks_cut_off(probe, finish):
+            print(f"[hub-brain] reply looked cut off ({len(probe)} chars, "
+                  f"finish={finish}); retrying once")
+            retry_kwargs, dropped = _retry_kwargs(kwargs)
+            if dropped:
+                print("[hub-brain] cut-off retry: dropped enable_thinking=false, "
+                      "this attempt may think")
+            r_text, r_finish, r_thought, r_calls = _attempt(
+                client, model, messages, temperature, max_tokens,
+                retry_kwargs, bool(tools))
+            if r_calls:  # the retry found a tool to call: always the better turn
+                return r_text, r_calls
+            r_probe = clean(r_text)
+            # take the retry when it reads complete or says more than the
+            # fragment did; otherwise keep the longer of the two (the
+            # fragment — an empty retry can never be the longer one)
+            if r_probe and (_ends_complete(_strip_lead_tags(r_probe))
+                            or len(r_probe) > len(probe)):
+                text = r_text
+    # both attempts cut off with nothing to show -> '' (the caller's
+    # EMPTY_REPLY placeholder takes over)
     return text, tool_calls
 
 
