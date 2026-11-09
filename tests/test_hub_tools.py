@@ -415,11 +415,11 @@ def test_max_steps_forces_final_plain_answer(tmp_path):
     client, llm = llm_client(tmp_path, [
         call_step("get_time", {}),
         call_step("get_time", {}),          # keeps insisting on tools
-        {"content": "fine, here is my answer"},
+        {"content": "fine, here is my answer."},
     ])
     assert client.put("/api/settings", json={"tools": {"max_steps": 3}}).status_code == 200
     res = client.post("/api/chat", json={"text": "hi"}).json()
-    assert res["reply"] == "fine, here is my answer"
+    assert res["reply"] == "fine, here is my answer."
     assert len(res["tools_used"]) == 1        # one batch actually ran
     assert len(llm.chat_requests) == 3        # planning + planning + final
     last = llm.chat_requests[-1]

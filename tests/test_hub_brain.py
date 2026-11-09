@@ -32,6 +32,10 @@ class FakeHubLLM:
         # requests whose max_tokens < truncate_below get only hidden reasoning,
         # empty content and finish_reason='length', like a reasoning model starved of tokens.
         self.truncate_below = None
+        # list of {content, finish, tool_call: (name, arguments)} — one canned
+        # streamed reply per chat request; the LAST entry repeats, so a
+        # runaway retry loop cannot hang a test that caps at one retry.
+        self.script = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -66,10 +70,27 @@ class FakeHubLLM:
                 outer.chat_requests.append(body)
                 if outer.fail:
                     return self._send({"error": {"message": "boom"}}, 500)
+                entry = outer._next_script()
                 if body.get("stream"):
                     if not outer.stream_ok:
                         return self._send({"error": {"message": "streaming not supported"}}, 400)
-                    return self._sse(body)
+                    return self._sse(body, entry)
+                if entry is not None:  # scripted answer, non-streaming shape
+                    msg = {"role": "assistant", "content": entry.get("content") or ""}
+                    if entry.get("tool_call"):
+                        name, arguments = entry["tool_call"]
+                        msg["tool_calls"] = [{"id": "call_fake", "type": "function",
+                                              "function": {"name": name,
+                                                          "arguments": arguments}}]
+                    return self._send({
+                        "id": "chatcmpl-fake", "object": "chat.completion", "created": 0,
+                        "model": outer.model_id,
+                        "choices": [{"index": 0,
+                                     "finish_reason": entry.get("finish", "stop"),
+                                     "message": msg}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                                  "total_tokens": 2},
+                    })
                 if self._truncated(body):  # all budget on thinking, nothing left to say
                     return self._send({
                         "id": "chatcmpl-fake", "object": "chat.completion", "created": 0,
@@ -87,8 +108,21 @@ class FakeHubLLM:
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 })
 
-            def _sse(self, body):
-                if self._truncated(body):  # thinking deltas, zero content, finish='length'
+            def _sse(self, body, entry=None):
+                if entry is not None:  # scripted reply: content, finish, optional tool call
+                    content = entry.get("content") or ""
+                    finish = entry.get("finish", "stop")
+                    deltas = [{"role": "assistant"}]
+                    if content:
+                        half = max(1, len(content) // 2)
+                        deltas += [{"content": content[:half]}, {"content": content[half:]}]
+                    if entry.get("tool_call"):
+                        name, arguments = entry["tool_call"]
+                        deltas.append({"tool_calls": [{
+                            "index": 0, "id": "call_fake", "type": "function",
+                            "function": {"name": name, "arguments": arguments}}]})
+                    deltas.append({})
+                elif self._truncated(body):  # thinking deltas, zero content, finish='length'
                     deltas = [{"role": "assistant"}, {"reasoning_content": "hmm " * 20}, {}]
                     finish = "length"
                 else:
@@ -121,6 +155,11 @@ class FakeHubLLM:
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         self.port = self.httpd.server_address[1]
+
+    def _next_script(self):
+        if not self.script:
+            return None
+        return self.script.pop(0) if len(self.script) > 1 else self.script[0]
 
     @property
     def base_url(self):
@@ -285,3 +324,128 @@ def test_server_failure_raises(fake_llm):
 def test_chat_without_base_url_raises():
     with pytest.raises(RuntimeError, match="LLM not configured"):
         brain_mod.Brain().chat({"base_url": ""}, [{"role": "user", "content": "hi"}])
+
+
+# ── cut-off reply guard (docs/API.md "Cut-off reply guard") ─────────────────
+
+def test_cutoff_stop_fragment_gets_one_retry(fake_llm):
+    # live failure: thinking off -> stream ends with finish 'stop' after
+    # a couple of words and the hub used to store/speak the fragment
+    fake_llm.script = [{"content": "Oh! Then", "finish": "stop"},
+                       {"content": "Oh! Then you must be new here, senpai.", "finish": "stop"}]
+    answer, _ = chat(fake_llm)
+    assert answer == "Oh! Then you must be new here, senpai."
+    assert len(fake_llm.chat_requests) == 2
+
+
+def test_complete_reply_never_retried(fake_llm):
+    fake_llm.script = [{"content": "Done!", "finish": "stop"}]  # short but complete
+    answer, _ = chat(fake_llm)
+    assert answer == "Done!"
+    assert len(fake_llm.chat_requests) == 1
+
+
+def test_empty_reply_gets_one_retry(fake_llm):
+    fake_llm.script = [{"content": "", "finish": "stop"},
+                       {"content": "Sorry, I drifted — what were we doing?", "finish": "stop"}]
+    answer, _ = chat(fake_llm)
+    assert answer == "Sorry, I drifted — what were we doing?"
+    assert len(fake_llm.chat_requests) == 2
+
+
+def test_length_truncation_mid_sentence_gets_one_retry(fake_llm):
+    # long enough to dodge the short-reply rule; finish='length' says the
+    # token budget died mid-sentence, so it is still a cut-off
+    fake_llm.script = [{"content": "The capital of France is actually a remarkably",
+                        "finish": "length"},
+                       {"content": "The capital of France is Paris.", "finish": "stop"}]
+    answer, _ = chat(fake_llm)
+    assert answer == "The capital of France is Paris."
+    assert len(fake_llm.chat_requests) == 2
+
+
+def test_long_complete_stop_reply_not_retried(fake_llm):
+    fake_llm.script = [{"content": "Paris is the capital of France, senpai.",
+                        "finish": "stop"}]
+    answer, _ = chat(fake_llm)
+    assert answer == "Paris is the capital of France, senpai."
+    assert len(fake_llm.chat_requests) == 1
+
+
+def test_tool_call_turn_never_retried(fake_llm):
+    # 'Let me check that.' reads like a fragment with no tools offered, but
+    # the turn DID call a tool: the guard must not touch it
+    fake_llm.script = [{"content": "Let me check that.", "finish": "tool_calls",
+                        "tool_call": ("web_search", '{"q": "x"}')}]
+    tools = [{"type": "function", "function": {"name": "web_search",
+                                               "parameters": {"type": "object"}}}]
+    out = brain_mod.Brain().chat_tools(llm_settings(fake_llm),
+                                       [{"role": "user", "content": "hi"}], tools)
+    assert out["tool_calls"] and out["tool_calls"][0]["name"] == "web_search"
+    assert len(fake_llm.chat_requests) == 1
+
+
+def test_cutoff_retry_drops_enable_thinking_keeps_the_rest(fake_llm):
+    fake_llm.script = [{"content": "Right away", "finish": "stop"},
+                       {"content": "Right away, here is your weather, senpai!",
+                        "finish": "stop"}]
+    answer, _ = chat(fake_llm, reasoning_effort="low",
+                     extra_body={"chat_template_kwargs": {"enable_thinking": False},
+                                 "top_k": 5})
+    assert answer == "Right away, here is your weather, senpai!"
+    first, second = fake_llm.chat_requests
+    assert first["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "chat_template_kwargs" not in second      # the retry may think again
+    assert second["top_k"] == 5                      # every other key survives
+    assert second["reasoning_effort"] == "low"       # reasoning_effort kept
+
+
+def test_cutoff_retry_worse_than_original_keeps_original(fake_llm):
+    fake_llm.script = [{"content": "Oh! Then", "finish": "stop"},
+                       {"content": "Hmm", "finish": "stop"}]
+    answer, _ = chat(fake_llm)
+    assert answer == "Oh! Then"  # keep the longer of the two
+    assert len(fake_llm.chat_requests) == 2
+
+
+def test_cutoff_retry_cap_is_one(fake_llm):
+    fake_llm.script = [{"content": "Oh", "finish": "stop"},
+                       {"content": "Then", "finish": "stop"}]
+    chat(fake_llm)
+    assert len(fake_llm.chat_requests) == 2  # never a third attempt
+
+
+def test_still_empty_after_retry_falls_back_to_placeholder(fake_llm):
+    fake_llm.script = [{"content": "", "finish": "stop"},
+                       {"content": "   ", "finish": "stop"}]
+    answer, _ = chat(fake_llm)
+    assert answer.startswith("...sorry senpai")
+    assert len(fake_llm.chat_requests) == 2
+
+
+def test_only_emotion_tag_reply_retries_then_placeholder(fake_llm):
+    fake_llm.script = [{"content": "[happy]", "finish": "stop"},
+                       {"content": "[happy]", "finish": "stop"}]
+    answer, _ = chat(fake_llm)
+    # a tag-only reply is an empty reply for the guard (the server strips
+    # '[happy]' later anyway); the retry is judged the same way
+    assert len(fake_llm.chat_requests) == 2
+    assert answer == "[happy]"  # brain keeps the raw text; the server's
+                                # EMPTY_REPLY floor turns it into the placeholder
+
+
+def test_cut_off_unit_rules():
+    cut = brain_mod._looks_cut_off
+    assert cut("Oh! Then", "stop")
+    assert cut("Oh", "stop")
+    assert cut("Right away", "stop")
+    assert cut("", "stop")
+    assert cut("[happy]", "stop")
+    assert cut("The capital of France is remarkably", "length")
+    assert not cut("Nice to meet you, senpai!", "stop")
+    assert not cut('"All done."', "stop")      # closer after terminal punct
+    assert not cut("(found it!)", "stop")
+    assert not cut("Sure thing, senpai! 🎉", "stop")  # emoji tail closes it
+    assert not cut("Here is the link https://example.com/docs/page", "stop")  # >25 chars
+    assert not cut("", "length")               # token-retry territory
+    assert not cut("Yes", "tool_calls")        # never guard a tool turn

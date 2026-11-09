@@ -663,6 +663,37 @@ say you don't know." — same shared cap (promise → claim → refusal →
 tool-talk, first hit wins), same discard rules; the hub log records
 `[turn] nudged: cited tool results without a tool call persona=<id>`.
 
+#### Cut-off reply guard
+
+Some template builds end the stream after a couple of words with
+`finish_reason: stop` (live case: qwen4exp on vLLM with
+`llm.extra_body.chat_template_kwargs.enable_thinking: false` — replies like
+`Oh! Then`, `Right away`, or empty; the empty one then made breeze-tts fail
+with `HTTP 400 input is required`). The guard lives in `hub/brain.py` and
+applies to every final answer (chat and chat_tools, tool-call turns
+excluded): the cleaned reply (leading `[happy]`-style tags not counted) is
+judged cut off when it is empty/whitespace-only with `finish` other than
+`length`, OR `finish` is `stop`/`length` and the reply is under 4 words or
+under 25 chars without terminal punctuation (`. ! ? …`, optional closing
+quote/bracket after them, or a closing emoji), OR `finish` is `length` and
+the reply does not end on terminal punctuation. A cut-off reply gets **one**
+retry on the same messages (shared budget with the token-doubling retry for
+empty `length` replies — never more than one second attempt). If the first
+attempt set `enable_thinking: false`, the retry **drops that key** so the
+model may think again (`reasoning_effort` and every other passthrough key
+are kept). The retry wins when it is non-empty and either ends on terminal
+punctuation or is longer; otherwise the longer of the two is kept. If both
+attempts stay empty, `chat` answers with the placeholder
+`"...sorry senpai, I lost my train of thought."`.
+
+Server-side floor (`POST /api/chat`): after emotion/action stripping the
+stored `reply` and the cleaned `speech` are never empty either — a tag-only
+or wordless reply is replaced by the same placeholder, so an audio route can
+never hand `''` to Breeze (`breeze-tts HTTP 400 input is required`). The log
+records `[hub-brain] reply looked cut off (<n> chars, finish=<f>); retrying
+once` and, on the server, `empty reply persona=<id>; storing the
+empty-reply placeholder`.
+
 
 ### GET /api/geocode
 

@@ -601,3 +601,52 @@ def test_root_serves_config_page(client):
     assert "text/html" in r.headers["content-type"]
     assert "<html" in r.text.lower()
     assert "localStorage" in r.text  # the page stores the hub key client-side
+
+
+# ── empty-reply floor (cut-off replies, docs/API.md "Cut-off reply guard") ──
+
+def test_tag_only_reply_stores_placeholder_not_empty(tmp_path, fake_llm):
+    # the live failure with thinking off: the model stops after the
+    # emotion tag alone. brain retries once; the server must still never
+    # store '' nor hand '' to TTS (breeze 400 'input is required').
+    fake_llm.script = [{"content": "[happy]", "finish": "stop"}]
+    client = make_client(tmp_path, llm_defaults={"base_url": fake_llm.base_url,
+                                                 "model": "auto", "max_tokens": 1024})
+    r = client.post("/api/chat", json={"text": "hi"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["reply"].startswith("...sorry senpai")
+    assert data["speech"].strip()          # never an empty string to TTS
+    assert data["emotion"] == "happy"      # the parsed tag survives
+    hist = client.get("/api/history").json()["messages"]
+    assert hist[-1]["role"] == "assistant"
+    assert hist[-1]["content"].startswith("...sorry senpai")
+    assert hist[-1]["speech"].strip()
+    assert len(fake_llm.chat_requests) == 2  # brain's single cut-off retry
+
+
+def test_audio_route_never_synthesises_empty_text(tmp_path, fake_llm, monkeypatch):
+    from hub import voice as voice_mod
+
+    spoken_to_breeze = []
+
+    def fake_speech(self, text, **kw):
+        spoken_to_breeze.append(text)
+        return b"RIFF" + b"\x00" * 36       # junk WAV body, shape is enough
+
+    monkeypatch.setattr(voice_mod.Breeze, "speech", fake_speech)
+    fake_llm.script = [{"content": "", "finish": "stop"}]
+    client = make_client(tmp_path, llm_defaults={"base_url": fake_llm.base_url,
+                                                 "model": "auto", "max_tokens": 1024})
+    assert client.put("/api/settings",
+                      json={"tts": {"base_url": fake_llm.base_url}}).status_code == 200
+    r = client.post("/api/chat", json={"text": "hi"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["reply"].startswith("...sorry senpai")
+    assert data["audio_url"]
+    a = client.get(data["audio_url"])
+    assert a.status_code == 200
+    assert spoken_to_breeze, "breeze was never asked to speak"
+    assert all(t.strip() for t in spoken_to_breeze)  # never '' to TTS
+    assert any("sorry senpai" in t for t in spoken_to_breeze)
