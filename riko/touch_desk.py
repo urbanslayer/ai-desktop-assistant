@@ -19,14 +19,19 @@ from __future__ import annotations
 
 import time
 
+from riko.avatar_scale import monitor_rect_for
+
 # ── arbitration timings (docs/TOUCH.md, exact) ──────────────────────
 HOLD_MS = 250        # still this long over a limb -> the page grabs the limb
 MOVE_PX = 6          # move further than this within HOLD_MS -> window drag
 
 # limb rects the page sends in bbox.parts (docs/TOUCH.md); everything else
 # on the window drags it, exactly like before touch existed.
-LIMB_PARTS = frozenset({"head", "hand_left", "hand_right", "arm_left",
-                        "arm_right", "foot_left", "foot_right"})
+# the contract spells them hand_l / arm_r / ...; accept *_left / *_right too
+LIMB_PARTS = frozenset({"head", "hand_l", "hand_r", "arm_l", "arm_r",
+                        "foot_l", "foot_r",
+                        "hand_left", "hand_right", "arm_left", "arm_right",
+                        "foot_left", "foot_right"})
 
 # ── sit-on-edge defaults (docs/TOUCH.md) ────────────────────────────
 SIT_DELTA = 8        # hips within this many px of the screen edge -> sit
@@ -49,6 +54,10 @@ def _num(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _is_limb_part(part) -> bool:
+    return str(part) in LIMB_PARTS
+
+
 def limb_rects(bbox) -> list:
     """[(part, x, y, w, h)] from a bbox post's `parts` dict. A part may be
     [x,y,w,h] or {x,y,w,h}; junk entries are skipped, never raised."""
@@ -57,7 +66,7 @@ def limb_rects(bbox) -> list:
     if not isinstance(parts, dict):
         return out
     for part, rect in parts.items():
-        if str(part) not in LIMB_PARTS:
+        if not _is_limb_part(part):
             continue
         if isinstance(rect, dict):
             raw = [rect.get(k) for k in ("x", "y", "w", "h")]
@@ -241,3 +250,27 @@ def monitor_from_hypr(monitors: list, window_at) -> dict | None:
         if area > best_area:
             best, best_area = {"bottom": y + h, "scale": scale, "name": name}, area
     return best
+
+
+def edge_y_from_hypr(clients: list, monitors: list, match) -> float | None:
+    """Sit line (window-CSS px, i.e. px of window height above the monitor's
+    USABLE bottom) from `hyprctl -j clients` + `-j monitors` rows: find her
+    floating client (match(client) true) and reuse avatar_scale's
+    monitor_rect_for — the same logical-space pick the scroll-zoom uses
+    (bars subtracted, scale divided). Hyprland happily keeps a floating
+    window partly off-screen: a small edge_y IS the sitting case. None =
+    not found / unknown monitor. Pure: rows come from a fixture, a fake
+    runner, or desktop.py's live hyprctl — never from tests."""
+    for c in clients or []:
+        if not isinstance(c, dict) or not match(c):
+            continue
+        rect = monitor_rect_for(c, monitors or [])
+        at = c.get("at")
+        try:
+            ay = float(at[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if rect is None:
+            return None
+        return float(rect[1] + rect[3] - ay)     # usable bottom - window top
+    return None

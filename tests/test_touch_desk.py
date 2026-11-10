@@ -189,3 +189,30 @@ def test_monitor_from_hypr_picks_containing_then_overlap(hypr_monitors):
     assert td.monitor_from_hypr(ms, [-10_000, -10_000]) is None   # nowhere near
     assert td.monitor_from_hypr([], [0, 0]) is None
     assert td.monitor_from_hypr(ms, "junk") is None
+
+
+# ── hyprctl sit-edge maths (fixtures only; live hyprctl never runs here) ──
+
+def _hypr_fixture_rows():
+    import json, pathlib
+    fx = pathlib.Path(__file__).parent / "fixtures"
+    return (json.loads((fx / "hypr_real_clients_riko.json").read_text()),
+            json.loads((fx / "hypr_real_monitors.json").read_text()))
+
+
+def test_edge_y_from_hypr_real_fixture():
+    from riko.avatar_scale import monitor_rect_for
+    clients, monitors = _hypr_fixture_rows()
+    match = lambda c: c.get("initialClass") == "riko"
+    row = next(c for c in clients if match(c))
+    rect = monitor_rect_for(row, monitors)
+    edge = td.edge_y_from_hypr(clients, monitors, match)
+    assert edge == pytest.approx(rect[1] + rect[3] - row["at"][1])
+    # hanging off the bottom: window top 100 px above the usable edge
+    hung = dict(row, at=[row["at"][0], rect[1] + rect[3] - 100])
+    assert td.edge_y_from_hypr([hung], monitors, match) == pytest.approx(100.0)
+    # fully below the edge: negative = the sit case, not an error
+    low = dict(row, at=[row["at"][0], rect[1] + rect[3] + 40])
+    assert td.edge_y_from_hypr([low], monitors, match) == pytest.approx(-40.0)
+    assert td.edge_y_from_hypr(clients, monitors, lambda c: False) is None
+    assert td.edge_y_from_hypr([], monitors, match) is None
