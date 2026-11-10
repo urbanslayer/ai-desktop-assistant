@@ -69,6 +69,8 @@
   .msg.user { background: var(--chip); }
   .msg.ai { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
   .msg .meta { font-size: 10px; color: var(--muted); }
+  .msg.note { background: transparent; color: var(--muted); font-size: 11px;
+              font-style: italic; max-width: 100%; }
   .transcript {
     max-height: 46vh; overflow-y: auto; border: 1px solid var(--line);
     border-radius: 8px; padding: 6px; background: var(--bg);
@@ -459,6 +461,31 @@
         <button class="btn primary small" id="msave">Add / update server</button>
         <button class="btn small" id="mcancel" hidden>Cancel edit</button>
       </div>
+    </div>
+    <div class="card">
+      <!-- Touch round (docs/TOUCH.md "Settings"): the POST /api/touch policy.
+           quiet speaks only for pat/tickle/holds over 3 s; a grab never
+           speaks in any mode. Cooldown + the 10-min cap count SPOKEN
+           reactions only; silently-ignored touches still land in History
+           as a grey note. The desktop tray's Touch reactions writes the
+           same block. -->
+      <h2>Touch <span class="hint" id="tchsrc"></span></h2>
+      <p class="hint">How she reacts when you touch her on the desktop
+        (pat / tickle / grab / hold) or when she sits on the screen edge.
+        Silent touches show in History as a grey system note.</p>
+      <div class="row">
+        <div><label>Reaction mode</label>
+          <select id="tchmode"><option value="off">off — never speaks</option>
+            <option value="quiet">quiet — pat, tickle, long holds</option>
+            <option value="chatty">chatty — everything but grabs</option></select></div>
+        <div><label>Cooldown s (0-3600)</label>
+          <input id="tchcool" type="number" min="0" max="3600" step="1"></div>
+        <div><label>Max spoken per 10 min (0-100)</label>
+          <input id="tchmax" type="number" min="0" max="100" step="1"></div>
+      </div>
+      <div style="margin-top:8px"><button class="btn primary small" id="tchsave">Save touch settings</button></div>
+      <div class="err" id="tch-err"></div>
+      <div class="hint" id="tch-ok"></div>
     </div>
     <div class="card">
       <!-- Music phase 1 (docs/SPOTIFY_NOTES.md, docs/API.md "Spotify"):
@@ -879,6 +906,11 @@ function renderHistory() {
     (m.role === "assistant" && m.content.trim().length < HSHORT)).slice().reverse();
   $("htx").innerHTML = rows.map((m) => {
     hFullText[m.id] = m.content;
+    if (m.role === "system")          // grey note (docs/TOUCH.md history)
+      return `<div class="msg note" id="hm-${m.id}"><span class="htext">` +
+        esc(m.content) + `</span>` +
+        (m.meta && m.meta.touch ? ` <span class="act">✋ ${esc(m.meta.touch.kind || "")}</span>` : "") +
+        `<div class="meta">#${m.id} · ${esc(m.created_at)} · via ${esc(m.source || "?")}</div></div>`;
     const long = m.content.length > 300;
     const text = `<span class="htext" data-id="${m.id}">` +
       (long ? esc(m.content.slice(0, 300)) +
@@ -899,6 +931,7 @@ function renderHistory() {
       (m.memory_writes && m.memory_writes.length
         ? ` · 🧠 ${esc(m.memory_writes.map((w) => w.text).join("; ").slice(0, 80))}` : "") +
       (m.timer_id ? ` · ⏰ timer #${m.timer_id}` : "") +    // docs/TIMERS.md H chip
+      (m.meta && m.meta.touch ? ` · ✋ ${esc(m.meta.touch.kind || "")}` : "") +      // docs/TOUCH.md
       ` <span class="hmenuwrap"><button class="btn small hmenu" data-id="${m.id}" ` +
       `title="actions">⋮</button><span class="hopts">` +
       `<button class="btn small danger hdelone" data-id="${m.id}">Delete</button> ` +
@@ -1732,7 +1765,7 @@ $("keysave").onclick = () => setKey($("hubtoken").value.trim());
 $("hubtoken").addEventListener("keydown", (e) => { if (e.key === "Enter") setKey($("hubtoken").value.trim()); });
 $("keyclear").onclick = () => { $("hubtoken").value = ""; setKey(""); };
 document.querySelectorAll("nav button").forEach((b) =>
-  b.onclick = () => { show(b.dataset.tab); if (b.dataset.tab === "settings") { loadSettings(); loadSpotify(); } });
+  b.onclick = () => { show(b.dataset.tab); if (b.dataset.tab === "settings") { loadSettings(); loadSpotify(); loadTouch(); } });
 $("psave").onclick = savePersona;
 $("pcancel").onclick = startCreate;
 $("hpick").onchange = loadHistory;
@@ -1835,8 +1868,31 @@ $("spdevices").onclick = async () => {
   } catch (e) { spErr(e); }
 };
 
+/* ── touch (docs/TOUCH.md "Settings" card) ───────────────────────────── */
+function loadTouch() {
+  return api("/api/settings").then((s) => {
+    const t = s.touch || {}, src = s.touch_source || {};
+    $("tchmode").value = ["off", "quiet", "chatty"].includes(t.mode) ? t.mode : "quiet";
+    $("tchcool").value = t.cooldown_s == null ? "" : t.cooldown_s;
+    $("tchmax").value = t.max_per_10min == null ? "" : t.max_per_10min;
+    $("tchsrc").textContent = Object.values(src).includes("saved")
+      ? "· saved overrides" : "· defaults";
+  }).catch(() => {});
+}
+$("tchsave").onclick = async () => {
+  $("tch-err").textContent = ""; $("tch-ok").textContent = "";
+  try {
+    const t = { mode: $("tchmode").value };
+    if ($("tchcool").value !== "") t.cooldown_s = Number($("tchcool").value);
+    if ($("tchmax").value !== "") t.max_per_10min = Number($("tchmax").value);
+    await api("/api/settings", { method: "PUT", json: { touch: t } });
+    $("tch-ok").textContent = "touch settings saved.";
+    await loadTouch();
+  } catch (e) { $("tch-err").textContent = e.message; }
+};
+
 startCreate();
-poll().then(() => { loadSettings(); loadSpotify(); });
+poll().then(() => { loadSettings(); loadSpotify(); loadTouch(); });
 setInterval(poll, 3000);
 eventsLoop();  // tool progress in the chat box; restarts on tab switch too
 </script>

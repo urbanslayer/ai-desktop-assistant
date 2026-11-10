@@ -17,7 +17,7 @@ try:  # package import (repo root) vs standalone (`python server.py` in hub/)
 except (ImportError, SystemError):  # standalone: hub/ is on sys.path
     import memory as _memory  # type: ignore[no-redef]
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Voice migration for personas written before the voice round (docs/VOICE.md):
 # a bland design-mode voice with a random seed, so they keep talking after the
@@ -253,6 +253,12 @@ class Store:
                 # both messages of a fired timer's turn carry the timer id
                 # (⏰ chip on the web page / history)
                 self.db.execute("ALTER TABLE messages ADD COLUMN timer_id INTEGER")
+        if version < 9:  # touch round (docs/TOUCH.md): per-message structured
+            # extras — meta.touch {kind, held_ms, part, mode, silent} on the
+            # rows a POST /api/touch wrote (the grey note + her reaction line)
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+            if "meta" not in cols:
+                self.db.execute("ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.commit()
 
@@ -420,7 +426,7 @@ class Store:
                     emotion: str | None = None, tools: list | None = None,
                     actions: list | None = None, speech: str = "",
                     memory_writes: list | None = None, voice: bool = False,
-                    timer_id: int | None = None) -> int:
+                    timer_id: int | None = None, meta: dict | None = None) -> int:
         """`emotion` only makes sense on assistant messages (docs/ROUNDS.md:
         null for user messages). `tools` is the compact tools_used list
         [{tool, label}] stored on the assistant reply. `actions` is the
@@ -434,16 +440,39 @@ class Store:
         with self._lock:
             cur = self.db.execute(
                 "INSERT INTO messages(persona,role,content,source,created_at,emotion,"
-                "tools,actions,speech,memory_writes,voice,timer_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "tools,actions,speech,memory_writes,voice,timer_id,meta) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (persona, role, content, source, now_iso(), emotion,
                  json.dumps(tools) if tools else "",
                  json.dumps(actions) if actions else "",
                  str(speech or ""),
                  json.dumps(memory_writes) if memory_writes else "",
-                 1 if voice else 0, timer_id))
+                 1 if voice else 0, timer_id,
+                 json.dumps(meta, ensure_ascii=False) if meta else "{}"))
             self.db.commit()
             assert cur.lastrowid is not None
             return cur.lastrowid
+
+    def spoken_touch_times(self, persona: str, limit: int = 60) -> list[str]:
+        """created_at (ISO-UTC) of the persona's SPOKEN touch reactions —
+        assistant rows from POST /api/touch whose meta.touch is not silent
+        and not kind 'action' (docs/TOUCH.md rate-limit window). Newest
+        first; the caller filters by window."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT created_at, meta FROM messages WHERE persona=? "
+                "AND role='assistant' AND source='touch' ORDER BY id DESC LIMIT ?",
+                (persona, limit)).fetchall()
+        out = []
+        for r in rows:
+            try:
+                meta = json.loads(r["meta"] or "{}")
+            except ValueError:
+                continue
+            t = meta.get("touch") if isinstance(meta, dict) else None
+            if isinstance(t, dict) and not t.get("silent") and t.get("kind") != "action":
+                out.append(r["created_at"])
+        return out
 
     def get_message(self, message_id: int) -> dict | None:
         with self._lock:
@@ -490,11 +519,19 @@ class Store:
                 mem_writes = json.loads(raw_mw)
             except ValueError:
                 mem_writes = []
+        meta = {}
+        raw_meta = row["meta"] if "meta" in row.keys() else ""
+        if raw_meta:
+            try:
+                parsed = json.loads(raw_meta)
+                meta = parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                meta = {}
         return {"id": row["id"], "persona": row["persona"], "role": row["role"],
                 "content": row["content"], "source": row["source"],
                 "emotion": row["emotion"], "tools_used": tools,
                 "actions": actions, "speech": speech,
-                "memory_writes": mem_writes,
+                "memory_writes": mem_writes, "meta": meta,
                 "voice": bool(row["voice"]) if "voice" in row.keys() else False,
                 "timer_id": (row["timer_id"] if "timer_id" in row.keys() else None),
                 "created_at": row["created_at"]}

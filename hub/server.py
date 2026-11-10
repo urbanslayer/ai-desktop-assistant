@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -34,6 +34,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from . import intents as _intents
     from . import memory as _memory
     from . import speech as _speech
+    from . import touch as _touch
     from . import voice as _voice
     from .clients import ClientHub
     from .events import EventBus
@@ -57,6 +58,7 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
     import intents as _intents  # type: ignore[no-redef]
     import memory as _memory  # type: ignore[no-redef]
     import speech as _speech  # type: ignore[no-redef]
+    import touch as _touch  # type: ignore[no-redef]
     import voice as _voice  # type: ignore[no-redef]
     from clients import ClientHub  # type: ignore[no-redef]
     from events import EventBus  # type: ignore[no-redef]
@@ -139,6 +141,11 @@ MEMORY_DEFAULTS = {
 TIMER_SETTINGS_DEFAULTS = {
     "allow_chaining": False,
 }
+
+# Touch settings (docs/TOUCH.md): the global reaction policy for
+# POST /api/touch — mode off|quiet|chatty, seconds between spoken reactions,
+# spoken reactions per rolling 10 minutes (counted per persona).
+TOUCH_SETTINGS_DEFAULTS = dict(_touch.SETTINGS_DEFAULTS)
 
 # Music phase 1 settings (docs/SPOTIFY_NOTES.md): ONE Spotify connection
 # under the owner's Developer Dashboard app (client id only, PKCE — no
@@ -447,6 +454,27 @@ def create_app(data_dir, api_key: str | None = None,
                 merged[key] = bool(saved[key])
         return merged
 
+    # ── touch settings (docs/TOUCH.md) ─────────────────────────────────
+    # One global policy (the web Settings card + the desktop tray write it);
+    # the 10-minute rate window is COUNTED per persona inside the route.
+    def stored_touch() -> dict:
+        saved = store.get_json("touch", {})
+        return dict(saved) if isinstance(saved, dict) else {}
+
+    def default_touch() -> dict:
+        return dict(TOUCH_SETTINGS_DEFAULTS)
+
+    def touch_settings() -> dict:
+        merged = default_touch()
+        saved = stored_touch()
+        if saved.get("mode") in _touch.MODES:
+            merged["mode"] = saved["mode"]
+        for key in ("cooldown_s", "max_per_10min"):
+            raw = saved.get(key)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+                merged[key] = raw
+        return merged
+
     # ── location settings (weather round, docs/API.md "Weather") ────────
     # Saved place wins; blank/reset falls back to the RIKO_LOCATION env
     # default (a plain place name geocoded lazily at first use, cached in
@@ -667,12 +695,16 @@ def create_app(data_dir, api_key: str | None = None,
         saved_spotify = stored_spotify()
         spotify_source = {k: ("saved" if k in saved_spotify else "default")
                           for k in SPOTIFY_DEFAULTS}
+        saved_touch = stored_touch()
+        touch_source = {k: ("saved" if k in saved_touch else "default")
+                        for k in TOUCH_SETTINGS_DEFAULTS}
         return {
             "llm": public_llm(llm_settings()),
             "tts": tts_settings(),
             "tools": tools_settings(),
             "memory": memory_settings(),
             "timers": timers_settings(),
+            "touch": touch_settings(),
             "mcp": {"servers": public_mcp_servers(mcp_servers())},
             "switch_phrases": switch_phrases(),
             "timezone": stored_timezone(),
@@ -690,6 +722,7 @@ def create_app(data_dir, api_key: str | None = None,
                          "tools": default_tools(),
                          "memory": default_memory(),
                          "timers": default_timers(),
+                         "touch": default_touch(),
                          "mcp": {"servers": public_mcp_servers([preset])
                                  if preset else []},
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES),
@@ -701,6 +734,7 @@ def create_app(data_dir, api_key: str | None = None,
             "tools_source": tools_source,
             "memory_source": memory_source,
             "timers_source": timers_source,
+            "touch_source": touch_source,
             "mcp_source": {"servers": "saved" if has_mcp
                            else ("env" if preset else "default")},
         }
@@ -1927,6 +1961,135 @@ def create_app(data_dir, api_key: str | None = None,
         kind, *rest = await run_in_threadpool(turn)
         return rest[0] if kind == "ok" else err(rest[0], rest[1])
 
+    # ── touch (docs/TOUCH.md) ───────────────────────────────────────────
+    @app.post("/api/touch")
+    async def post_touch(request: Request):
+        """One physical touch from a body client. Fast no-LLM answers for
+        mode off / cooldown / 10-min limit / busy / always-silent kinds;
+        otherwise she gets ONE short in-character sentence (no tools) and
+        the reply rides the same storage/audio path as a chat reply. A
+        silently-ignored touch still lands as a grey system note plus a
+        meta.silent assistant line — never a fake user message."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        kind_ = str(body.get("kind") or "")
+        bad = _touch.validate(kind_)
+        if bad:
+            return err(400, bad)
+        held = body.get("held_ms")
+        held_ms = (float(held) if isinstance(held, (int, float))
+                   and not isinstance(held, bool) else None)
+        part = str(body.get("part") or "").strip() or None
+
+        def work():
+            pid = str(body.get("persona") or "") or store.active()
+            if not store.persona_exists(pid):
+                return ("err", 404, f"no persona '{pid}'")
+            cfg = touch_settings()
+            mode = str(cfg.get("mode") or "quiet")
+
+            def note_row(reason, spoken_row=None):
+                """System note + the short silent assistant line (or the
+                already-stored reaction), then bump. -> state_version."""
+                store.add_message(pid, "system", _touch.note_text(kind_, mode),
+                                  "touch", meta={
+                                      "touch": {"kind": kind_, "mode": mode,
+                                                "held_ms": held_ms, "part": part,
+                                                "reason": reason, "note": True}})
+                if spoken_row is None:
+                    store.add_message(pid, "assistant", _touch.silent_line(reason),
+                                      "touch", meta={
+                                          "touch": {"kind": kind_, "mode": mode,
+                                                    "silent": True,
+                                                    "reason": reason}})
+                bump_state()
+                return store.version()
+
+            lock = persona_lock_for(pid)
+            have_lock = lock.acquire(blocking=False)
+            try:
+                spoken = store.spoken_touch_times(pid)
+                now = datetime.now(timezone.utc)
+                cutoff = (now - timedelta(seconds=_touch.RATE_WINDOW_S)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+                reason = _touch.gate(
+                    mode, kind_, held_ms,
+                    cooldown_s=cfg.get("cooldown_s"),
+                    last_spoken_iso=spoken[0] if spoken else None,
+                    now_epoch=time.time(),
+                    spoken_in_window=sum(1 for iso in spoken if iso >= cutoff),
+                    max_per_10min=cfg.get("max_per_10min"),
+                    busy=not have_lock)
+                if reason != "llm":
+                    return ("ok", _touch.silent_reply(
+                        reason, note_row(reason)))
+
+                # ── the one-sentence reaction turn (persona lock held) ──
+                persona = store.get_persona(pid)
+                settings = llm_settings()
+                touch_meta = {"kind": kind_, "mode": mode,
+                              "held_ms": held_ms, "part": part}
+                try:
+                    messages = [{"role": "system",
+                                 "content": persona["system_prompt"] + "\n\n"
+                                 + _touch.system_line()}]
+                    max_history = int(settings.get("max_history") or 40)
+                    messages += [{"role": m["role"], "content": m["content"]}
+                                 for m in store.recent_messages(pid, max_history)
+                                 if str(m.get("content") or "").strip()]
+                    messages.append({"role": "user",
+                                     "content": _touch.reaction_prompt(
+                                         kind_, held_ms, part)})
+                    raw = brain.chat(settings, messages)
+                except Exception as e:
+                    log.info("[touch] LLM failed persona=%s kind=%s: %s",
+                             pid, kind_, e)
+                    return ("ok", _touch.silent_reply(
+                        "llm_error", note_row("llm_error")))
+                emotion, answer = _emotion.parse_emotion(raw)
+                body_actions = (clients_hub.body_actions()
+                                if persona.get("embodied", True) else [])
+                answer, actions, ignored = _body.parse_actions(answer, body_actions)
+                if ignored:
+                    log.info("[touch] ignored_actions persona=%s names=%s",
+                             pid, ",".join(ignored))
+                if not answer.strip():
+                    answer = _brain.EMPTY_REPLY
+                spoken_text = _speech.speech_text(answer)
+                if not spoken_text.strip():
+                    spoken_text = _speech.speech_text(_brain.EMPTY_REPLY)
+                note_id = store.add_message(
+                    pid, "system", _touch.note_text(kind_, mode), "touch",
+                    meta={"touch": {**touch_meta, "reason": "llm", "note": True}})
+                assistant_id = store.add_message(
+                    pid, "assistant", answer, "touch", emotion=emotion,
+                    actions=actions, speech=spoken_text,
+                    meta={"touch": {**touch_meta, "note_id": note_id}})
+                bump_state()
+                audio_url = None
+                if tts_on() and (persona.get("voice") or {}).get("mode") != "off":
+                    audio_url = f"/api/messages/{assistant_id}/audio"
+                if actions:
+                    # the page plays the gesture even when the client's own
+                    # mode makes audio local (docs/TOUCH.md: hub fires action,
+                    # page plays it)
+                    events.publish("action", persona_id=pid, emotion=emotion,
+                                   actions=actions, touch=touch_meta)
+                return ("ok", {"ok": True, "spoke": True, "text": answer,
+                               "emotion": emotion, "actions": actions,
+                               "audio_url": audio_url, "reason": "llm",
+                               "state_version": store.version()})
+            finally:
+                if have_lock:
+                    lock.release()
+
+        kind_, *rest = await run_in_threadpool(work)
+        return rest[0] if kind_ == "ok" else err(rest[0], rest[1])
+
     # ── timer routes (docs/TIMERS.md H) ─────────────────────────────────
     def timer_public(row: dict) -> dict:
         """API view: no captured snapshot (its settings carry the api_key —
@@ -2164,6 +2327,30 @@ def create_app(data_dir, api_key: str | None = None,
                     return err(422, "timers.allow_chaining must be a boolean")
                 saved_tmr["allow_chaining"] = tmr["allow_chaining"]
             store.set_json("timers_settings", saved_tmr)
+        if "touch" in body:
+            tch = body["touch"]
+            if not isinstance(tch, dict):
+                return err(422, "touch must be an object")
+            saved_tch = stored_touch()
+            if "mode" in tch:
+                if tch["mode"] not in _touch.MODES:
+                    return err(422, "touch.mode must be one of off, quiet, chatty")
+                saved_tch["mode"] = tch["mode"]
+            if "cooldown_s" in tch:
+                raw = tch["cooldown_s"]
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                        or not 0 <= float(raw) <= 3600:
+                    return err(422, "touch.cooldown_s must be a number "
+                                    "between 0 and 3600")
+                saved_tch["cooldown_s"] = float(raw)
+            if "max_per_10min" in tch:
+                raw = tch["max_per_10min"]
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                        or not 0 <= int(raw) <= 100:
+                    return err(422, "touch.max_per_10min must be an integer "
+                                    "between 0 and 100")
+                saved_tch["max_per_10min"] = int(raw)
+            store.set_json("touch", saved_tch)
         if "mcp" in body:
             mcp = body["mcp"]
             if not isinstance(mcp, dict):
@@ -2287,6 +2474,8 @@ def create_app(data_dir, api_key: str | None = None,
             changed |= store.del_json("memory")
         if body.get("timers"):
             changed |= store.del_json("timers_settings")
+        if body.get("touch"):
+            changed |= store.del_json("touch")
         if body.get("mcp"):
             changed |= store.del_json("mcp")
             mcp_manager.sync(mcp_servers())
@@ -2301,9 +2490,10 @@ def create_app(data_dir, api_key: str | None = None,
         if not (body.get("llm") or body.get("tts") or body.get("tools")
                 or body.get("memory") or body.get("mcp") or body.get("timers")
                 or body.get("switch_phrases") or body.get("timezone")
-                or body.get("location") or body.get("spotify")):
+                or body.get("location") or body.get("spotify")
+                or body.get("touch")):
             return err(422, 'set "llm", "tts", "tools", "memory", "mcp", '
-                            '"timers", "switch_phrases", "timezone", '
+                            '"timers", "touch", "switch_phrases", "timezone", '
                             '"location" and/or "spotify" to true')
         if changed:
             bump_state()
@@ -3043,6 +3233,7 @@ def create_app(data_dir, api_key: str | None = None,
     app.state.store = store
     app.state.brain = brain
     app.state.mcp = mcp_manager
+    app.state.persona_lock_for = persona_lock_for  # tests: hold it to force reason=busy
 
     # MCP servers from a previous run connect in the background as soon as
     # the app exists (works in local mode too, where the parent app may not
