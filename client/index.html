@@ -92,7 +92,9 @@
     import { gestureEnvelope } from './js/ik.js';
     import { AvatarMotion } from './js/motion.js';
     import { WalkDirector } from './js/walk.js';
-    import { clampScale, stepScale, dollyDistance, approachScale } from './js/scale.js';
+    import { clampScale, stepScale, dollyDistance, approachScale,
+             GestureTracker, framingDistance, feetAnchorTarget,
+             GESTURE_HEADROOM, FOOT_MARGIN_PX, SCALE_MAX } from './js/scale.js';
 
     // desktop.py opens this page with ?desktop=1: see-through background, no click-to-start,
     // and the whole body in frame. In a normal browser it looks like it always did.
@@ -116,6 +118,18 @@
     const GAZE_PARAM = new URLSearchParams(location.search).get('gaze');
     // QA hook (?roam=1): force roam-strip mode even without desktop settings.
     const ROAM_PARAM = new URLSearchParams(location.search).has('roam');
+    // QA hook (?wheelzoom=startMs:count:deltaY:gapMs): fire real WheelEvents
+    // at the canvas so a scroll-zoom gesture can be photographed frame by
+    // frame (harness: client/tools/capture_frames.py --gestures).
+    const WHEEL_ZOOM_QA = new URLSearchParams(location.search).get('wheelzoom');
+    // Headless capture with ?desktop=1 fakes the DESKTOP side inside the
+    // page: /control/avatar-scale resizes the CANVAS here (window = base x
+    // scale, like the real window resize does) instead of being POSTed, so
+    // a gesture run exercises the same grow/fit + resize-refit path.
+    const FAKE_DESK = DESKTOP && !!CAPTURE;
+    let fakeWin = null;   // canvas size while faking a window (null = viewport)
+    const viewW = () => (fakeWin ? fakeWin.w : innerWidth);
+    const viewH = () => (fakeWin ? fakeWin.h : innerHeight);
     // In ?force= mode the director is silenced: only the forced items move her.
     // Exception: force=walk@N must still flow, or the capture harness could
     // never photograph the gait (it also implies ?roam=1 for the walk director).
@@ -137,23 +151,27 @@
     // ── Scene ──
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: DESKTOP, preserveDrawingBuffer: !!CAPTURE });
     renderer.setPixelRatio(devicePixelRatio);
-    renderer.setSize(innerWidth, innerHeight);
+    renderer.setSize(viewW(), viewH());
     document.body.prepend(renderer.domElement);
 
     const scene = new THREE.Scene();
     if (DESKTOP) renderer.setClearColor(0x000000, 0);  // fully transparent around her
     else scene.background = new THREE.Color(0xffffff);
-    const camera = new THREE.PerspectiveCamera(30, innerWidth / innerHeight, 0.1, 20);
+    const camera = new THREE.PerspectiveCamera(30, viewW() / viewH(), 0.1, 20);
     const light = new THREE.DirectionalLight(0xffffff, Math.PI);
     light.position.set(1, 1, 1);
     scene.add(light);
     if (DESKTOP) scene.add(new THREE.AmbientLight(0xffffff, 0.6));  // no white room to bounce off, so lift the shadows
 
     addEventListener('resize', () => {
-      camera.aspect = innerWidth / innerHeight;
+      camera.aspect = viewW() / viewH();
       camera.updateProjectionMatrix();
-      renderer.setSize(innerWidth, innerHeight);
+      renderer.setSize(viewW(), viewH());
       if (typeof updateWalkBounds === 'function') updateWalkBounds();
+      // THE frame the compositor resized us: re-frame so pixels-per-metre
+      // and the feet stay exactly where they were (scale.js invariant) —
+      // this is what makes the gesture's grow/fit invisible.
+      if (DESKTOP && !manualFrame) applyScaleFrame(scaleShown);
     });
 
     // ── Load her ──
@@ -255,6 +273,7 @@
       // Gesture-aware framing (see applyFraming below): her whole body and
       // the wave/think envelope fit the window at its current aspect.
       applyFraming();
+      if (DESKTOP) applyScaleFrame(scaleShown);  // wear the saved zoom (feet-anchored)
       rebuildClips();
       // reply actions may name .vrma gestures: teach the director their timings
       director.library(Object.fromEntries(Object.entries(clips)
@@ -303,6 +322,11 @@
         const needW = env.xHalf * 2 * 1.06;
         const dist = Math.max(needH / 2 / halfFovY,
                               needW / 2 / (halfFovY * camera.aspect), 0.8);
+        // the fit reference for the visual-scale framing (applyScaleFrame):
+        // distance that fits her at scale 1.0 in the BASE window, and her
+        // feet height in world units. Both are rig constants — window size
+        // cancels out, which is exactly what keeps zoom continuous.
+        fitMeasure = { dist, yBot };
         // near plane close enough that her raised hand never clips when the
         // camera sits at this distance; far plane keeps room for user zoom-out
         camera.near = Math.max(0.02, Math.min(0.1, dist * 0.01));
@@ -321,35 +345,83 @@
       }
     }
 
-    // ── Scroll = size her (desktop): plain wheel changes the avatar SCALE
-    //    (0.4x–2.5x, ~8% steps, scale.js) and POSTs it to the desktop via
-    //    /control/avatar-scale; the desktop resizes the window to
-    //    base_size x scale with her feet anchored and clamps it to the
-    //    monitor (riko/avatar_scale.py). The page keeps its fit-to-body
-    //    framing — a bigger window shows a bigger her, never a crop. The
-    //    shown scale glides toward the wheel's target and POSTs at ≤ 20 Hz
-    //    from the render loop (final value included when the glide lands),
-    //    so the window grows smoothly instead of jumping per notch.
-    //    Ctrl+scroll keeps the OLD camera dolly (close-up crop); double
-    //    click (or the tray's Reset size) restores scale 1.0 + the camera.
+    // ── Scroll = zoom her (desktop): the PAGE renders the zoom ──────────
+    //    Plain wheel over her changes a VISUAL scale (0.4x–2.5x, delta-
+    //    continuous: one notch ≈ 8%, small trackpad deltas proportional —
+    //    scale.js). The render loop glides scaleShown toward it and
+    //    re-frames the camera EVERY FRAME (framingDistance: pixels-per-
+    //    metre = visual x the base-window fit rate, feet anchored a fixed
+    //    14 px above the window bottom), so she grows/shrinks smoothly
+    //    and immediately, no window round trip in the loop.
+    //    The real WINDOW moves once per gesture each way: the first wheel
+    //    event POSTs a HEADROOM request (window = target x 1.6, feet
+    //    anchored, monitor-clamped by the desktop — riko/avatar_scale.py
+    //    batches resize+move into ONE hyprctl call); 400 ms after the
+    //    wheel stops, a FIT request sizes the window to the final scale
+    //    and persists it. Re-framing on the resulting canvas resize
+    //    preserves pixels-per-metre and the feet pixel position, so both
+    //    window moves are invisible. The desktop answers each POST with
+    //    {window, max}: windowScale tracks what the window really is,
+    //    pageMax is the monitor-fit ceiling that stops final growth.
+    //    Ctrl+scroll keeps the OLD camera dolly (manual framing until a
+    //    reset); double-click / tray Reset size restores 1.0 + the fit.
     let scaleTarget = clampScale(settings.avatar_scale);
     let scaleShown = scaleTarget;
-    let scalePostAt = -1, scaleSent = null;
-    function postScale(value, force = false) {
-      if (!DESKTOP) return;
+    let windowScale = scaleTarget;      // what the desktop window is really at
+    let windowAsk = scaleTarget;        // last window scale we POSTed to the desktop
+    let pageMax = SCALE_MAX;            // monitor-fit ceiling from the desktop
+    let manualFrame = false;            // Ctrl+scroll dolly owns the framing
+    let fitMeasure = null;              // {dist, yBot} set by applyFraming
+    const baseW = Math.max(1, Math.round(viewW() / scaleTarget));  // window px at scale 1.0
+    const baseH = Math.max(1, Math.round(viewH() / scaleTarget));
+    const sizeGesture = new GestureTracker();
+    function applyScaleFrame(v) {
+      // Visual zoom for THIS frame: distance keeps pixels-per-metre at
+      // v x (fit rate) regardless of the canvas size, and her feet sit
+      // FOOT_MARGIN_PX above the canvas bottom — whose screen point is
+      // feet-anchored — so a window resize changes neither.
+      if (!vrm || !fitMeasure) return;
+      const W = viewW(), H = viewH();
+      const dist = framingDistance(fitMeasure.dist, H, baseH, v);
+      const yt = feetAnchorTarget(fitMeasure.yBot, dist, camera.fov, H, FOOT_MARGIN_PX);
+      camera.near = Math.max(0.02, Math.min(0.1, dist * 0.01));
+      camera.far = Math.max(20, dist * 6);
+      camera.position.set(0, yt, dist);
+      controls.target.set(0, yt, 0);
+      camera.aspect = W / H;
+      camera.updateProjectionMatrix();
+      if (director.walk) {   // strip width in metres = the visible canvas
+        updateWalkBounds();
+        vrm.scene.position.x = director.walk.x;
+      }
+    }
+    function postScale(value, win, gesture) {
+      if (!DESKTOP && !FAKE_DESK) return;
       const v = Math.round(value * 1000) / 1000;
-      if (!force && v === scaleSent) return;
-      scaleSent = v;
+      const w = Math.round(win * 1000) / 1000;
+      windowAsk = w;   // gesture bookkeeping compares against what we ASKED
+      if (FAKE_DESK) {   // capture harness: the page IS the desktop
+        windowScale = w;
+        fakeWin = { w: Math.round(baseW * w), h: Math.round(baseH * w) };
+        dispatchEvent(new Event('resize'));  // same path a WM resize takes
+        return;
+      }
       fetch('/control/avatar-scale', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scale: v }),
+        body: JSON.stringify({ scale: v, window: w, gesture: !!gesture }),
+      }).then((r) => r.json()).then((res) => {
+        if (!res) return;
+        if (res.ok && Number.isFinite(+res.window)) windowScale = +res.window;
+        if (Number.isFinite(+res.max)) pageMax = Math.min(SCALE_MAX, +res.max);
       }).catch(() => {});   // plain browser tab: no desktop to resize
     }
     function resetAvatarSize() {
+      sizeGesture.reset();
+      manualFrame = false;
       scaleTarget = 1.0;
       scaleShown = 1.0;
-      postScale(1.0, true);
-      applyFraming();       // undo a Ctrl+scroll close-up too
+      postScale(1.0, 1.0, false);
+      applyScaleFrame(1.0);       // undo a Ctrl+scroll close-up too
     }
     if (DESKTOP) {
       controls.enableZoom = false;  // the wheel is ours now; dolly is manual
@@ -359,12 +431,16 @@
           const d = camera.position.distanceTo(controls.target);
           const nd = dollyDistance(d, e.deltaY, controls.minDistance, controls.maxDistance);
           camera.position.sub(controls.target).setLength(nd).add(controls.target);
+          manualFrame = true;
           return;
         }
-        scaleTarget = stepScale(scaleTarget, e.deltaY);
+        manualFrame = false;   // the wheel's zoom framing takes over again
+        scaleTarget = Math.min(pageMax, stepScale(scaleTarget, e.deltaY, e.deltaMode));
+        const grow = sizeGesture.wheel(performance.now(), scaleTarget, windowAsk);
+        if (grow !== null) postScale(scaleTarget, grow, true);
       }, { passive: false });
       renderer.domElement.addEventListener('dblclick', () => resetAvatarSize());
-      postScale(scaleTarget, true);  // make the window match the saved scale
+      postScale(scaleTarget, scaleTarget, false);  // make the window match the saved scale
     }
 
     // ── The director: decides what she does, motion.js does the moving ──
@@ -627,6 +703,19 @@
         return [_p.x, _p.y, _p.z];
       };
       const inCanvas = (n) => (n ? Math.abs(n[0]) <= 0.9 && Math.abs(n[1]) <= 0.9 && n[2] >= -1 && n[2] <= 1 : null);
+      // world -> CANVAS PIXELS (the fake-desktop canvas can differ from the
+      // viewport; everything visual is measured on the canvas)
+      const _q = new THREE.Vector3();
+      const worldPx = (p) => {
+        if (!p) return null;
+        _q.set(p[0], p[1], p[2]).project(camera);
+        return [(_q.x * 0.5 + 0.5) * viewW(), (-_q.y * 0.5 + 0.5) * viewH()];
+      };
+      const headPx = worldPx([h[0], (rig?.headTop ?? h[1] + 0.09), h[2]]);
+      const footWorld = bones.leftFoot && bones.rightFoot
+        ? [bones.leftFoot[0], Math.min(bones.leftFoot[1], bones.rightFoot[1]), bones.leftFoot[2]]
+        : (bones.leftFoot || bones.rightFoot);
+      const footPx = worldPx(footWorld);
       const rArm = rig?.arms?.right, lArm = rig?.arms?.left;
       const handNdc = ndc(bones.rightHand), elbowNdc = ndc(bones.rightLowerArm);
       const lHandNdc = ndc(bones.leftHand), lElbowNdc = ndc(bones.leftLowerArm);
@@ -654,6 +743,11 @@
           leftHandInCanvas: inCanvas(lHandNdc),
           leftElbowInCanvas: inCanvas(lElbowNdc),
           gazeDbg: motion.__debug(),
+          headFootPx: headPx && footPx ? Math.round(footPx[1] - headPx[1]) : null,
+          feetFromBottomPx: footPx ? Math.round(viewH() - footPx[1]) : null,
+          visualScale: Math.round(scaleShown * 1000) / 1000,
+          windowScale: Math.round(windowScale * 1000) / 1000,
+          canvasH: viewH(),
           // world pos of the eyes node (VRM0 rigs have no normalized eye
           // bones): ground truth for where the face points in renders
           eyesWorld: (() => {
@@ -730,6 +824,20 @@
         requestAnimationFrame(trackWave);
       };
       requestAnimationFrame(trackWave);
+    }
+    if (CAPTURE && WHEEL_ZOOM_QA) {
+      // ?wheelzoom=startMs:count:deltaY:gapMs — fire real wheel events at the
+      // canvas: a synthetic scroll-zoom gesture for frame-by-frame capture.
+      const [g0, gN, gDy, gGap] = String(WHEEL_ZOOM_QA).split(':').map(Number);
+      setTimeout(() => {
+        let fired = 0;
+        const iv = setInterval(() => {
+          renderer.domElement.dispatchEvent(new WheelEvent('wheel', {
+            deltaY: gDy, deltaMode: 0, bubbles: true, cancelable: true,
+          }));
+          if (++fired >= gN) clearInterval(iv);
+        }, gGap);
+      }, g0);
     }
     if (CAPTURE) {
       const wokeAt = performance.now();
@@ -912,9 +1020,14 @@
     }
 
     window.riko = { openInput, closeInput, requestWave, resetSize: resetAvatarSize,
-                    motion, director, measure: () => window.rikoMeasure() };
+                    motion, director, measure: () => window.rikoMeasure(),
+                    scale: () => ({ shown: scaleShown, target: scaleTarget, window: windowScale }),
+                    wheel: (deltaY, deltaMode = 0) => renderer.domElement.dispatchEvent(
+                      new WheelEvent('wheel', { deltaY, deltaMode, bubbles: true, cancelable: true })),
+                    resizeWindow: (w) => FAKE_DESK && postScale(w, w, false) };
                     // desktop.py calls these; motion/director/measure are for debugging,
-                    // riko-ctl wave and the smoke test, resetSize for the tray's Reset size
+                    // riko-ctl wave and the smoke test, resetSize for the tray's Reset size,
+                    // scale/wheel/resizeWindow for the capture harness and manual QA
 
     // ── Ask Python for her next line and UI events, tell it when a clip is done ──
     voice.onended = voice.onerror = () => fetch('/done', { method: 'POST' });
@@ -966,7 +1079,9 @@
               if (Math.abs(s - scaleTarget) > 1e-6) {
                 scaleTarget = s;
                 scaleShown = s;
-                postScale(s, true);
+                manualFrame = false;
+                sizeGesture.reset();
+                postScale(s, s, false);   // resize event re-frames the camera
               }
             }).catch(() => {});
           })
@@ -1013,15 +1128,17 @@
     const clock = new THREE.Clock();
     renderer.setAnimationLoop(() => {
       const dt = clock.getDelta();
-      if (DESKTOP && scaleShown !== scaleTarget) {
-        // ease the window size toward the wheel's target: ≤ 20 Hz POSTs,
-        // and the exact final value goes out when the glide lands
-        scaleShown = approachScale(scaleShown, scaleTarget, dt);
-        const nowS = T();
-        if (nowS - scalePostAt >= 0.05) {
-          scalePostAt = nowS;
-          postScale(scaleShown, scaleShown === scaleTarget);
+      if (DESKTOP && !manualFrame) {
+        // render the zoom EVERY frame (glide + camera re-frame), and when
+        // the wheel has been quiet for GESTURE_IDLE_MS ask the desktop to
+        // FIT the window to the final scale (once per gesture)
+        const next = approachScale(scaleShown, scaleTarget, dt);
+        if (next !== scaleShown) {
+          scaleShown = next;
+          applyScaleFrame(scaleShown);
         }
+        const fit = sizeGesture.tick(performance.now(), scaleTarget);
+        if (fit !== null) postScale(scaleTarget, fit, false);
       }
       feed(director.tick(T(), dt));  // idle gestures, endings, decay, roam schedule
       if (ROAM && director.walk && vrm) {

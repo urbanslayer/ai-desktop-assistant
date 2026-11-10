@@ -994,71 +994,90 @@ def main():
         elif cmd == "reset-size":  # tray Reset size: the page resets scale +
             # camera and POSTs scale 1.0 back through /control/avatar-scale
             win.js("window.riko && riko.resetSize && riko.resetSize()")
-        elif cmd.startswith("avatar-scale:"):  # scroll = size her (see below)
+        elif cmd.startswith("avatar-scale:"):  # scroll = zoom her (see below)
+            parts = cmd.split(":")             # final:window:gesture-flag
             try:
-                request_avatar_scale(float(cmd.partition(":")[2]))
-            except ValueError:
+                request_avatar_scale(float(parts[1]), float(parts[2]), parts[3] == "1")
+            except (ValueError, IndexError):
                 pass
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
 
-    # ── Scroll = size her ────────────────────────────────────────────────
-    # The page owns the requested scale (plain wheel over her, 0.4–2.5,
-    # scale.js) and POSTs it to /control/avatar-scale at <= 20 Hz with the
-    # final value when the wheel stops; the page camera keeps its fit-to-body
-    # framing, so a bigger window is simply a bigger her — never a crop.
-    # Here the Qt thread resizes the real window with her FEET anchored
-    # (riko/avatar_scale.scaled_geometry) and persists per persona.
-    # A plain Qt resize covers X11/KDE (move works there); GNOME may refuse
-    # the move — the resize still happens. Under Hyprland Wayland clients
-    # can't size or place themselves, so resize AND move go through the
-    # compositor for HER OWN window only (Lua hl.dsp.window.* selected by
-    # address, legacy hyprlang by class — riko/avatar_scale picks the
-    # syntax with riko/desktop_sense's config-style detection). Each
-    # Hyprland apply costs reads + compositor dispatches that can stall, so
-    # requests COALESCE: apply right away when quiet, else keep the newest
-    # and re-apply on a 120 ms trailing timer — the page's final value
-    # always lands. Clamping to the monitor happens in the pure math: past
-    # the fit limit the size stops growing, nothing else changes.
+    # ── Scroll = zoom her ────────────────────────────────────────────────
+    # The PAGE renders the zoom every frame (client/js/scale.js): the wheel
+    # glides her VISUAL scale in-page, and the real window only moves at
+    # gesture boundaries — ONE headroom grow on the first wheel event
+    # ({gesture: true, window: target x 1.6}) and ONE fit once the wheel
+    # has been quiet 400 ms ({gesture: false, window: final}); the page
+    # re-frames its camera the moment the canvas size lands, so both window
+    # moves are invisible (pixels-per-metre + feet pixels unchanged).
+    # /control/avatar-scale carries {scale, window, gesture}.
+    # Under Hyprland Wayland clients cannot size or place themselves, so
+    # resize AND move go through the compositor for HER OWN window only, as
+    # ONE batched hyprctl request over CACHED window + monitor state
+    # (riko/avatar_scale.HyprlandSizer; Lua hl.dsp.window.* selected by
+    # address, legacy hyprlang by class — syntax picked with
+    # riko/desktop_sense's config-style detection, v0.56.2 batch semantics
+    # source-verified). That IO is plain subprocesses, so the HTTP thread
+    # runs it inline and the POST's JSON answers {window, max}: the page
+    # keeps its headroom and its fit clamp honest from those numbers. Qt
+    # paths (X11 resize/move, the roam strip's band) hop to the Qt thread
+    # through the bridge and COALESCE on a trailing timer; GNOME may refuse
+    # the move — the resize still happens. Clamping to the monitor lives in
+    # the pure math: past the fit limit the size stops growing, nothing
+    # else changes.
     scale_state = {"want": None, "applied": None, "cur": scale0}
+    scale_sizer = (avatar_scale.HyprlandSizer(base_w, base_h, APP_ID)
+                   if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl")
+                   else None)
     scale_timer = QTimer()
     scale_timer.setSingleShot(True)
     scale_timer.setInterval(120)
 
-    def apply_avatar_scale(scale, persist=True):
-        """Qt thread: put the window (or the roam strip) at `scale`."""
+    def apply_avatar_scale(scale, window_scale=None, persist=True):
+        """Qt thread: put the window (or the roam strip) at the request.
+        `scale` is her final size (what persists); `window_scale` is what
+        the canvas needs right now — headroom above `scale` mid-gesture,
+        == scale at the fit."""
         s = avatar_scale.clamp_scale(scale)
+        ws = avatar_scale.clamp_window_scale(
+            scale if window_scale is None else window_scale)
         scale_state["cur"] = s
         if roamc.in_strip:
-            roamc.set_scale(s)   # band height follows, bottom edge anchored
-        elif os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):
-            res = avatar_scale.apply_hyprland_scale(s, base_w, base_h, APP_ID)
-            if not res.get("ok"):
-                print(f"[size] hyprland: {res.get('error')}", flush=True)
+            roamc.set_scale(avatar_scale.clamp_scale(ws))  # band follows, bottom anchored
         else:
             scr = win.screen() or QGuiApplication.primaryScreen()
             g = scr.availableGeometry()
             x, y, w, h = avatar_scale.scaled_geometry(
                 (g.x(), g.y(), g.width(), g.height()),
-                (win.x(), win.y(), win.width(), win.height()), base_w, base_h, s)
+                (win.x(), win.y(), win.width(), win.height()), base_w, base_h,
+                ws, max_scale=avatar_scale.WINDOW_SCALE_MAX)
             win.resize(w, h)
             win.move(x, y)   # grow upward from the feet where the WM allows it
         if persist:
             pid = (hub_client.active_persona() or {}).get("id") or "default"
             appstate.save_scale(pid, s)
 
-    def request_avatar_scale(s):
-        """Newest requested scale (bridge thread == Qt thread here)."""
-        scale_state["want"] = s
+    def request_avatar_scale(scale, window_scale=None, gesture=False):
+        """Newest request (bridge thread == Qt thread here). Grow requests
+        and the final fit land through the same coalescer; the trailing
+        timer always applies the newest, so the fit can never be lost."""
+        scale_state["want"] = (round(float(scale), 4),
+                               round(float(scale if window_scale is None else window_scale), 4),
+                               bool(gesture))
         if not scale_timer.isActive():
-            apply_avatar_scale(s)
-            scale_state["applied"] = s
+            _scale_apply_want()
         scale_timer.start()   # trailing catch-up for anything newer
 
-    def _scale_timer_fire():
+    def _scale_apply_want():
         if scale_state["want"] != scale_state["applied"]:
-            apply_avatar_scale(scale_state["want"])
+            s, ws, gesture = scale_state["want"]
+            apply_avatar_scale(s, ws, persist=not gesture)
             scale_state["applied"] = scale_state["want"]
+
+    def _scale_timer_fire():
+        _scale_apply_want()
+        if scale_state["want"] != scale_state["applied"]:
             scale_timer.start()   # newer still? keep catching up
     scale_timer.timeout.connect(_scale_timer_fire)
     roamc.on_leave = lambda: apply_avatar_scale(scale_state["cur"], persist=False)
@@ -1228,19 +1247,43 @@ def main():
                 return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
             return {"ok": True}
         elif cmd == "avatar-scale":
-            # scroll over her = her size: the page asks for a scale and the
-            # desktop resizes the window (feet anchored, monitor-clamped) and
-            # persists it per persona. Numbers only; the band clamp lives in
-            # riko/avatar_scale so page and desktop can't drift apart.
+            # scroll over her = her zoom: the PAGE renders the visual zoom
+            # every frame and asks the desktop only for WINDOW moves at
+            # gesture boundaries — {scale: final size (persisted at the
+            # fit), window: the scale the canvas needs (headroom during the
+            # gesture, == scale at the fit), gesture: bool}. Numbers only;
+            # the band clamps live in riko/avatar_scale so page and desktop
+            # can't drift apart. The reply carries the window scale really
+            # applied and the monitor-fit ceiling for final scales.
             try:
                 s = float(args.get("scale"))
+                w = float(args.get("window", args.get("scale")))
             except (TypeError, ValueError):    # missing, None or text
                 return {"ok": False, "error": "avatar-scale: numeric scale (0.4 - 2.5)"}
-            if s != s or s in (float("inf"), float("-inf")):
+            if s != s or s in (float("inf"), float("-inf")) \
+                    or w != w or w in (float("inf"), float("-inf")):
                 return {"ok": False, "error": "avatar-scale: numeric scale (0.4 - 2.5)"}
             s = avatar_scale.clamp_scale(s)
-            bridge.command.emit(f"avatar-scale:{s:.4f}")
-            return {"ok": True, "scale": s}
+            w = avatar_scale.clamp_window_scale(w)
+            gesture = bool(args.get("gesture"))
+            if scale_sizer is not None and not roamc.in_strip:
+                # Wayland cannot self-size: compositor IO is subprocesses
+                # only, fine on this thread; one batched hyprctl per apply
+                # over the sizer's cached window + monitor state.
+                res = scale_sizer.apply(w)
+                if res.get("ok") and not gesture:
+                    scale_state["cur"] = s
+                    pid = (hub_client.active_persona() or {}).get("id") or "default"
+                    appstate.save_scale(pid, s)
+                return {"ok": bool(res.get("ok")), "scale": s,
+                        "window": res.get("scale", w),
+                        "max": res.get("max", avatar_scale.SCALE_MAX),
+                        "error": res.get("error", "")}
+            bridge.command.emit(f"avatar-scale:{s:.4f}:{w:.4f}:{'1' if gesture else '0'}")
+            if not gesture:
+                scale_state["cur"] = s  # the Qt apply lands momentarily
+            return {"ok": True, "scale": s, "window": w,
+                    "max": avatar_scale.SCALE_MAX}
         elif cmd in PAGE_CMDS:  # type / hide-input / toggle / show / hide / quit / wave
             bridge.command.emit(cmd)
         else:

@@ -1,384 +1,431 @@
-"""Scroll-to-size the window (not the viewport): the pure math, the Hyprland
-dispatches (fake hyprctl runner — never the live session), the roam strip
-height, and the per-persona persistence.
+"""Tests for riko/avatar_scale.py — the desktop-side scroll-zoom window math.
 
-The page-side wheel math lives in client/js/scale.test.js (node --test).
+The page renders the zoom; this module sizes the WINDOW at gesture
+boundaries. Covered: the scale bands, the monitor-fit clamp (real 0.56.2
+rows), feet-anchored geometry, the ONE-batched-hyprctl-per-apply discipline,
+monitor/window caching (gesture grow→fit lands feet-anchored with exactly
+one dispatch per boundary), and failure → cache invalidation. No compositor,
+no window, no screenshot: fake hyprctl runners only.
 """
 import json
-from types import SimpleNamespace
+import math
+import os
+import time
 
-import pytest
+from riko import avatar_scale as asc
 
-from riko import appstate, avatar_scale, roam
+BASE_W, BASE_H = 420, 680
+
+FIX = os.path.join(os.path.dirname(__file__), "fixtures")
+with open(os.path.join(FIX, "hypr_real_monitors.json")) as fh:
+    REAL_MONITORS = json.load(fh)
+with open(os.path.join(FIX, "hypr_real_clients_riko.json")) as fh:
+    REAL_CLIENTS = json.load(fh)
+
+# monitor 1 = HDMI-A-1: 2560x1440 physical @ 1.25 scale at x=5120, a 44 px
+# top bar reserved → usable LOGICAL rect (the exact monitor the owner runs
+# Riko on; her window row [6675, 227, 420, 680] is already logical-space)
+MON1 = asc.monitor_logical_rect(REAL_MONITORS[1])
+assert MON1 is not None                      # fixture sanity for every test below
+
+OWN = next(c for c in REAL_CLIENTS if c.get("class") == "riko")
+assert OWN is not None
 
 
-# ── clamp / fit ──────────────────────────────────────────────────────────
+# ── the bands ─────────────────────────────────────────────────────────
+
 def test_clamp_scale_band_and_junk():
-    assert avatar_scale.clamp_scale(1.0) == 1.0
-    assert avatar_scale.clamp_scale(0.1) == avatar_scale.SCALE_MIN
-    assert avatar_scale.clamp_scale(99) == avatar_scale.SCALE_MAX
-    for junk in (None, "big", {}, float("nan"), float("inf")):
-        assert avatar_scale.clamp_scale(junk) == avatar_scale.SCALE_DEFAULT
+    assert asc.clamp_scale(0.1) == asc.SCALE_MIN
+    assert asc.clamp_scale(3.0) == asc.SCALE_MAX
+    assert asc.clamp_scale(1.25) == 1.25
+    for junk in (None, "", "abc", float("nan"), float("inf"), -float("inf"), True, object()):
+        assert asc.clamp_scale(junk) == asc.SCALE_DEFAULT
 
 
-def test_effective_scale_clamps_to_monitor_fit():
-    mon = (0, 0, 1920, 1080)
-    m = avatar_scale.MONITOR_MARGIN
-    # 2.5x would be 1050x1700 — taller than the monitor: capped by HEIGHT
-    fit = avatar_scale.effective_scale(mon, 420, 680, 2.5)
-    assert fit == pytest.approx((1080 - 2 * m) / 680)
-    # a tiny monitor caps WIDTH first and the band edges still apply below
-    fit_w = avatar_scale.effective_scale((0, 0, 500, 2000), 420, 680, 2.0)
-    assert fit_w == pytest.approx((500 - 2 * m) / 420)
-    # inside the band and inside the monitor: the request passes through
-    assert avatar_scale.effective_scale(mon, 420, 680, 1.2) == 1.2
+def test_clamp_window_scale_allows_gesture_headroom():
+    assert asc.clamp_window_scale(0.1) == asc.SCALE_MIN
+    # headroom above SCALE_MAX is legal for WINDOW scales (the monitor
+    # clamp bounds it for real); junk still defaults to 1.0
+    assert asc.clamp_window_scale(2.5 * 1.6) == 4.0   # 4.0 < the 5.0 ceiling
+    assert asc.clamp_window_scale(99) == asc.WINDOW_SCALE_MAX
+    assert asc.clamp_window_scale(None) == asc.SCALE_DEFAULT
+    assert asc.clamp_window_scale(float("nan")) == asc.SCALE_DEFAULT
 
 
-# ── feet-anchored geometry ───────────────────────────────────────────────
-MON = (0, 0, 1920, 1080)
-CUR = (700, 380, 420, 680)          # bottom-centre (feet) at (910, 1060)
+# ── monitor fit clamp ─────────────────────────────────────────────────
+
+def test_monitor_fit_clamp():
+    s = asc.effective_scale(MON1, BASE_W, BASE_H, 2.5)
+    w, h = round(BASE_W * s), round(BASE_H * s)
+    assert w <= MON1[2] - 2 * asc.MONITOR_MARGIN
+    assert h <= MON1[3] - 2 * asc.MONITOR_MARGIN
+    assert s < 2.5   # a 1.25-scale 2560 monitor cannot show the full band
+    assert asc.effective_scale(MON1, BASE_W, BASE_H, 1.0) == 1.0
+    # headroom windows raise the ceiling; the monitor itself is the wall
+    big = asc.effective_scale(MON1, BASE_W, BASE_H, 4.0, max_scale=asc.WINDOW_SCALE_MAX)
+    assert big >= s and big <= min(MON1[2] / BASE_W, MON1[3] / BASE_H)
+    # avail_h: growth above an anchored feet line caps tighter than the
+    # whole monitor (feet anchoring beats filling the screen)
+    tight = asc.effective_scale(MON1, BASE_W, BASE_H, 2.5, avail_h=340)
+    assert tight * BASE_H <= 340
+    # junk scale -> 1.0-equivalent size, tiny monitor stays positive
+    assert asc.effective_scale(MON1, BASE_W, BASE_H, "junk") == 1.0
+    assert asc.effective_scale((0, 0, 100, 100), BASE_W, BASE_H, 2.0) >= 0.01
 
 
-def test_scaled_geometry_anchors_the_feet():
-    for scale in (0.5, 1.0, 1.5):
-        x, y, w, h = avatar_scale.scaled_geometry(MON, CUR, 420, 680, scale)
-        assert w == round(420 * scale) and h == round(680 * scale)
-        assert x + w / 2 == pytest.approx(910, abs=0.5)   # same centre line
-        assert y + h == 1060                              # feet stay put
-        # the whole window stays on the monitor
-        assert 0 <= x and x + w <= 1920 and 0 <= y and y + h <= 1080
-
-
-def test_scaled_geometry_stops_growing_at_the_monitor():
-    # 2.0x would be 840x1360 on a 1080-high monitor: clamped to the fit cap,
-    # still aspect-exact, fully on screen, feet as low as they can go
-    x, y, w, h = avatar_scale.scaled_geometry(MON, CUR, 420, 680, 2.0)
-    assert h == 1080 - 2 * avatar_scale.MONITOR_MARGIN
-    assert w == round(420 * h / 680)
-    assert 0 <= x and x + w <= 1920 and 0 <= y and y + h <= 1080
-
-
-def test_scaled_geometry_clamped_offscreen_window_stays_visible():
-    # window near the bottom edge: growing upward runs out of room, the
-    # result is clamped fully inside the monitor instead of hanging off it
-    cur = (1500, 1000, 420, 680)     # bottom 1680 is already below (odd pos)
-    x, y, w, h = avatar_scale.scaled_geometry(MON, cur, 420, 680, 1.0)
-    assert 0 <= x and x + w <= 1920 and 0 <= y and y + h <= 1080
-
-
-# ── Hyprland dispatches (own window only; fake runner) ───────────────────
-def test_dispatches_lua_select_window_by_address():
-    exprs = avatar_scale.hypr_scale_dispatches("lua", 630, 1020, 595, 40,
-                                               address="0xabc123")
-    assert exprs == [
-        'hl.dsp.window.resize({x=630, y=1020, window="address:0xabc123"})',
-        'hl.dsp.window.move({x=595, y=40, window="address:0xabc123"})',
-    ]
-    assert all("address:0xabc123" in e for e in exprs)   # never another window
-
-
-def test_dispatches_legacy_select_window_by_class():
-    exprs = avatar_scale.hypr_scale_dispatches("legacy", 630, 1020, 595, 40,
-                                               address="", app_id="riko")
-    assert exprs == [
-        '"resizewindowpixel exact 630 1020,class:^(riko)$"',
-        '"movewindowpixel exact 595 40,class:^(riko)$"',
-    ]
-
-
-def _fake_hypr(rico_at=(700, 380), rico_size=(420, 680), monitor_id=0,
-               dispatch_reply="ok", extra_windows=True):
-    """Fake hyprctl runner: one riko window plus decoys; records argv."""
-    clients = [{"class": "firefox", "address": "0xff00", "at": [0, 0],
-                "size": [800, 600], "monitor": monitor_id}]
-    if extra_windows:
-        clients.append({"class": "kitty", "address": "0xbee", "at": [0, 0],
-                        "size": [800, 600], "monitor": monitor_id})
-    clients.append({"class": "riko", "address": "0x1234abcd",
-                    "at": list(rico_at), "size": list(rico_size),
-                    "monitor": monitor_id, "floating": True})
-    monitors = [{"id": 0, "name": "eDP-1", "x": 0, "y": 0,
-                 "width": 1920, "height": 1080, "scale": 1, "transform": 0,
-                 "reserved": [0, 0, 0, 0], "disabled": False},
-                {"id": 1, "name": "DP-3", "x": 1920, "y": 0,
-                 "width": 2560, "height": 1440, "scale": 1, "transform": 0,
-                 "reserved": [0, 0, 0, 0], "disabled": False}]
-    seen = []
-
-    def runner(argv, timeout=10, **kw):
-        d = SimpleNamespace(returncode=0, stderr="", stdout="")
-        seen.append(list(argv))
-        if argv[:3] == ["hyprctl", "clients", "-j"]:
-            d.stdout = json.dumps(clients)
-        elif argv[:3] == ["hyprctl", "monitors", "-j"]:
-            d.stdout = json.dumps(monitors)
-        elif argv[:2] == ["hyprctl", "dispatch"]:
-            d.stdout = dispatch_reply
-        return d
-    return runner, seen
-
-
-def _fake_style_dir(tmp_path, style):
-    d = tmp_path / f"hypr-{style}"
-    d.mkdir()
-    (d / ("hyprland.lua" if style == "lua" else "hyprland.conf")).write_text(
-        "// fixture\n", encoding="utf-8")
-    return d
-
-
-@pytest.mark.parametrize("style", ["lua", "legacy"])
-def test_apply_hyprland_scale_feet_anchored(tmp_path, style):
-    runner, seen = _fake_hypr()
-    res = avatar_scale.apply_hyprland_scale(
-        1.5, 420, 680, runner=runner, config_dir=str(_fake_style_dir(tmp_path, style)))
-    assert res["ok"] is True, res
-    assert res["geometry"] == (595, 40, 630, 1020)      # feet at (910,1060) kept
-    assert len(res["dispatched"]) == 2                  # resize THEN move
-    # every dispatch that went to the compositor is one of ours (the legacy
-    # style probe 'jitter' may also appear; nothing else does)
-    fired = [a[2] for a in seen if a[:2] == ["hyprctl", "dispatch"]
-             and a[2] != "jitter"]
-    assert fired == res["dispatched"]
-    if style == "lua":
-        assert 'address:0x1234abcd' in res["dispatched"][0]
-    else:
-        assert "class:^(riko)$" in res["dispatched"][0]
-
-
-def test_apply_hyprland_scale_uses_the_windows_own_monitor():
-    # the riko window lives on monitor 1 (1920,0,2560,1440): the fit clamp
-    # and the on-screen clamp use THAT monitor, not the first row
-    runner, _ = _fake_hypr(monitor_id=1)
-    res = avatar_scale.apply_hyprland_scale(1.5, 420, 680, runner=runner,
-                                            style="lua")
-    assert res["ok"] is True
-    x, y, w, h = res["geometry"]
-    assert 1920 <= x and x + w <= 1920 + 2560 and 0 <= y and y + h <= 1440
-
-
-def test_apply_hyprland_scale_requires_ok_reply_and_mapped_window():
-    runner, _ = _fake_hypr(dispatch_reply="no active window")
-    res = avatar_scale.apply_hyprland_scale(1.2, 420, 680, runner=runner,
-                                            style="lua")
-    assert res["ok"] is False and "no active window" in res["error"]
-
-    runner2, _ = _fake_hypr(extra_windows=False)
-
-    def nomap(argv, timeout=10, **kw):
-        return SimpleNamespace(returncode=0, stderr="", stdout="[]")
-    res2 = avatar_scale.apply_hyprland_scale(1.2, 420, 680, runner=nomap,
-                                             style="lua")
-    assert res2["ok"] is False and "not mapped" in res2["error"]
-
-
-# ── REAL hyprctl rows (fixtures captured from live Hyprland 0.56.2) ──────
-# The old invented monitor shape (`size: {x,y}` / `recommendedMode`) does
-# not exist in real `hyprctl -j monitors` output: rows carry PHYSICAL
-# width/height + scale + transform + reserved bars; window coords and the
-# resize/move dispatches are all LOGICAL layout px (proof: the real riko
-# row is size [420,680] == the requested base size on the 1.25-scale
-# monitor). fixtures/hypr_real_monitors.json + hypr_real_clients_riko.json:
-# DP-2 id0 x0 2560x1440 s1 | DP-3 id2 x2560 2560x1440 s1 |
-# HDMI-A-1 id1 x5120 2560x1440 s1.25 -> logical 2048x1152; all reserved
-# [0,44,0,0] (top bar). The riko row: monitor 1, at [6675,227], size
-# [420,680].
-import pathlib
-
-FIXTURES = pathlib.Path(__file__).parent / "fixtures"
-
-
-def _real_rows():
-    monitors = json.loads((FIXTURES / "hypr_real_monitors.json")
-                          .read_text(encoding="utf-8"))
-    clients = json.loads((FIXTURES / "hypr_real_clients_riko.json")
-                         .read_text(encoding="utf-8"))
-    return monitors, clients[0]
-
-
-def _real_runner(dispatch_reply="ok"):
-    monitors, own = _real_rows()
-
-    def runner(argv, timeout=10, **kw):
-        d = SimpleNamespace(returncode=0, stderr="", stdout="")
-        if argv[:3] == ["hyprctl", "clients", "-j"]:
-            d.stdout = json.dumps([own])
-        elif argv[:3] == ["hyprctl", "monitors", "-j"]:
-            d.stdout = json.dumps(monitors)
-        elif argv[:2] == ["hyprctl", "dispatch"]:
-            d.stdout = dispatch_reply
-        return d
-    return runner
-
-
-# usable logical rect of the 1.25-scale HDMI-A-1: x 5120, y 0+44 (bar),
-# 2560/1.25=2048 wide, 1440/1.25-44=1108 tall
-HDMI = (5120, 44, 2048, 1108)
-
+# ── real 0.56.2 monitor rows ──────────────────────────────────────────
 
 def test_monitor_logical_rect_real_rows():
-    monitors, own = _real_rows()
-    rects = {m["id"]: avatar_scale.monitor_logical_rect(m) for m in monitors}
-    assert rects[0] == (0, 44, 2560, 1396)        # DP-2: scale 1, minus 44px bar
-    assert rects[2] == (2560, 44, 2560, 1396)     # DP-3
-    assert rects[1] == HDMI                        # HDMI-A-1: scale 1.25 applied
-    disabled = dict(monitors[0], disabled=True)
-    assert avatar_scale.monitor_logical_rect(disabled) is None
-    # rotated transforms swap w/h (1/3/5/7 = 90/270)
-    assert avatar_scale.monitor_logical_rect(
-        {"width": 2560, "height": 1440, "scale": 1, "transform": 1,
-         "x": 0, "y": 0}) == (0, 0, 1440, 2560)
-    assert avatar_scale.monitor_logical_rect(
-        {"width": 2560, "height": 1440, "scale": 1, "transform": 3,
-         "x": 0, "y": 0}) == (0, 0, 1440, 2560)
-    # scale applies AFTER the swap
-    assert avatar_scale.monitor_logical_rect(
-        {"width": 2560, "height": 1440, "scale": 1.25, "transform": 5,
-         "x": 0, "y": 0}) == (0, 0, 1152, 2048)
-    # transform 0/2/4/6 do NOT swap
-    assert avatar_scale.monitor_logical_rect(
-        {"width": 2560, "height": 1440, "scale": 1, "transform": 2,
-         "x": 0, "y": 0}) == (0, 0, 2560, 1440)
+    # DP-2: 2560x1440 @ scale 1, 44 px top bar reserved
+    assert asc.monitor_logical_rect(REAL_MONITORS[0]) == (0, 44, 2560, 1396)
+    # HDMI-A-1: PHYSICAL 2560x1440 at scale 1.25 → logical 2048x1152 minus
+    # the bar; x/y are already logical (5120 = two scale-1 monitors to the
+    # left). This logical-vs-physical trap made the owner's zoom stop at 1.3.
+    assert MON1 == (5120, 44, 2048, 1108)
 
 
-def test_monitor_logical_rect_reserved_bars_shrink_the_rect():
-    # reserved is [left, top, right, bottom] -> the usable rect is inset
-    m = {"width": 1920, "height": 1080, "scale": 1, "transform": 0,
-         "x": 100, "y": 200, "reserved": [10, 20, 30, 40]}
-    assert avatar_scale.monitor_logical_rect(m) == (110, 220, 1880, 1020)
-    # a row whose bars eat the whole area is unusable, not a negative rect
-    assert avatar_scale.monitor_logical_rect(
-        dict(m, reserved=[1000, 500, 1000, 500])) is None
+def test_monitor_logical_rect_scale_transform_reserved():
+    base = {"id": 0, "width": 1920, "height": 1080, "x": 0, "y": 0,
+            "scale": 1, "transform": 0, "reserved": [0, 0, 0, 0]}
+    assert asc.monitor_logical_rect(base) == (0, 0, 1920, 1080)
+    s = dict(base, scale=1.25, x=2000, y=-500)
+    assert asc.monitor_logical_rect(s) == (2000, -500, 1536, 864)
+    assert asc.monitor_logical_rect(dict(base, transform=1)) == (0, 0, 1080, 1920)
+    assert asc.monitor_logical_rect(dict(base, transform=2)) == (0, 0, 1920, 1080)
+    assert asc.monitor_logical_rect(dict(base, reserved=[10, 40, 20, 0])) == (10, 40, 1890, 1040)
+    assert asc.monitor_logical_rect(dict(base, disabled=True)) is None
+    # a non-list `reserved` is ignored (tolerant), not fatal
+    assert asc.monitor_logical_rect(dict(base, reserved="junk")) == (0, 0, 1920, 1080)
+    for junk in (None, {}, [], dict(base, width=0), dict(base, scale=0),
+                 dict(base, scale="x"), dict(base, reserved=[0, 1080, 0, 0])):
+        assert asc.monitor_logical_rect(junk) is None
 
 
-def test_monitor_rect_for_real_client_row():
-    monitors, own = _real_rows()
-    assert avatar_scale.monitor_rect_for(own, monitors) == HDMI
+def test_monitor_rect_for_matches_client_monitor_id():
+    assert asc.monitor_rect_for(OWN, REAL_MONITORS) == MON1
+    by_id = [{"id": 7, "width": 800, "height": 600, "x": 0, "y": 0,
+              "scale": 1, "transform": 0, "reserved": [0, 0, 0, 0]}]
+    assert asc.monitor_rect_for({"monitor": 7, "at": [1, 1], "size": [10, 10]}, by_id) == (0, 0, 800, 600)
 
 
-def test_monitor_rect_for_falls_back_to_window_centre():
-    monitors, own = _real_rows()
-    # monitor -1 / missing (window not assigned): the monitor whose usable
-    # logical rect contains the window centre wins — here HDMI-A-1
-    # (centre 6885, 567 inside 5120..7168 x 44..1152)
-    assert avatar_scale.monitor_rect_for(dict(own, monitor=-1), monitors) == HDMI
-    no_key = {k: v for k, v in own.items() if k != "monitor"}
-    assert avatar_scale.monitor_rect_for(no_key, monitors) == HDMI
-    # a bogus id falls back the same way (id lookup missed, centre matches)
-    assert avatar_scale.monitor_rect_for(dict(own, monitor=99), monitors) == HDMI
-    # centre on no monitor and no overlap -> None (not a random first row)
-    assert avatar_scale.monitor_rect_for(
-        dict(own, monitor=-1, at=[50000, 50000]), monitors) is None
+def test_monitor_rect_for_falls_back_to_containment_and_overlap():
+    mons = [
+        {"id": 0, "width": 1000, "height": 1000, "x": 0, "y": 0, "scale": 1,
+         "transform": 0, "reserved": [0, 0, 0, 0]},
+        {"id": 1, "width": 1000, "height": 1000, "x": 1000, "y": 0, "scale": 1,
+         "transform": 0, "reserved": [0, 0, 0, 0]},
+        {"id": 2, "width": 500, "height": 500, "x": 2000, "y": 0, "scale": 1,
+         "transform": 0, "reserved": [0, 0, 0, 0], "disabled": True},
+    ]
+    # monitor -1/missing: centre inside the right monitor
+    assert asc.monitor_rect_for({"at": [1400, 100], "size": [10, 10]}, mons) == (1000, 0, 1000, 1000)
+    # straddling with more coverage on the left: centre decides (tie area → largest overlap)
+    assert asc.monitor_rect_for({"monitor": -1, "at": [900, 100], "size": [10, 10]}, mons) == (0, 0, 1000, 1000)
+    # fully off all monitors: biggest overlap wins (zero here -> None)
+    assert asc.monitor_rect_for({"at": [9000, 9000], "size": [10, 10]}, mons) is None
+    # disabled monitor id (2): the id never matches, so the centre-containment
+    # fallback decides — the window physically lives on the left monitor
+    assert asc.monitor_rect_for({"monitor": 2, "at": [0, 0], "size": [10, 10]}, mons) == (0, 0, 1000, 1000)
+    assert asc.monitor_rect_for(None, mons) is None
+    assert asc.monitor_rect_for({"monitor": 0}, []) is None
 
 
-def test_monitor_rect_for_skips_disabled_monitor():
-    monitors, own = _real_rows()
-    mons = [dict(m, disabled=(m["id"] == 1)) for m in monitors]
-    # id 1 disabled: neither the id match nor the centre fallback may use it
-    # (the window rect lies fully right of DP-3, so nothing overlaps -> None)
-    assert avatar_scale.monitor_rect_for(own, mons) is None
+def test_monitor_rect_for_survives_garbage_rows():
+    # a future Hyprland schema with unexpected rows must not explode
+    assert asc.monitor_rect_for(OWN, [None, "junk", 5]) is None
+    assert asc.monitor_rect_for({"monitor": "x", "at": None, "size": None}, REAL_MONITORS) is None
 
 
-def test_apply_hyprland_scale_real_rows_clamps_on_scaled_monitor():
-    # 2.5x on HDMI-A-1: usable height 1152 minus the 44px bar minus margins
-    # -> max height 1068 logical px (NOT 1440 physical and not 1152-full)
-    runner = _real_runner()
-    res = avatar_scale.apply_hyprland_scale(2.5, 420, 680, runner=runner,
-                                            style="lua")
-    assert res["ok"] is True, res
+# ── feet-anchored geometry ────────────────────────────────────────────
+
+def test_grow_anchors_feet_centre():
+    mon = (0, 0, 2560, 2400)                           # room for a 2x window
+    cur = (1000, 700, BASE_W, BASE_H)
+    x, y, w, h = asc.scaled_geometry(mon, cur, BASE_W, BASE_H, 2.0)
+    assert (w, h) == (round(BASE_W * 2), round(BASE_H * 2))
+    assert y + h == cur[1] + cur[3]                    # bottom edge never moves
+    assert abs((x + w / 2) - (cur[0] + cur[2] / 2)) <= 1  # horizontal centre too
+
+
+def test_shrink_anchors_feet_centre():
+    mon = (0, 0, 2560, 2400)
+    cur = (1000, 700, BASE_W * 2, BASE_H * 2)
+    x, y, w, h = asc.scaled_geometry(mon, cur, BASE_W, BASE_H, 1.0)
+    assert (w, h) == (BASE_W, BASE_H)
+    assert y + h == cur[1] + cur[3]
+    assert abs((x + w / 2) - (cur[0] + cur[2] / 2)) <= 1
+
+
+def test_headroom_then_fit_lands_back_on_the_start_rect():
+    # the exact gesture the page runs: fit at 1.0 → headroom grow → fit at
+    # a bigger final scale; feet anchoring is what makes the moves invisible
+    start = (6000, 300, BASE_W, BASE_H)
+    g1 = asc.scaled_geometry(MON1, start, BASE_W, BASE_H, 1.0)
+    assert g1 == start
+    grow = asc.scaled_geometry(MON1, g1, BASE_W, BASE_H, 1.4 * 1.6)
+    fit = asc.scaled_geometry(MON1, grow, BASE_W, BASE_H, 1.4)
+    assert grow[1] + grow[3] == g1[1] + g1[3]          # grow anchors the feet
+    assert grow[3] > g1[3]
+    assert fit[1] + fit[3] == grow[1] + grow[3]        # fit anchors them again
+    assert fit[3] == grow[3]                           # 1.4 exceeds this
+    #   monitor's growth room, so both clamp at the same height (feet first!)
+    assert fit[1] + fit[3] == start[1] + start[3]
+
+
+def test_growth_stops_instead_of_moving_the_feet():
+    # window whose feet are low on the monitor: growth is capped to the
+    # space ABOVE the feet; the bottom edge NEVER slides down (y-clamping
+    # the top instead would = exactly the jerky jump this design kills)
+    mon = (0, 0, 1920, 1080)
+    cur = (700, 1080 - BASE_H, BASE_W, BASE_H)         # bottom at the monitor bottom
+    g = asc.scaled_geometry(mon, cur, BASE_W, BASE_H, 3.0)
+    assert g[1] + g[3] == cur[1] + cur[3]              # feet never move
+    assert g[1] >= 0                                   # top stays on-screen
+    assert g[3] <= 1080
+
+
+def test_geometry_clamped_fully_inside_monitor():
+    # window near the left edge growing: gets pushed right, never off-screen
+    cur = (1010, 300, BASE_W, BASE_H)
+    x, y, w, h = asc.scaled_geometry(MON1, cur, BASE_W, BASE_H, 1.5)
+    assert x >= MON1[0] and x + w <= MON1[0] + MON1[2]
+    assert y >= MON1[1] and y + h <= MON1[1] + MON1[3]
+    # window at the very bottom growing: y sticks to the top, never below
+    cur = (6000, MON1[1] + MON1[3] - BASE_H, BASE_W, BASE_H)
+    x, y, w, h = asc.scaled_geometry(MON1, cur, BASE_W, BASE_H, 1.4)
+    assert y + h <= MON1[1] + MON1[3]
+    assert y >= MON1[1]
+    # a monitor with an odd offset (owner layout: x=5120, y=-500 style)
+    off = (5120, -500, MON1[2], MON1[3])
+    cur = (6000, -100, BASE_W, BASE_H)
+    x, y, w, h = asc.scaled_geometry(off, cur, BASE_W, BASE_H, 1.3)
+    assert x >= 5120 and x + w <= 5120 + MON1[2]
+    assert y >= -500 and y + h <= -500 + MON1[3]
+
+
+# ── compositor commands ───────────────────────────────────────────────
+
+def test_lua_dispatches_target_own_window_only():
+    out = asc.hypr_scale_dispatches("lua", 840, 1360, 700, 120, "0xabc", "riko")
+    assert len(out) == 2
+    assert "address:0xabc" in out[0] and "address:0xabc" in out[1]
+    assert "x=840, y=1360" in out[0]        # resize FIRST (feet anchor math
+    assert "x=700, y=120" in out[1]         #  assumes the final size)
+
+
+def test_legacy_dispatches_quote_own_class():
+    out = asc.hypr_scale_dispatches("legacy", 840, 1360, 700, 120, "0xabc")
+    assert out[0] == '"resizewindowpixel exact 840 1360,class:^(riko)$"'
+    assert out[1] == '"movewindowpixel exact 700 120,class:^(riko)$"'
+
+
+def test_batch_is_one_request_split_on_semicolons():
+    # hyprctl v0.56.2 source: --batch sends the rest of the argv as ONE
+    # [[BATCH]] request; the server splits on ';' OUTSIDE brackets and runs
+    # each part through the normal dispatch path — so exactly two parts.
+    argv = asc.hypr_scale_batch("lua", 840, 1360, 700, 120, "0xabc")
+    assert argv[0] == "hyprctl" and argv[1] == "--batch"
+    parts = argv[2].split(" ; ")
+    assert len(parts) == 2
+    assert parts[0].startswith("dispatch hl.dsp.window.resize(")
+    assert parts[1].startswith("dispatch hl.dsp.window.move(")
+    assert "address:0xabc" in argv[2]
+    assert "[" not in argv[2]               # no bracket that could eat a split
+
+
+def test_batch_reply_ok():
+    assert asc.batch_reply_ok("ok\n\n\nok") == (True, "")
+    ok, err = asc.batch_reply_ok("ok\n\n\nunknown dispatcher")
+    assert ok is False and err == "unknown dispatcher"
+    assert asc.batch_reply_ok("ok") == (False, "ok")      # missing 2nd reply
+    assert asc.batch_reply_ok("") == (False, "empty reply")
+
+
+# ── the sizer: fake hyprctl, no compositor, no window ─────────────────
+
+def own_row(at, size, addr="0x5642c7cbeba0", monitor=1):
+    row = dict(OWN, at=list(at), size=list(size), address=addr, monitor=monitor)
+    other = dict(OWN, title="Other", address="0xdeadbeef")
+    other["class"] = "kitty"          # 'class' is a keyword: set via item
+    return json.dumps([other, row])
+
+class FakeHypr:
+    """Fake hyprctl: clients/monitors answer with the owner's real rows,
+    --batch records the dispatch and (like v0.56.2) replies 'ok' per part."""
+
+    def __init__(self, at, size, addr="0x5642c7cbeba0", style="lua", fail_batch=False,
+                 monitor=1):
+        self.at, self.size = list(at), list(size)
+        self.addr = addr
+        self.style = style
+        self.fail_batch = fail_batch
+        self.monitor = monitor
+        self.dispatches = []          # every --batch argv
+        self.listing_calls = 0        # -j clients/monitors round trips
+
+    def __call__(self, argv, timeout=None, **kw):
+        return self._one(list(argv))
+
+    def _one(self, argv):
+        class R:
+            returncode, stderr = 0, ""
+        if argv[:2] == ["hyprctl", "--batch"]:
+            self.dispatches.append(argv)
+            R.stdout = "\n\n\n".join(["bad dispatch"] if self.fail_batch else ["ok"] * 2)
+            return R
+        if argv[:2] == ["hyprctl", "-j"]:
+            argv = ["hyprctl", argv[2], "-j"]     # accept both arg orders
+        if argv[:2] == ["hyprctl", "clients"]:
+            self.listing_calls += 1
+            R.stdout = own_row(self.at, self.size, self.addr, self.monitor)
+            return R
+        if argv[:2] == ["hyprctl", "monitors"]:
+            self.listing_calls += 1
+            R.stdout = json.dumps(REAL_MONITORS)
+            return R
+        if argv == ["hyprctl", "dispatch", "hl.dsp.no_op()"]:
+            R.stdout = "ok"          # the ambiguous-config probe
+            return R
+        raise AssertionError(f"unexpected argv {argv}")
+
+    def apply_batch(self, w, h, x, y):
+        # apply the batch like the compositor would: the LAST dispatch wins
+        for part in self.dispatches[-1][2].split(" ; "):
+            if "window.resize" in part:
+                self.size = [w, h]
+            elif "window.move" in part:
+                self.at = [x, y]
+            elif "resizewindowpixel" in part:
+                self.size = [w, h]
+            elif "movewindowpixel" in part:
+                self.at = [x, y]
+
+
+def sizer(runner=None, at=(6675, 227), size=(BASE_W, BASE_H), style="lua", **kw):
+    fake = runner if isinstance(runner, FakeHypr) else FakeHypr(at, size, **kw)
+    return asc.HyprlandSizer(BASE_W, BASE_H, "riko", runner=fake, style=style), fake
+
+
+def test_sizer_apply_is_one_batch_and_feet_anchor():
+    # DP-3 (id 2, scale 1) placed high enough that 1.5x growth room exists
+    sz, fake = sizer(at=(3000, 500), size=(BASE_W, BASE_H), monitor=2)
+    res = sz.apply(1.5)
+    assert res["ok"]
+    assert len(fake.dispatches) == 1                    # ONE compositor request
+    assert fake.dispatches[0][:2] == ["hyprctl", "--batch"]
+    assert len(fake.dispatches[0]) == 3                 # argv is exactly hyprctl --batch <one string>
     x, y, w, h = res["geometry"]
-    m = avatar_scale.MONITOR_MARGIN
-    assert h == 1152 - 44 - 2 * m == 1068
-    assert w == round(420 * h / 680) == 660        # aspect kept
-    rx, ry, rw, rh = HDMI
-    assert rx <= x and x + w <= rx + rw and ry <= y and y + h <= ry + rh
-    # dispatches carry the LOGICAL px (e.g. 660x1068), never physical
-    assert f"x={w}, y={h}" in res["dispatched"][0]
+    assert (w, h) == (round(BASE_W * 1.5), round(BASE_H * 1.5))
+    assert y + h == 500 + BASE_H                        # feet anchored
+    assert abs((x + w / 2) - (3000 + BASE_W / 2)) <= 1
+    assert f"x={w}, y={h}" in fake.dispatches[0][2]     # batch carries the geometry
+    assert f"x={x}, y={y}" in fake.dispatches[0][2]
+    assert abs(res["scale"] - 1.5) < 1e-9
 
 
-def test_apply_hyprland_scale_real_rows_feet_anchored():
-    # 1.08x fits: feet stay at (6885, 907) — the window's current bottom
-    runner = _real_runner()
-    res = avatar_scale.apply_hyprland_scale(1.08, 420, 680, runner=runner,
-                                            style="lua")
-    assert res["ok"] is True, res
-    x, y, w, h = res["geometry"]
-    assert (w, h) == (454, 734)
-    assert y + h == 227 + 680                       # feet anchored
-    assert x + w / 2 == pytest.approx(6675 + 420 / 2, abs=0.5)
-    rx, ry, rw, rh = HDMI
-    assert rx <= x and x + w <= rx + rw and ry <= y and y + h <= ry + rh
+def test_sizer_monitors_and_window_are_cached():
+    sz, fake = sizer(at=(3000, 500), monitor=2)
+    sz.apply(1.2)
+    n = fake.listing_calls
+    assert n >= 2                                       # first apply reads clients+monitors
+    sz.apply(1.3)
+    assert fake.listing_calls == n                      # grow+fit reuse the cache
+    assert len(fake.dispatches) == 2                    # but each apply dispatches
 
 
-def test_apply_hyprland_scale_invented_keys_now_diagnosable():
-    # regression for the live '[size] hyprland: monitor for own window
-    # unknown' failure: a row in the OLD invented shape (no width/height)
-    # must produce an error line carrying the numbers, not a bare message
-    _, own = _real_rows()
-    fake_mon = [{"id": 1, "name": "HDMI-A-1", "x": 5120, "y": 0,
-                 "size": {"x": 2560, "y": 1440}}]
-
-    def runner(argv, timeout=10, **kw):
-        d = SimpleNamespace(returncode=0, stderr="", stdout="")
-        if argv[:3] == ["hyprctl", "clients", "-j"]:
-            d.stdout = json.dumps([own])
-        elif argv[:3] == ["hyprctl", "monitors", "-j"]:
-            d.stdout = json.dumps(fake_mon)
-        return d
-    res = avatar_scale.apply_hyprland_scale(1.2, 420, 680, runner=runner,
-                                            style="lua")
-    assert res["ok"] is False
-    err = res["error"]
-    assert "monitor for own window unknown" in err
-    assert "window monitor id 1" in err and "monitor ids [1]" in err
-    assert "'size'" in err and "keys present" in err
+def test_sizer_monitor_cache_expires():
+    t = [1000.0]
+    fake = FakeHypr((3000, 500), (BASE_W, BASE_H), monitor=2)
+    s2 = asc.HyprlandSizer(BASE_W, BASE_H, "riko", runner=fake, style="lua",
+                           clock=lambda: t[0])
+    s2.apply(1.1)
+    n = fake.listing_calls
+    t[0] += asc.MONITOR_CACHE_TTL + 1                   # display config may have changed
+    s2.apply(1.2)
+    assert fake.listing_calls > n
 
 
-def test_apply_hyprland_scale_unmapped_error_lists_classes():
-    def runner(argv, timeout=10, **kw):
-        d = SimpleNamespace(returncode=0, stderr="", stdout="")
-        if argv[:3] == ["hyprctl", "clients", "-j"]:
-            d.stdout = json.dumps([{"class": "firefox"}, {"class": "kitty"}])
-        return d
-    res = avatar_scale.apply_hyprland_scale(1.2, 420, 680, runner=runner,
-                                            style="lua")
-    assert res["ok"] is False and "not mapped" in res["error"]
-    assert "['firefox', 'kitty']" in res["error"]
+def test_sizer_grow_then_fit_lands_on_the_start_rect():
+    # the invisible-fit contract, desktop side: grow to headroom, fit to
+    # final — the fit rect has the bottom edge back exactly where the
+    # gesture started it, so her feet never moved on screen
+    sz, fake = sizer()
+    g1 = sz.apply(1.0)["geometry"]
+    assert (g1[2], g1[3]) == (BASE_W, BASE_H)
+    grow = sz.apply(1.4 * 1.6)["geometry"]
+    assert grow[1] + grow[3] == g1[1] + g1[3]           # grow anchors the feet
+    assert grow[3] > g1[3]
+    fit = sz.apply(1.4)["geometry"]
+    assert fit[1] + fit[3] == grow[1] + grow[3]         # fit anchors them again
+    assert fit[3] == grow[3]      # 1.4 > this monitor's growth room (863 px
+    #                             above her feet): grow and fit clamp equal,
+    #                             the FEET, not the fill, decide the ceiling
+    assert len(fake.dispatches) == 3                    # grow + fit = ONE batch each
 
 
-# ── roam strip height follows the scale ──────────────────────────────────
-def test_strip_geometry_follows_scale_bottom_anchored():
-    geo = (0, 0, 1920, 1080)
-    assert roam.strip_geometry(geo, 680, 1.0) == (0, 432, 1920, 648)   # 60% cap
-    assert roam.strip_geometry(geo, 680, 0.4) == (0, 808, 1920, 272)   # 272 = 680*0.4
-    assert roam.strip_geometry(geo, 680, 2.5) == (0, 432, 1920, 648)   # capped
-    x, y, w, h = roam.strip_geometry(geo, 680, 1.5)
-    assert (x, w) == (0, 1920) and y + h == 1080                       # full width, bottom edge
-    tiny = roam.strip_geometry(geo, 300, 0.4)                          # 120 -> min 200
-    assert tiny[3] == 200 and tiny[1] + tiny[3] == 1080
-    strip_small_monitor = roam.strip_geometry((0, 0, 800, 300), 680, 2.0)
-    assert strip_small_monitor[3] <= 300                               # never taller than the screen
+def test_sizer_reports_fit_cap_and_clamps_growth():
+    sz, fake = sizer()
+    res = sz.apply(2.5)                                 # band max on the 1.25 monitor
+    assert res["ok"]
+    assert res["max"] < 2.5                             # monitor says stop here
+    w, h = res["geometry"][2], res["geometry"][3]
+    assert h <= MON1[3] - 2 * asc.MONITOR_MARGIN
+    assert abs(res["scale"] - res["max"]) < 1e-6        # applied == the cap
+    # headroom windows can't buy pixels the monitor doesn't have: both the
+    # final cap and the headroom clamp meet at the growth room (feet first)
+    big = sz.apply(1.9 * 1.6)
+    assert big["ok"] and big["scale"] >= res["max"]
+    assert big["geometry"][1] + big["geometry"][3] == res["geometry"][1] + res["geometry"][3]
+    # the cap is a float, never a crash: a window taller than the monitor
+    tiny = asc.HyprlandSizer(3000, 2000, "riko", runner=FakeHypr([0, 0], [3000, 2000]), style="lua")
+    cap = tiny.fit_cap()
+    assert 0.01 <= cap < 1.0
 
 
-# ── persistence per persona ──────────────────────────────────────────────
-def test_scale_persists_per_persona(monkeypatch, tmp_path):
-    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path / "state"))
-    assert appstate.load_scale("riko") is None          # never chosen
-    assert appstate.save_scale("riko", 1.5) is True
-    assert appstate.save_scale("asuka", 0.8) is True
-    assert appstate.load_scale("riko") == 1.5
-    assert appstate.load_scale("asuka") == 0.8          # independent
-    assert appstate.load_scale("other") is None
-    assert appstate.save_scale("riko", 1.2) is True     # last write wins
-    assert appstate.load_scale("riko") == 1.2 and appstate.load_scale("asuka") == 0.8
+def test_sizer_refreshes_after_dispatch_failure():
+    fake = FakeHypr((6675, 227), (BASE_W, BASE_H), fail_batch=True)
+    sz, _ = sizer(runner=fake)
+    res = sz.apply(1.2)
+    assert not res["ok"] and "bad dispatch" in res["error"]
+    n_after_fail = fake.listing_calls                   # caches were dropped
+    assert n_after_fail >= 2
+    fake.fail_batch = False
+    res = sz.apply(1.3)
+    assert res["ok"]
+    assert fake.listing_calls >= n_after_fail + 2       # state re-read before dispatch
 
 
-def test_scale_persistence_rejects_junk(monkeypatch, tmp_path):
-    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path / "state"))
-    for bad in (0.2, 3.0, "big", None, True, float("nan")):
-        assert appstate.save_scale("riko", bad) is False, bad
-    # a hand-mangled file reads as "never chosen", never raises
-    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-    p = tmp_path / "state" / "avatar_scale.json"
-    for junk in ("{ not json", "[1,2]", '{"riko": "big"}', '{"riko": 9}'):
-        p.write_text(junk, encoding="utf-8")
-        assert appstate.load_scale("riko") is None
+def test_sizer_missing_own_window_is_error_not_crash():
+    sz = asc.HyprlandSizer(BASE_W, BASE_H, "riko",
+                           runner=lambda argv, timeout=None, **kw: _r("[]"),
+                           style="lua")
+    res = sz.apply(1.0)
+    assert not res["ok"] and "window" in res["error"].lower()
+    sz = asc.HyprlandSizer(BASE_W, BASE_H, "riko",
+                           runner=lambda argv, timeout=None, **kw: _r("not json"),
+                           style="lua")
+    res = sz.apply(1.0)
+    assert not res["ok"] and "hyprctl clients failed" in res["error"]
+
+
+def test_sizer_legacy_style_selects_class():
+    sz, fake = sizer(style="legacy")
+    res = sz.apply(1.5)
+    assert res["ok"]
+    assert "class:^(riko)$" in fake.dispatches[-1][2]
+    assert "hl.dsp" not in fake.dispatches[-1][2]
+
+
+def _r(out):
+    class R:
+        returncode, stderr, stdout = 0, "", out
+    return R
+
+
+# ── constants the page and desktop must agree on ──────────────────────
+
+def test_constants_match_the_page():
+    assert asc.SCALE_MIN == 0.4 and asc.SCALE_MAX == 2.5
+    assert asc.SCALE_STEP == 1.08
+    assert asc.MONITOR_CACHE_TTL == 30.0
+    assert math.isfinite(asc.WINDOW_SCALE_MAX)

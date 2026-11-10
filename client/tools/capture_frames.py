@@ -70,6 +70,10 @@ SCENARIOS = {
     "think": ("think@0", []),
     "wave": ("wave@0", []),
     "walk": ("walk@0.5", []),  # gait photos: use a wide --size, e.g. 1920x680
+    # scroll-zoom smoothness QA: needs --desktop (FAKE_DESK resizes the canvas
+    # at gesture boundaries exactly like the real window does) and --gestures.
+    # Frame times are RELATIVE TO WAKE; the gesture starts at its startMs.
+    "zoom": (None, []),
 }
 
 
@@ -159,6 +163,9 @@ def main():
                     help="open the page with ?desktop=1 (the desktop.py framing)")
     ap.add_argument("--gaze", default=None,
                     help="page ?gaze= offset 'yaw,pitch' in degrees (forced gaze)")
+    ap.add_argument("--gestures", default=None,
+                    help="page ?gestures= 'startMs:count:deltaY:gapMs' — synthetic "
+                         "wheel gesture on the canvas (for the zoom scenario)")
     args = ap.parse_args()
 
     force, events = SCENARIOS[args.scenario]
@@ -180,24 +187,27 @@ def main():
     profile = os.path.join(TMP, "riko-chrome-profile")
     subprocess.run(["rm", "-rf", profile], check=False)  # temp profile, never the owner's
     url = f"http://127.0.0.1:{port}/?capture={args.secs}"
-    if args.desktop:
+    if args.desktop or args.scenario == "zoom":
         url += "&desktop=1"
     if force:
         url += f"&force={force}"
     if args.gaze:
         url += f"&gaze={args.gaze}"
+    if args.gestures:
+        url += f"&wheelzoom={args.gestures}"
     maxsec = max(float(s) for s in args.secs.split(","))
     dur = args.runtime if args.runtime else maxsec + 8
     cmd = [
         "chromium", "--headless=new", f"--user-data-dir={profile}", "--no-sandbox",
         "--enable-unsafe-swiftshader", "--use-gl=angle", "--use-angle=swiftshader",
         "--autoplay-policy=no-user-gesture-required", f"--window-size={w},{h}",
-        "--disable-dev-shm-usage", "--hide-scrollbars",
+        "--disable-dev-shm-usage", "--hide-scrollbars", "--enable-logging=stderr",
         "--allow-file-access", url,
     ]
     print(f"[harness] chromium for {dur}s -> {args.outdir}", flush=True)
+    errlog = open(os.path.join(args.outdir, "chromium.log"), "wb")  # console/stderr for debugging
     # own process group: chromium forks children that survive a plain proc.kill()
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errlog,
                             start_new_session=True)
     try:
         time.sleep(dur)
