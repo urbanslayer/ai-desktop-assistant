@@ -227,9 +227,12 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 7. **Hub backups**: nightly copy of `~/AI/Docker/riko-hub/data` (and `breeze-tts/data/voices`, the ASR
    model is re-downloadable) to the owner's Duplicati on Nemu, or a simple dated tarball with rotation. Owner to
    confirm the target.
-   Status 2026-11-10: tooling done (`scripts/backup_hub.sh` + `scripts/backup_pull.sh`, systemd user timers in
-   `scripts/systemd/`, docs/BACKUPS.md) — eve nightly tar.zst with rotation keeps 14,   PC mirrors it via rsync over ssh for Duplicati on Nemu. **Not deployed yet; the hub currently has ZERO backups.** Install steps
-   are in docs/BACKUPS.md.
+   Status 2026-11-10: **DONE — tooling built AND running.** `scripts/backup_hub.sh` (eve) + `scripts/backup_pull.sh`
+   (PC) + systemd user timers (`scripts/systemd/`) + docs/BACKUPS.md. Installed: `riko-backup.timer` on eve
+   (03:20, linger on) and `riko-backup-pull.timer` on the PC (04:40), both enabled; first archives taken and
+   verified (archive extracted, `PRAGMA integrity_check` = ok, 2,131 messages). Rotation keeps 14. Snapshots use
+   the sqlite3 backup API inside the hub container (the image has no sqlite3 CLI). Remaining owner step: point
+   Duplicati on Nemu at `~/Backups/riko-hub` on this PC.
 
 ## Owner's steps
 
