@@ -550,18 +550,21 @@
       _tp.set(p[0], p[1], p[2]).project(camera);
       return [(_tp.x * 0.5 + 0.5) * innerWidth, (-_tp.y * 0.5 + 0.5) * innerHeight];
     }
-    // Touch HUD (docs/TOUCH.md visual checks), drawn over the WebGL canvas so
-    // ?capture screenshots contain it: sit edge line + grab-target ring.
-    const _hudScene = new THREE.Scene();
-    const _hudCam = new THREE.OrthographicCamera(0, innerWidth, 0, innerHeight, -10, 10);
+    // Touch HUD (docs/TOUCH.md visual checks), drawn into the MAIN render as
+    // children of the camera (a 2D overlay at fixed depth), so ?capture
+    // screenshots contain it: sit edge line + grab-target ring.
+    const _hudRoot = new THREE.Group();
     const _edgeMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(1, 2),
+      new THREE.PlaneGeometry(1, 1),
       new THREE.MeshBasicMaterial({ color: 0x78beff, transparent: true, opacity: 0.6, depthTest: false }));
     const _ringMesh = new THREE.Mesh(
-      new THREE.RingGeometry(6, 8, 28),
+      new THREE.RingGeometry(0.78, 1, 28),
       new THREE.MeshBasicMaterial({ color: 0xffaa50, transparent: true, opacity: 0.95, depthTest: false }));
+    for (const m of [_edgeMesh, _ringMesh]) { m.renderOrder = 999; m.frustumCulled = false; }
     _edgeMesh.visible = _ringMesh.visible = false;
-    _hudScene.add(_edgeMesh, _ringMesh);
+    _hudRoot.add(_edgeMesh, _ringMesh);
+    scene.add(camera);
+    camera.add(_hudRoot);
     let _specFace = null;      // empirically-detected "facing camera" yaw
     function specFaceWant() {
       if (_specFace != null) return _specFace;
@@ -759,15 +762,14 @@
       // hips + crosshair at the live grab target. Drawn into the WEBGL canvas
       // (a HUD pass), not the DOM, so ?capture screenshots include them.
       {
-        const w = innerWidth, hh = innerHeight;
-        if (_hudCam.right !== w || _hudCam.bottom !== hh) {
-          _hudCam.right = w; _hudCam.bottom = hh; _hudCam.updateProjectionMatrix();
-        }
+        const W = innerWidth, H = innerHeight, D = 0.5;
+        const halfH = Math.tan((camera.fov * Math.PI) / 360) * D;
+        const halfW = halfH * (W / H);
         const s = pose.sitState;
         if (s && s.edgePx != null && s.w > 0.01) {
           _edgeMesh.visible = true;
-          _edgeMesh.position.set(w / 2, s.edgePx, -1);
-          _edgeMesh.scale.set(w, 1, 1);
+          _edgeMesh.position.set(0, (0.5 - s.edgePx / H) * 2 * halfH, -D);
+          _edgeMesh.scale.set(2 * halfW, 2 * halfH * (2 / H), 1);
           _edgeMesh.material.opacity = 0.6 * Math.min(1, s.w);
         } else _edgeMesh.visible = false;
         let shown = false;
@@ -776,7 +778,8 @@
             const [px, py] = _pxOf(g.cur);
             if (Number.isFinite(px) && Number.isFinite(py)) {
               _ringMesh.visible = true;
-              _ringMesh.position.set(px, py, -1);
+              _ringMesh.position.set((px / W * 2 - 1) * halfW, (0.5 - py / H) * 2 * halfH, -D);
+              _ringMesh.scale.setScalar(7 * 2 * halfH / H);   // ~7 px radius
               shown = true;
               break;
             }
@@ -1618,12 +1621,6 @@
       vrm.update(dt);
       controls.update();  // runs the glide
       renderer.render(scene, camera);
-      if (_edgeMesh.visible || _ringMesh.visible) {
-        renderer.autoClear = false;
-        renderer.clearDepth();
-        renderer.render(_hudScene, _hudCam);
-        renderer.autoClear = true;
-      }
     });
   </script>
 </body>
