@@ -184,7 +184,7 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
      page section.
    - **Hooks that already exist:** the gesture/pose sampler (`samplePose`/`sampleGesture`,
      `mirrorPose`), `director.js`, action tags (`hub/body.py`), and the persona `appearance` field.
-7. **Touch and posing: interacting with her body, not just moving her** (owner request). **Plan only;
+7. **Touch and posing: interacting with her body, not just moving her** (owner request). **IN PROGRESS 2026-11-10 — contract docs/TOUCH.md;
    feasibility looks good.**
    - **Sit on the screen edge:** drag her down so her legs go past the bottom of the screen, and she
      sits on the edge with her legs dangling off-screen. Lift her back up and she stands again.

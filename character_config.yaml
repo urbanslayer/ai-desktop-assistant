@@ -134,7 +134,7 @@ desktop:
   # days). An existing spotifyd login is found and COPIED into the Riko
   # cache; none found -> the tray prints the authenticate command above.
   music:
-    spotifyd: off        # off | managed (Riko starts/stops it) | external (you do)
+    spotifyd: managed    # off | managed (Riko starts/stops it) | external (you do)
     # device_name: ""    # Spotify Connect name; default: the persona name,
                          # else "Riko" (the hub's Settings > Spotify default)
     backend: pulseaudio  # spotifyd audio backend. spotifyd knows ONLY
