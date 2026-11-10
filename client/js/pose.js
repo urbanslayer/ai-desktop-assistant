@@ -334,7 +334,9 @@ export class PoseLayer {
       s.offset = clamp(s.offset + (s.edgeWorldY - (m._restPos.y + s.offset)) * Math.min(1, dt * 12),
                        -1.25 * (legs?.legLen || 0.7), 0.25);
     } else if (s.edgePx != null && ctx_viewH(s)) {
-      // px feedback: move hips so their projected y sits on the line
+      // px feedback: move hips so their projected y sits on the line.
+      // screen-y is DOWN but world-y is UP: hips above the line (err > 0,
+      // py < edge) must LOWER hips.position.y — hence offset -= err.
       const { viewH } = { viewH: s.viewH };
       m.vrm.scene.updateMatrixWorld(true);
       const p = hips.getWorldPosition(this._v1).clone().project(m.camera);
@@ -342,7 +344,7 @@ export class PoseLayer {
       const dist = Math.max(0.3, m.camera.position.distanceTo(this._v1));
       const mPerPx = (2 * Math.tan((m.camera.fov * Math.PI) / 360) * dist) / Math.max(1, viewH);
       const err = s.edgePx - py;   // px (down = positive)
-      s.offset = clamp(s.offset + err * mPerPx * Math.min(1, dt * 15),
+      s.offset = clamp(s.offset - err * mPerPx * Math.min(1, dt * 15),
                        -1.25 * (legs?.legLen || 0.7), 0.25);
     }
     hips.position.y = m._restPos.y + s.offset * e;

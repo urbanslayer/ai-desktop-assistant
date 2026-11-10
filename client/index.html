@@ -836,11 +836,14 @@
             };
             return [one(ax, 0), one(ay, 1)];
           };
-          const op = tk[0];
+          const opTok = tk[0];
+          const colon = opTok.indexOf(':');
+          const op = colon < 0 ? opTok : opTok.slice(0, colon);
+          const opArg = colon < 0 ? tk[1] : opTok.slice(colon + 1);
           if (CAPTURE) console.log(`[touch] spec step: ${body}`);
           if (op === 'sit' || op === 'stand' || op === 'mode') {
-            onCommand(op === 'sit' ? `sit:${tk[1]}` : op === 'stand' ? 'stand'
-                  : `touch-mode:${tk[1]}`);
+            onCommand(op === 'sit' ? `sit:${opArg}` : op === 'stand' ? 'stand'
+                  : `touch-mode:${opArg}`);
           } else if (op === 'grab') {
             const [x, y] = xy(tk[2], tk[3]);
             const dx = +tk[4], dy = +tk[5], dur = +tk[6] || 900;

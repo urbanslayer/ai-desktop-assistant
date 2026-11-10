@@ -215,6 +215,29 @@ if (THREE) {
     assert.equal(pose.sitState, null);
   });
 
+  test('sit px branch: hips converge onto the window edge line (camera space)', need, () => {
+    const { motion, pose } = makePoseRig();
+    motion.setGazeOverride({ yaw: 0, pitch: 0 });
+    sim(motion, pose, 0.3);
+    const viewH = 680;
+    const pxY = () => {
+      motion.vrm.scene.updateMatrixWorld(true);
+      const p = motion._node('hips').getWorldPosition(new THREE.Vector3()).project(motion.camera);
+      return (1 - p.y) / 2 * viewH;
+    };
+    const start = pxY();
+    const edge = start + 150;                      // a line 150 px BELOW the hips
+    pose.sit(edge, viewH);
+    sim(motion, pose, 1.5);
+    const landed = pxY();
+    assert.ok(Math.abs(landed - edge) < 6,
+      `hips px ${landed.toFixed(1)} vs edge ${edge} (started ${start.toFixed(1)})`);
+    // and re-pinning to a new line still converges (sit:476 -> sit:578 flow)
+    pose.sit(edge - 120, viewH);
+    sim(motion, pose, 1.5);
+    assert.ok(Math.abs(pxY() - (edge - 120)) < 6, `re-pin failed: ${pxY().toFixed(1)}`);
+  });
+
   test('reactions decay: flinch ends at 0, head tilt/giggle vanish after their window', need, () => {
     const { motion, pose } = makePoseRig();
     sim(motion, pose, 0.2);
