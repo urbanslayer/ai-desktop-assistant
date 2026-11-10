@@ -316,15 +316,20 @@ export class PoseLayer {
     const e = EASE(s.w);
     const ts = legs ? legs.thighSign : 1;
     const ks = legs ? legs.kneeSign : 1;
+    // Leg flex adapts to sit depth: hips near the standing height = chair
+    // sit (knees strongly flexed); hips far below = high ledge, legs hang
+    // nearly straight. depth is the hip drop in leg-lengths (0..~1.5).
+    const depth = legs ? Math.max(0, -(s.offset || 0) / (legs.legLen || 0.7)) : 0;
+    const flex = clamp(1.35 - depth, 0.12, 1);
     if (legs) {
       for (const side of ['left', 'right']) {
         const up = m._node(`${side}UpperLeg`);
         const lo = m._node(`${side}LowerLeg`);
-        if (up) this._mulEuler(up, ts * SIT_THIGH * e, 0, 0);
-        if (lo) this._mulEuler(lo, ks * SIT_KNEE * e, 0, 0);
+        if (up) this._mulEuler(up, ts * SIT_THIGH * flex * e, 0, 0);
+        if (lo) this._mulEuler(lo, ks * SIT_KNEE * flex * e, 0, 0);
       }
       const spine = m._node('spine');
-      if (spine) this._mulEuler(spine, ts * SIT_SPINE * e, 0, 0);
+      if (spine) this._mulEuler(spine, ts * SIT_SPINE * flex * e, 0, 0);
     }
     // pin the hips onto the edge line
     const hips = m._node('hips');
@@ -332,7 +337,7 @@ export class PoseLayer {
     if (s.edgeWorldY != null) {
       const y = hips.getWorldPosition(this._v1).y;
       s.offset = clamp(s.offset + (s.edgeWorldY - (m._restPos.y + s.offset)) * Math.min(1, dt * 12),
-                       -1.25 * (legs?.legLen || 0.7), 0.25);
+                       -1.7 * (legs?.legLen || 0.7), 0.25);
     } else if (s.edgePx != null && ctx_viewH(s)) {
       // px feedback: move hips so their projected y sits on the line.
       // screen-y is DOWN but world-y is UP: hips above the line (err > 0,
@@ -345,7 +350,7 @@ export class PoseLayer {
       const mPerPx = (2 * Math.tan((m.camera.fov * Math.PI) / 360) * dist) / Math.max(1, viewH);
       const err = s.edgePx - py;   // px (down = positive)
       s.offset = clamp(s.offset - err * mPerPx * Math.min(1, dt * 15),
-                       -1.25 * (legs?.legLen || 0.7), 0.25);
+                       -1.7 * (legs?.legLen || 0.7), 0.25);
     }
     hips.position.y = m._restPos.y + s.offset * e;
   }
