@@ -227,6 +227,9 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 7. **Hub backups**: nightly copy of `~/AI/Docker/riko-hub/data` (and `breeze-tts/data/voices`, the ASR
    model is re-downloadable) to the owner's Duplicati on Nemu, or a simple dated tarball with rotation. Owner to
    confirm the target.
+   Status 2026-11-10: tooling done (`scripts/backup_hub.sh` + `scripts/backup_pull.sh`, systemd user timers in
+   `scripts/systemd/`, docs/BACKUPS.md) — eve nightly tar.zst with rotation keeps 14,   PC mirrors it via rsync over ssh for Duplicati on Nemu. **Not deployed yet; the hub currently has ZERO backups.** Install steps
+   are in docs/BACKUPS.md.
 
 ## Owner's steps
 
