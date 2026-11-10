@@ -51,12 +51,15 @@ def _hub_env(tmp_path, fake_home, monkeypatch, *, docker_mode="up", keep="14",
     shim.mkdir(exist_ok=True)
     snap_src = tmp_path / "online-snapshot.db"
     snap_src.write_bytes(b"ONLINESNAP-CONTENT")
-    # fake docker: `ps` reports the hub running/stopped; `exec sqlite3`
-    # succeeds; `cp` copies a canned consistent-snapshot file out.
+    # fake docker: `ps` reports the hub running/stopped; `exec python`
+    # (sqlite3 backup API) and `exec sqlite3` succeed; `cp` copies a canned
+    # consistent-snapshot file out.  docker_mode "up-cli" makes the in-container
+    # `python` route fail so the sqlite3 CLI route must take over.
+    python_rc = 0 if docker_mode in ("up",) else 1
     _write_shim(shim, "docker", f"""
 case "$1" in
-  ps) if [ "$FAKE_DOCKER_MODE" = up ]; then echo riko-hub-hub-1; fi; exit 0;;
-  exec) case "$3" in sqlite3|rm) exit 0;; esac; exit 1;;
+  ps) if [ "$FAKE_DOCKER_MODE" != down ]; then echo riko-hub-hub-1; fi; exit 0;;
+  exec) case "$3" in python) exit {python_rc};; sqlite3|rm) exit 0;; esac; exit 1;;
   cp) shift; cp "$FAKE_SNAP_FILE" "$2"; exit 0;;
 esac
 exit 1
@@ -134,9 +137,22 @@ class TestBackupHub:
         assert "./riko-hub.compose.yaml" in members
         # logged, no leftovers
         log = (fake_home / ".local" / "state" / "riko-backup.log").read_text()
-        assert "online snapshot (.backup): history.db" in log
+        assert "online snapshot (python backup API): history.db" in log
         assert "finished OK" in log
         assert not list(backup_dir.glob(".tmp.*"))
+
+    def test_sqlite_cli_route_when_python_exec_fails(self, tmp_path, fake_home, monkeypatch):
+        """The hub image has no sqlite3 CLI, but if the in-container python
+        route fails the sqlite3 `.backup` route must still be tried (and win
+        over the plain copy)."""
+        env = _hub_env(tmp_path, fake_home, monkeypatch, docker_mode="up-cli",
+                       timestamp="20261110-0325")
+        r = _run(HUB_SCRIPT, env)
+        assert r.returncode == 0, r.stderr
+        members = _members(_archives(fake_home / "Backups" / "riko-hub")[0])
+        assert members["./hub-snapshots/history.db"] == b"ONLINESNAP-CONTENT"
+        log = (fake_home / ".local" / "state" / "riko-backup.log").read_text()
+        assert "online snapshot (.backup): history.db" in log
 
     def test_sqlite_fallback_when_container_down(self, tmp_path, fake_home, monkeypatch):
         env = _hub_env(tmp_path, fake_home, monkeypatch, docker_mode="down",

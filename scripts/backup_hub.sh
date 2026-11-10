@@ -59,22 +59,31 @@ mkdir -p "$STAGE" "$SNAP"
 cp -a "$HUB_DATA" "$STAGE/hub-data"
 
 # ── consistent sqlite snapshots ────────────────────────────────────────────
-# Preferred: `docker exec <hub> sqlite3 <db> .backup` (safe while writing).
-# Fallback: plain file copy — consistent when the container is down; logged
-# as possibly-mid-write when it is up but .backup failed.
+# Preferred order: (1) `python -c` with the sqlite3 backup API inside the hub
+# container (the python:3.12-slim image has sqlite3 but no sqlite3 CLI),
+# (2) `docker exec <hub> sqlite3 <db> .backup` when a CLI exists,
+# (3) plain file copy — consistent when the container is down; logged as
+# possibly-mid-write when it is up but both snapshot routes failed.
+_SNAP_PY='import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()'
 while IFS= read -r -d '' db; do
   rel="${db#"$HUB_DATA"/}"
   name="${rel//\//_}"
   ok=0
   if [[ -n "$CONTAINER" ]] && command -v docker >/dev/null 2>&1; then
     in_tmp="/tmp/riko-snap-$$-$name"
-    if docker exec "$CONTAINER" sqlite3 "$CONTAINER_DATA/$rel" ".backup '$in_tmp'" 2>/dev/null \
+    if docker exec "$CONTAINER" python -c "$_SNAP_PY" "file:$CONTAINER_DATA/$rel?mode=ro" "$in_tmp" 2>/dev/null \
+       && docker cp "$CONTAINER:$in_tmp" "$SNAP/$name" 2>/dev/null; then
+      docker exec "$CONTAINER" rm -f "$in_tmp" 2>/dev/null || true
+      ok=1
+      log "sqlite online snapshot (python backup API): $rel"
+    elif docker exec "$CONTAINER" sqlite3 "$CONTAINER_DATA/$rel" ".backup '$in_tmp'" 2>/dev/null \
        && docker cp "$CONTAINER:$in_tmp" "$SNAP/$name" 2>/dev/null; then
       docker exec "$CONTAINER" rm -f "$in_tmp" 2>/dev/null || true
       ok=1
       log "sqlite online snapshot (.backup): $rel"
     else
-      log "WARN: online .backup failed for $rel; falling back to a file copy"
+      docker exec "$CONTAINER" rm -f "$in_tmp" 2>/dev/null || true
+      log "WARN: online snapshot failed for $rel; falling back to a file copy"
     fi
   fi
   if (( ! ok )); then

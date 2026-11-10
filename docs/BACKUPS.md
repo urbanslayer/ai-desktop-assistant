@@ -27,7 +27,7 @@ Per archive (`scripts/backup_hub.sh`, runs on eve):
 | Archive member | Source on eve | Notes |
 | --- | --- | --- |
 | `hub-data/` | `~/AI/Docker/riko-hub/data` (~116 MB) | the whole hub data dir: sqlite history/memory/timers, uploaded avatars, persona assets |
-| `hub-snapshots/` | one file per `*.db` | consistent snapshot via `docker exec <hub> sqlite3 <db> ".backup"` while the container is up; plain copy when it is down (or `.backup` fails — logged as a warning) |
+| `hub-snapshots/` | one file per `*.db` | consistent snapshot taken **inside the hub container with Python's sqlite3 backup API** (the image has no `sqlite3` CLI), falling back to `sqlite3 ".backup"` if a CLI exists, then to a plain copy when the container is down (or both fail — logged as a warning) |
 | `breeze-voices/` | `~/AI/Docker/breeze-tts/data/voices` | the owner's voice samples only |
 | `riko-hub.compose.yaml`, `riko-hub.env`, `breeze-tts.compose.yaml`, `breeze-tts.env` | deploy dirs | only if present; `.env` holds secrets → archive is mode 600, dir 700 |
 
