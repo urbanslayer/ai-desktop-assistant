@@ -320,7 +320,7 @@ export class PoseLayer {
     // sit (knees strongly flexed); hips far below = high ledge, legs hang
     // nearly straight. depth is the hip drop in leg-lengths (0..~1.5).
     const depth = legs ? Math.max(0, -(s.offset || 0) / (legs.legLen || 0.7)) : 0;
-    const flex = clamp(1.35 - depth, 0.12, 1);
+    const flex = clamp(1.5 - depth, 0.45, 1);
     if (legs) {
       for (const side of ['left', 'right']) {
         const up = m._node(`${side}UpperLeg`);
