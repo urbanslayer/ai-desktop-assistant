@@ -1,0 +1,45 @@
+[
+ {
+  "address": "0x5642c7cbeba0",
+  "mapped": true,
+  "hidden": false,
+  "visible": true,
+  "acceptsInput": true,
+  "at": [
+   6675,
+   227
+  ],
+  "size": [
+   420,
+   680
+  ],
+  "workspace": {
+   "id": 9,
+   "name": "9"
+  },
+  "floating": true,
+  "monitor": 1,
+  "class": "riko",
+  "title": "Riko",
+  "initialClass": "riko",
+  "initialTitle": "Riko",
+  "pid": 703455,
+  "xwayland": false,
+  "pinned": true,
+  "pinFullscreened": false,
+  "fullscreen": 0,
+  "fullscreenClient": 0,
+  "fullscreenHandler": "default",
+  "allowedOverFullscreen": true,
+  "grouped": [],
+  "tags": [],
+  "swallowing": "0x0",
+  "focusHistoryID": 3,
+  "inhibitingIdle": false,
+  "xdgTag": "",
+  "xdgDescription": "",
+  "contentType": "none",
+  "tearingHint": false,
+  "stableId": "1800006b"
+ }
+]

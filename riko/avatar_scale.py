@@ -114,24 +114,97 @@ def hypr_scale_dispatches(style: str, w: int, h: int, x: int, y: int,
     ]
 
 
+def monitor_logical_rect(m: dict):
+    """Usable LOGICAL (x, y, w, h) of one real `hyprctl -j monitors` row, or
+    None when the row is disabled/unusable (keys verified against live
+    Hyprland 0.56.2, tests/fixtures/hypr_real_monitors.json).
+
+    Real rows carry PHYSICAL mode pixels in `width`/`height` plus a `scale`
+    (e.g. 1.25); `x`/`y` are already logical layout coords (owner's layout:
+    HDMI-A-1 at x=5120 = 2560+2560 of its two scale-1 neighbours, logical
+    width 2560/1.25=2048). `transform` 1/3/5/7 rotate 90/270 -> swap w/h.
+    `reserved` [l, t, r, b] are bar reservations — subtract them so the
+    usable area excludes the bars. Window coords/dispatches share this
+    logical space (client row size [420, 680] == requested base size on the
+    1.25-scale monitor)."""
+    if not isinstance(m, dict) or m.get("disabled"):
+        return None
+    try:
+        w = int(m.get("width") or 0)
+        h = int(m.get("height") or 0)
+        scale = float(m.get("scale") or 1.0)
+        x, y = int(m.get("x") or 0), int(m.get("y") or 0)
+        transform = int(m.get("transform") or 0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0 or scale <= 0:
+        return None
+    if transform in (1, 3, 5, 7):
+        w, h = h, w
+    lw, lh = round(w / scale), round(h / scale)
+    res = m.get("reserved")
+    if isinstance(res, (list, tuple)) and len(res) == 4:
+        try:
+            left, top, right, bottom = (int(v) for v in res)
+        except (TypeError, ValueError):
+            left = top = right = bottom = 0
+        x += left
+        y += top
+        lw -= left + right
+        lh -= top + bottom
+    if lw <= 0 or lh <= 0:
+        return None
+    return (x, y, lw, lh)
+
+
 def monitor_rect_for(clients_row: dict, monitors: list):
-    """The (x, y, w, h) of the monitor a hyprctl client row lives on, or
-    None. Rows carry `monitor` (id); -j monitors keys on `id`. Sizes come
-    from `size` (0.5x) or the recommended mode; positions are absolute."""
+    """The usable logical (x, y, w, h) of the monitor a hyprctl client row
+    lives on, or None. The row's `monitor` field is the monitor `id`; when
+    it is missing/-1 (unassigned) fall back to the monitor whose logical
+    rect contains the window centre, else the one with the largest overlap.
+    Disabled monitors never match."""
+    if not isinstance(clients_row, dict):
+        return None
     mid = clients_row.get("monitor")
+    mid = mid if isinstance(mid, int) and not isinstance(mid, bool) else None
+    rects = []
     for m in monitors or []:
-        if mid is not None and m.get("id") != mid:
+        rect = monitor_logical_rect(m)
+        if rect is None:
             continue
-        size = m.get("size")
-        if isinstance(size, dict) and size.get("x") and size.get("y"):
-            w, h = int(size["x"]), int(size["y"])
-        else:
-            mode = m.get("recommendedMode") or {}
-            w, h = int(mode.get("width") or 0), int(mode.get("height") or 0)
-        if w <= 0 or h <= 0:
-            continue
-        return (int(m.get("x", 0)), int(m.get("y", 0)), w, h)
-    return None
+        if mid is not None and mid >= 0 and isinstance(m, dict) and m.get("id") == mid:
+            return rect
+        rects.append(rect)
+    if not rects:
+        return None
+    try:
+        at, size = clients_row.get("at") or [0, 0], clients_row.get("size") or [0, 0]
+        wx, wy, ww, wh = int(at[0]), int(at[1]), int(size[0]), int(size[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    cx, cy = wx + ww / 2.0, wy + wh / 2.0
+    for rx, ry, rw, rh in rects:
+        if rx <= cx < rx + rw and ry <= cy < ry + rh:
+            return (rx, ry, rw, rh)
+    # centre on no monitor (straddling/offscreen): largest overlap wins
+    best, best_area = None, 0
+    for rx, ry, rw, rh in rects:
+        area = (max(0, min(wx + ww, rx + rw) - max(wx, rx))
+                * max(0, min(wy + wh, ry + rh) - max(wy, ry)))
+        if area > best_area:
+            best, best_area = (rx, ry, rw, rh), area
+    return best
+
+
+def _monitor_diag(monitors, clients_row) -> str:
+    """Numbers for a '[size]' failure line: window's monitor id + centre,
+    the monitor ids seen and the KEYS the rows carry, so a future Hyprland
+    schema mismatch is diagnosable from the log alone."""
+    ids = [m.get("id") for m in monitors or [] if isinstance(m, dict)]
+    keys = sorted({k for m in monitors or [] if isinstance(m, dict) for k in m})
+    return (f"window monitor id {clients_row.get('monitor')!r}, "
+            f"at/size {clients_row.get('at')}/{clients_row.get('size')}, "
+            f"monitor ids {ids}, keys present {keys}")
 
 
 def _load_json(text):
@@ -164,15 +237,20 @@ def apply_hyprland_scale(scale, base_w: int, base_h: int, app_id: str = "riko",
 
     clients = _load_json(reply(["hyprctl", "clients", "-j"]).stdout)
     if not isinstance(clients, list):
-        return {"ok": False, "error": "hyprctl clients failed", "scale": s}
+        return {"ok": False, "error": "hyprctl clients failed (no JSON list "
+                f"on stdout; got {str(clients)[:80]!r})", "scale": s}
     own = next((c for c in clients
                 if isinstance(c, dict) and c.get("class") == app_id), None)
     if not own:
-        return {"ok": False, "error": "own window not mapped yet", "scale": s}
+        classes = sorted({str(c.get("class")) for c in clients if isinstance(c, dict)})
+        return {"ok": False, "error": f"own window not mapped yet ({len(clients)} "
+                f"windows, classes {classes[:10]})", "scale": s}
     monitors = _load_json(reply(["hyprctl", "monitors", "-j"]).stdout)
-    monitor = monitor_rect_for(own, monitors if isinstance(monitors, list) else [])
+    monitors = monitors if isinstance(monitors, list) else []
+    monitor = monitor_rect_for(own, monitors)
     if not monitor:
-        return {"ok": False, "error": "monitor for own window unknown", "scale": s}
+        return {"ok": False, "error": f"monitor for own window unknown "
+                f"({_monitor_diag(monitors, own)})", "scale": s}
     at = own.get("at") or [0, 0]
     size = own.get("size") or [base_w, base_h]
     current = (int(at[0]), int(at[1]), int(size[0]), int(size[1]))
