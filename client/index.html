@@ -62,6 +62,25 @@
       font: inherit; color: #221a30; background: rgba(255, 255, 255, 0.96); box-shadow: 0 4px 18px rgba(0, 0, 0, 0.3);
     }
     #input.show { display: block; }
+  /* Touch overlays (docs/TOUCH.md): the sit edge line the hips pin onto,
+     and a crosshair at the live IK grab target so captures can be judged
+     visually ("hips on the line", "grabbed hand at the cursor"). */
+  #touch-edge-line {
+    position: fixed; left: 0; right: 0; height: 2px; z-index: 5;
+    background: rgba(120, 190, 255, 0.55);
+    box-shadow: 0 0 8px rgba(120, 190, 255, 0.35);
+    display: none; pointer-events: none;
+  }
+  #touch-target {
+    position: fixed; width: 16px; height: 16px; margin: -8px 0 0 -8px;
+    border: 2px solid rgba(255, 170, 80, 0.95); border-radius: 50%;
+    display: none; pointer-events: none; z-index: 6;
+  }
+  #touch-target::after {
+    content: ''; position: absolute; left: 50%; top: 50%;
+    width: 3px; height: 3px; margin: -1.5px; border-radius: 50%;
+    background: rgba(255, 170, 80, 0.95);
+  }
   </style>
   <!-- Vendored libraries (offline: no CDN). See client/vendor/README.md;
        tests/test_client_vendor.py guards versions, hashes and local paths. -->
@@ -77,6 +96,8 @@
   </script>
 </head>
 <body>
+  <div id="touch-edge-line"></div>
+  <div id="touch-target"></div>
   <div id="start">Loading...</div>
   <div id="bubble"></div>
   <div id="hud"><div id="heard"></div><div id="approval"></div><div id="status"></div></div>
@@ -723,6 +744,34 @@
         if (ev?.type === 'grab-start') startGrab(ev.part, _lastPt.x, _lastPt.y);
       }
       _touchRec.expire(performance.now());
+      // QA specs need a deterministic front view: pin facing while one runs.
+      if (TOUCH_SPEC) faceWant = 0;
+      // Overlays (docs/TOUCH.md visual checks): edge line under the sitting
+      // hips + crosshair at the live grab target.
+      {
+        const s = pose.sitState;
+        const el = document.getElementById('touch-edge-line');
+        if (s && s.edgePx != null && s.w > 0.01) {
+          el.style.display = 'block';
+          el.style.top = `${s.edgePx}px`;
+          el.style.opacity = String(Math.min(1, s.w));
+        } else el.style.display = 'none';
+        const tel = document.getElementById('touch-target');
+        let shown = false;
+        for (const [, g] of pose.grabs) {
+          if (g.state === 'in' && g.cur) {
+            const [px, py] = _pxOf(g.cur);
+            if (Number.isFinite(px) && Number.isFinite(py)) {
+              tel.style.display = 'block';
+              tel.style.left = `${px}px`;
+              tel.style.top = `${py}px`;
+              shown = true;
+              break;
+            }
+          }
+        }
+        if (!shown) tel.style.display = 'none';
+      }
       const block = pose.active || !!pose.sitState;
       if (block !== touchBlocked) {
         touchBlocked = block;
@@ -914,7 +963,7 @@
       // one bad action must not kill the rest of this event batch
       try {
         // grabbed or sitting: no roaming, no idle gestures (gaze keeps going)
-        if (pose.active && (a.type === 'gesture' || a.type === 'walk_start' || a.type === 'walk_turn')) {
+        if ((pose.active || TOUCH_SPEC) && (a.type === 'gesture' || a.type === 'walk_start' || a.type === 'walk_turn')) {
           return;
         }
         if (TIMING && (a.type === 'gesture' || a.type === 'gesture_stop')) {
