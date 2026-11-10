@@ -597,7 +597,7 @@
     function hipsPxY() {
       if (!vrm) return null;
       const b = vrm.humanoid.getNormalizedBoneNode('hips');
-      return b ? _pxOf(b.getWorldPosition(new THREE.Vector3()))[1] : null;
+      return b ? _pxOf(b.getWorldPosition(new THREE.Vector3()).toArray())[1] : null;
     }
     function feetPxY() {
       if (!vrm) return null;
@@ -622,6 +622,7 @@
     function startGrab(part, x, y) {
       const b = vrm?.humanoid.getNormalizedBoneNode(PART_BONE[part]);
       if (!b) return;
+      if (CAPTURE) console.log(`[touch] GRAB ${part} at ${Math.round(x)},${Math.round(y)}`);
       const w0 = b.getWorldPosition(new THREE.Vector3());
       pose.setTarget(part, w0.toArray());   // blend in from where it actually is
       grabDepth = camera.position.distanceTo(w0);
@@ -682,7 +683,9 @@
       if (e.button !== 0 || !vrm || !motion.rig || e.target !== renderer.domElement) return;
       _lastPt.x = e.clientX; _lastPt.y = e.clientY;
       _touchPress.down(e.clientX, e.clientY, e.timeStamp || performance.now());
-      const gs = _touchPress.setPart(hitTest(computeParts(), e.clientX, e.clientY));
+      const _hp = computeParts();
+      const gs = _touchPress.setPart(hitTest(_hp, e.clientX, e.clientY));
+      if (CAPTURE) console.log(`[touch] down ${e.clientX},${e.clientY} part=${gs?.part ?? 'pending'} rects=${JSON.stringify(_hp)}`);
       if (gs) startGrab(gs.part, e.clientX, e.clientY);
     }, true);
     addEventListener('pointermove', (e) => {
@@ -693,6 +696,7 @@
         return;
       }
       const ev = _touchPress.move(e.clientX, e.clientY, ms);
+      if (CAPTURE && _touchPress.active) console.log(`[touch] move -> ${ev ? ev.type : 'null'}`);
       if (ev?.type === 'grab-start') startGrab(ev.part, e.clientX, e.clientY);
     }, true);
     addEventListener('pointerup', (e) => {
@@ -715,6 +719,7 @@
     function touchFrame(dt) {
       if (_touchPress.active && !grabId) {
         const ev = _touchPress.move(_lastPt.x, _lastPt.y, performance.now());
+        if (CAPTURE) console.log(`[touch] poll -> ${ev ? ev.type : 'null'} (t0 age ${Math.round(performance.now() - (_touchPress.p?.t0 ?? 0))} part=${_touchPress.p?.part})`);
         if (ev?.type === 'grab-start') startGrab(ev.part, _lastPt.x, _lastPt.y);
       }
       _touchRec.expire(performance.now());
@@ -823,21 +828,23 @@
           const tk = body.trim().split(/\s+/);
           const xy = (ax, ay) => {   // part-name or literal px
             const parts = computeParts() || {};
-            const one = (t) => {
+            const one = (t, i) => {   // i=0: rect center x, i=1: rect center y
               const d = parseFloat(t);
               if (Number.isFinite(d)) return d;
               const r = parts[t];
-              return r ? r[0] + r[2] / 2 : NaN;
+              return r ? r[i] + r[i + 2] / 2 : NaN;   // cx = r[0]+r[2]/2, cy = r[1]+r[3]/2
             };
-            return [one(ax), one(ay)];
+            return [one(ax, 0), one(ay, 1)];
           };
           const op = tk[0];
+          if (CAPTURE) console.log(`[touch] spec step: ${body}`);
           if (op === 'sit' || op === 'stand' || op === 'mode') {
             onCommand(op === 'sit' ? `sit:${tk[1]}` : op === 'stand' ? 'stand'
                   : `touch-mode:${tk[1]}`);
           } else if (op === 'grab') {
             const [x, y] = xy(tk[2], tk[3]);
             const dx = +tk[4], dy = +tk[5], dur = +tk[6] || 900;
+            const holdAfter = +tk[7] || 0;   // keep the pointer parked after the drag
             window.__rikoClick('pointerdown', x, y);
             const steps = 30, hold = 320;   // > HOLD_MS: the still-hold grabs
             for (let i = 1; i <= steps; i++) {
@@ -846,7 +853,7 @@
               hold + dur * i / steps);
             }
             setTimeout(() => window.__rikoClick('pointerup', x + dx, y + dy),
-                       hold + dur + 40);
+                       hold + dur + holdAfter + 40);
           } else if (op === 'tap') {
             const [x, y] = xy(tk[1], tk[2]);
             window.__rikoClick('pointerdown', x, y);
@@ -1095,6 +1102,15 @@
             const out = {};
             for (const [id, g] of Object.entries(pose.debug().grabs || {})) {
               if (g.target) out[id] = worldPx(g.target);
+            }
+            return out;
+          })(),
+          // where the clamped IK solve ACTUALLY puts the wrist (reach/limit/
+          // capsule clamped target) — hand-vs-this is the honest grab accuracy
+          grabSolvedPx: (() => {
+            const out = {};
+            for (const [id, g] of Object.entries(pose.debug().grabs || {})) {
+              if (g.solved) out[id] = worldPx(g.solved);
             }
             return out;
           })(),

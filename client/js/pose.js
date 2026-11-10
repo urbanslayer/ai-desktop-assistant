@@ -402,7 +402,10 @@ export class PoseLayer {
     const restU = m._rest.get(`${side}UpperArm`), restL = m._rest.get(`${side}LowerArm`);
     upN.quaternion.copy(restU).slerp(this._limit(restU, localU, GRAB_LIMITS[`${side}UpperArm`]), ew);
     loN.quaternion.copy(restL).slerp(this._limit(restL, localL, GRAB_LIMITS[`${side}LowerArm`]), ew);
-    if (handN) handN.updateMatrixWorld(true);   // live wrist for the next measure
+    if (handN) {
+      handN.updateMatrixWorld(true);   // live wrist for the next measure
+      g.solved = handN.getWorldPosition(new T.Vector3()).toArray();
+    }
   }
 
   _grabLeg(side, g, ew) {
@@ -507,6 +510,7 @@ export class PoseLayer {
     for (const [id, g] of this.grabs) {
       out.grabs[id] = { state: g.state, w: +g.w.toFixed(3),
                         target: g.cur.map((v) => +v.toFixed(4)), shake: g.shake };
+      if (g.solved) out.grabs[id].solved = g.solved.map((v) => +v.toFixed(4));
     }
     if (this.sitState) {
       out.sitEdge = this.sitState.edgePx ?? this.sitState.edgeWorldY;
