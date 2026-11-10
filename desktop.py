@@ -49,6 +49,8 @@ from PySide6.QtWidgets import (QApplication, QInputDialog, QLineEdit, QMenu,
 from riko import appstate, asr, avatar_scale, client_tools, hub_client, shortcuts, tts, viewer
 from riko import roam as roam_state
 from riko.config import load_config
+from riko.music import oauth_local as music_oauth
+from riko.music import spotifyd as music_spotifyd
 from riko.session import Session
 
 APP_ID = "riko"  # Wayland app_id / X11 class; window rules match on these
@@ -827,6 +829,80 @@ def build_stop_typing_action(menu, typing_svc, command_pack=None):
     return action
 
 
+def build_music_menu(menu, player, listener=None, notify=None):
+    """Music submenu (music phase 1, docs/SPOTIFY_NOTES.md): Start/Stop the
+    spotifyd desktop player, its status, and Connect Spotify (the local
+    loopback OAuth listener catches the redirect and hands the code to the
+    hub). With desktop.music.spotifyd: off the whole submenu is omitted.
+    Messages land as tray notifications (no modal boxes from the tray)."""
+    if player is None or player.mode == "off":
+        return None
+    music_menu = QMenu("Music", menu)
+
+    def _notify(title, body):
+        if notify is not None:
+            try:
+                notify(title, body)
+                return
+            except Exception:
+                pass
+        print(f"[music] {title}: {body}", flush=True)
+
+    status_action = QAction("player: …", music_menu)
+    status_action.setEnabled(False)
+    music_menu.addAction(status_action)
+
+    start_action = QAction("Start player", music_menu)
+
+    def _start(checked=None):
+        result = player.start()
+        _notify("Music", result.get("message", ""))
+        if not result.get("ok"):
+            print(f"[music] start: {result.get('message', '')}", flush=True)
+    start_action.triggered.connect(_start)
+
+    stop_action = QAction("Stop player", music_menu)
+
+    def _stop(checked=None):
+        result = player.stop()
+        _notify("Music", result.get("message", ""))
+    stop_action.triggered.connect(_stop)
+
+    music_menu.addAction(start_action)
+    music_menu.addAction(stop_action)
+
+    connect_action = QAction("Connect Spotify…", music_menu)
+
+    def _connect(checked=None):
+        if listener is None:
+            _notify("Music", "no local OAuth listener — set "
+                             "desktop.music.spotifyd to managed/external")
+            return
+        try:
+            listener.connect()
+        except Exception as e:
+            _notify("Music", f"Spotify connect failed: {e}")
+    connect_action.triggered.connect(_connect)
+    music_menu.addAction(connect_action)
+
+    def _refresh():
+        st = player.status()
+        if st.get("setup_needed"):
+            status_action.setText("player: spotifyd not installed")
+        elif st.get("running"):
+            status_action.setText(f"player: running (pid {st.get('pid')})")
+        elif st.get("mode") == "external":
+            status_action.setText("player: external (you manage spotifyd)")
+        else:
+            status_action.setText("player: stopped")
+        start_action.setEnabled(not st.get("running"))
+        stop_action.setEnabled(bool(st.get("running")))
+    music_menu.aboutToShow.connect(lambda: _refresh())
+    _refresh()
+    menu.addMenu(music_menu)
+    return music_menu
+
+
 def main():
     parser = argparse.ArgumentParser(description="Riko as a floating desktop avatar.")
     parser.add_argument("--asr", choices=["remote", "local", "groq"], help="speech to text (overrides the config)")
@@ -1394,6 +1470,35 @@ def main():
         typing_svc.dictation.notice = _dictation_notice
     dictation_action = build_dictation_action(menu, typing_svc, _dictation_apply)
     stop_typing_action = build_stop_typing_action(menu, typing_svc, command_pack)
+
+    # ── Music phase 1 (docs/SPOTIFY_NOTES.md) ───────────────────────────
+    # spotifyd is the Spotify Connect device named after the persona
+    # (default 'Riko') the hub's spotify_* tools steer. managed = Riko
+    # starts/stops the child process; external = you run it; off = no
+    # submenu, no listener, no ducking. While she speaks the player's MPRIS
+    # volume dips (silent no-op without dbus/MPRIS). The OAuth listener on
+    # 127.0.0.1:8911 catches Spotify's redirect for the hub (loopback is
+    # the only plain-HTTP redirect Spotify allows).
+    music_cfg = (cfg.get("desktop") or {}).get("music") or {}
+    try:
+        music_persona = str((hub_client.active_persona() or {}).get("name") or "")
+    except Exception:
+        music_persona = ""
+    music_player = music_spotifyd.SpotifydPlayer(
+        music_cfg, str(music_cfg.get("device_name") or music_persona or "Riko"))
+    music_duck = music_spotifyd.MprisDuck(
+        music_cfg.get("duck_volume", music_spotifyd.DEFAULT_DUCK_FRACTION))
+    if music_player.mode != "off":
+        session.on_speak = music_duck.on_speak
+        music_listener = music_oauth.OAuthListener(
+            hub_client.get(), port=music_cfg.get("oauth_port",
+                                                 music_oauth.DEFAULT_PORT))
+        music_listener.start()   # port busy = another instance owns it, fine
+    else:
+        music_listener = None
+    build_music_menu(menu, music_player, music_listener,
+                     notify=lambda title, body: tray.showMessage(title, body))
+    app.aboutToQuit.connect(music_player.stop)
 
     for label, fn in ((f"Type to her{hint('type')}", lambda: on_command("type")),
                       (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle)):

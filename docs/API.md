@@ -1038,6 +1038,76 @@ rendered; the desktop calls it on window focus (throttled). Any ordinary
 `POST /api/chat` user message cancels `chat.user_message` timers the same
 way; the fired timer's own turn never self-cancels.
 
+## Spotify (music phase 1, docs/SPOTIFY_NOTES.md)
+
+The hub owns the **one** Spotify connection and only STEERS Spotify Connect
+devices over the Web API — nothing here streams audio (the desktop's
+`spotifyd` makes the sound). Auth is Authorization Code + PKCE: client id
+only, no client secret, so the hub can hold the flow safely.
+
+Settings block (GET /api/settings projection `spotify` — schema keys only;
+tokens live in the store under a write-only key, mirror of the api_key
+rule): `{enabled, client_id, device_name (default "Riko"), accounts_url,
+api_url}`. `accounts_url`/`api_url` default to the real Spotify hosts;
+`RIKO_SPOTIFY_ACCOUNTS_URL` / `RIKO_SPOTIFY_API_URL` override them (tests
+point them at the in-repo fake server). PUT accepts the same keys plus
+`clear_client_id`; a blank `client_id` never wipes a saved one. Resetting
+settings drops stored settings but keeps the tokens (disconnect drops
+those).
+
+Developer Dashboard app (one-time, owner): create an app at
+https://developer.spotify.com/dashboard, add redirect URI
+`http://127.0.0.1:8911/callback` (Spotify only allows HTTPS or the literal
+127.0.0.1 — the LAN hub can't receive the redirect itself; the desktop app
+listens and hands the code to the hub), copy the Client ID into the
+Settings page's Spotify card.
+
+```bash
+curl -s -H "$AUTH" "$HUB/api/spotify/status"
+# {"enabled":true,"configured":true,"connected":true,
+#  "connected_as":"owner person","scope":"user-read-playback-state …",
+#  "scopes":"…","default_redirect_uri":"http://127.0.0.1:8911/callback",
+#  "device_name":"Riko","token_expires_at":1762400000.0,
+#  "quota_backoff_left":0,"now_playing":{…snapshot…}|null,"polling":true}
+# booleans/expiry only — a token string NEVER appears in any GET.
+
+curl -s -H "$AUTH" "$HUB/api/spotify/connect-url"          # ?redirect_uri=… optional
+# {"url":"https://accounts.spotify.com/authorize?…","state":"…",
+#  "code_verifier":"…","redirect_uri":"http://127.0.0.1:8911/callback"}
+# the hub keeps this PKCE pair single-use for 15 min
+
+curl -s -H "$AUTH" -X POST "$HUB/api/spotify/connect" -d \
+  '{"code":"…","redirect_uri":"http://127.0.0.1:8911/callback","state":"…"}'
+# from the desktop listener; OR the Settings page paste-back box:
+#   {"paste":"http://127.0.0.1:8911/callback?code=…&state=…"}
+# a bare code or a bare query string also parse. code_verifier falls back
+# to the stored handshake. Returns the status object. 400/409 with a plain
+# message when the state mismatches or no client id is set.
+
+curl -s -H "$AUTH" -X POST "$HUB/api/spotify/disconnect"   # drop tokens, keep settings
+curl -s -H "$AUTH" "$HUB/api/spotify/now-playing"
+# {"playing":true,"uri":"spotify:track:…","track":"…","artists":"…",
+#  "album":"…","duration_ms":354000,"position_ms":12345,"device":"Riko",
+#  "context_uri":"…"}    // 409 not connected, 429 inside quota back-off
+curl -s -H "$AUTH" "$HUB/api/spotify/devices"
+# {"devices":[{"id":"…","name":"Riko","type":"Speaker","active":true,"volume":40}]}  # cached 60 s
+curl -s -H "$AUTH" -X POST "$HUB/api/spotify/transfer" -d '{"device":"Riko"}'
+# make that device the player ("make this the player" on the card)
+```
+
+Dev-mode rules baked into `hub/spotify.py` (docs/SPOTIFY_NOTES.md): search
+`limit` ≤ 10, no batch-fetch endpoints, likes go through
+`PUT /me/library?uris=…`, a 429 `QUOTA_EXCEEDED` arms a back-off for the
+advertised `Retry-After` window during which every music action answers
+"cooling down" instantly (no hammering), and a 403/404 on any player call
+answers "is Premium still active?" (`GET /me` no longer reports Premium).
+
+`now_playing` event: published on the events long-poll ONLY on a real state
+change (uri/playing/device), while the hub polls ≤ every 5 s — and only
+after something started playing; paused or idle stops polling entirely
+(`spotify_hub.wake()` restarts it after play/resume/transfer). Late clients
+catch up with `GET /api/spotify/now-playing`.
+
 ## Voice & audio (docs/VOICE.md)
 
 The **hub is the only component that talks to Breeze-TTS-2** (the GPU-side
@@ -1299,6 +1369,7 @@ Built-in hub tools:
 | `web_search` | SearXNG JSON search → `{results: [{title, url, content}]}`. Needs a `searxng_url` setting/env (`RIKO_SEARXNG_URL`); **not offered** when unset |
 | `fetch_page` | GET a URL, extract readable text (title + paragraphs/heads/lists, ≤ 20 000 chars, ≤ 10 MB, ≤ 20 s). Refuses loopback/private IPs unless `allow_private_fetch` |
 | `get_time` | hub clock as ISO-8601 with UTC offset |
+| `spotify_play` / `spotify_control` / `spotify_now_playing` / `spotify_devices` / `spotify_transfer` / `spotify_like_current` | music over the Spotify Web API (see *Spotify* above); **not offered** until Spotify is configured, always listed for permissions |
 
 Permissions per tool name, effective policy (`GET /api/tools` shows all of
 it): an explicit `settings.tools.permissions[name]` wins (`always` / `ask` /
@@ -1479,8 +1550,9 @@ curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 #   {"seq":19,"time":"…","type":"timer_set","id":3,"label":"tea","persona_id":"riko","due_at":"2026-11-05T12:30:00Z","due_at_local":"2026-11-05T12:30:00+00:00","cancel_on":[],"asked":false},
 #   {"seq":20,"time":"…","type":"timer_fired","id":3,"label":"tea","persona_id":"riko","message_id":42},
 #   {"seq":21,"time":"…","type":"turn_finished","persona":"riko","origin":"timer","persona_id":"riko","timer":{"id":3,"label":"tea"},"message_id":42,"reply":"Your tea is ready!","speech":"Your tea is ready!","emotion":"happy","actions":[],"audio_url":"/api/messages/42/audio"},
-#   {"seq":22,"time":"…","type":"state_changed","version":22}
-# ],"last":22}
+#   {"seq":22,"time":"…","type":"state_changed","version":22},
+#   {"seq":23,"time":"…","type":"now_playing","playing":true,"uri":"spotify:track:…","track":"Bohemian Rhapsody","artists":"Queen","album":"A Night at the Opera","duration_ms":354000,"position_ms":12345,"device":"Riko","context_uri":"spotify:album:…"}
+# ],"last":23}
 ```
 
 Loop: keep `last`, pass it back as `after`, `wait` ≤ 30 s (default 25). The
@@ -1508,6 +1580,11 @@ the proactive reply without another round-trip: `origin: "timer"`,
 `persona_id`, `timer: {id, label}`, `reply`, `speech`, `emotion`, `actions`,
 `audio_url` (and the usual `persona`, `message_id`, `emotion`). Desktop
 clients: play origin-timer turns like normal replies; queue them if busy.
+`now_playing` (music phase 1, docs/SPOTIFY_NOTES.md) fires ONLY on a real
+playback state change — `{playing, uri, track, artists, album, duration_ms,
+position_ms, device, context_uri}` (fields as in
+`GET /api/spotify/now-playing`); the hub stops polling while paused/idle, so
+a paused→playing change arrives when the next play wakes the poller.
 
 ## Client tool channel (desktop / Android tools the model can call)
 

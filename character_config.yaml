@@ -122,6 +122,20 @@ desktop:
                        # riding her startup wave). false = stay quiet until you
                        # talk to her.
 
+  # Music phase 1 (docs/SPOTIFY_NOTES.md): Spotify playback on this PC.
+  # The hub only steers Spotify Connect (Web API); the sound here comes
+  # from spotifyd, a headless Connect daemon. Riko NEVER installs it:
+  # missing binary -> the tray says exactly what to do
+  # (sudo pacman -S spotifyd, then one-time 'spotifyd authenticate').
+  music:
+    spotifyd: off        # off | managed (Riko starts/stops it) | external (you do)
+    # device_name: ""    # Spotify Connect name; default: the persona name,
+                         # else "Riko" (the hub's Settings > Spotify default)
+    backend: pipewire    # spotifyd audio backend (this desktop's audio server)
+    oauth_port: 8911     # 127.0.0.1 OAuth listener for Spotify's redirect
+    duck_volume: 0.15    # player volume multiplier while she speaks
+                         # (best-effort over D-Bus/MPRIS; no-op without them)
+
   # Ears: how you talk to her.
   #   push_to_talk = the classic: hold Space, the 'listening…' pill shows,
   #                  release to send.

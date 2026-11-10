@@ -127,3 +127,26 @@ special model when it needs to: OpenAI GPT models, Anthropic Claude, Gemini, Ope
 3. Default permission for actions that change things (send, buy, post, delete): always ask (recommended), or
    allow some per site?
 4. Web search: your SearXNG on Nemu (recommended, private, free), or a paid API (Brave, Tavily)?
+
+## Music (phase 1, built): Spotify over the Web API
+
+Decisions and the verified 2026 API rules live in `docs/SPOTIFY_NOTES.md`;
+routes/event in `docs/API.md` (*Spotify*); implementation `hub/spotify.py`,
+`hub/tools/spotify_tools.py`, desktop side `riko/music/` (spotifyd manager +
+loopback OAuth listener + MPRIS ducking).
+
+Six hub tools: `spotify_play(query, kind=track|album|playlist|artist,
+device?)`, `spotify_control(action=pause|resume|next|prev|seek|volume|
+shuffle, value?)`, `spotify_now_playing()`, `spotify_devices()`,
+`spotify_transfer(device)`, `spotify_like_current()`. They are listed in
+`GET /api/tools` even when Spotify is off (permissions stay editable) but
+only *offered* once a client id is saved. The hub never streams audio; it
+steers Spotify Connect devices, and the desktop sound is `spotifyd`
+(`desktop.music.spotifyd: off | managed | external`).
+
+Prompt line while the tools are offered (registry `_music_line`):
+
+> For music requests use spotify_* tools; the device named Riko is the
+> desktop player (spotify_devices shows what is online,
+> spotify_play/spotify_transfer pick where it plays). Never claim you cannot
+> play music while these tools are offered.
