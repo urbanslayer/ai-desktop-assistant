@@ -53,7 +53,8 @@ export const HEAD_GRAB_LIMITS = { x: [-0.2, 0.25], y: [-0.4, 0.4], z: [-0.12, 0.
 
 // sit pose (radians, on top of rest, signed by the rig-probed thighSign/kneeSign)
 const SIT_THIGH = 1.35;      // thighs roughly horizontal toward the viewer
-const SIT_KNEE = 1.30;       // shins hanging down
+const SIT_KNEE = 1.43;       // shins hanging down (measured knee flex ~75-82 deg;
+                             // 1.30 read 67 deg on rigs whose foot sits forward)
 const SIT_SPINE = 0.10;      // spine slightly forward
 const SIT_BLEND = 0.5;       // in/out seconds (docs/TOUCH.md)
 const GRAB_IN = 0.18;        // grab pull-in seconds
@@ -316,11 +317,14 @@ export class PoseLayer {
     const e = EASE(s.w);
     const ts = legs ? legs.thighSign : 1;
     const ks = legs ? legs.kneeSign : 1;
-    // Leg flex adapts to sit depth: hips near the standing height = chair
-    // sit (knees strongly flexed); hips far below = high ledge, legs hang
-    // nearly straight. depth is the hip drop in leg-lengths (0..~1.5).
-    const depth = legs ? Math.max(0, -(s.offset || 0) / (legs.legLen || 0.7)) : 0;
-    const flex = clamp(1.5 - depth, 0.45, 1);
+    // SIT_THIGH/SIT_KNEE at FULL weight are the measured seated shape
+    // (thighs ~13 deg from horizontal toward the viewer, knee flex ~75 deg,
+    // shins near-vertical). The old depth-adaptive decay (legs hung straighter
+    // the deeper the hips dropped) read as STANDING cut by a line at the 85%
+    // edge: knee flex fell under 40 deg. docs/TOUCH.md wants thighs forward +
+    // shins dangling on the screen edge at ANY sit depth, so the pose holds
+    // full flex; the hip pin alone adapts to where the edge really is.
+    const flex = 1;
     if (legs) {
       for (const side of ['left', 'right']) {
         const up = m._node(`${side}UpperLeg`);
@@ -508,23 +512,56 @@ export class PoseLayer {
     node.quaternion.multiply(this._q1);
   }
 
-  /** QA/measurement hook (window.rikoMeasure reports these to the harness). */
+  /** QA/measurement hook (window.rikoMeasure reports these to the harness).
+   *  legAngles are measured from the LIVE WORLD joint positions (deg):
+   *    thighBelowHoriz = thigh angle below the hip's horizontal plane
+   *                      (negative = knee ABOVE horizontal; seated gate |x|<=30)
+   *    thighZ          = knee-minus-hip world z (toward the viewer: > 0)
+   *    kneeFlex        = angle(thigh, shin) at the knee (seated gate 70..110)
+   *    shinFromVertical= angle(shin, straight-down) (seated gate <= 25)
+   *  hipsErrPx = projected hips y minus the sit edge line (gate |x| <= 6). */
   debug() {
     const m = this.motion;
+    const T = this.THREE;
     const out = { grabs: {}, sitting: !!this.sitState, sitEdge: null, hipsOffset: null,
                   reacts: [...this.reacts.keys()], flinchX: this.flinchX,
-                  torso: { ...this.torso } };
+                  torso: { ...this.torso }, legAngles: {} };
     for (const [id, g] of this.grabs) {
       out.grabs[id] = { state: g.state, w: +g.w.toFixed(3),
                         target: g.cur.map((v) => +v.toFixed(4)), shake: g.shake };
       if (g.solved) out.grabs[id].solved = g.solved.map((v) => +v.toFixed(4));
     }
+    const wp = (n) => (n ? n.getWorldPosition(new T.Vector3()).toArray() : null);
+    const angDeg = (a, b) => {
+      const la = len(a), lb = len(b);
+      if (!(la > 1e-9 && lb > 1e-9)) return null;
+      return Math.acos(clamp(dot(a, b) / (la * lb), -1, 1)) * 180 / Math.PI;
+    };
+    for (const side of ['left', 'right']) {
+      const hip = wp(m._node(`${side}UpperLeg`));
+      const knee = wp(m._node(`${side}LowerLeg`));
+      const ankle = wp(m._node(`${side}Foot`));
+      if (!hip || !knee || !ankle) continue;
+      const th = sub(knee, hip), sh = sub(ankle, knee);
+      out.legAngles[side] = {
+        thighBelowHoriz: +(90 - angDeg(th, [0, -1, 0])).toFixed(2),
+        thighZ: +th[2].toFixed(4),
+        kneeFlex: +angDeg(th, sh).toFixed(2),
+        shinFromVertical: +angDeg(sh, [0, -1, 0]).toFixed(2),
+      };
+    }
     if (this.sitState) {
+      const s = this.sitState;
       out.sitEdge = this.sitState.edgePx ?? this.sitState.edgeWorldY;
       out.hipsOffset = +this.sitState.offset.toFixed(4);
       out.sitW = +this.sitState.w.toFixed(3);
       const hips = m._node('hips');
-      if (hips) out.hipsWorldY = +hips.getWorldPosition(new this.THREE.Vector3()).y.toFixed(4);
+      if (hips) out.hipsWorldY = +hips.getWorldPosition(new T.Vector3()).y.toFixed(4);
+      if (s.edgePx != null && s.viewH > 0 && m.camera && hips) {
+        const p = hips.getWorldPosition(new T.Vector3()).project(m.camera);
+        out.hipsPx = +(((1 - p.y) / 2) * s.viewH).toFixed(2);
+        out.hipsErrPx = +(out.hipsPx - s.edgePx).toFixed(2);
+      }
     }
     return out;
   }

@@ -103,3 +103,44 @@ def test_touch_kinds_match_contract():
     assert desktop.TOUCH_KINDS == {
         "pat", "poke", "tickle", "grab", "hold", "release", "action",
         "sit", "stand"}
+
+
+# ── /control/bbox seam in NON-roam desktop mode (review blocker) ─────────
+
+class XcbSpy:
+    """Stands in for _Xcb: records any input-region write that reaches it."""
+
+    def __init__(self):
+        import ctypes
+        self.ct = ctypes
+        self.display = object()
+        self.region_calls = []
+
+    def set_input_region(self, xid, region):
+        self.region_calls.append((xid, region))
+
+
+def test_bbox_post_non_roam_stores_seam_and_never_touches_input_region(qapp):
+    """The floating window gets parts/hips_y for the press arbiter + sit
+    watcher, and RoamController.apply_bbox() must not reshape its input
+    region (click-through stays exactly as the small-window mode left it)."""
+    payload = json.loads((FX / "touch_bbox_parts.json").read_text())
+    assert {"parts", "hips_y", "feet_y", "x", "y", "w", "h"} <= payload.keys()
+
+    win = FakeWin()
+    roamc = desktop.RoamController(win, {"desktop": {"roam": "off"}}, tray=None)
+    assert roamc.enabled is False and roamc.in_strip is False
+    spy = XcbSpy()
+    roamc.xcb, roamc.xid = spy, 0xDEAD     # armed backend: proves the no-op is real
+
+    r = desktop.handle_bbox_post(win, roamc, payload)
+    assert r == {"ok": True}
+    assert win.last_bbox is payload        # arbiter + sit watcher data source
+    assert spy.region_calls == []          # input region untouched (no-op apply)
+    assert roamc.x == (payload["x"], payload["y"], payload["w"], payload["h"])
+
+    # a malformed bbox reports the error but still stores the seam (the
+    # arbiter only needs parts/hips_y, which may be valid without the rect)
+    r3 = desktop.handle_bbox_post(win, roamc, {"parts": {}, "hips_y": 300})
+    assert r3["ok"] is False
+    assert win.last_bbox["hips_y"] == 300

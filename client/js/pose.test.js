@@ -215,6 +215,35 @@ if (THREE) {
     assert.equal(pose.sitState, null);
   });
 
+  test('sit: MEASURED leg angles pass the seated gates at any edge depth', need, () => {
+    // Reviewer gates (docs/TOUCH.md round T1): thighs within 30 deg of
+    // horizontal pointing toward the viewer (+z), knee flex 70-110 deg,
+    // shins within 25 deg of vertical — at the shallow AND the deep edge.
+    // The old depth-adaptive flex decay failed these at the deep edge.
+    const { motion, pose } = makePoseRig();
+    sim(motion, pose, 0.3);
+    for (const drop of [0.38, 0.62]) {          // ~70% and ~85% window edges
+      pose.sitWorld(motion._restPos.y - drop);
+      sim(motion, pose, 1.0);
+      assert.ok(pose.sitBlendDone, `blend never finished (drop ${drop})`);
+      const dbg = pose.debug();
+      for (const side of ['left', 'right']) {
+        const a = dbg.legAngles[side];
+        assert.ok(a, `no legAngles for ${side}`);
+        assert.ok(Math.abs(a.thighBelowHoriz) <= 30,
+          `drop ${drop} ${side}: thigh pitch ${a.thighBelowHoriz} deg from horizontal`);
+        assert.ok(a.thighZ > 0.05, `drop ${drop} ${side}: thigh not toward viewer (z=${a.thighZ})`);
+        assert.ok(a.kneeFlex >= 70 && a.kneeFlex <= 110,
+          `drop ${drop} ${side}: knee flex ${a.kneeFlex} deg outside 70..110`);
+        assert.ok(a.shinFromVertical <= 25,
+          `drop ${drop} ${side}: shin ${a.shinFromVertical} deg from vertical`);
+      }
+      pose.stand();
+      sim(motion, pose, 0.7);
+      assert.ok(pose.standBlendDone);
+    }
+  });
+
   test('sit px branch: hips converge onto the window edge line (camera space)', need, () => {
     const { motion, pose } = makePoseRig();
     motion.setGazeOverride({ yaw: 0, pitch: 0 });

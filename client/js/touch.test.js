@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   hitTest, PressTracker, TouchRecogniser, TouchPostGate, PART_PRIORITY,
-  HOLD_MS, MOVE_SLOP, TAP_GAP_MS, RAPID_MS,
+  HOLD_MS, MOVE_SLOP, TAP_GAP_MS, RAPID_MS, bboxSeamChanged, SeamPostPolicy,
 } from './touch.js';
 
 // a plausible parts map (window CSS px), non-overlapping except hand inside arm
@@ -150,4 +150,56 @@ test('post gate: same part+kind 1.5 s; grab/release always; off mutes at the pag
   assert.equal(g.allow('head', 'poke'), true);       // different kind passes
   for (let i = 0; i < 5; i++) assert.equal(g.allow('hand_r', 'grab'), true);
   for (let i = 0; i < 5; i++) assert.equal(g.allow('hand_r', 'release'), true);
+});
+
+// ── non-roam desktop bbox seam (docs/TOUCH.md) ───────────────────────────
+// The seam payload the page posts in NON-roam desktop mode must NOT need
+// director.walk (bboxBody(cx) is walk-free by construction); these tests
+// cover the pure posting policy the page drives it through.
+
+const seamPayload = (over = {}) => ({
+  x: 169, y: 0, w: 162, h: 537, hips_y: 311, feet_y: 511,
+  parts: {
+    head: [225, 104, 50, 54], hand_l: [286, 254, 45, 44], hand_r: [169, 254, 45, 44],
+    arm_l: [274, 206, 55, 90], arm_r: [171, 206, 55, 90],
+    foot_l: [239, 463, 52, 49], foot_r: [209, 463, 52, 49],
+    torso: [215, 150, 70, 140], hips: [221, 279, 58, 65],
+  },
+  ...over,
+});
+
+test('bboxSeamChanged: <2 px jitter is not a change; >=2 px anywhere is', () => {
+  assert.equal(bboxSeamChanged(seamPayload(), seamPayload()), false);
+  assert.equal(bboxSeamChanged(seamPayload(), seamPayload({ hips_y: 312 })), false);
+  assert.equal(bboxSeamChanged(seamPayload(), seamPayload({ hips_y: 313 })), true);
+  assert.equal(bboxSeamChanged(seamPayload(), seamPayload({ w: 164 })), true);
+  const moved = seamPayload();
+  moved.parts.hand_l = [286, 256, 45, 44];              // +2 px in a part rect
+  assert.equal(bboxSeamChanged(seamPayload(), moved), true);
+  const grew = seamPayload();
+  grew.parts.head = [225, 104, 51, 54];                 // +1 px: still quiet
+  assert.equal(bboxSeamChanged(seamPayload(), grew), false);
+});
+
+test('bboxSeamChanged: unknown <-> known and added/removed parts are changes', () => {
+  assert.equal(bboxSeamChanged(seamPayload(), seamPayload({ hips_y: null })), true);
+  assert.equal(bboxSeamChanged(seamPayload({ hips_y: null }), seamPayload()), true);
+  const noHead = seamPayload();
+  delete noHead.parts.head;
+  assert.equal(bboxSeamChanged(seamPayload(), noHead), true);   // part vanished
+  assert.equal(bboxSeamChanged(noHead, seamPayload()), true);   // part appeared
+  assert.equal(bboxSeamChanged(null, seamPayload()), true);
+});
+
+test('SeamPostPolicy: first post always; then only >=2 px moves or 1 s beats', () => {
+  const p = new SeamPostPolicy({ minPx: 2, repostS: 1.0 });
+  assert.equal(p.shouldPost(seamPayload(), 0.0), true);        // first sample
+  assert.equal(p.shouldPost(seamPayload(), 0.1), false);       // idle: quiet
+  assert.equal(p.shouldPost(seamPayload(), 0.9), false);
+  assert.equal(p.shouldPost(seamPayload({ hips_y: 300 }), 0.95), true);  // drag: 11 px
+  assert.equal(p.shouldPost(seamPayload({ hips_y: 300 }), 1.04), false); // settled again
+  assert.equal(p.shouldPost(seamPayload({ hips_y: 300 }), 1.90), false); // 0.95 s: no
+  assert.equal(p.shouldPost(seamPayload({ hips_y: 300 }), 2.01), true);  // 1 s heartbeat
+  p.reset();
+  assert.equal(p.shouldPost(seamPayload(), 5.0), true);        // persona swap re-posts
 });

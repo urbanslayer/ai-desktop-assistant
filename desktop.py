@@ -703,6 +703,25 @@ class RoamController(QObject):
         return bool(inside)
 
 
+def handle_bbox_post(win, roamc, args: dict) -> dict:
+    """The /control/bbox branch (docs/TOUCH.md).
+
+    ALWAYS stores the post on the window: the press arbiter hit-tests
+    args["parts"] limb rects and the sit watcher reads args["hips_y"] —
+    in NON-roam desktop mode too (the page posts the touch seam at ~10 Hz
+    sampled / >=2 px changed since the roam strip stopped owning it).
+    The roam controller then re-shapes the click-through input region from
+    the rect, but RoamController.apply_bbox() no-ops outside the strip, so
+    the floating window's input region/click-through is NOT touched here.
+    """
+    win.last_bbox = args
+    try:
+        roamc.update_bbox(args["x"], args["y"], args["w"], args["h"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
+    return {"ok": True}
+
+
 def _hyprland_rule(width, height):
     """Float + size + pin her through a runtime window rule (Hyprland 0.55+, Lua config).
 
@@ -1501,16 +1520,7 @@ def main():
                 return {"ok": False, "error": f"bad walk-state x: {x!r}"}
             return {"ok": True}
         elif cmd == "bbox":
-            # her projected body box (page coords = window coords), ~10 Hz:
-            # desktop.py shapes the click-through input region from this,
-            # the press arbiter hit-tests args["parts"] limb rects from it
-            # and the sit watcher reads args["hips_y"] (docs/TOUCH.md)
-            win.last_bbox = args
-            try:
-                roamc.update_bbox(args["x"], args["y"], args["w"], args["h"])
-            except (KeyError, TypeError, ValueError):
-                return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
-            return {"ok": True}
+            return handle_bbox_post(win, roamc, args)
         elif cmd == "touch":
             # the page's gesture recogniser (docs/TOUCH.md): forward to the
             # hub on a worker thread — this HTTP thread never waits on it

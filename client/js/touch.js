@@ -240,3 +240,58 @@ export class TouchPostGate {
     return true;
   }
 }
+
+/**
+ * /control/bbox seam diff (docs/TOUCH.md §parts): did the payload move by
+ * >= minPx in ANY component? prev/next = {x,y,w,h,hips_y,feet_y,
+ * parts:{name:[x,y,w,h],...}}. unknown <-> known counts as a change (the
+ * desktop must learn about a part the moment it becomes known).
+ */
+export function bboxSeamChanged(prev, next, minPx = 2) {
+  if (!prev || !next) return true;
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const diff = (a, b) => {
+    if (a === null || b === null) return a !== b;
+    return Math.abs(a - b) >= minPx;
+  };
+  for (const k of ['x', 'y', 'w', 'h', 'hips_y', 'feet_y']) {
+    if (diff(num(prev[k]), num(next[k]))) return true;
+  }
+  const pa = prev.parts || {}, pb = next.parts || {};
+  for (const k of new Set([...Object.keys(pa), ...Object.keys(pb)])) {
+    const ra = Array.isArray(pa[k]) ? pa[k] : null;
+    const rb = Array.isArray(pb[k]) ? pb[k] : null;
+    if (!ra || !rb) { if (pa[k] !== pb[k]) return true; continue; }
+    for (let i = 0; i < 4; i++) if (diff(num(ra[i]), num(rb[i]))) return true;
+  }
+  return false;
+}
+
+/**
+ * Non-roam desktop posting policy for the touch seam (docs/TOUCH.md): the
+ * caller samples at ~10 Hz; a payload POSTS when it differs from the last
+ * posted one by >= minPx px, on a repostS heartbeat (so the desktop can
+ * never act on stale rects), or on the very first sample.
+ */
+export class SeamPostPolicy {
+  constructor({ minPx = 2, repostS = 1.0 } = {}) {
+    this.minPx = minPx;
+    this.repostS = repostS;
+    this.prev = null;
+    this.postedAt = -Infinity;
+  }
+
+  shouldPost(payload, nowS) {
+    if (this.prev !== null
+        && nowS - this.postedAt < this.repostS
+        && !bboxSeamChanged(this.prev, payload, this.minPx)) return false;
+    this.prev = payload;
+    this.postedAt = nowS;
+    return true;
+  }
+
+  reset() {
+    this.prev = null;
+    this.postedAt = -Infinity;
+  }
+}

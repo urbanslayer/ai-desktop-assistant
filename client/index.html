@@ -95,6 +95,7 @@
     import { AvatarMotion } from './js/motion.js';
     import {
       hitTest, PressTracker, TouchRecogniser, TouchPostGate, GRABBABLE,
+      SeamPostPolicy,
     } from './js/touch.js';
     import { PoseLayer, GRAB_KIND } from './js/pose.js';
     import { WalkDirector } from './js/walk.js';
@@ -541,6 +542,7 @@
       _touchPress = new PressTracker();
       _touchRec = new TouchRecogniser();
       grabId = null; grabDepth = null; sitReported = null; touchBlocked = false;
+      _seamPolicy.reset();         // the new model's rects are a fresh first post
     }
 
     // ── body-part screen rects (the bbox seam, docs/TOUCH.md §parts) ──
@@ -581,6 +583,20 @@
     }
     let _specFace = null;      // empirically-detected "facing camera" yaw
     let _specOrbitAz = null;   // QA orbit azimuth (rad), pinned while set
+    const _orbitOff = new THREE.Vector3();
+    const _orbitSph = new THREE.Spherical();
+    function specOrbitTo(az) {
+      // The vendored OrbitControls has NO setAzimuthalAngle (calling it threw
+      // and killed the whole setAnimationLoop callback — pose/sit/bbox all
+      // froze). Move the camera around controls.target by hand instead;
+      // update() re-derives its state from the camera position, so it sticks.
+      _orbitOff.copy(camera.position).sub(controls.target);
+      _orbitSph.setFromVector3(_orbitOff);
+      _orbitSph.theta = az;
+      _orbitSph.makeSafe();
+      camera.position.copy(controls.target).add(_orbitOff.setFromSpherical(_orbitSph));
+      controls.update();
+    }
     function specFaceWant() {
       if (_specFace != null) return _specFace;
       try {
@@ -730,8 +746,14 @@
       _lastPt.x = e.clientX; _lastPt.y = e.clientY;
       _touchPress.down(e.clientX, e.clientY, e.timeStamp || performance.now());
       const _hp = computeParts();
-      const gs = _touchPress.setPart(hitTest(_hp, e.clientX, e.clientY));
-      if (CAPTURE) console.log(`[touch] down ${e.clientX},${e.clientY} part=${gs?.part ?? 'pending'} rects=${JSON.stringify(_hp)}`);
+      const _hit = hitTest(_hp, e.clientX, e.clientY);
+      const gs = _touchPress.setPart(_hit);
+      // A press that starts ON a grabbable part belongs to touch, never to
+      // the camera: stop it before OrbitControls (a bubble-phase listener on
+      // the canvas) sees it, or the grab drag would pan/orbit the view.
+      // Roam strip keeps its own left-drag semantics (drag HER, not the view).
+      if (!ROAM && GRABBABLE.has(_hit)) e.stopPropagation();
+      if (CAPTURE) console.log(`[touch] down ${e.clientX},${e.clientY} part=${gs?.part ?? _hit ?? 'pending'} rects=${JSON.stringify(_hp)}`);
       if (gs) startGrab(gs.part, e.clientX, e.clientY);
     }, true);
     addEventListener('pointermove', (e) => {
@@ -773,13 +795,10 @@
       // "front" is empirical — exports bake different root orientations — so
       // derive it from where the eyes sit relative to the hips, once.
       if (TOUCH_SPEC) faceWant = specFaceWant();
+      if (TOUCH_SPEC && _specOrbitAz != null) specOrbitTo(_specOrbitAz);  // side-view op
       // Overlays (docs/TOUCH.md visual checks): edge line under the sitting
       // hips + crosshair at the live grab target. Drawn into the WEBGL canvas
       // (a HUD pass), not the DOM, so ?capture screenshots include them.
-      if (TOUCH_SPEC && _specOrbitAz != null) {
-        controls.setAzimuthalAngle(_specOrbitAz);
-        controls.update();
-      }
       {
         const D = 0.6;   // overlay plane distance from camera (in front of the avatar)
         const s = pose.sitState;
@@ -832,17 +851,20 @@
 
     const _bboxV = new THREE.Vector3();
     let bboxAt = 0, xPostAt = 0;
-    function postBbox() {
-      const w = director?.walk;
+    // /control/bbox payload for a body centred at world-x `cx`: projected
+    // window rect + touch seams (parts rects, hips/feet line, CSS px —
+    // docs/TOUCH.md). Walk-independent: the non-roam desktop posts the SAME
+    // seam so press arbitration and the sit watcher work in the floating
+    // window too. Desktop ignores unknown keys; absent fields mean unknown.
+    function bboxBody(cx) {
       const rig = motion.rig;
-      if (!w || !rig) return;
       const half = rig.shoulderWidth / 2 + 0.12
         + (motion.gesture && IK_ARM_GESTURES[motion.gesture.name] ? 0.35 : 0);
       const yTop = rig.bboxTop + 0.02, yBot = Math.min(rig.bboxBottom, 0) - 0.02;
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-      for (const sx of [-half, half]) {
+      for (const sx of [cx - half, cx + half]) {
         for (const sy of [yTop, (yTop + yBot) / 2, yBot]) {
-          _bboxV.set(w.x + sx, sy, 0.15).project(camera);
+          _bboxV.set(sx, sy, 0.15).project(camera);
           const px = (_bboxV.x * 0.5 + 0.5) * innerWidth;
           const py = (-_bboxV.y * 0.5 + 0.5) * innerHeight;
           x0 = Math.min(x0, px); x1 = Math.max(x1, px);
@@ -853,18 +875,45 @@
       const x = Math.max(0, Math.round(x0 - pad)), y = Math.max(0, Math.round(y0 - pad));
       const bw = Math.min(innerWidth - x, Math.round(x1 - x0 + pad * 2));
       const bh = Math.min(innerHeight - y, Math.round(y1 - y0 + pad * 2));
-      // touch seams (docs/TOUCH.md): body-part rects + hips/feet line, CSS px.
-      // Desktop ignores unknown keys; absent fields mean unknown.
       const parts = computeParts();
       const hy = hipsPxY(), fy = feetPxY();
+      return {
+        x, y, w: bw, h: bh,
+        ...(parts ? { parts } : {}),
+        ...(hy != null ? { hips_y: Math.round(hy) } : {}),
+        ...(fy != null ? { feet_y: Math.round(fy) } : {}),
+      };
+    }
+    function postBbox() {
+      const w = director?.walk;
+      const rig = motion.rig;
+      if (!w || !rig) return;
       fetch('/control/bbox', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          x, y, w: bw, h: bh,
-          ...(parts ? { parts } : {}),
-          ...(hy != null ? { hips_y: Math.round(hy) } : {}),
-          ...(fy != null ? { feet_y: Math.round(fy) } : {}),
-        }),
+        body: JSON.stringify(bboxBody(w.x)),
+      }).catch(() => {});
+    }
+    // Non-roam desktop mode: same seam at ~10 Hz SAMPLED, POSTED only when
+    // it moved >= 2 px or once per second (SeamPostPolicy, docs/TOUCH.md).
+    // Without this the desktop never gets `parts`/`hips_y` outside the roam
+    // strip: every press becomes a window move and the sit watcher idles.
+    const _seamPolicy = new SeamPostPolicy({ minPx: 2, repostS: 1.0 });
+    let seamSampleAt = 0;
+    function deskTouchHousekeeping(now) {
+      if (!vrm || !motion.rig) return;
+      if (now - seamSampleAt < 0.1) return;
+      seamSampleAt = now;
+      const body = bboxBody(vrm.scene.position.x || 0);
+      // First frames project through a camera whose matrices haven't run a
+      // render yet — those samples come out absurd (|px| >> viewport); they
+      // would poison the desktop arbiter's hit rects, so drop them silently.
+      const head = body.parts && body.parts.head;
+      if (!head || !Number.isFinite(head[0])
+          || Math.abs(head[1]) > 8 * innerHeight || Math.abs(head[0]) > 8 * innerWidth) return;
+      if (!_seamPolicy.shouldPost(body, now)) return;
+      fetch('/control/bbox', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
       }).catch(() => {});
     }
     function walkHousekeeping(now) {
@@ -1206,6 +1255,12 @@
           })(),
           headFootPx: headPx && footPx ? Math.round(footPx[1] - headPx[1]) : null,
           feetFromBottomPx: footPx ? Math.round(viewH() - footPx[1]) : null,
+          // sit gates (docs/TOUCH.md): px the lowest foot hangs BELOW the
+          // sit edge line (positive = past the edge, dangling)
+          feetBelowEdgePx: (() => {
+            const e = pose.sitState?.edgePx;
+            return (feetPxY() != null && e != null) ? Math.round(feetPxY() - e) : null;
+          })(),
           visualScale: Math.round(scaleShown * 1000) / 1000,
           windowScale: Math.round(windowScale * 1000) / 1000,
           canvasH: viewH(),
@@ -1636,6 +1691,10 @@
       } else if (vrm && vrm.scene.position.x !== 0 && !ROAM) {
         vrm.scene.position.x = 0;
       }
+      // The touch seam runs in NON-roam desktop mode too (docs/TOUCH.md):
+      // without it the press arbiter never sees `parts` and the sit watcher
+      // never sees `hips_y` in the normal floating window.
+      if (DESKTOP && vrm && !(ROAM && director.walk)) deskTouchHousekeeping(T());
       feedVowel();
       motion.update(dt);
       pose.apply(dt, { viewH: viewH() });   // pose layer on TOP of the life layer
