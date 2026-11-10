@@ -219,6 +219,7 @@ def tools_prompt(spec_names: list[str], now_local: str = "",
         + _typing_line(spec_names)
         + _appedit_line(spec_names)
         + _commands_line(spec_names)
+        + _music_line(spec_names)
         + f"Current date/time: {now} (UTC)." + local
     )
 
@@ -304,6 +305,20 @@ def _commands_line(spec_names) -> str:
             "read-only command; explain the result in plain words. "
             "Elevated commands are refused outright — never suggest sudo "
             "or running something as root. ")
+
+
+def _music_line(spec_names) -> str:
+    """One line while the spotify_* tools are offered (docs/SPOTIFY_NOTES.md,
+    docs/TOOLS.md): the Web API steers Spotify Connect devices only — the
+    device named in Settings (default 'Riko') is this desktop's player."""
+    names = [str(n) for n in (spec_names or [])]
+    if not any(n.endswith("spotify_play") or "__spotify_play" in n
+               for n in names):
+        return ""
+    return ("For music requests use spotify_* tools; the device named Riko "
+            "is the desktop player (spotify_devices shows what is online, "
+            "spotify_play/spotify_transfer pick where it plays). Never "
+            "claim you cannot play music while these tools are offered. ")
 
 
 def now_iso_static() -> str:

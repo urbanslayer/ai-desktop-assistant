@@ -57,6 +57,10 @@ class Session:
         self._vad_holds = 0          # >0 = VAD paused (thinking/speaking/Space held)
         self._vad_lock = threading.Lock()
         self._spoke_last_turn = False  # worker-only: did the last turn make sound?
+        # Music phase 1 (docs/SPOTIFY_NOTES.md): desktop.py wires a ducking
+        # hook around speech — fn(True) when she starts talking, fn(False)
+        # when she stops. None = no ducking (hub-only runs).
+        self.on_speak: Optional[Callable[[bool], None]] = None
         # ── hub live events (docs/TIMERS.md D) ──────────────────────────
         self.on_timer_notice: Optional[Callable[[str, str], None]] = None  # desktop.py: tray
         # Dictation router (docs/TYPING.md §8), wired by desktop.py:
@@ -571,7 +575,20 @@ class Session:
                             speech=speech)
         viewer.emit("status", state="speaking")
         self._spoke_last_turn = wav is not None
+        # duck the desktop music player while she talks (best-effort; the
+        # hook itself never raises, but a dumb desktop hook shouldn't kill
+        # the reply either)
+        if self.on_speak is not None:
+            try:
+                self.on_speak(True)
+            except Exception:
+                pass
         viewer.play(wav, answer, emotion=emotion, actions=actions or [])
+        if self.on_speak is not None:
+            try:
+                self.on_speak(False)
+            except Exception:
+                pass
         if self._vad is not None and wav is not None:
             # Her voice is really over NOW (the page reported it): audio from
             # here on is echo-era and may pre-roll the next VAD segment.

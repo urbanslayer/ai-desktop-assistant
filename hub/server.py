@@ -41,9 +41,11 @@ try:  # package import (repo root: `from hub.server import create_app`)
                              sdk_available as mcp_available,
                              validate_servers as validate_mcp_servers)
     from .toolloop import run_turn
+    from . import spotify as _spotify
     from .tools import weather as _weather
     from .tools.memory_tools import build_memory_specs
     from .tools.registry import build_hub_specs, hub_tool_info, permission_for, tools_prompt
+    from .tools.spotify_tools import build_spotify_specs
     from .tools import timers as _timers
     from .scheduler import TimerScheduler, TimerPermanent
     from .store import Store, default_voice, now_iso
@@ -63,10 +65,12 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
                             sdk_available as mcp_available,
                             validate_servers as validate_mcp_servers)
     from toolloop import run_turn  # type: ignore[no-redef]
+    import spotify as _spotify  # type: ignore[no-redef]
     from tools import weather as _weather  # type: ignore[no-redef]
     from tools.memory_tools import build_memory_specs  # type: ignore[no-redef]
     from tools.registry import (build_hub_specs, hub_tool_info,  # type: ignore[no-redef]
                                 permission_for, tools_prompt)
+    from tools.spotify_tools import build_spotify_specs  # type: ignore[no-redef]
     from tools import timers as _timers  # type: ignore[no-redef]
     from scheduler import TimerScheduler, TimerPermanent  # type: ignore[no-redef]
     from store import Store, default_voice, now_iso  # type: ignore[no-redef]
@@ -134,6 +138,21 @@ MEMORY_DEFAULTS = {
 # reminder cannot schedule another one forever (chain guard).
 TIMER_SETTINGS_DEFAULTS = {
     "allow_chaining": False,
+}
+
+# Music phase 1 settings (docs/SPOTIFY_NOTES.md): ONE Spotify connection
+# under the owner's Developer Dashboard app (client id only, PKCE — no
+# secret). The tokens themselves live in their own store key
+# (`spotify_tokens`, written by hub/spotify.py) and NEVER appear in
+# GET /api/settings — only these schema keys are exposed. Blank
+# accounts_url/api_url = the built-in Spotify hosts; the RIKO_SPOTIFY_*
+# env defaults (main()) can point them at the in-repo fake server in tests.
+SPOTIFY_DEFAULTS = {
+    "enabled": False,
+    "client_id": "",            # write-only-ish: a blank edit never wipes it
+    "device_name": "Riko",      # the Spotify Connect device = desktop player
+    "accounts_url": "",         # blank = https://accounts.spotify.com
+    "api_url": "",              # blank = https://api.spotify.com/v1
 }
 
 # Seed persona: the system prompt copied from character_config.yaml at build
@@ -222,7 +241,8 @@ def create_app(data_dir, api_key: str | None = None,
                memory_defaults: dict | None = None,
                mcp_defaults: dict | None = None,
                timers_defaults: dict | None = None,
-               location_defaults: dict | None = None) -> FastAPI:
+               location_defaults: dict | None = None,
+               spotify_defaults: dict | None = None) -> FastAPI:
     """Build the hub app over `data_dir` (SQLite + avatars live there).
 
     api_key None/empty disables auth. llm_defaults fills any LLM settings
@@ -257,6 +277,7 @@ def create_app(data_dir, api_key: str | None = None,
     mcp_defaults = dict(mcp_defaults or {})
     timers_defaults = dict(timers_defaults or {})
     location_defaults = dict(location_defaults or {})
+    spotify_defaults = dict(spotify_defaults or {})
     app = FastAPI(title="riko-hub", version=HUB_VERSION, docs_url=None, redoc_url=None)
     # one chat turn at a time PER PERSONA (docs/TIMERS.md H): a fired timer
     # waits for its own persona's chat to free without blocking the others
@@ -517,6 +538,53 @@ def create_app(data_dir, api_key: str | None = None,
             out = out + [preset]
         return out
 
+    # ── spotify settings + hub (music phase 1, docs/SPOTIFY_NOTES.md) ──
+    # One Spotify connection, tokens in the store key `spotify_tokens`
+    # (write-only: GET /api/settings never sees them, /api/spotify/status
+    # reports booleans/expiry only). SpotifyHub owns the quota back-off,
+    # device cache and the now_playing poller.
+    def stored_spotify() -> dict:
+        saved = dict(store.get_json("spotify", {}))
+        for key in ("accounts_url", "api_url"):
+            if key in saved and not str(saved[key] or "").strip():
+                del saved[key]
+        if "client_id" in saved and not str(saved["client_id"] or "").strip():
+            del saved["client_id"]      # legacy blank = unset, like api_key
+        return saved
+
+    def default_spotify() -> dict:
+        merged = dict(SPOTIFY_DEFAULTS)
+        merged.update(spotify_defaults)
+        merged["enabled"] = bool(merged.get("enabled"))
+        merged["device_name"] = (str(merged.get("device_name") or "").strip()
+                                 or "Riko")
+        return merged
+
+    def spotify_settings() -> dict:
+        # projected onto the schema keys: junk (or a stray token) saved into
+        # the block by an older/newer client never rides along on reads
+        merged = default_spotify()
+        saved = stored_spotify()
+        for key in SPOTIFY_DEFAULTS:
+            if key in saved:
+                merged[key] = saved[key]
+        return merged
+
+    spotify_hub = _spotify.SpotifyHub(store, events, spotify_settings,
+                                      defaults=spotify_defaults,
+                                      on_change=bump_state)
+
+    def spotify_error_response(e: Exception) -> JSONResponse:
+        """Route-side mapping of hub/spotify.py errors (docs/API.md)."""
+        if isinstance(e, _spotify.SpotifyQuota):
+            return err(429, str(e))
+        if isinstance(e, _spotify.SpotifyPremium):
+            return err(403, str(e))
+        if isinstance(e, (_spotify.SpotifyNotConfigured,
+                          _spotify.SpotifyNotConnected)):
+            return err(409, str(e))
+        return err(400, str(e))
+
     # ── timezone setting (docs/TIMERS.md H) — blank = server TZ ─────────
     def stored_timezone() -> str:
         """Saved IANA zone name, '' when unset (unset = server default)."""
@@ -596,6 +664,9 @@ def create_app(data_dir, api_key: str | None = None,
                 location_source[k] = "env"      # the RIKO_LOCATION default
             else:
                 location_source[k] = "default"  # default = no location
+        saved_spotify = stored_spotify()
+        spotify_source = {k: ("saved" if k in saved_spotify else "default")
+                          for k in SPOTIFY_DEFAULTS}
         return {
             "llm": public_llm(llm_settings()),
             "tts": tts_settings(),
@@ -609,6 +680,11 @@ def create_app(data_dir, api_key: str | None = None,
             "location": location_settings(),
             "location_source": location_source,
             "units_effective": units_effective(),
+            # music phase 1: schema keys only — the tokens live in another
+            # store key and can NEVER ride along here
+            "spotify": spotify_settings(),
+            "spotify_source": spotify_source,
+            "spotify_connected": spotify_hub.connected(),
             "defaults": {"llm": defaults_public,
                          "tts": default_tts(),
                          "tools": default_tools(),
@@ -618,7 +694,8 @@ def create_app(data_dir, api_key: str | None = None,
                                  if preset else []},
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES),
                          "timezone": default_timezone(),
-                         "location": default_location()},
+                         "location": default_location(),
+                         "spotify": default_spotify()},
             "llm_source": source,
             "tts_source": tts_source,
             "tools_source": tools_source,
@@ -1317,6 +1394,11 @@ def create_app(data_dir, api_key: str | None = None,
             # turn_timers_api also records creations for the fallback.
             hub_specs += _timers.build_timer_specs(store, pid, turn_timers_api,
                                                    lambda: timer_capture)
+            # music phase 1 (docs/SPOTIFY_NOTES.md): the spotify_* player
+            # tools ride the same per-turn build; they are LISTED while the
+            # tools are on but only OFFERED once Spotify is configured
+            # (ToolSpec.available -> toolloop/tool_prompt filtering).
+            hub_specs += build_spotify_specs(spotify_hub, tools_cfg)
             for s in hub_specs:
                 if permission_for(s.name, "hub", s.risk, permissions) != "never":
                     specs.append(s)
@@ -2144,6 +2226,42 @@ def create_app(data_dir, api_key: str | None = None,
                         new_loc[k] = str(loc.get(k) or "").strip()[:100]
                     saved_loc = {**saved_loc, **new_loc}
                 store.set_json("location", saved_loc)
+        if "spotify" in body:
+            # music phase 1 (docs/SPOTIFY_NOTES.md): schema keys only. The
+            # tokens are NEVER written through here (they live in
+            # spotify_tokens, written by the connect flow), and an empty
+            # client_id NEVER wipes the saved one — api_key semantics.
+            sp = body["spotify"]
+            if not isinstance(sp, dict):
+                return err(422, "spotify must be an object")
+            saved_sp = stored_spotify()
+            if str(sp.get("client_id") or "").strip():
+                saved_sp["client_id"] = str(sp["client_id"]).strip()[:120]
+            if sp.get("clear_client_id"):
+                saved_sp.pop("client_id", None)
+            if "device_name" in sp:
+                name = str(sp["device_name"] or "").strip()
+                if name:
+                    saved_sp["device_name"] = name[:60]
+                else:
+                    saved_sp.pop("device_name", None)   # blank = 'Riko'
+            for key in ("accounts_url", "api_url"):
+                if key in sp:
+                    value = str(sp[key] or "").strip()
+                    if value:
+                        if not value.startswith(("http://", "https://")):
+                            return err(422, f"spotify.{key} must be an "
+                                            "http(s) URL")
+                        saved_sp[key] = value[:300]
+                    else:
+                        saved_sp.pop(key, None)  # blank = built-in default
+            if "enabled" in sp:
+                if not isinstance(sp["enabled"], bool):
+                    return err(422, "spotify.enabled must be a boolean")
+                saved_sp["enabled"] = sp["enabled"]
+            store.set_json("spotify", saved_sp)
+            if sp.get("enabled"):
+                spotify_hub.wake()   # re-check playback right after enabling
         bump_state()
         return settings_response()
 
@@ -2178,13 +2296,15 @@ def create_app(data_dir, api_key: str | None = None,
             changed |= store.del_json("timezone")
         if body.get("location"):
             changed |= store.del_json("location")
+        if body.get("spotify"):
+            changed |= store.del_json("spotify")   # tokens survive a reset
         if not (body.get("llm") or body.get("tts") or body.get("tools")
                 or body.get("memory") or body.get("mcp") or body.get("timers")
                 or body.get("switch_phrases") or body.get("timezone")
-                or body.get("location")):
+                or body.get("location") or body.get("spotify")):
             return err(422, 'set "llm", "tts", "tools", "memory", "mcp", '
-                            '"timers", "switch_phrases", "timezone" '
-                            'and/or "location" to true')
+                            '"timers", "switch_phrases", "timezone", '
+                            '"location" and/or "spotify" to true')
         if changed:
             bump_state()
         return settings_response()
@@ -2569,6 +2689,14 @@ def create_app(data_dir, api_key: str | None = None,
                                                        s["permission_override"],
                                                        s.get("permission_default",
                                                             ""))})
+        # music phase 1: the spotify_* rows are always listed (permissions
+        # stay editable while Spotify is off), availability = configured
+        for s in build_spotify_specs(spotify_hub, cfg):
+            tools.append({"name": s.name, "display": s.display, "source": "hub",
+                          "risk": s.risk, "available": s.available,
+                          "description": s.description,
+                          "permission": permission_for(s.name, "hub", s.risk,
+                                                       permissions)})
         return {"tools": tools, "settings": cfg, "defaults": default_tools(),
                 "status": tools_status_response(),
                 # online body set (docs/BODY.md §1): what she can do right now
@@ -2599,6 +2727,86 @@ def create_app(data_dir, api_key: str | None = None,
     @app.get("/api/tools/status")
     def get_tools_status():
         return tools_status_response()
+
+    # ── spotify (music phase 1, docs/SPOTIFY_NOTES.md) ─────────────────
+    # The hub owns the ONE Spotify connection. Auth is Authorization Code
+    # + PKCE (client id only, no secret); the redirect lands on a loopback
+    # listener (the desktop app on http://127.0.0.1:8911/callback) or the
+    # owner pastes the redirected URL back on the Settings page. Tokens
+    # live in the store (write-only); nothing here streams audio — the
+    # Player API only steers Spotify Connect devices.
+    @app.get("/api/spotify/status")
+    def get_spotify_status():
+        """{enabled, configured, connected, connected_as, scope, device_name,
+        token_expires_at, quota_backoff_left, now_playing, polling, ...} —
+        booleans/expiry only, never a token."""
+        return spotify_hub.status()
+
+    @app.get("/api/spotify/connect-url")
+    def get_spotify_connect_url(redirect_uri: str = ""):
+        """Start the handshake: {url, state, code_verifier, redirect_uri}.
+        The desktop listener and the Settings page both fetch this; the hub
+        keeps the PKCE pair until connect() consumes it (single use)."""
+        try:
+            return spotify_hub.connect_url(redirect_uri)
+        except _spotify.SpotifyError as e:
+            return spotify_error_response(e)
+
+    @app.post("/api/spotify/connect")
+    async def post_spotify_connect(request: Request):
+        """Finish the handshake: {code, redirect_uri, code_verifier?} from
+        the desktop listener, or {paste: <the full redirected URL>} from the
+        Settings page. code_verifier falls back to the stored handshake."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        try:
+            return await run_in_threadpool(spotify_hub.connect, body)
+        except _spotify.SpotifyError as e:
+            return spotify_error_response(e)
+
+    @app.post("/api/spotify/disconnect")
+    def post_spotify_disconnect():
+        """Drop the tokens (settings + app stay; Connect again to re-link)."""
+        return spotify_hub.disconnect()
+
+    @app.get("/api/spotify/now-playing")
+    async def get_spotify_now_playing():
+        """Late-client answer to 'what is playing': the cached young snapshot
+        or one fresh API call. 409 while not connected, 429 inside a quota
+        back-off window."""
+        try:
+            return await run_in_threadpool(spotify_hub.now_playing)
+        except _spotify.SpotifyError as e:
+            return spotify_error_response(e)
+
+    @app.get("/api/spotify/devices")
+    async def get_spotify_devices():
+        """[{id, name, type, active, volume}] — cached 60 s (quota
+        discipline, docs/SPOTIFY_NOTES.md)."""
+        try:
+            return {"devices": await run_in_threadpool(spotify_hub.devices)}
+        except _spotify.SpotifyError as e:
+            return spotify_error_response(e)
+
+    @app.post("/api/spotify/transfer")
+    async def post_spotify_transfer(request: Request):
+        """{device: name-or-id}: make that device the player now
+        ('make this the player' on the Settings card)."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        try:
+            return await run_in_threadpool(
+                spotify_hub.transfer, str(body.get("device") or ""))
+        except _spotify.SpotifyError as e:
+            return spotify_error_response(e)
 
     # ── long-term memory (docs/WALK_MEMORY.md M) ────────────────────────
     def valid_fact_scope(scope: str) -> bool:
@@ -2863,6 +3071,16 @@ def create_app(data_dir, api_key: str | None = None,
     if timers_defaults.get("start") or timers_defaults.get("poll_s") is not None:
         timer_scheduler.start()
 
+    # ── spotify now_playing poller (music phase 1) ──────────────────────
+    # Daemon thread like the timer scheduler: polls currently-playing at
+    # most every 5 s WHILE PLAYING, publishes now_playing on state changes,
+    # and makes NO Spotify calls while paused/idle. Like the timers,
+    # create_app() does not start the thread (tests drive poll_tick());
+    # main() passes start=True.
+    app.state.spotify = spotify_hub
+    if spotify_defaults.get("start") or spotify_defaults.get("poll_s") is not None:
+        spotify_hub.start()
+
     @app.on_event("shutdown")
     async def _mcp_shutdown():
         await run_in_threadpool(mcp_manager.shutdown)
@@ -2870,6 +3088,10 @@ def create_app(data_dir, api_key: str | None = None,
     @app.on_event("shutdown")
     async def _timers_shutdown():
         timer_scheduler.stop()
+
+    @app.on_event("shutdown")
+    async def _spotify_shutdown():
+        spotify_hub.stop()
 
     return app
 
@@ -2899,6 +3121,15 @@ def main():
     # ("Gloucester, UK" or a postcode-ish town) used until the owner picks a
     # place on the Settings page; geocoded lazily at first use (cached).
     location_defaults = {"place": os.getenv("RIKO_LOCATION", "")}
+    # Music phase 1 (docs/SPOTIFY_NOTES.md): RIKO_SPOTIFY_ACCOUNTS_URL /
+    # RIKO_SPOTIFY_API_URL override the Spotify hosts (tests point them at
+    # the in-repo fake server); the client id itself is Settings-page-only.
+    # start=True: the real hub runs the now_playing poller thread.
+    spotify_defaults = {
+        "accounts_url": os.getenv("RIKO_SPOTIFY_ACCOUNTS_URL", ""),
+        "api_url": os.getenv("RIKO_SPOTIFY_API_URL", ""),
+        "start": True,
+    }
     # Home Assistant (docs/API.md "Home Assistant via MCP"): RIKO_HA_URL is
     # the HA base URL, RIKO_HA_TOKEN the long-lived access token; both set =
     # the built-in 'homeassistant' MCP server is offered. The token never
@@ -2914,7 +3145,8 @@ def main():
                      timers_defaults={"poll_s": os.getenv("RIKO_TIMER_POLL_S", "1"),
                                       "allow_chaining": os.getenv(
                                           "RIKO_TIMER_ALLOW_CHAINING", "")
-                                      .strip().lower() in ("1", "true", "yes", "on")})
+                                      .strip().lower() in ("1", "true", "yes", "on")},
+                     spotify_defaults=spotify_defaults)
     host = os.getenv("RIKO_HUB_HOST", "0.0.0.0")
     port = int(os.getenv("RIKO_HUB_PORT", "8002"))
     print(f"[hub] data={data_dir} llm={llm_defaults['base_url'] or '(not configured)'} "

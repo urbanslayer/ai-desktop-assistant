@@ -32,6 +32,12 @@ services:
       # to private/loopback addresses (SSRF guard off; trusted LAN only).
       RIKO_SEARXNG_URL: "${RIKO_SEARXNG_URL:-}"
       RIKO_ALLOW_PRIVATE_FETCH: "${RIKO_ALLOW_PRIVATE_FETCH:-0}"
+      # Spotify (docs/SPOTIFY_NOTES.md, docs/API.md "Spotify"): leave these
+      # empty for the real Spotify hosts; only tests point them at the in-repo
+      # fake server. The client id lives in hub settings (web page), never
+      # in env; tokens live in the hub store and never leave it.
+      RIKO_SPOTIFY_ACCOUNTS_URL: "${RIKO_SPOTIFY_ACCOUNTS_URL:-}"
+      RIKO_SPOTIFY_API_URL: "${RIKO_SPOTIFY_API_URL:-}"
       # Weather (docs/API.md "Weather"): the weather tool needs no key (it
       # calls Open-Meteo directly). RIKO_LOCATION is a default home place
       # (e.g. "Gloucester, UK") until the owner picks one on the Settings

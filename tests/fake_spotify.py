@@ -1,0 +1,196 @@
+"""In-repo fake Spotify (music phase 1 tests): ONE loopback HTTP server that
+plays both roles — accounts.spotify.com (POST /api/token) and
+api.spotify.com/v1 (search, player, devices, library, me). Tests point the
+hub's spotify.accounts_url / spotify.api_url settings at it; no real
+network is ever touched.
+
+Programmable per endpoint: `one_shot(method, path, status, body, headers)`
+queues a single canned response (e.g. 429 QUOTA_EXCEEDED with Retry-After),
+everything else follows the state fields (.tokens, .now, .devices, .search).
+Every request is recorded in .log as {method, path, query, form, json, auth}
+— tests assert against that instead of guessing.
+"""
+from __future__ import annotations
+
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+TRACK = {"uri": "spotify:track:AAA", "name": "Bohemian Rhapsody",
+         "duration_ms": 354000,
+         "artists": [{"name": "Queen"}],
+         "album": {"name": "A Night at the Opera"}}
+DEVICE_RIKO = {"id": "dev-riko", "name": "Riko", "type": "Speaker",
+               "is_active": True, "volume_percent": 40}
+DEVICE_ECHO = {"id": "dev-echo", "name": "Echo Kitchen", "type": "Smartphone",
+               "is_active": False, "volume_percent": 60}
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def _owner(self):
+        return self.server.fake
+
+    def _record(self, body_raw):
+        fake = self._owner()
+        parsed = urllib.parse.urlsplit(self.path)
+        entry = {"method": self.command, "path": parsed.path,
+                 "query": dict(urllib.parse.parse_qsl(parsed.query)),
+                 "form": {}, "json": None,
+                 "auth": self.headers.get("Authorization", "")}
+        if body_raw:
+            if "application/x-www-form-urlencoded" in (
+                    self.headers.get("Content-Type") or ""):
+                entry["form"] = dict(urllib.parse.parse_qsl(body_raw.decode()))
+            else:
+                try:
+                    import json
+                    entry["json"] = json.loads(body_raw.decode())
+                except ValueError:
+                    pass
+        fake.log.append(entry)
+        return parsed
+
+    def _respond(self, status, body, headers=None):
+        payload = b"" if body is None else (
+            body if isinstance(body, bytes)
+            else _json_bytes(body))
+        self.send_response(status)
+        if payload:
+            self.send_header("Content-Type", "application/json")
+        for k, v in (headers or {}).items():
+            self.send_header(k, str(v))
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if payload:
+            self.wfile.write(payload)
+
+    def _dispatch(self, body_raw):
+        fake = self._owner()
+        parsed = self._record(body_raw)
+        shot = fake.take_shot(self.command, parsed.path)
+        if shot is not None:
+            status, body, headers = shot
+            return self._respond(status, body, headers)
+        return fake.route(self.command, parsed.path,
+                          fake.log[-1]["query"],
+                          body_raw, self._respond)
+
+    def do_GET(self):
+        self._dispatch(b"")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        self._dispatch(self.rfile.read(length) if length else b"")
+
+    do_PUT = do_POST
+    do_DELETE = do_POST
+
+    def log_message(self, format, *args):
+        pass
+
+
+def _json_bytes(obj) -> bytes:
+    import json
+    return json.dumps(obj).encode("utf-8")
+
+
+class FakeSpotify:
+    """The programmable state + the server. `base` is the root URL; the hub
+    settings are accounts_url=base, api_url=base+'/v1'."""
+
+    def __init__(self):
+        self.log: list[dict] = []
+        self._shots: dict[tuple[str, str], list] = {}
+        self.tokens = {"access_token": "ACCESS-1", "refresh_token": "REFRESH-1",
+                       "expires_in": 3600, "token_type": "Bearer",
+                       "scope": "user-read-playback-state"}
+        self.token_error = None            # (status, body) for /api/token
+        self.search = {"track": [TRACK], "playlist": [], "album": [],
+                       "artist": [{"uri": "spotify:artist:ART1",
+                                   "name": "Queen"}]}
+        self.now = None                    # currently-playing dict | None=204
+        self.devices = [dict(DEVICE_RIKO), dict(DEVICE_ECHO)]
+        self.me = {"id": "owner", "display_name": "Owner Person"}
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.server.fake = self
+        self.server.daemon_threads = True
+        import threading
+        self._thread = threading.Thread(target=self.server.serve_forever,
+                                        daemon=True)
+        self._thread.start()
+
+    @property
+    def base(self) -> str:
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    # -- programmability ---------------------------------------------------
+    def one_shot(self, method: str, path: str, status: int, body=None,
+                 headers=None) -> None:
+        """Queue ONE canned response for method+path (before state routing)."""
+        self._shots.setdefault((method.upper(), path), []).append(
+            (status, body, headers or {}))
+
+    def take_shot(self, method, path):
+        queue = self._shots.get((method, path))
+        return queue.pop(0) if queue else None
+
+    def hits(self, method: str, path: str) -> int:
+        return sum(1 for e in self.log
+                   if e["method"] == method and e["path"] == path)
+
+    def last(self, method: str, path: str) -> dict:
+        for e in reversed(self.log):
+            if e["method"] == method and e["path"] == path:
+                return e
+        return {}
+
+    # -- routing ------------------------------------------------------------
+    def route(self, method, path, query, body_raw, respond):
+        if path == "/api/token":
+            if self.token_error:
+                return respond(*self.token_error)
+            entry = self.log[-1]
+            form = entry["form"]
+            if form.get("grant_type") == "authorization_code":
+                if not form.get("code") or not form.get("code_verifier"):
+                    return respond(400, {"error": "invalid_request",
+                                         "error_description": "missing code/verifier"})
+                body = dict(self.tokens)
+                body["access_token"] = "ACCESS-EXCHANGED"
+                return respond(200, body)
+            # refresh
+            body = dict(self.tokens)
+            body["access_token"] = "ACCESS-REFRESHED"
+            body.pop("refresh_token", None)     # Spotify often omits it
+            return respond(200, body)
+        if method == "GET" and path == "/v1/me":
+            return respond(200, self.me)
+        if method == "GET" and path == "/v1/search":
+            kind = query.get("type", "track")
+            return respond(200, {kind: {"items": self.search.get(kind, [])}})
+        if method == "GET" and path == "/v1/me/player/currently-playing":
+            if self.now is None:
+                return respond(204, None)
+            return respond(200, self.now)
+        if method == "GET" and path == "/v1/me/player/devices":
+            return respond(200, {"devices": self.devices})
+        if path.startswith("/v1/me/player") or path == "/v1/me/library":
+            return respond(202, None)
+        return respond(404, {"error": {"message": f"fake: no route {method} {path}"}})
+
+
+def entry_auth_ok(*a):
+    return True
+
+
+def playing_snapshot(uri=TRACK["uri"], name=TRACK["name"], is_playing=True,
+                     device=DEVICE_RIKO, progress_ms=1000):
+    """A currently-playing body shaped like Spotify's."""
+    return {"is_playing": bool(is_playing), "progress_ms": progress_ms,
+            "item": dict(TRACK, uri=uri, name=name),
+            "device": dict(device),
+            "context": {"uri": uri}}

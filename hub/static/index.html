@@ -460,6 +460,45 @@
         <button class="btn small" id="mcancel" hidden>Cancel edit</button>
       </div>
     </div>
+    <div class="card">
+      <!-- Music phase 1 (docs/SPOTIFY_NOTES.md, docs/API.md "Spotify"):
+           one Spotify account via Authorization Code + PKCE (client id only,
+           no secret). The desktop app's 127.0.0.1:8911 listener finishes the
+           login; from a remote browser use the paste-back box below. -->
+      <h2>Spotify <span class="chip" id="sp-status">…</span></h2>
+      <p class="hint">Music over the Spotify Web API — Riko plays on the Spotify
+        Connect device named below (the desktop player). Needs Spotify Premium
+        and one Spotify Developer Dashboard app: add redirect URI
+        <code>http://127.0.0.1:8911/callback</code>, then paste its Client ID
+        here. Tokens live on the hub and are never shown.</p>
+      <label><input type="checkbox" id="sp-enabled" style="width:auto; vertical-align:middle">
+        Spotify enabled (offers the spotify_* tools)</label>
+      <div class="row">
+        <div><label>Client ID <span class="hint" id="sp-idstate"></span></label>
+          <input id="sp-clientid" placeholder="not set" autocomplete="off"></div>
+        <div><label>Desktop player device name</label>
+          <input id="sp-devicename" placeholder="Riko"></div>
+      </div>
+      <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap">
+        <button class="btn primary small" id="spsave">Save Spotify settings</button>
+        <button class="btn small" id="spconnect">Connect Spotify</button>
+        <button class="btn small" id="spdisconnect" hidden>Disconnect</button>
+      </div>
+      <div id="sp-connectbox" hidden>
+        <label style="margin-top:8px">1 — open this URL in your browser and log in to Spotify:</label>
+        <textarea id="sp-url" rows="3" readonly></textarea>
+        <label>2 — after approving, the browser lands on a page that may not load;
+          copy the WHOLE address-bar URL and paste it here:</label>
+        <input id="sp-paste" placeholder="http://127.0.0.1:8911/callback?code=…&state=…">
+        <button class="btn primary small" id="spfinish">Finish connect</button>
+      </div>
+      <p class="hint" id="sp-connected-as"></p>
+      <h2 style="margin-top:14px">Devices</h2>
+      <div id="sp-devices" class="hint">—</div>
+      <button class="btn small" id="spdevices">Refresh devices</button>
+      <div class="err" id="sp-err"></div>
+      <div class="hint" id="sp-ok"></div>
+    </div>
   </section>
 
   <!-- ──────────────────────────── chat ── -->
@@ -1693,7 +1732,7 @@ $("keysave").onclick = () => setKey($("hubtoken").value.trim());
 $("hubtoken").addEventListener("keydown", (e) => { if (e.key === "Enter") setKey($("hubtoken").value.trim()); });
 $("keyclear").onclick = () => { $("hubtoken").value = ""; setKey(""); };
 document.querySelectorAll("nav button").forEach((b) =>
-  b.onclick = () => { show(b.dataset.tab); if (b.dataset.tab === "settings") loadSettings(); });
+  b.onclick = () => { show(b.dataset.tab); if (b.dataset.tab === "settings") { loadSettings(); loadSpotify(); } });
 $("psave").onclick = savePersona;
 $("pcancel").onclick = startCreate;
 $("hpick").onchange = loadHistory;
@@ -1703,8 +1742,96 @@ $("cinput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat
 
 $("hubtoken").value = key();
 if (!key()) showKeyBar("Enter the hub key (or this hub has no key):");
+
+/* ── spotify (music phase 1, docs/API.md "Spotify") ─────────────────── */
+function spErr(e) { $("sp-ok").textContent = ""; $("sp-err").textContent = String(e && e.message || e); }
+function spOk(m) { $("sp-err").textContent = ""; $("sp-ok").textContent = m; }
+function renderSpotifyStatus(st) {
+  $("sp-status").textContent = st.connected
+    ? "connected" + (st.connected_as ? " · " + st.connected_as : "")
+    : (st.configured ? "not connected" : "no client id");
+  $("spdisconnect").hidden = !st.connected;
+  $("sp-connected-as").textContent = st.connected
+    ? ("Playing through the device named “" + (st.device_name || "Riko") + "”"
+       + (st.quota_backoff_left > 0
+          ? " · quota cooldown ~" + Math.ceil(st.quota_backoff_left) + "s" : ""))
+    : "";
+}
+async function refreshSpotifyStatus() {
+  try { renderSpotifyStatus(await api("/api/spotify/status")); } catch (e) { /* hub down */ }
+}
+async function loadSpotify() {
+  try {
+    const s = await api("/api/settings");
+    const sp = s.spotify || {}, src = s.spotify_source || {};
+    const def = ((s.defaults || {}).spotify || {});
+    $("sp-enabled").checked = !!sp.enabled;
+    $("sp-clientid").value = sp.client_id || "";
+    $("sp-idstate").textContent = src.client_id === "saved" ? "· saved" : "";
+    $("sp-devicename").value = src.device_name === "saved" ? (sp.device_name || "") : "";
+    $("sp-devicename").placeholder = def.device_name || "Riko";
+    await refreshSpotifyStatus();
+  } catch (e) { spErr(e); }
+}
+$("spsave").onclick = async () => {
+  const sp = { enabled: $("sp-enabled").checked };
+  if ($("sp-clientid").value.trim()) sp.client_id = $("sp-clientid").value.trim();
+  if ($("sp-devicename").value.trim()) sp.device_name = $("sp-devicename").value.trim();
+  try {
+    await api("/api/settings", { method: "PUT", json: { spotify: sp } });
+    spOk("Spotify settings saved.");
+    await loadSpotify();
+  } catch (e) { spErr(e); }
+};
+$("spconnect").onclick = async () => {
+  try {
+    const info = await api("/api/spotify/connect-url");
+    $("sp-url").value = info.url;
+    $("sp-paste").value = "";
+    $("sp-connectbox").hidden = false;
+    spOk("Open the URL above; on this PC the desktop app may catch the login by itself.");
+  } catch (e) { spErr(e); }
+};
+$("spfinish").onclick = async () => {
+  try {
+    const st = await api("/api/spotify/connect", { method: "POST", json: { paste: $("sp-paste").value } });
+    $("sp-connectbox").hidden = true;
+    renderSpotifyStatus(st);
+    spOk("Spotify connected.");
+  } catch (e) { spErr(e); }
+};
+$("spdisconnect").onclick = async () => {
+  try {
+    const st = await api("/api/spotify/disconnect", { method: "POST" });
+    renderSpotifyStatus(st);
+    spOk("Spotify disconnected — the app and settings stay.");
+  } catch (e) { spErr(e); }
+};
+$("spdevices").onclick = async () => {
+  try {
+    const d = await api("/api/spotify/devices");
+    if (!d.devices.length) {
+      $("sp-devices").textContent = "no Spotify Connect device online — start the desktop player (tray: Music ▸ Start player) or open Spotify somewhere";
+      return;
+    }
+    $("sp-devices").innerHTML = d.devices.map((x) => "<div>" + esc(x.name)
+      + " <span class=\"hint\">(" + esc(x.type) + (x.active ? " · NOW PLAYING" : "") + ")</span> "
+      + (x.active ? "" : "<button class=\"btn small\" data-dev=\"" + esc(x.name) + "\">make this the player</button>")
+      + "</div>").join("");
+    document.querySelectorAll("#sp-devices button[data-dev]").forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api("/api/spotify/transfer", { method: "POST", json: { device: b.dataset.dev } });
+          spOk("Player switched to “" + b.dataset.dev + "”.");
+          $("spdevices").onclick();
+        } catch (e) { spErr(e); }
+      };
+    });
+  } catch (e) { spErr(e); }
+};
+
 startCreate();
-poll().then(() => { loadSettings(); });
+poll().then(() => { loadSettings(); loadSpotify(); });
 setInterval(poll, 3000);
 eventsLoop();  // tool progress in the chat box; restarts on tab switch too
 </script>
