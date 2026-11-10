@@ -43,6 +43,10 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 2. **Music: Spotify and Tidal** (owner request). She can play music on request ("play some lo-fi on
    Spotify"), with a small "now playing" popup by her showing the track, artist, cover art and
    source (Spotify/Tidal, which device), plus play/pause/skip. Later, the Android app streams too.
+   **Owner decisions + verified API rules 2026-11-10 → see docs/SPOTIFY_NOTES.md** (Premium: yes;
+   playback via spotifyd managed by Riko; Spotify first, Tidal after developer access; OAuth callback
+   must be a `127.0.0.1` loopback — the hub's LAN HTTP URL is not a valid redirect URI; development
+   mode caps search at 10 results, drops batch fetches, and `GET /me` no longer reports Premium).
    Constraints to verify against current terms when this starts:
    - **Spotify:** playback control through the Web API needs **Spotify Premium**, and the Web API only
      controls a Spotify Connect device; it doesn't stream audio itself. Desktop options:
