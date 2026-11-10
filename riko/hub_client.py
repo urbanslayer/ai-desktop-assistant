@@ -127,6 +127,43 @@ class HubClient:
             body["voice"] = True
         return self._json("POST", "/api/chat", json=body, timeout=CHAT_TIMEOUT)
 
+    def touch(self, kind, part=None, hold_ms=None, persona=None, sitting=None):
+        """One physical touch from the owner's mouse (docs/TOUCH.md).
+        Returns {reacted, spoke, text, emotion, actions, audio_url, reason,
+        detail, state_version}. Fast (< 50 ms) whenever the hub decides not
+        to speak; only the spoken path waits on the LLM, so run this off the
+        UI thread. kind ∈ pat|poke|tickle|grab|hold|release|action|sit|stand."""
+        body = {"kind": kind}
+        if part:
+            body["part"] = part
+        if hold_ms is not None:
+            body["hold_ms"] = hold_ms
+        if persona:
+            body["persona"] = persona
+        if sitting is not None:
+            body["sitting"] = bool(sitting)
+        return self._json("POST", "/api/touch", json=body, timeout=CHAT_TIMEOUT)
+
+    def settings(self):
+        """GET /api/settings (None on a hub too old for the route)."""
+        try:
+            return self._json("GET", "/api/settings")
+        except HubError as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def save_touch_mode(self, mode):
+        """PUT /api/settings {"touch": {"mode": ...}} — the tray's Touch
+        reactions writes the SAME block the web Settings card edits
+        (docs/TOUCH.md). Returns the merged settings, or None on an old hub."""
+        try:
+            return self._json("PUT", "/api/settings", json={"touch": {"mode": mode}})
+        except HubError as e:
+            if e.status == 404:
+                return None
+            raise
+
     def history(self, persona=None, after=0, limit=50):
         params = {"after": after, "limit": limit}
         if persona:

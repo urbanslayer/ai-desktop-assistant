@@ -44,11 +44,11 @@ def memory_tool(client, name, writes=None):
 
 # ── store: migration, FTS5, fallback ────────────────────────────────────────
 
-def test_fts5_is_available_and_new_db_is_v8(tmp_path):
+def test_fts5_is_available_and_new_db_is_v9(tmp_path):
     # The contract pins this: python:3.12-slim's sqlite3 must have FTS5, and
     # the tests run on the same interpreter the hub ships with.
     s = Store(tmp_path / "hub.db")
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 8
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 9
     assert s.fts_enabled is True
     tables = {r[0] for r in s.db.execute("SELECT name FROM sqlite_master")}
     assert {"facts", "facts_fts"} <= tables
@@ -92,7 +92,7 @@ def test_old_v5_database_migrates(tmp_path):
     db.close()
 
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 9
     assert s.fts_enabled and s.get_persona("riko")["name"] == "Riko"
     assert s.recent_messages("riko", 10)[0]["content"] == "old question"
     assert s.recent_messages("riko", 10)[0]["memory_writes"] == []  # legacy row

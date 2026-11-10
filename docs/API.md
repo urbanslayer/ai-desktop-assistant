@@ -111,12 +111,18 @@ curl -s -H "Authorization: Bearer$KEY" $HUB/api/state
   ],
   "voice": false,                  // user messages: true when the text came from speech recognition
   "timer_id": null,                // set on BOTH messages of a fired timer turn (docs/TIMERS.md)
+  "meta": {},                      // structured extras per source; touch rows carry meta.touch (docs/TOUCH.md)
   "created_at": "2026-11-03T18:00:00Z"
 }
 ```
 
 `id` is global and monotonically increasing across all personas — it is your
-`after` cursor. `role` is `user` or `assistant`. `source` is the client name
+`after` cursor. `role` is `user`, `assistant`, or `system` — a grey
+**touch note** line (`source: "touch"`, `meta.touch.note: true`) recording a
+physical touch that never became speech (docs/TOUCH.md; render it grey, it
+is not something anyone said). `meta.touch` on touch rows carries
+`{kind, mode, part, held_ms}` plus `silent: true` on the placeholder line or
+`note_id` on the spoken reaction. `source` is the client name
 you passed to `/api/chat` (`desktop`, `android`, `web`, `terminal`,
 `import`, …). `emotion` is one of the fixed emotion ids (see *Emotion tags*)
 and `content` **never contains the raw tag**; `actions` is the parsed
@@ -194,6 +200,7 @@ history (your cursor may then jump *backwards*; if
 | `POST /api/history/{message_id}/remember` | save a message as a memory fact |
 | `POST /api/history/import` | bulk-import old logs |
 | `POST /api/chat` | the only writing route in daily use |
+| `POST /api/touch` | physical-touch reaction (docs/TOUCH.md); instant no-LLM answer whenever she stays silent |
 | `GET /api/memory` | list/search long-term facts (scope filter) |
 | `POST /api/memory` | add a fact by hand (dedups) |
 | `PUT /api/memory/{id}` | edit a fact's text / pin |
@@ -223,7 +230,7 @@ history (your cursor may then jump *backwards*; if
 | `POST /api/personas/{id}/voice/lock` | freeze designed voice: its take becomes the clone |
 | `GET /api/settings` | LLM + TTS + tools settings + defaults + per-field source (key never returned) |
 | `PUT /api/settings` | change settings (blank field = unset → default; `clear_api_key`) |
-| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timers/timezone/location/switch-phrase overrides → defaults |
+| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timers/touch/timezone/location/switch-phrase overrides → defaults |
 | `GET /api/geocode?q=<place>` | Open-Meteo geocoder for the Settings Location picker (up to 5 matches) |
 | `POST /api/settings/test` | model probe + breeze health → `{ok, model, tts}` |
 | `GET /api/timers` | one-shot timers (docs/TIMERS.md; `?status=` filter) |
@@ -732,6 +739,7 @@ is what the page PUTs as `settings.location`.
   "memory": {"enabled": true, "prompt_budget_tokens": 600,
              "auto_remember": true},
   "timers": {"allow_chaining": false},              // docs/TIMERS.md reviewer additions
+  "touch": {"mode": "quiet", "cooldown_s": 45, "max_per_10min": 4},   // docs/TOUCH.md
   "switch_phrases": ["switch to", "change to", "become", "persona",
                      "talk to", "i want to talk to"],
   "timezone": "",                                  // saved override, "" = server zone
@@ -769,7 +777,9 @@ is what the page PUTs as `settings.location`.
   "mcp_source": {"servers": "saved"},
   "memory_source": {"enabled": "default", "prompt_budget_tokens": "default",
                     "auto_remember": "saved"},
-  "timers_source": {"allow_chaining": "saved"}
+  "timers_source": {"allow_chaining": "saved"},
+  "touch_source": {"mode": "default", "cooldown_s": "default",
+                   "max_per_10min": "default"}      // docs/TOUCH.md
 }
 ```
 
@@ -854,13 +864,22 @@ Semantics (made so a careless form save cannot break the hub):
   (bad name/transport/command/url, duplicate names, `timeout` < 1) → `422`.
 - Numbers validate as before: `422` on non-numeric or negative
   temperature/max_tokens/max_history, or non-object `extra_body`.
+- **The `touch` block** (docs/TOUCH.md): `mode` is `off | quiet | chatty`
+  (default **quiet**), `cooldown_s` 0–3600, `max_per_10min` 0–100 (int).
+  Defaults FOLLOW THE MODE when a number is not explicitly saved: quiet (and
+  off) → 45 s / 4 spoken per 10 min, chatty → 15 s / 12. `quiet` speaks only
+  for `pat`, `tickle` and `release` after a hold over 3 s; `chatty` speaks
+  for every kind; `grab`, `action`, `sit` and `stand` never speak in any
+  mode. Values are plain (no secrets). The desktop tray's *Touch reactions*
+  writes `mode` through this same route, so the web card and the tray can
+  never drift apart.
 - **The `timers` block** (docs/TIMERS.md reviewer additions):
   `allow_chaining` (bool) decides whether a timer-**fired** turn may set
   another timer at all; non-boolean → `422`. Blank = default = `false`.
   Default-overridable with `RIKO_TIMER_ALLOW_CHAINING=1`.
 
 `POST /api/settings/reset` with `{"llm": true, "tts": true, "tools": true,
-"memory": true, "mcp": true, "timers": true, "timezone": true, "location": true, "switch_phrases": true}` (each side optional,
+"memory": true, "mcp": true, "timers": true, "touch": true, "timezone": true, "location": true, "switch_phrases": true}` (each side optional,
 `422` if none)
 drops the saved overrides so the defaults apply again. Returns the same body
 as `GET`.
@@ -1129,6 +1148,61 @@ change (uri/playing/device), while the hub polls ≤ every 5 s — and only
 after something started playing; paused or idle stops polling entirely
 (`spotify_hub.wake()` restarts it after play/resume/transfer). Late clients
 catch up with `GET /api/spotify/now-playing`.
+
+## Touch reactions (docs/TOUCH.md)
+
+The owner's mouse touches her on the desktop. The PAGE recognises the
+gesture and reacts instantly on its own; the desktop forwards it here and
+plays whatever she decides to say exactly like a chat reply. The hub owns
+the policy (`Settings ▸ Touch` / tray *Touch reactions*).
+
+### POST /api/touch → touch reply
+
+```json
+{"persona": "riko", "part": "head", "kind": "pat", "hold_ms": null, "sitting": false}
+```
+
+`kind` ∈ `pat | poke | tickle | grab | hold | release | action | sit | stand`
+(anything else → `400 {"detail": "unknown touch kind: …"}`); `part` is the
+body part the page hit-tested (optional text, ≤ 32 chars); `hold_ms` matters
+for `hold`/`release`; `sitting` is passed through into the stored meta. The
+body must be a JSON object. Unknown/absent `persona` → the active one; no
+such persona → `404 {"detail": "no persona '<id>'"}`. Same bearer-key auth as
+everything else.
+
+```json
+{"ok": true, "reacted": true, "spoke": true, "text": "Senpai! Careful with the hair!",
+ "emotion": "happy", "actions": [], "audio_url": "/api/messages/77/audio",
+ "reason": "llm", "detail": "llm", "state_version": 42}
+```
+
+- **Fast, no LLM** (`reacted: false`, < 50 ms) whenever she stays silent:
+  `reason` is `off` (mode off), `cooldown`, `quiet` (kind not spoken in
+  quiet mode), `busy` (she is mid-turn for this persona — never queued),
+  or `limit` (10-minute cap) / `silent_kind` (grab/action/sit/stand in
+  chatty). `detail` always carries the internal reason verbatim.
+- **Spoken** (`reacted: true, reason: "llm"`): ONE short in-character
+  sentence from the persona prompt + a single touch-context line — no tools
+  offered, small `max_tokens`; emotion tags (`hub/emotion.py`) and action
+  tags (`hub/body.py`) parse as in chat, TTS like any reply
+  (`audio_url` when hub TTS is on).
+- **History, always:** the trigger is stored as a grey **system note**
+  (`source: "touch"`, `meta.touch.note: true`, e.g. `owner touched: patted
+  her head (quiet)`) — never a fake user message — followed by her spoken
+  reaction or, when silent, a short `meta.touch.silent: true` assistant
+  line. The rate limit counts SPOKEN reactions only:
+  last-spoken vs `cooldown_s`, and spoken-in-600 s vs `max_per_10min`.
+- LLM failure is silent and honest: `reacted: false, reason: "llm_error"`.
+
+```bash
+curl -s -H "$AUTH" -X POST "$HUB/api/touch" -d '{"kind":"pat","part":"head"}' -H 'content-type: application/json'
+```
+
+Desktop seams (viewer `POST /control/<cmd>`, docs/TOUCH.md): `bbox` carries
+`parts` + `hips_y`; `/control/touch` `{part, kind, x, y, hold_ms}` forwards
+here off every UI thread; `/control/sit-state` `{sitting}` reports the page
+finished blending. Desktop → page bridge commands: `sit:<edge_y_css_px>`
+(re-sent when the edge moves ≥ 4 px), `stand`, `touch-mode:<off|quiet|chatty>`.
 
 ## Voice & audio (docs/VOICE.md)
 
