@@ -48,11 +48,30 @@ def hub_app(tmp_path, fake):
     return app, client
 
 
-def seed_tokens(app, expires_in=3600.0, refresh="REFRESH-1"):
+def seed_tokens(app, expires_in=3600.0, refresh="REFRESH-1",
+                scope="user-read-playback-state"):
     store = app.state.store
     store.set_json("spotify_tokens", {
         "access_token": "ACCESS-SEED", "refresh_token": refresh,
-        "expires_at": time.time() + expires_in, "scope": "user-read-playback-state"})
+        "expires_at": time.time() + expires_in, "scope": scope})
+
+
+# full consent since the 2026-11-10 scope change (owner playlists + liked
+# songs); seed_tokens() alone keeps the OLD narrow scope → missing_scopes
+FULL_SCOPES = ("user-read-playback-state user-modify-playback-state "
+               "user-read-currently-playing user-library-modify "
+               "playlist-read-private playlist-read-collaborative "
+               "user-library-read")
+
+
+def seed_owner(app):
+    seed_tokens(app, scope=FULL_SCOPES)
+
+
+DANCE = {"uri": "spotify:playlist:DANCE1", "name": "Dance",
+         "tracks": {"total": 42}}
+CHILL = {"uri": "spotify:playlist:CHILL1", "name": "Chill Vibes 🌙",
+         "tracks": {"total": 8}}
 
 
 def events_of(client, after=0):
@@ -435,3 +454,174 @@ def test_disconnect_drops_tokens_and_wakes_off(hub_app, fake):
     st = client.post("/api/spotify/disconnect").json()
     assert not st["connected"] and not st["polling"]
     assert client.get("/api/spotify/now-playing").status_code == 409
+
+
+# ── owner's own playlists + liked songs (2026-11-10 live-bug round) ─────────
+#
+# Catalogue /search does not reliably surface the user's own (private)
+# playlists, so kind=playlist matches GET /me/playlists FIRST; 'my liked
+# songs' plays GET /me/tracks as uris; SCOPES grew, so an old connection
+# must Disconnect + Connect once (status.missing_scopes says so).
+
+def test_play_owner_playlist_by_name_never_searches(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    fake.playlists = [None, DANCE, CHILL]      # null entry like real Spotify
+    hub = app.state.spotify
+    r = hub.play("Dance", "playlist")          # 'Dance' is a PRIVATE playlist
+    assert r["uri"] == DANCE["uri"] and r["source"] == "library"
+    assert fake.hits("GET", "/v1/search") == 0        # catalogue untouched
+    play = fake.last("PUT", "/v1/me/player/play")
+    assert play["json"]["context_uri"] == DANCE["uri"]
+    assert play["query"]["device_id"] == DEVICE_RIKO["id"]
+
+
+def test_play_my_playlist_words_and_kind_rule(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    fake.playlists = [DANCE, CHILL]
+    hub = app.state.spotify
+    # 'my dance playlist' said kind=track → the query's word 'playlist'
+    # forces kind=playlist and the owner's library matches first
+    r = hub.play("my dance playlist", "track")
+    assert r["uri"] == DANCE["uri"] and r["kind"] == "playlist"
+    assert fake.hits("GET", "/v1/search") == 0
+    # emoji + filler words in the OWNER's name still match
+    r2 = hub.play("chill vibes", "playlist")
+    assert r2["uri"] == CHILL["uri"]
+
+
+def test_play_owner_playlist_fuzzy(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    fake.playlists = [DANCE, CHILL]
+    r = app.state.spotify.play("dnace", "playlist")   # typo still finds Dance
+    assert r["uri"] == DANCE["uri"]
+    assert fake.hits("GET", "/v1/search") == 0
+
+
+def test_play_playlist_ties_prefer_exact_case_and_mention_alts(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    twin = dict(DANCE, uri="spotify:playlist:DANCE2", name="Dance!")
+    fake.playlists = [twin, DANCE]              # equal after normalising
+    r = app.state.spotify.play("Dance", "playlist")
+    assert r["uri"] == DANCE["uri"]             # exact-case name wins
+    assert r["alternatives"] == ["Dance!"]      # ... and gets mentioned
+    spec = next(s for s in build_spotify_specs(app.state.spotify)
+                if s.name == "spotify_play")
+    out = spec.run({"query": "Dance", "kind": "playlist"})
+    assert "your playlist “Dance”" in out and "Dance!" in out
+
+
+def test_play_playlist_falls_back_to_search_none_filtered(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    fake.playlists = [DANCE]                    # no match for the query
+    fake.search["playlist"] = [None, {"uri": "spotify:playlist:CAT9",
+                                      "name": "Workout Bangers"}]
+    r = app.state.spotify.play("Workout Bangers", "playlist")
+    assert r["uri"] == "spotify:playlist:CAT9" and r["source"] == "search"
+    assert fake.hits("GET", "/v1/search") == 1  # owner list first, then search
+    play = fake.last("PUT", "/v1/me/player/play")
+    assert play["json"]["context_uri"] == "spotify:playlist:CAT9"
+
+
+def test_play_liked_songs_starts_uris(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    fake.saved = [{"track": {"uri": "spotify:track:T1"}}, None,
+                  {"track": {"uri": "spotify:track:T2"}}, {"track": None}]
+    hub = app.state.spotify
+    r = hub.play("my liked songs")
+    assert r["kind"] == "liked" and r["count"] == 2
+    play = fake.last("PUT", "/v1/me/player/play")
+    assert play["json"]["uris"] == ["spotify:track:T1", "spotify:track:T2"]
+    assert fake.hits("GET", "/v1/me/tracks") == 1
+    # shuffle requested → the uris are shuffled (same set, may reorder)
+    r2 = hub.play("play my saved tracks", "track", shuffle=True)
+    play2 = fake.last("PUT", "/v1/me/player/play")
+    assert sorted(play2["json"]["uris"]) == ["spotify:track:T1",
+                                             "spotify:track:T2"]
+    assert r2["shuffle"] is True
+    spec = next(s for s in build_spotify_specs(hub) if s.name == "spotify_play")
+    assert "Liked Songs" in spec.run({"query": "my liked songs"})
+    # the Web API can't start the Liked Songs context: no context_uri
+    assert "context_uri" not in play["json"]
+
+
+def test_missing_scopes_answer_reconnect(hub_app, fake):
+    app, client = hub_app
+    seed_tokens(app)                    # OLD narrow scope (live-bug state)
+    fake.playlists = [DANCE]
+    hub = app.state.spotify
+    st = client.get("/api/spotify/status").json()
+    assert st["connected"]
+    assert "playlist-read-private" in st["missing_scopes"]
+    assert "user-library-read" in st["missing_scopes"]
+    with pytest.raises(SpotifyError,
+                       match="reconnect Spotify to allow playlists"):
+        hub.play("Dance", "playlist")   # the live bug now says WHY
+    with pytest.raises(SpotifyError,
+                       match="reconnect Spotify to allow liked songs"):
+        hub.play("my liked songs")
+    # plain tracks keep working without the new scopes
+    hub.play("bohemian rhapsody")
+    assert fake.hits("GET", "/v1/search") == 1
+
+
+def test_playlists_cache_and_tool_lists_names(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    fake.playlists = [None, DANCE, CHILL]
+    hub = app.state.spotify
+    rows = hub.playlists()
+    assert rows == [{"name": "Dance", "uri": DANCE["uri"], "tracks": 42},
+                    {"name": "Chill Vibes 🌙", "uri": CHILL["uri"],
+                     "tracks": 8}]
+    hub.playlists()                                   # cached, quota-respecting
+    hub.play("Dance", "playlist")
+    assert fake.hits("GET", "/v1/me/playlists") == 1
+    hub.playlists(force=True)                         # explicit refresh works
+    assert fake.hits("GET", "/v1/me/playlists") == 2
+    spec = next(s for s in build_spotify_specs(hub) if s.name == "spotify_playlists")
+    out = spec.run({})
+    assert "Dance" in out and "42 tracks" in out and "Chill Vibes" in out
+    only = spec.run({"query": "chill"})
+    assert "Chill Vibes" in only and "Dance" not in only
+    assert spec.available if hasattr(spec, "available") else True
+
+
+def test_playlists_pagination(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    fake.playlists = [None] + [dict(DANCE, uri=f"spotify:playlist:P{i}",
+                                    name=f"Mix {i}") for i in range(60)]
+    rows = app.state.spotify.playlists(force=True)
+    assert len(rows) == 60                            # 50 + 10 across pages
+    assert fake.hits("GET", "/v1/me/playlists") == 2
+    assert fake.last("GET", "/v1/me/playlists")["query"]["offset"] == "50"
+
+
+def test_connect_invalidates_playlists_cache(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    fake.playlists = [DANCE]
+    app.state.spotify.playlists()
+    assert fake.hits("GET", "/v1/me/playlists") == 1
+    info = client.get("/api/spotify/connect-url").json()
+    fake.tokens["scope"] = FULL_SCOPES
+    client.post("/api/spotify/connect",
+                json={"paste": f"{REDIRECT}?code=C&state={info['state']}"})
+    app.state.spotify.playlists()                     # re-consent → refetch
+    assert fake.hits("GET", "/v1/me/playlists") == 2
+
+
+def test_status_full_consent_has_no_missing_scopes(hub_app, fake):
+    app, client = hub_app
+    seed_owner(app)
+    st = client.get("/api/spotify/status").json()
+    assert st["missing_scopes"] == []
+    # not connected → nothing to flag
+    client.post("/api/spotify/disconnect")
+    assert client.get("/api/spotify/status").json()["missing_scopes"] == []

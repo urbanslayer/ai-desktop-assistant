@@ -135,18 +135,32 @@ routes/event in `docs/API.md` (*Spotify*); implementation `hub/spotify.py`,
 `hub/tools/spotify_tools.py`, desktop side `riko/music/` (spotifyd manager +
 loopback OAuth listener + MPRIS ducking).
 
-Six hub tools: `spotify_play(query, kind=track|album|playlist|artist,
-device?)`, `spotify_control(action=pause|resume|next|prev|seek|volume|
+Seven hub tools: `spotify_play(query, kind=track|album|playlist|artist,
+device?, shuffle?)`, `spotify_control(action=pause|resume|next|prev|seek|volume|
 shuffle, value?)`, `spotify_now_playing()`, `spotify_devices()`,
-`spotify_transfer(device)`, `spotify_like_current()`. They are listed in
+`spotify_transfer(device)`, `spotify_like_current()`,
+`spotify_playlists(query?)` (the owner's playlist names + track counts — the
+answer to "what playlists do I have?"). They are listed in
 `GET /api/tools` even when Spotify is off (permissions stay editable) but
 only *offered* once a client id is saved. The hub never streams audio; it
 steers Spotify Connect devices, and the desktop sound is `spotifyd`
 (`desktop.music.spotifyd: off | managed | external`).
 
+The owner's library is searched FIRST for their own playlists
+(`GET /me/playlists`, cached ~5 min): catalogue search does not reliably
+surface private playlists, so "play my dance playlist" needs
+`kind=playlist` (a query containing "playlist" forces it anyway). "my liked/
+saved songs" plays the saved tracks. `playlist-read-private`,
+`playlist-read-collaborative` and `user-library-read` joined SCOPES
+(2026-11-10): an older connection answers "reconnect Spotify to allow
+playlists" until the owner Disconnects + Connects once (the web card shows
+the same via `missing_scopes`).
+
 Prompt line while the tools are offered (registry `_music_line`):
 
 > For music requests use spotify_* tools; the device named Riko is the
 > desktop player (spotify_devices shows what is online,
-> spotify_play/spotify_transfer pick where it plays). Never claim you cannot
-> play music while these tools are offered.
+> spotify_play/spotify_transfer pick where it plays). For the owner's own
+> playlists ("my X playlist") use spotify_play with kind=playlist — the
+> owner's library is searched first; spotify_playlists lists what they have.
+> Never claim you cannot play music while these tools are offered.

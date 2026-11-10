@@ -317,7 +317,10 @@ def _music_line(spec_names) -> str:
         return ""
     return ("For music requests use spotify_* tools; the device named Riko "
             "is the desktop player (spotify_devices shows what is online, "
-            "spotify_play/spotify_transfer pick where it plays). Never "
+            "spotify_play/spotify_transfer pick where it plays). For the "
+            "owner's own playlists (\"my X playlist\") use spotify_play with "
+            "kind=playlist — the owner's library is searched first; "
+            "spotify_playlists lists what they have. Never "
             "claim you cannot play music while these tools are offered. ")
 
 

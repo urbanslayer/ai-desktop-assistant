@@ -80,3 +80,39 @@ independent causes, both fixed in `riko/music/spotifyd.py`:
 - "Add to library" uses `PUT /me/library` with a Spotify URI.
 - Keep a strict quota discipline: cache device lists, prefer MPRIS for now-playing, no aggressive
   polling of `currently-playing`.
+
+## Owner playlists + Liked Songs (live-bug round, 2026-11-10)
+
+The owner asked "play my dance playlist" and got "no playlist found":
+`play()` only used catalogue `GET /search`, which **does not reliably
+surface the user's own (especially private) playlists**. Fixed in
+`hub/spotify.py`:
+
+- **Owner library first.** `play(kind="playlist")` matches the owner's own
+  playlists (`GET /me/playlists`, paginated `limit=50` + `offset`, cached
+  ~5 min in the hub and invalidated on connect/disconnect) by normalised
+  name — casefold, emoji/punctuation stripped, filler words "my"/"the"/
+  "playlist" dropped — with the ladder exact > startswith > contains >
+  fuzzy (difflib ratio ≥ 0.8). Equally good matches: exact-case name first,
+  else the first tied entry, and the tool result **names the alternatives**.
+  Only when nothing matches does `play()` fall back to catalogue search.
+- **`kind` guard.** A query containing the word "playlist" forces
+  `kind=playlist` — the LLM otherwise sends "play my dance playlist" as a
+  track search. The tool descriptions say the same ("use kind=playlist — the
+  owner's library is searched first").
+- **Null entries.** Spotify interleaves `null` entries in `items` lists
+  (observed in playlists listings) — every items list is filtered for
+  `None` before use: `/search`, `/me/playlists`, `/me/tracks`.
+- **Liked Songs.** "my liked/saved songs" plays `GET /me/tracks` (first
+  page, ≤ 50) as `uris` via `PUT /me/player/play` — the Web API cannot
+  start the Liked Songs context directly. `shuffle: true` shuffles the
+  uris client-side first.
+- **Scopes grew: `playlist-read-private playlist-read-collaborative
+  user-library-read` added to `SCOPES`.** Granted scopes freeze at consent
+  time, so the owner must **Disconnect + Connect once** (one-time).
+  `/api/spotify/status` exposes `missing_scopes`; the web Spotify card and
+  every blocked owner-library call answer "reconnect Spotify to allow
+  playlists / liked songs" instead of pretending the library is empty.
+- **New tool `spotify_playlists(query?)`** (risk `read`, permission default
+  `always`): the owner's playlist names + track counts, so "what playlists
+  do I have?" has an honest, quota-cheap answer (cached list).

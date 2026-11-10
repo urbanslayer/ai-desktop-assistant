@@ -1747,12 +1747,17 @@ if (!key()) showKeyBar("Enter the hub key (or this hub has no key):");
 function spErr(e) { $("sp-ok").textContent = ""; $("sp-err").textContent = String(e && e.message || e); }
 function spOk(m) { $("sp-err").textContent = ""; $("sp-ok").textContent = m; }
 function renderSpotifyStatus(st) {
+  const missing = st.missing_scopes || [];
   $("sp-status").textContent = st.connected
-    ? "connected" + (st.connected_as ? " · " + st.connected_as : "")
+    ? "connected" + (missing.length ? " · needs reconnect" : "")
+      + (st.connected_as ? " · " + st.connected_as : "")
     : (st.configured ? "not connected" : "no client id");
   $("spdisconnect").hidden = !st.connected;
   $("sp-connected-as").textContent = st.connected
     ? ("Playing through the device named “" + (st.device_name || "Riko") + "”"
+       + (missing.length
+          ? " · reconnect Spotify to allow playlists (Disconnect, then Connect — missing: " + missing.join(", ") + ")"
+          : "")
        + (st.quota_backoff_left > 0
           ? " · quota cooldown ~" + Math.ceil(st.quota_backoff_left) + "s" : ""))
     : "";

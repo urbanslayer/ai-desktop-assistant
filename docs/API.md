@@ -1066,10 +1066,15 @@ Settings page's Spotify card.
 curl -s -H "$AUTH" "$HUB/api/spotify/status"
 # {"enabled":true,"configured":true,"connected":true,
 #  "connected_as":"owner person","scope":"user-read-playback-state …",
-#  "scopes":"…","default_redirect_uri":"http://127.0.0.1:8911/callback",
+#  "scopes":"…","missing_scopes":["playlist-read-private",…],
+#  "default_redirect_uri":"http://127.0.0.1:8911/callback",
 #  "device_name":"Riko","token_expires_at":1762400000.0,
 #  "quota_backoff_left":0,"now_playing":{…snapshot…}|null,"polling":true}
 # booleans/expiry only — a token string NEVER appears in any GET.
+# `missing_scopes` = required scopes the granted token lacks: a connection
+# made BEFORE the 2026-11-10 scope change lacks the playlist/library scopes,
+# and the card then says "reconnect Spotify to allow playlists" — the owner
+# Disconnects + Connects ONCE to re-consent.
 
 curl -s -H "$AUTH" "$HUB/api/spotify/connect-url"          # ?redirect_uri=… optional
 # {"url":"https://accounts.spotify.com/authorize?…","state":"…",
@@ -1102,6 +1107,22 @@ Dev-mode rules baked into `hub/spotify.py` (docs/SPOTIFY_NOTES.md): search
 advertised `Retry-After` window during which every music action answers
 "cooling down" instantly (no hammering), and a 403/404 on any player call
 answers "is Premium still active?" (`GET /me` no longer reports Premium).
+Item lists from Spotify may interleave `null` entries — always filtered.
+
+Owner library first (2026-11-10 live-bug round): catalogue `/search` does
+NOT reliably surface the user's own (esp. private) playlists, so
+`spotify_play(kind=playlist)` matches `GET /me/playlists` (paginated, cached
+~5 min, invalidated on connect/disconnect) by normalised name FIRST
+(exact > startswith > contains > fuzzy ≥0.8; ties: exact-case, alternatives
+named in the result); only then catalogue search. A query containing
+"playlist" forces `kind=playlist`. "my liked/saved songs" plays
+`GET /me/tracks` first page as `uris` (the Web API can't start the Liked
+Songs context directly; `shuffle: true` shuffles them).
+`spotify_playlists(query?)` lists the owner's playlist names + track counts.
+Scopes `playlist-read-private`, `playlist-read-collaborative` and
+`user-library-read` joined SCOPES — connections made earlier answer "reconnect
+Spotify to allow playlists/liked songs" until the owner Disconnects + Connects
+once.
 
 `now_playing` event: published on the events long-poll ONLY on a real state
 change (uri/playing/device), while the hub polls ≤ every 5 s — and only
@@ -1370,7 +1391,7 @@ Built-in hub tools:
 | `web_search` | SearXNG JSON search → `{results: [{title, url, content}]}`. Needs a `searxng_url` setting/env (`RIKO_SEARXNG_URL`); **not offered** when unset |
 | `fetch_page` | GET a URL, extract readable text (title + paragraphs/heads/lists, ≤ 20 000 chars, ≤ 10 MB, ≤ 20 s). Refuses loopback/private IPs unless `allow_private_fetch` |
 | `get_time` | hub clock as ISO-8601 with UTC offset |
-| `spotify_play` / `spotify_control` / `spotify_now_playing` / `spotify_devices` / `spotify_transfer` / `spotify_like_current` | music over the Spotify Web API (see *Spotify* above); **not offered** until Spotify is configured, always listed for permissions |
+| `spotify_play` / `spotify_control` / `spotify_now_playing` / `spotify_devices` / `spotify_transfer` / `spotify_like_current` / `spotify_playlists` | music over the Spotify Web API (see *Spotify* above); **not offered** until Spotify is configured, always listed for permissions |
 
 Permissions per tool name, effective policy (`GET /api/tools` shows all of
 it): an explicit `settings.tools.permissions[name]` wins (`always` / `ask` /

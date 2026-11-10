@@ -33,10 +33,14 @@ state is paused/idle and wakes on the next play/resume/transfer.
 from __future__ import annotations
 
 import base64
+import difflib
 import hashlib
+import random
+import re
 import secrets
 import threading
 import time
+import unicodedata
 import urllib.parse
 
 import requests
@@ -46,9 +50,18 @@ DEFAULT_API_BASE = "https://api.spotify.com/v1"
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:8911/callback"
 DEFAULT_DEVICE_NAME = "Riko"
 # scopes the tools need: player state + control, currently-playing for the
-# event/late clients, and library writes for spotify_like_current
+# event/late clients, library writes for spotify_like_current, and (2026-11-10,
+# owner-playlist round) the owner's own playlists + saved tracks — catalogue
+# /search does NOT reliably surface the user's own (esp. private) playlists,
+# so 'play my X playlist' and 'my liked songs' need these. Changing SCOPES
+# means the owner must Disconnect + Connect once to re-consent (status
+# exposes missing_scopes; the card and tool errors say to reconnect).
 SCOPES = ("user-read-playback-state user-modify-playback-state "
-          "user-read-currently-playing user-library-modify")
+          "user-read-currently-playing user-library-modify "
+          "playlist-read-private playlist-read-collaborative "
+          "user-library-read")
+PLAYLIST_SCOPES = ("playlist-read-private", "playlist-read-collaborative")
+LIKED_SCOPES = ("user-library-read",)
 SEARCH_LIMIT_MAX = 10          # dev-mode hard cap (docs/SPOTIFY_NOTES.md)
 POLL_S = 5.0                   # now_playing poll ceiling while playing
 MIN_POLL_S = 1.0               # test floor
@@ -57,6 +70,8 @@ REFRESH_SLACK_S = 60.0         # refresh this long before expiry
 DEVICE_CACHE_S = 60.0          # device list cache (quota discipline)
 USER_AGENT = "riko-hub/1 spotify"
 PENDING_TTL_S = 900.0          # a PKCE handshake is single-use and short
+PLAYLIST_CACHE_S = 300.0       # /me/playlists cache (~5 min; quota discipline)
+OWN_PAGE_LIMIT = 50            # /me/playlists + /me/tracks page size
 
 
 class SpotifyError(RuntimeError):
@@ -83,6 +98,88 @@ class SpotifyQuota(SpotifyError):
 class SpotifyPremium(SpotifyError):
     """403/404 on a player call: GET /me no longer reports Premium, so the
     subscription is the first suspect (docs/SPOTIFY_NOTES.md)."""
+
+
+# ── pure helpers (scopes, owner-name matching) ──────────────────────────────
+
+REQUIRED_SCOPES = tuple(SCOPES.split())
+
+
+def missing_scopes_for(granted: str) -> list[str]:
+    """Required scopes absent from the granted `scope` string. An empty
+    granted string (old connection, pre-scope-storage) counts as everything
+    missing — the owner must re-consent once."""
+    g = set(str(granted or "").split())
+    return [s for s in REQUIRED_SCOPES if s not in g]
+
+
+NAME_STOPWORDS = {"my", "the", "playlist"}
+
+
+def normalise_name(text: str) -> str:
+    """Playlist-name matcher key: casefold, drop emoji/punctuation, drop the
+    filler words 'my', 'the', 'playlist' ('My Dance 🕺 Playlist' → 'dance')."""
+    s = unicodedata.normalize("NFKD", str(text or ""))
+    chars = []
+    for ch in s.casefold():
+        cat = unicodedata.category(ch)
+        if cat == "Mn":                    # stray combining accent after NFKD
+            continue
+        chars.append(ch if cat[0] in ("L", "N") or ch.isspace() else " ")
+    return " ".join(w for w in "".join(chars).split()
+                    if w not in NAME_STOPWORDS)
+
+
+def match_playlists(query: str, playlists: list) -> tuple[dict | None, list[str]]:
+    """Pick the user's own playlist a spoken query means: exact > startswith
+    > contains > fuzzy (difflib ratio ≥ 0.8). Ties: exact-case name first,
+    else the first tied entry. Returns (playlist | None, [other tied names])
+    so callers can mention the alternatives."""
+    nq = normalise_name(query)
+    if not nq:
+        return None, []
+    scored: list[tuple[int, dict]] = []
+    for pl in playlists or []:
+        if not pl:                         # Spotify interleaves null entries
+            continue
+        nn = normalise_name(pl.get("name") or "")
+        if not nn:
+            continue
+        if nn == nq:
+            rank = 0
+        elif nn.startswith(nq):
+            rank = 1
+        elif nq in nn or nn in nq:
+            rank = 2
+        elif difflib.SequenceMatcher(None, nq, nn).ratio() >= 0.8:
+            rank = 3
+        else:
+            continue
+        scored.append((rank, pl))
+    if not scored:
+        return None, []
+    best_rank = min(r for r, _ in scored)
+    ties = [pl for r, pl in scored if r == best_rank]
+    raw = str(query or "").strip()
+    exact = [p for p in ties
+             if str(p.get("name") or "").strip() == raw]
+    best = exact[0] if exact else ties[0]
+    alts = [str(p.get("name") or "") for p in ties if p is not best]
+    return best, alts
+
+
+_LIKED_ADJ = re.compile(r"\b(liked|loved|saved|favourite|favourites|favorite|favorites)\b")
+_SONG_NOUN = re.compile(r"\b(songs?|tracks?|music)\b")
+
+
+def is_liked_songs(query: str) -> bool:
+    """'my liked songs', 'play my saved tracks', 'favourites' …"""
+    n = normalise_name(query)
+    if not n:
+        return False
+    if bool(_LIKED_ADJ.search(n) and _SONG_NOUN.search(n)):
+        return True
+    return bool(re.search(r"\bfavou?rites\b", n))
 
 
 # ── PKCE + authorize URL (pure, testable) ───────────────────────────────────
@@ -319,11 +416,44 @@ class SpotifyClient:
 
     def search(self, query: str, kind: str, limit: int = 3) -> list[dict]:
         """One search type, limit clamped to the dev-mode cap of 10.
-        Returns the raw items (already the right type for `kind`)."""
+        Returns the raw items (already the right type for `kind`).
+        Spotify interleaves NULL entries in items lists — always filtered."""
         limit = max(1, min(SEARCH_LIMIT_MAX, int(limit)))
         data = self.api("GET", "/search",
                         params={"q": query, "type": kind, "limit": limit})
-        return ((data or {}).get(kind) or {}).get("items") or []
+        items = ((data or {}).get(kind) or {}).get("items") or []
+        return [i for i in items if i]
+
+    def my_playlists(self, limit: int = OWN_PAGE_LIMIT) -> list[dict]:
+        """GET /me/playlists, paginated (limit + offset) — the ONLY
+        dependable way to see the owner's own (esp. private) playlists;
+        catalogue /search does not reliably surface them. Null entries in
+        items are filtered like everywhere else."""
+        out: list[dict] = []
+        offset = 0
+        while True:
+            data = self.api("GET", "/me/playlists",
+                            params={"limit": int(limit), "offset": offset}) or {}
+            page = [p for p in (data.get("items") or []) if p]
+            out.extend(page)
+            offset += int(limit)
+            if not data.get("next") or not page or offset > 1000:
+                break                       # paginate, hard stop at 20 pages
+        return out
+
+    def saved_tracks(self, limit: int = OWN_PAGE_LIMIT) -> list[str]:
+        """First page of GET /me/tracks → track URIs. The Web API cannot
+        start the Liked Songs context directly, so liked-songs playback
+        passes these URIs to start_playback."""
+        data = self.api("GET", "/me/tracks", params={"limit": int(limit)}) or {}
+        uris = []
+        for row in data.get("items") or []:
+            if not row:
+                continue
+            uri = str(((row.get("track") or {}).get("uri")) or "")
+            if uri.startswith("spotify:track:"):
+                uris.append(uri)
+        return uris
 
     def current_playback(self) -> dict | None:
         """GET /me/player/currently-playing → None when nothing plays."""
@@ -427,6 +557,7 @@ class SpotifyHub:
         self._quota_left = 0.0
         self._lock = threading.Lock()
         self._devices_cache: tuple[float, list] = (0.0, [])
+        self._playlists_cache: tuple[float, list] = (0.0, [])
         self._now_cache: dict | None = None
         self._last_sig: tuple | None = None
         self._wake = threading.Event()      # set = poll (something is playing)
@@ -473,6 +604,25 @@ class SpotifyHub:
                 "Spotify (Developer Dashboard app, docs/SPOTIFY_NOTES.md)")
         return SpotifyClient(settings, self.tokens(),
                              save=lambda t: self.store.set_json("spotify_tokens", t))
+
+    # -- scopes ---------------------------------------------------------------
+    def missing_scopes(self) -> list[str]:
+        """Required scopes the granted token lacks. The owner re-consents by
+        Disconnect + Connect once (SCOPES changed 2026-11-10)."""
+        if not self.connected():
+            return []
+        return missing_scopes_for(str(self.tokens().get("scope") or ""))
+
+    def require_scope(self, needed: tuple[str, ...], what: str) -> None:
+        """Guard an owner-library op: the granted token must carry `needed`
+        scopes, else answer with the reconnect line (docs/SPOTIFY_NOTES.md —
+        SCOPES changed, so an old connection must re-consent once)."""
+        granted = set(str(self.tokens().get("scope") or "").split())
+        if any(s not in granted for s in needed):
+            raise SpotifyError(
+                f"Spotify is connected with older permissions — reconnect "
+                f"Spotify to allow {what}: Settings > Spotify > Disconnect, "
+                "then Connect once")
 
     def _save_tokens(self, tokens: dict) -> None:
         self.store.set_json("spotify_tokens", tokens)
@@ -588,6 +738,8 @@ class SpotifyHub:
         self._save_tokens(tokens)
         self._now_cache = None
         self._last_sig = None
+        with self._lock:
+            self._playlists_cache = (0.0, [])   # fresh consent → fresh library
         if self.on_change:
             self.on_change()
         return self.status()
@@ -600,6 +752,7 @@ class SpotifyHub:
         self._wake.clear()
         with self._lock:
             self._devices_cache = (0.0, [])
+            self._playlists_cache = (0.0, [])
         if gone and self.on_change:
             self.on_change()
         return self.status()
@@ -616,6 +769,9 @@ class SpotifyHub:
             "connected_as": str(tokens.get("connected_as") or ""),
             "scope": str(tokens.get("scope") or ""),
             "scopes": SCOPES,
+            # required scopes the granted token lacks → owner must
+            # Disconnect + Connect once (docs/SPOTIFY_NOTES.md)
+            "missing_scopes": self.missing_scopes(),
             "default_redirect_uri": DEFAULT_REDIRECT_URI,
             "quota_backoff_left": round(self.quota_backoff(), 1),
             # write-only tokens are NEVER included: only booleans/expiry
@@ -665,6 +821,28 @@ class SpotifyHub:
                            f"desktop, start the player from the tray: Music "
                            f"> Start player")
 
+    def playlists(self, force: bool = False) -> list[dict]:
+        """The owner's own playlists [{name, uri, tracks}] — GET
+        /me/playlists (limit 50 + offset, inside the quota window) cached
+        ~5 min; invalidated by connect/disconnect. needs
+        playlist-read-private/collaborative."""
+        self.require()
+        self.require_scope(PLAYLIST_SCOPES, "playlists")
+        now = time.monotonic()
+        with self._lock:
+            stamp, cached = self._playlists_cache
+        if cached and not force and now - stamp < PLAYLIST_CACHE_S:
+            return [dict(p) for p in cached]
+        raw = self.call(self.client().my_playlists)
+        out = [{"name": str(p.get("name") or ""),
+                "uri": str(p.get("uri") or ""),
+                "tracks": (p.get("tracks") or {}).get("total")
+                if isinstance(p.get("tracks"), dict) else None}
+               for p in raw if p]
+        with self._lock:
+            self._playlists_cache = (now, [dict(p) for p in out])
+        return out
+
     def _playback_device(self, wanted: dict) -> str:
         """Return a device id to send play commands to, transferring first
         when the wanted device isn't the active one."""
@@ -676,9 +854,17 @@ class SpotifyHub:
         return wanted["id"]
 
     def play(self, query: str, kind: str = "track",
-             device: str = "") -> dict:
-        """query → search (limit ≤ 10) → top hit → start it on the chosen
-        device. Returns {uri, name, artists, device, kind}."""
+             device: str = "", shuffle: bool = False) -> dict:
+        """query → what to play. The OWNER's library is searched first:
+        'my liked/saved songs' plays the saved tracks (GET /me/tracks →
+        uris — the Web API can't start the Liked Songs context directly),
+        and a playlist query is matched against the owner's own playlists
+        first (catalogue /search does NOT reliably surface the user's own,
+        esp. private, playlists). Otherwise: catalogue search (limit ≤ 10,
+        null entries filtered) → top hit → start it on the chosen device.
+        A query mentioning 'playlist' forces kind=playlist ('play my X
+        playlist' arrives as track otherwise). Returns {uri, name, artists,
+        device, kind, source, alternatives}."""
         self.require()
         query = str(query or "").strip()
         if not query:
@@ -687,6 +873,22 @@ class SpotifyHub:
         kind = str(kind or "track").strip().lower()
         if kind not in ("track", "album", "playlist", "artist"):
             raise SpotifyError("kind must be track, album, playlist or artist")
+        if "playlist" in query.lower():
+            kind = "playlist"        # 'play my dance playlist' says track
+        if kind != "playlist" and is_liked_songs(query):
+            return self.play_liked_songs(device=device, shuffle=shuffle)
+        if kind == "playlist":
+            best, alternatives = match_playlists(query, self.playlists())
+            if best:
+                wanted = self.resolve_device(device)
+                dev_id = self._playback_device(wanted)
+                self.call(self.client().start_playback,
+                          context_uri=best["uri"], device_id=dev_id)
+                self.wake()
+                return {"uri": best["uri"], "name": best["name"],
+                        "artists": "", "device": wanted["name"],
+                        "kind": "playlist", "source": "library",
+                        "alternatives": alternatives}
         artists = ""
         items = self.call(self.client().search, query, kind, 3)
         if kind == "artist":
@@ -704,6 +906,11 @@ class SpotifyHub:
                     uri = str(pl[0].get("uri") or uri)
         else:
             if not items:
+                if kind == "playlist":
+                    raise SpotifyError(
+                        f"Spotify found no playlist matching “{query}” — "
+                        "not in your own playlists and not in search "
+                        "(spotify_playlists lists what you have)")
                 raise SpotifyError(f"Spotify found no {kind} matching “{query}”")
             top = items[0]
             uri = str(top.get("uri") or "")
@@ -726,7 +933,31 @@ class SpotifyHub:
                       device_id=dev_id)
         self.wake()
         return {"uri": uri, "name": name, "artists": artists,
-                "device": wanted["name"], "kind": kind}
+                "device": wanted["name"], "kind": kind, "source": "search",
+                "alternatives": []}
+
+    def play_liked_songs(self, device: str = "",
+                         shuffle: bool = False) -> dict:
+        """'my liked/saved songs': first page of GET /me/tracks (≤ 50) →
+        start_playback with the uris (the Web API can't start the Liked
+        Songs context directly). shuffle=True shuffles the uris first.
+        needs user-library-read."""
+        self.require()
+        self.require_scope(LIKED_SCOPES, "liked songs")
+        uris = self.call(self.client().saved_tracks)
+        if not uris:
+            raise SpotifyError("your Spotify Liked Songs list is empty — "
+                               "like a track first (spotify_like_current)")
+        if shuffle:
+            random.shuffle(uris)
+        wanted = self.resolve_device(device)
+        dev_id = self._playback_device(wanted)
+        self.call(self.client().start_playback, uris=uris, device_id=dev_id)
+        self.wake()
+        return {"uri": "", "name": "Liked Songs", "artists": "",
+                "device": wanted["name"], "kind": "liked",
+                "source": "library", "count": len(uris),
+                "shuffle": bool(shuffle), "alternatives": []}
 
     def control(self, action: str, value=None) -> dict:
         """pause|resume|next|prev|seek|volume|shuffle. seek/volume take a

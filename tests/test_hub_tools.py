@@ -324,7 +324,7 @@ def test_api_tools_lists_builtins(tmp_path):
                        "timer", "list_timers", "cancel_timer",
                        "spotify_play", "spotify_control", "spotify_now_playing",
                        "spotify_devices", "spotify_transfer",
-                       "spotify_like_current"}  # memory round M, timers round H, weather round, music phase 1
+                       "spotify_like_current", "spotify_playlists"}  # memory round M, timers round H, weather round, music phase 1
     assert by["web_search"]["available"] is False   # no SearXNG configured
     assert by["get_time"]["available"] is True
     assert by["weather"]["risk"] == "read"          # keyless Open-Meteo, always offered

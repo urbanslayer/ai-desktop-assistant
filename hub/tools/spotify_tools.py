@@ -1,24 +1,34 @@
 """Spotify hub tools (music phase 1, docs/SPOTIFY_NOTES.md + docs/TOOLS.md D).
 
-Six tools, all routed through the hub's SpotifyHub (hub/spotify.py): the hub
+Seven tools, all routed through the hub's SpotifyHub (hub/spotify.py): the hub
 holds the token, enforces the dev-mode quota back-off and keeps the answers
 human-readable (docs/ROUNDS.md: a tool result verifies the effect and says it
 in one plain line). Nothing here streams audio — the Web API only controls
 Spotify Connect devices; the desktop player is spotifyd under the device name
-from settings (default "Riko").
+from settings (default "Riko"). Owner playlists/liked songs come from
+GET /me/playlists and /me/tracks — catalogue /search does not reliably
+surface the owner's own (private) playlists.
 """
 from __future__ import annotations
 
+try:                                   # package mode (uv run python -m hub.server)
+    from ..spotify import normalise_name
+except ImportError:                    # standalone mode (`python server.py` in hub/)
+    from spotify import normalise_name  # type: ignore[no-redef]
 from .registry import ToolSpec
 
 DESCRIPTIONS = {
     "spotify_play": (
         "Play music on Spotify: query is a song, artist, album or playlist "
         "name (or 'some <mood>'-style search words). kind: track (default) | "
-        "album | playlist | artist. device: a Spotify Connect device name — "
+        "album | playlist | artist. For the owner's own playlists (\"my X "
+        "playlist\") use kind=playlist — the owner's library is searched "
+        "first (catalogue search misses private playlists). 'my liked "
+        "songs'/'saved tracks' plays the saved songs. shuffle: true shuffles "
+        "(used for liked songs). device: a Spotify Connect device name — "
         "omit it to use the desktop player named in Settings (default "
-        "'Riko'). Resolves the top search hit and starts it; the result "
-        "names what is now playing and where. Requires Spotify Premium."),
+        "'Riko'). Resolves the best hit and starts it; the result names "
+        "what is now playing and where. Requires Spotify Premium."),
     "spotify_control": (
         "Control Spotify playback: action = pause | resume | next | prev | "
         "seek | volume | shuffle. value: seconds from track start for seek, "
@@ -35,6 +45,11 @@ DESCRIPTIONS = {
         "(e.g. 'Echo Kitchen'); playback keeps going there."),
     "spotify_like_current": (
         "Like (save to the library) the track Spotify is playing right now."),
+    "spotify_playlists": (
+        "List the owner's own Spotify playlists by name with track counts — "
+        "the answer to 'what playlists do I have?'. query (optional) filters "
+        "by name. To play one use spotify_play with kind=playlist — the "
+        "owner's library is searched first."),
 }
 
 SPECS = (
@@ -43,11 +58,15 @@ SPECS = (
         "type": "object",
         "properties": {
             "query": {"type": "string",
-                      "description": "song / artist / album / playlist to play"},
+                      "description": "song / artist / album / playlist to play "
+                                     "('my liked songs' plays the saved tracks)"},
             "kind": {"type": "string", "enum": ["track", "album", "playlist", "artist"]},
             "device": {"type": "string",
                        "description": "Connect device name (default: the "
                                       "device named in Settings, 'Riko')"},
+            "shuffle": {"type": "boolean",
+                        "description": "shuffle the queue (for 'play my "
+                                       "liked songs shuffled')"},
         },
         "required": ["query"],
     }, lambda a: f"playing “{str((a or {}).get('query', ''))[:60]}” on Spotify"),
@@ -74,6 +93,15 @@ SPECS = (
     }, lambda a: f"moving Spotify to “{str((a or {}).get('device', ''))[:40]}”"),
     ("spotify_like_current", "act", {"type": "object", "properties": {}},
      lambda a: "liking the current track"),
+    ("spotify_playlists", "read", {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string",
+                      "description": "optional name filter"},
+        },
+    }, lambda a: (f"listing Spotify playlists matching "
+                  f"“{str((a or {}).get('query', ''))[:40]}”"
+                  if (a or {}).get("query") else "listing Spotify playlists")),
 )
 
 
@@ -88,7 +116,7 @@ def _fmt_track(snap: dict) -> str:
 
 
 def build_spotify_specs(hub, tools_cfg: dict | None = None) -> list[ToolSpec]:
-    """The six spotify_* specs bound to a SpotifyHub (hub/spotify.py).
+    """The seven spotify_* specs bound to a SpotifyHub (hub/spotify.py).
     They are ALWAYS listed (permissions must stay editable while Spotify is
     off); `available` reflects enabled+configured, and every run answers in
     one plain human line or raises SpotifyError with one."""
@@ -101,14 +129,28 @@ def build_spotify_specs(hub, tools_cfg: dict | None = None) -> list[ToolSpec]:
             return False
 
     def play(args: dict):
-        r = hub.play(str((args or {}).get("query") or ""),
-                     str((args or {}).get("kind") or "track"),
-                     str((args or {}).get("device") or ""))
+        a = args or {}
+        r = hub.play(str(a.get("query") or ""),
+                     str(a.get("kind") or "track"),
+                     str(a.get("device") or ""),
+                     shuffle=bool(a.get("shuffle")))
+        if r["kind"] == "liked":
+            how = " shuffled" if r.get("shuffle") else ""
+            return (f"Playing {r['count']} of your Liked Songs{how} on "
+                    f"Spotify device “{r['device']}”.")
         who = f" by {r['artists']}" if r.get("artists") else ""
-        where = r["name"] + who
-        if r["kind"] != "track":
+        if r.get("source") == "library":
+            where = f"your playlist “{r['name']}”"
+        elif r["kind"] != "track":
             where = f"{r['kind']} “{r['name']}”"
-        return f"Playing {where} on Spotify device “{r['device']}”."
+        else:
+            where = r["name"] + who
+        line = f"Playing {where} on Spotify device “{r['device']}”."
+        alts = [x for x in (r.get("alternatives") or []) if x]
+        if alts:
+            line += (" You also have " + ", ".join(f"“{x}”" for x in alts)
+                     + " — say which one you meant if it wasn't this.")
+        return line
 
     def control(args: dict):
         a = args or {}
@@ -159,9 +201,25 @@ def build_spotify_specs(hub, tools_cfg: dict | None = None) -> list[ToolSpec]:
         return (f"Liked {_fmt_track(r)} — it is saved to the Spotify "
                 "library.")
 
+    def playlists(args: dict):
+        rows = hub.playlists()
+        q = normalise_name(str((args or {}).get("query") or ""))
+        if q:
+            rows = [r for r in rows if q in normalise_name(r["name"])]
+        if not rows:
+            base = "You have no Spotify playlists yet."
+            return base if not q else (f"No Spotify playlist name matches "
+                                       f"“{(args or {}).get('query')}”. " +
+                                       base)
+        return ("Your Spotify playlists: " + "; ".join(
+            f"{r['name']}" + (f" ({r['tracks']} tracks)"
+                              if r.get("tracks") is not None else "")
+            for r in rows))
+
     runs = {"spotify_play": play, "spotify_control": control,
             "spotify_now_playing": now_playing, "spotify_devices": devices,
-            "spotify_transfer": transfer, "spotify_like_current": like_current}
+            "spotify_transfer": transfer, "spotify_like_current": like_current,
+            "spotify_playlists": playlists}
     specs = []
     for name, risk, params, label in SPECS:
         specs.append(ToolSpec(

@@ -1,8 +1,8 @@
 """In-repo fake Spotify (music phase 1 tests): ONE loopback HTTP server that
 plays both roles — accounts.spotify.com (POST /api/token) and
-api.spotify.com/v1 (search, player, devices, library, me). Tests point the
-hub's spotify.accounts_url / spotify.api_url settings at it; no real
-network is ever touched.
+api.spotify.com/v1 (search, player, devices, library, me, me/playlists,
+me/tracks). Tests point the hub's spotify.accounts_url / spotify.api_url
+settings at it; no real network is ever touched.
 
 Programmable per endpoint: `one_shot(method, path, status, body, headers)`
 queues a single canned response (e.g. 429 QUOTA_EXCEEDED with Retry-After),
@@ -107,6 +107,10 @@ class FakeSpotify:
         self.search = {"track": [TRACK], "playlist": [], "album": [],
                        "artist": [{"uri": "spotify:artist:ART1",
                                    "name": "Queen"}]}
+        # owner library (2026-11-10 round): /me/playlists + /me/tracks.
+        # Tests fill these; None entries mimic Spotify's interleaved nulls.
+        self.playlists = []                # [{uri, name, tracks:{total}}]
+        self.saved = []                    # [{"track": {...}} | None]
         self.now = None                    # currently-playing dict | None=204
         self.devices = [dict(DEVICE_RIKO), dict(DEVICE_ECHO)]
         self.me = {"id": "owner", "display_name": "Owner Person"}
@@ -172,6 +176,17 @@ class FakeSpotify:
         if method == "GET" and path == "/v1/search":
             kind = query.get("type", "track")
             return respond(200, {kind: {"items": self.search.get(kind, [])}})
+        if method == "GET" and path == "/v1/me/playlists":
+            limit = int(query.get("limit") or 50)
+            offset = int(query.get("offset") or 0)
+            page = self.playlists[offset:offset + limit]
+            nxt = (f"{self.base}/v1/me/playlists?limit={limit}"
+                   f"&offset={offset + limit}"
+                   if offset + limit < len(self.playlists) else None)
+            return respond(200, {"items": page, "next": nxt})
+        if method == "GET" and path == "/v1/me/tracks":
+            limit = int(query.get("limit") or 50)
+            return respond(200, {"items": self.saved[:limit]})
         if method == "GET" and path == "/v1/me/player/currently-playing":
             if self.now is None:
                 return respond(204, None)
