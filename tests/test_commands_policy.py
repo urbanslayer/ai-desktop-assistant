@@ -138,6 +138,96 @@ def test_rm_recursive_inside_home_only_asks(home):
     assert D("rm notes/a.txt", home).mode == "ask"     # plain rm: ask
 
 
+# ── refusals see THROUGH wrapper programs and shell strings ─────
+# (rule 1: the refusals hold EVEN WITH approval, so a wrapper or a
+#  shell string must never downgrade them to ask)
+@pytest.mark.parametrize("cmd", [
+    # wrapper programs: the real program is judged
+    "env sudo ls", "env VAR=x sudo ls", "env -i PATH=/bin sudo ls",
+    "env -u DISPLAY sudo ls", "env -S 'sudo x'", "nice sudo ls",
+    "nice -n 5 sudo ls", "nice -5 sudo ls", "ionice -c3 sudo ls",
+    "nohup sudo ls", "timeout 5 sudo ls", "timeout -k 2 5 sudo ls",
+    "time sudo ls", "stdbuf -oL sudo ls", "chrt -f 1 sudo ls",
+    "taskset -c 0 sudo ls", "setsid sudo ls", "flock /tmp/l sudo ls",
+    "flock -c 'sudo ls' /tmp/l", "unbuffer sudo ls",
+    "watch -n 5 sudo ls", "script -c 'sudo x'", "busybox sudo ls",
+    "command sudo ls", "command -v sudo", "exec sudo ls",
+    "builtin sudo ls", "env nice sudo ls", "sudo sudo ls",
+    "doas -n sudo ls",
+    # find -exec/-ok judge the EXECUTED program
+    "find notes -exec sudo ls ;", "find notes -exec rm -rf / ;",
+    "find notes -execdir rm -rf /etc ;", "find notes -ok rm -rf / ;",
+    # absolute / relative paths to refused binaries
+    "/usr/bin/sudo ls", "./sudo ls", "../bin/su root",
+    # wrappers hiding destroyers / power / session kills
+    "timeout 5 rm -rf /etc", "xargs -a l.txt sudo rm -rf /",
+    "nice rm -rf /var", "env FOO=1 systemctl poweroff",
+    # shell strings: every segment is scanned, recursively
+    "ls; rm -rf ~", "ls && rm -rf ~", "ls || rm -rf ~",
+    "ls ; sudo rm -rf x", "bash -c 'sudo ls'", 'bash -c "sudo ls"',
+    "sh -c 'ls; rm -rf ~'", "bash -lc 'sudo x'", "zsh -c 'x && sudo y'",
+    "bash -c 'ls | sudo rm -rf /'", "bash -c 'kill $(pgrep sway)'",
+    "echo hi && sudo ls", "true; pkill sway", "ls || kill -9 Hyprland",
+    "(sudo ls)", "echo $(sudo ls)", "echo `sudo ls`",
+    "diff <(sudo ls) <(ls)", "ls && sudo reboot", "ls; loginctl lock",
+    "ls | mkfs.ext4 /dev/sda", "true && env sudo ls",
+    # wrappers with flags we cannot interpret: word-scan safety net
+    "timeout --weird sudo ls", "xargs --mystery sudo ls",
+])
+def test_refusals_see_through_wrappers_and_shell(cmd, home):
+    d = D(cmd, home)
+    assert d.mode == "refuse", f"{cmd}: {d.mode} ({d.reason})"
+
+
+@pytest.mark.parametrize("cmd", [
+    # clean payloads behind wrappers/shell strings: still ask, not refuse
+    "env FOO=1 ls", "bash -c 'ls | grep x'", "sh -c 'ls; pwd'",
+    "timeout 5 make build", "xargs -a list.txt ls", "watch ls",
+    "nohup make", "find notes -exec cat {} ;", "busybox ls",
+    "script -c 'make'", "ls; rm -rf ~/notes/tmp", "nice -n 5 df",
+    # repo-configured external programs: ask, never auto
+    "git diff --ext-diff", "git diff --textconv", "git show --ext-diff",
+    "git log -p --textconv",
+    # structures the best-effort lexer cannot check safely: refuse
+    "cat <<EOF", "echo $(unbalanced", "echo `unbalanced", "(( i=0 ))",
+])
+def test_wrapper_and_shell_ask_and_uncertain_home(cmd, home):
+    mode = D(cmd, home).mode
+    if cmd in ("cat <<EOF", "echo $(unbalanced", "echo `unbalanced",
+               "(( i=0 ))"):
+        assert mode == "refuse", f"{cmd}: {mode}"
+        assert "too complex to check safely" in D(cmd, home).reason
+    else:
+        assert mode == "ask", f"{cmd}: {mode} " \
+            f"({D(cmd, home).reason})"
+
+
+# ── auto-run git never executes repo-configured programs ───────
+def test_git_autorun_is_hardened(home):
+    cfg = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
+    safe = ["--no-ext-diff", "--no-textconv"]
+    d = D("git diff", home)
+    assert d.mode == "auto"
+    assert d.argv == ["git"] + cfg + ["diff"] + safe
+    d = D("git show HEAD", home)
+    assert d.mode == "auto"
+    assert d.argv == ["git"] + cfg + ["show", "HEAD"] + safe
+    d = D("git log -p --oneline", home)
+    assert d.mode == "auto"
+    assert d.argv == ["git"] + cfg + ["log", "-p", "--oneline"] + safe
+    # no patch output -> no external diff runs, but fsmonitor/hooks stay off
+    for cmd, sub in (("git log --oneline -5", ["log", "--oneline", "-5"]),
+                     ("git status", ["status"]),
+                     ("git --no-pager log", ["--no-pager", "log"]),
+                     ("git branch -v", ["branch", "-v"])):
+        d = D(cmd, home)
+        assert d.mode == "auto", f"{cmd}: {d.reason}"
+        assert d.argv == ["git"] + cfg + sub, d.argv
+    # owner-widened git entries get the same hardening
+    d = D("git stash list", home, extra_auto=["git stash"])
+    assert d.mode == "auto" and d.argv[:2] == ["git", "-c"]
+
+
 @pytest.mark.parametrize("cmd,hint", [
     ("vim notes/a.txt", "cat"), ("nano x", "cat"), ("less x", "cat"),
     ("top", "top -b -n1"), ("htop", "top"), ("man ls", ""),

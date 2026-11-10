@@ -28,6 +28,17 @@ duration_ms, cwd, auto: bool}`
    `shutdown`, `reboot`, `poweroff`, `kill`/`pkill`/`killall` targeting compositor/session processes.
    Refuse disk destroyers: `mkfs*`, `dd` writing to `/dev/*`, `wipefs`, `shred` on devices, `rm` with
    `-r`/`-f` on `/`, `~`, or any path outside `$HOME` and `/tmp`.
+   These refusals are applied by a **recursive scan that sees through wrappers and shell strings**:
+   - wrapper programs are unwrapped before judging the real program: `env` (incl. `VAR=x` assignments,
+     `-i`/`-u`/`-S`, and `env -S 'sudo x'`), `nice`, `ionice`, `nohup`, `timeout`, `time`, `stdbuf`,
+     `chrt`, `taskset`, `setsid`, `flock`, `unbuffer`, `script -c`, `watch`, `xargs`, `busybox
+     <applet>`, `command`, `exec`, `builtin`, and `find -exec/-execdir/-ok` (the *executed* program);
+   - shell strings — `bash`/`sh`/`zsh`/`dash -c '...'` and the tool's own shell-syntax path — are split
+     into segments on `;` `&&` `||` `|` `&` newlines plus `$( )`, backticks and `(...)` (best-effort
+     lexer; when the structure cannot be parsed safely the command is **refused** as "too complex to
+     check safely — run it yourself", never waved through), and the full refusal set applies to every
+     segment, recursively: `ls; rm -rf ~` and `xargs sudo ls` refuse even though an approval follows;
+   - absolute/relative paths to refused binaries count too (`/usr/bin/sudo ls`, `./sudo ls`).
 2. **No shell by default.** Parse with `shlex`, run with an argv (`subprocess.run(argv, shell=False)`).
    Commands that need a shell (pipes `|`, `;`, `&&`, `||`, redirects `> >> <`, `$(...)`, backticks,
    globs) are allowed **only with approval** and then run via `bash -c` with the exact string shown in the
@@ -79,6 +90,13 @@ Defaults:
 
 Everything else asks. Riko can't widen the allowlist herself.
 
+Auto-run `git` must never execute **repo-configured** programs (external diff drivers and textconv
+filters come from the clone's own `.git/config`, and `git status` may poll an fsmonitor hook), so the
+decision injects them into the exec argv: every auto-run git gets `-c core.fsmonitor=false
+-c core.hooksPath=/dev/null`, and the verbs that print patches (`diff`, `show`, `log -p`) additionally
+get `--no-ext-diff --no-textconv`. An explicit `--ext-diff`/`--textconv` in the command means the owner
+asked for the external driver: that asks instead of auto-running.
+
 ## Recipes
 
 Natural-language shortcuts so "how much space is free on the root volume?" becomes `df -h /`
@@ -106,7 +124,10 @@ refusals still refuse).
 Never execute real commands in tests: the runner is injectable and `tests/conftest.py` makes the real
 `subprocess` path raise for this package unless a test opts into a harmless fixture binary (e.g. a tmp
 script). Cover: allowlist hits/misses (shell syntax, secret path, write flags, subcommands), refusals
-(sudo, power, compositor, mkfs/dd/rm), approval flow (exact command shown, deny → not run, hub
-approval alone not enough), env scrubbing, timeout kill, output cap, redaction, cwd rules, audit line.
+(sudo, power, compositor, mkfs/dd/rm — including hidden behind wrapper programs or inside shell
+strings, and via paths to the refused binary), the too-complex-to-check refusal, auto-run git argv
+hardening (fsmonitor/hooks off, `--no-ext-diff --no-textconv`, `--ext-diff`/`--textconv` ask), approval
+flow (exact command shown, deny → not run, hub approval alone not enough), env scrubbing, timeout kill,
+output cap, redaction, cwd rules, audit line.
 Recipes: lookup finds the owner's exact phrasings (root/home volume space, memory users, GPU heat),
 every default recipe auto-runs or is explicitly `asks: true`, and config override/extend behaves.

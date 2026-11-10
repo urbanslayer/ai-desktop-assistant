@@ -13,10 +13,23 @@ Rules (docs/COMMANDS.md 'Execution rules' + 'Auto-run allowlist'):
     read-only verbs — that is where block_reason is too coarse);
   * never a disk destroyer: mkfs*, dd of=/dev/*, wipefs, shred /dev/*,
     rm -r/-f on /, ~, or any path outside $HOME and /tmp;
+  * those refusals hold EVEN WITH approval, so they are applied by a
+    recursive scan: wrapper programs (env/nice/ionice/nohup/timeout/time/
+    stdbuf/chrt/taskset/setsid/flock/unbuffer/script -c/watch/xargs/
+    find -exec/busybox/command/exec/...) are unwrapped to the real
+    program, and shell strings (bash -c '...', and this tool's own
+    shell-syntax path) are split into segments on ; && || | & newlines
+    plus $()/backticks/() and scanned segment by segment. A structure
+    the best-effort lexer cannot parse safely is REFUSED, not waved
+    through; absolute/relative paths to refused binaries count too
+    (_tok_name basenames);
   * never interactive (vim/less/top/ssh-without-command/REPL/man …);
   * no shell by default: shell syntax forces approval + `bash -c`;
   * auto-run only for allowlisted read-only programs over clean arguments
-    (no secret path, no write flag, cwd inside $HOME or /tmp).
+    (no secret path, no write flag, cwd inside $HOME or /tmp); auto-run
+    git runs with -c core.fsmonitor=false -c core.hooksPath=/dev/null and
+    (diff/show/log -p) --no-ext-diff --no-textconv, so no repo-configured
+    external program ever executes unattended.
 """
 from __future__ import annotations
 
@@ -156,20 +169,15 @@ def touches_secret(token, home: str) -> bool:
     return False
 
 
-def _segments(argv: list[str]) -> list[list[str]]:
-    """Split a shell-mode argv into per-command segments on | ; & so the
-    hard-refusal checks see `sudo` even inside a pipeline."""
-    segs, cur = [], []
-    for tok in argv:
-        if tok in ("|", ";", "&&", "||", "&"):
-            if cur:
-                segs.append(cur)
-            cur = []
-        else:
-            cur.append(tok)
-    if cur:
-        segs.append(cur)
-    return segs
+def _deny_elevation(argv: list[str]) -> str | None:
+    if not argv:
+        return None
+    prog = _tok_name(argv[0])
+    if prog in ELEVATE:
+        return f"never elevated ({prog})"
+    if prog == "machinectl" and "shell" in _paths(argv[1:]):
+        return "never elevated (machinectl)"
+    return None
 
 
 def _flags(tokens: list[str]) -> list[str]:
@@ -296,6 +304,501 @@ def _read_files_auto(tokens: list[str], cwd: str, home: str) -> bool:
     return existing >= 1 and checked == existing
 
 
+# ── refusal scan: wrapper programs + shell strings ─────────────
+# docs/COMMANDS.md rule 1: the refusals hold EVEN WITH approval, so a
+# refusal may not hide behind a wrapper (`env sudo ls`, `timeout 5 sudo
+# ls`, `xargs sudo ...`) or inside a shell string (`bash -c "ls; rm -rf
+# ~"`, `ls && sudo x`, `$(sudo ...)`). The scan below sees through both,
+# recursively; a structure it cannot parse safely is REFUSED, never
+# waved through.
+
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+
+class _ShellUncertain(Exception):
+    """Shell structure this best-effort lexer cannot check safely."""
+
+
+def _placeholder(inner: str, op: str, cl: str) -> str:
+    """Sentinel-wrapped stand-in for $( )/backtick/process-substitution
+    content: the words stay (the session-kill word scan still sees them);
+    only quote chars go, so the outer tokenizer can't misread them."""
+    return op + re.sub(r"['\"`]", "", str(inner)) + cl
+
+
+def _quoted_span(text: str, i: int) -> int:
+    """text[i] is ' or "; return the index just past the closing quote."""
+    q = text[i]
+    j, n = i + 1, len(text)
+    while j < n:
+        if text[j] == "\\" and q == '"' and j + 1 < n:
+            j += 2
+            continue
+        if text[j] == q:
+            return j + 1
+        j += 1
+    raise _ShellUncertain("unbalanced quote")
+
+
+def _paren_span(text: str, i: int) -> tuple[str, int]:
+    """text[i] == '(' (already quote-stripped OUTSIDE, quotes INSIDE are
+    honoured): return (content, index just past the matching ')')."""
+    depth, j, n = 0, i, len(text)
+    while j < n:
+        ch = text[j]
+        if ch in "'\"":
+            j = _quoted_span(text, j)
+            continue
+        if ch == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[i + 1:j], j + 1
+        j += 1
+    raise _ShellUncertain("unbalanced ( )")
+
+
+def _dollar_paren_span(text: str, i: int) -> tuple[str | None, int]:
+    """text starts with '$(' at i. Arithmetic $(( )) yields None (no
+    command can hide in it); anything else returns its content."""
+    if text.startswith("$((", i):
+        end = text.find("))", i + 3)
+        if end < 0:
+            raise _ShellUncertain("unbalanced $(( ))")
+        return None, end + 2
+    return _paren_span(text, i + 1)
+
+
+def _extract_subs(text: str) -> tuple[str, list[str]]:
+    """Replace every $( ) / backtick / <( ) command region with a
+    space-free placeholder; return (cleaned text, region contents)."""
+    out: list[str] = []
+    inner: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "'":
+            j = _quoted_span(text, i)          # no expansion in '...'
+            out.append(text[i:j])
+            i = j
+            continue
+        if ch == '"':
+            j = i + 1
+            buf = ['"']
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    buf.append(text[j:j + 2])
+                    j += 2
+                    continue
+                if text[j] == "`":
+                    k = text.find("`", j + 1)
+                    if k < 0:
+                        raise _ShellUncertain("unbalanced backtick")
+                    inner.append(text[j + 1:k])
+                    buf.append(_placeholder(text[j + 1:k], "\x01", "\x02"))
+                    j = k + 1
+                    continue
+                if text.startswith("$(", j):
+                    sub, j2 = _dollar_paren_span(text, j)
+                    if sub is not None:
+                        inner.append(sub)
+                    buf.append(_placeholder(sub or "arith", "\x01", "\x02"))
+                    j = j2
+                    continue
+                buf.append(text[j])
+                j += 1
+            if j >= n:
+                raise _ShellUncertain("unbalanced \" quote")
+            out.append("".join(buf) + '"')
+            i = j + 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch == "`":
+            k = text.find("`", i + 1)
+            if k < 0:
+                raise _ShellUncertain("unbalanced backtick")
+            inner.append(text[i + 1:k])
+            out.append(_placeholder(text[i + 1:k], "\x01", "\x02"))
+            i = k + 1
+            continue
+        if text.startswith("$(", i):
+            sub, j2 = _dollar_paren_span(text, i)
+            if sub is not None:
+                inner.append(sub)
+            out.append(_placeholder(sub or "arith", "\x01", "\x02"))
+            i = j2
+            continue
+        if ch in "<>" and i + 1 < n and text[i + 1] == "(":
+            sub, j2 = _paren_span(text, i + 1)     # process substitution
+            inner.append(sub)
+            out.append(ch + _placeholder(sub, "\x03", "\x04"))
+            i = j2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), inner
+
+
+def _split_segments(text: str) -> list[list[str]]:
+    """Split command text into segments on | ; && || & newlines and
+    (subshell parens); redirect operators and their targets are dropped.
+    Assumes $( )/backticks are already placeholders (_extract_subs)."""
+    segs: list[list[str]] = []
+    cur: list[str] = []
+    tok: list[str] = []
+    i, n = 0, len(text)
+
+    def end_tok():
+        if tok:
+            v = "".join(tok)
+            tok.clear()
+            if v:
+                cur.append(v)
+
+    def end_seg():
+        end_tok()
+        if cur:
+            segs.append(list(cur))
+            cur.clear()
+
+    def skip_target():
+        nonlocal i
+        while i < n and text[i] in " \t":
+            i += 1
+        while i < n and text[i] not in " \t\n":
+            if text[i] in "'\"":
+                i = _quoted_span(text, i)
+                continue
+            i += 1
+
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if ch in " \t\r\f\v":
+            end_tok()
+            i += 1
+            continue
+        if ch == "\n":
+            end_tok()
+            end_seg()
+            i += 1
+            continue
+        if ch in "\x01\x02\x03\x04":
+            tok.append(ch)
+            i += 1
+            continue
+        if ch in "'\"":
+            j = _quoted_span(text, i)
+            tok.append(text[i + 1:j - 1])       # content, quotes dropped
+            i = j
+            continue
+        if ch == "\\":
+            if i + 1 < n:
+                tok.append(nxt)
+                i += 2
+            else:
+                i += 1
+            continue
+        if ch == ";":
+            end_tok()
+            end_seg()
+            i += 1
+            continue
+        if ch == "|":
+            end_tok()
+            end_seg()
+            i += 2 if nxt in "&|" else 1
+            continue
+        if ch == "&":
+            if nxt == ">":                      # cmd &>file: one redirect
+                end_tok()
+                i += 2
+                skip_target()
+                continue
+            end_tok()
+            end_seg()
+            i += 2 if nxt == "&" else 1
+            continue
+        if ch == "(":
+            if nxt == "(":
+                raise _ShellUncertain("arithmetic (( )) syntax")
+            end_tok()
+            end_seg()
+            i += 1
+            continue
+        if ch == ")":
+            end_tok()
+            end_seg()
+            i += 1
+            continue
+        if ch == "<":
+            if nxt == "<":
+                raise _ShellUncertain("here-document")
+            end_tok()
+            i += 1
+            if i < n and text[i] == "&":
+                i += 1
+            skip_target()
+            continue
+        if ch == ">":
+            end_tok()
+            i += 1
+            if i < n and text[i] == ">":
+                i += 1
+            if i < n and text[i] == "&":
+                i += 1
+            skip_target()
+            continue
+        tok.append(ch)
+        i += 1
+    end_seg()
+    return segs
+
+
+def _lex_shell(text: str) -> list[list[str]]:
+    """Best-effort: a shell string (or the tool's own shell-syntax path)
+    into command segments, including the commands inside $( ), backticks,
+    <( ) and (subshells). Raises _ShellUncertain when the structure can
+    not be checked safely."""
+    cleaned, inner = _extract_subs(str(text))
+    segs = _split_segments(cleaned)
+    for sub in inner:
+        segs.extend(_lex_shell(sub))
+    return segs
+
+
+class _Wrapper:
+    """Option spec for a wrapper program: which flags are boolean, which
+    take a value (their argument is skipped too), which flag's value is a
+    SHELL STRING to lex (env -S, script -c, flock -c), whether leading
+    NAME=value assignments count as options (env), whether the whole
+    payload is only the shell-string value (script), and whether the
+    first positional is data before the real program (timeout duration,
+    flock file, taskset mask, chrt priority)."""
+    __slots__ = ("bools", "values", "shell_value", "assign",
+                 "needs_shell_value", "skip_first")
+
+    def __init__(self, bools=(), values=(), shell_value=(), assign=False,
+                 needs_shell_value=False, skip_first=False):
+        self.bools = set(bools)
+        self.values = set(values)
+        self.shell_value = set(shell_value)
+        self.assign = assign
+        self.needs_shell_value = needs_shell_value
+        self.skip_first = skip_first
+
+
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+_WRAPPERS = {
+    "env": _Wrapper(bools=("-i", "--ignore-environment", "-0", "--null",
+                           "-v", "--debug", "-b"),
+                    values=("-u", "--unset", "--chdir"),
+                    shell_value=("-S",), assign=True),
+    "nice": _Wrapper(values=("-n", "-a")),
+    "ionice": _Wrapper(bools=("-k", "--ignore"),
+                       values=("-c", "-n", "-p", "--class", "--priority",
+                               "--pid")),
+    "nohup": _Wrapper(),
+    "time": _Wrapper(bools=("-p", "-v", "-q", "-a", "--quiet", "--verbose",
+                            "--portability", "--append", "--shell"),
+                     values=("-o", "-f", "--output", "--format")),
+    "stdbuf": _Wrapper(bools=("-F", "--fork"),
+                       values=("-o", "-i", "-e", "--output", "--input",
+                               "--error")),
+    "setsid": _Wrapper(bools=("-c", "--ctty", "-f", "--fork", "-w",
+                              "--wait")),
+    "unbuffer": _Wrapper(),
+    "chrt": _Wrapper(bools=("-p", "-f", "-r", "-i", "-o", "-b", "-R",
+                            "--fifo", "--rr", "--idle", "--other",
+                            "--batch", "--reset-policy"),
+                     skip_first=True),
+    "taskset": _Wrapper(bools=("-p", "-a", "-g"),
+                        values=("-c", "--cpu-list"), skip_first=True),
+    "flock": _Wrapper(bools=("-n", "--nonblock", "-s", "--shared",
+                             "-u", "--unlock", "-x", "--exclusive"),
+                      values=("-w", "--timeout", "--fd"),
+                      shell_value=("-c", "--command"), skip_first=True),
+    "timeout": _Wrapper(bools=("-v", "--verbose", "--preserve-status",
+                               "--foreground"),
+                        values=("-k", "--kill-after", "-s", "--signal"),
+                        skip_first=True),
+    "xargs": _Wrapper(bools=("-0", "--null", "-t", "--verbose", "-r",
+                             "--no-run-if-empty", "-o", "--open-tty",
+                             "-x", "--exit"),
+                      values=("-a", "-d", "-I", "-E", "-n", "-L", "-P",
+                              "-s", "--delimiter", "--replace", "--eof",
+                              "--max-args", "--max-lines", "--max-procs",
+                              "--max-chars", "--argv-file")),
+    "watch": _Wrapper(bools=("-d", "--differences", "-t", "--no-title",
+                             "-b", "--beep", "-e", "--exec", "-x", "-g",
+                             "-c", "--color", "-f", "--follow"),
+                      values=("-n", "--interval", "-w", "--watchinterval",
+                              "--chginterval", "--label")),
+    "script": _Wrapper(bools=("-e", "--return", "--force", "-q", "--quiet",
+                              "-f", "--flush", "-r", "--responsive"),
+                       values=("-o", "--log", "-O", "--log-out",
+                               "-T", "--timing", "-E", "--exit"),
+                       shell_value=("-c", "--command"),
+                       needs_shell_value=True),
+    "command": _Wrapper(bools=("-v", "-V"), values=("-p",)),
+    "exec": _Wrapper(),
+    "builtin": _Wrapper(),
+    "busybox": _Wrapper(),
+}
+
+
+def _shell_c_index(rest: list[str]) -> int | None:
+    """Index of bash/sh's -c flag (possibly bundled: -lc)."""
+    for i, t in enumerate(rest):
+        if t == "-c" or re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", t):
+            return i
+    return None
+
+
+def _unwrap(argv: list[str]):
+    """Inner command candidates hidden behind a wrapper program (the real
+    program of env/nice/timeout/xargs, the -c string of bash/script, the
+    applet of busybox, the payload of find -exec ...). Returns [] for a
+    plain program, None when the payload cannot be located (unknown
+    wrapper flags), and raises _ShellUncertain for an unlexable
+    shell-string payload. sudo/doas themselves never get here: they
+    refuse as the segment head."""
+    if not argv:
+        return []
+    first = _tok_name(argv[0])
+    rest = [str(t) for t in argv[1:]]
+    if first in _SHELLS:
+        idx = _shell_c_index(rest)
+        if idx is None or idx + 1 >= len(rest):
+            return []                    # script FILE: contents unknown
+        return _lex_shell(rest[idx + 1])
+    if first == "find":
+        cands: list[list[str]] = []
+        i = 1
+        while i < len(rest):
+            if rest[i] in ("-exec", "-execdir", "-ok", "-okdir"):
+                prog = []
+                j = i + 1
+                while j < len(rest) and rest[j] not in (";", "+", "\\;"):
+                    prog.append(rest[j])
+                    j += 1
+                if prog:
+                    cands.append(prog)
+                i = j + 1
+            else:
+                i += 1
+        return cands
+    spec = _WRAPPERS.get(first)
+    if spec is None:
+        return []
+    cands = []
+    i = 0
+    while i < len(rest):
+        t = rest[i]
+        if t == "--":
+            i += 1
+            break
+        if spec.assign and _ASSIGN_RE.match(t):
+            i += 1
+            continue
+        if first == "nice" and re.fullmatch(r"-\d+", t):
+            i += 1
+            continue
+        if t.startswith("-") and t != "-":
+            name, eq, val = t.partition("=")
+            if name in spec.shell_value:
+                frag = val if eq else (rest[i + 1] if i + 1 < len(rest) else "")
+                cands.extend(_lex_shell(frag))
+                i += 1 if eq else 2
+                continue
+            if eq or name in spec.values:
+                i += 1 if eq else 2
+                continue
+            if name in spec.bools:
+                i += 1
+                continue
+            return None                  # unknown flag: payload unknown
+        break
+    pos = rest[i:]
+    if spec.needs_shell_value:
+        return cands
+    if pos:
+        cands.append(pos)
+        if spec.skip_first and len(pos) > 1:
+            cands.append(pos[1:])
+    return cands
+
+
+def _scan_command(argv, cwd: str, home: str, depth: int = 0) -> str | None:
+    """The full refusal set over one command, applied RECURSIVELY through
+    wrapper programs. A wrapper whose payload cannot be located is
+    word-scanned for elevation/session names as a safety net."""
+    if not argv:
+        return None
+    denied = (_deny_elevation(argv) or _deny_session_power(argv)
+              or _deny_interactive(argv) or _deny_destroyer(argv, cwd, home))
+    if denied:
+        return denied
+    if depth >= 5:
+        return None
+    try:
+        cands = _unwrap([str(t) for t in argv])
+    except _ShellUncertain:
+        cands = None
+    if cands is None:
+        words = re.findall(r"[A-Za-z0-9._/-]+", " ".join(str(t)
+                                                         for t in argv))
+        for w in words:
+            name = _tok_name(w)
+            if name in ELEVATE:
+                return f"never elevated ({name})"
+            if name in _SESSION_IDS or _is_session_name(name):
+                return (f"kills or controls the session/compositor "
+                        f"({name})")
+        return None
+    for cand in cands:
+        denied = _scan_command(cand, cwd, home, depth + 1)
+        if denied:
+            return denied
+    return None
+
+
+# ── auto-run hardening for git ─────────────────────────────────
+# Auto-run git must not execute REPO-configured programs: external diff
+# drivers and textconv filters come from .git/config (clone a hostile
+# repo and `git diff` runs their code), and `git status` may poll an
+# fsmonitor hook. Read verbs therefore run with these injected.
+_GIT_SAFE_CFG = ["-c", "core.fsmonitor=false", "-c",
+                 "core.hooksPath=/dev/null"]
+_GIT_DIFF_SAFE = ["--no-ext-diff", "--no-textconv"]
+_GIT_DIFF_SAFE_VERBS = {"diff", "show"}
+
+
+def _harden_git_argv(argv: list[str]) -> list[str]:
+    """git + read-only hardening flags (see above); non-git argv as-is."""
+    if not argv or _tok_name(argv[0]) != "git":
+        return list(argv)
+    toks = [str(t) for t in argv[1:]]
+    sub = ""
+    for t in toks:
+        if not t.startswith("-"):
+            sub = _tok_name(t)
+            break
+    out = [argv[0], *_GIT_SAFE_CFG, *toks]
+    if sub in _GIT_DIFF_SAFE_VERBS or (sub == "log"
+                                       and any(t in ("-p", "--patch")
+                                               for t in toks)):
+        out += _GIT_DIFF_SAFE
+    return out
+
+
 def _auto_rule(argv: list[str], cwd: str, home: str) -> bool:
     """True = this single-argv command is on the read-only allowlist."""
     if not argv:
@@ -384,6 +887,12 @@ def _auto_rule(argv: list[str], cwd: str, home: str) -> bool:
         sub = toks[i] if i < len(toks) else ""
         if sub not in _GIT_READ:
             return False
+        # explicit external diff driver / textconv: the repo's own
+        # programs would run — see _harden_git_argv
+        if any(t == "--ext-diff" or t.startswith("--ext-diff=")
+               or t == "--textconv" or t.startswith("--textconv=")
+               for t in toks[i + 1:]):
+            return False
         # --output=<file> and -c overrides anywhere: writes/config noise
         return not any(t == "-c" or t.startswith("--output")
                        for t in toks[i + 1:])
@@ -445,39 +954,24 @@ def decide(command: str, cwd=None, timeout=None, home=None, extra_auto=None,
         or touches_secret(cwd_tok, home)
 
     shell = has_shell_syntax(raw)
-    if shell:
-        segs = _segments(argv_all)
-        for seg in segs:
-            prog = _tok_name(seg[0]) if seg else ""
-            if prog in ELEVATE or (prog == "machinectl"
-                                   and "shell" in _paths(seg[1:])):
-                return Decision(command=raw, mode="refuse",
-                                reason=f"never elevated ({prog})", cwd=cwd_abs,
-                                exists=exists, timeout=tmo, secret_touch=secret,
-                                shell=True)
-            denied = (_deny_session_power(seg) or _deny_interactive(seg)
-                      or _deny_destroyer(seg, cwd_abs, home))
-            if denied:
-                return Decision(command=raw, mode="refuse", reason=denied,
-                                cwd=cwd_abs, exists=exists, timeout=tmo,
-                                secret_touch=secret, shell=True)
-        argv = ["bash", "-c", raw]
-    else:
-        denied = (_deny_session_power(argv_all) or _deny_interactive(argv_all)
-                  or _deny_destroyer(argv_all, cwd_abs, home))
+    too_complex = ("it is too complex to check safely — run it yourself")
+    try:
+        segs = _lex_shell(raw) if shell else [argv_all]
+    except _ShellUncertain:
+        return Decision(command=raw, mode="refuse", reason=too_complex,
+                        cwd=cwd_abs, exists=exists, timeout=tmo,
+                        secret_touch=secret, shell=shell)
+    # The refusal set sees EVERY segment and looks THROUGH wrapper
+    # programs and shell strings (rule 1: refusals hold even with
+    # approval, so `env sudo ls` or `bash -c "ls; rm -rf ~"` must not
+    # sneak in as a mere ask).
+    for seg in segs:
+        denied = _scan_command(seg, cwd_abs, home)
         if denied:
             return Decision(command=raw, mode="refuse", reason=denied,
                             cwd=cwd_abs, exists=exists, timeout=tmo,
-                            secret_touch=secret)
-        if argv_all and (_tok_name(argv_all[0]) in ELEVATE
-                         or (_tok_name(argv_all[0]) == "machinectl"
-                             and "shell" in _paths(argv_all[1:]))):
-            return Decision(command=raw, mode="refuse",
-                            reason=f"never elevated "
-                                   f"({_tok_name(argv_all[0])})",
-                            cwd=cwd_abs, exists=exists, timeout=tmo,
-                            secret_touch=secret)
-        argv = argv_all
+                            secret_touch=secret, shell=shell)
+    argv = ["bash", "-c", raw] if shell else argv_all
 
     base = Decision(command=raw, argv=argv, shell=shell, cwd=cwd_abs,
                     exists=exists, timeout=tmo, secret_touch=secret)
@@ -507,9 +1001,11 @@ def decide(command: str, cwd=None, timeout=None, home=None, extra_auto=None,
     two = prog + " " + _tok_name(argv[1]) if len(argv) > 1 else ""
     if prog in extra or (two and two in extra):
         base.mode = "auto"
+        base.argv = _harden_git_argv(argv)
         return base
     if _auto_rule(argv, cwd_abs, home):
         base.mode = "auto"
+        base.argv = _harden_git_argv(argv)
         return base
     base.mode = "ask"
     base.reason = f"'{prog}' is not on the read-only auto-run allowlist"
