@@ -94,6 +94,7 @@
     import { WalkDirector } from './js/walk.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
              GestureTracker, framingDistance, feetAnchorTarget,
+             sizeChanged, controlsDistanceBand,
              GESTURE_HEADROOM, FOOT_MARGIN_PX, SCALE_MAX } from './js/scale.js';
 
     // desktop.py opens this page with ?desktop=1: see-through background, no click-to-start,
@@ -163,16 +164,24 @@
     scene.add(light);
     if (DESKTOP) scene.add(new THREE.AmbientLight(0xffffff, 0.6));  // no white room to bounce off, so lift the shadows
 
-    addEventListener('resize', () => {
-      camera.aspect = viewW() / viewH();
+    // The size the renderer + camera are framed for right now. The render
+    // loop compares the live canvas size against this EVERY frame (the
+    // size-changed rule in scale.js): the frame the canvas changes size
+    // must be re-framed for the NEW size BEFORE it renders, so a compositor
+    // resize can never paint one frame with stale framing.
+    let framedW = viewW(), framedH = viewH();
+    function syncViewport() {
+      framedW = viewW(); framedH = viewH();
+      camera.aspect = framedW / framedH;
       camera.updateProjectionMatrix();
-      renderer.setSize(viewW(), viewH());
+      renderer.setSize(framedW, framedH);
       if (typeof updateWalkBounds === 'function') updateWalkBounds();
       // THE frame the compositor resized us: re-frame so pixels-per-metre
       // and the feet stay exactly where they were (scale.js invariant) —
       // this is what makes the gesture's grow/fit invisible.
       if (DESKTOP && !manualFrame) applyScaleFrame(scaleShown);
-    });
+    }
+    addEventListener('resize', syncViewport);
 
     // ── Load her ──
     // The avatar is the ACTIVE persona's, served by riko/viewer.py from the hub.
@@ -384,6 +393,12 @@
       const W = viewW(), H = viewH();
       const dist = framingDistance(fitMeasure.dist, H, baseH, v);
       const yt = feetAnchorTarget(fitMeasure.yBot, dist, camera.fov, H, FOOT_MARGIN_PX);
+      // controls.update() clamps the camera radius to its distance band
+      // EVERY frame and rewrites camera.position — the stock 0.5..6 cap
+      // yanked a headroom window's ~8-unit framing distance back to 6 and
+      // cropped her feet for hundreds of ms. Widen the band around OUR
+      // distance so the framing we just computed is what renders.
+      [controls.minDistance, controls.maxDistance] = controlsDistanceBand(dist);
       camera.near = Math.max(0.02, Math.min(0.1, dist * 0.01));
       camera.far = Math.max(20, dist * 6);
       camera.position.set(0, yt, dist);
@@ -826,18 +841,23 @@
       requestAnimationFrame(trackWave);
     }
     if (CAPTURE && WHEEL_ZOOM_QA) {
-      // ?wheelzoom=startMs:count:deltaY:gapMs — fire real wheel events at the
-      // canvas: a synthetic scroll-zoom gesture for frame-by-frame capture.
-      const [g0, gN, gDy, gGap] = String(WHEEL_ZOOM_QA).split(':').map(Number);
-      setTimeout(() => {
-        let fired = 0;
-        const iv = setInterval(() => {
-          renderer.domElement.dispatchEvent(new WheelEvent('wheel', {
-            deltaY: gDy, deltaMode: 0, bubbles: true, cancelable: true,
-          }));
-          if (++fired >= gN) clearInterval(iv);
-        }, gGap);
-      }, g0);
+      // ?wheelzoom=startMs:count:deltaY:gapMs[;same;...] — fire real wheel
+      // events at the canvas: synthetic scroll-zoom gestures for frame-by-
+      // frame capture (several ';' specs test grow THEN shrink in one run;
+      // harness: client/tools/capture_frames.py --gestures).
+      for (const spec of String(WHEEL_ZOOM_QA).split(';')) {
+        const [g0, gN, gDy, gGap] = spec.split(':').map(Number);
+        if (!Number.isFinite(g0) || !Number.isFinite(gN)) continue;
+        setTimeout(() => {
+          let fired = 0;
+          const iv = setInterval(() => {
+            renderer.domElement.dispatchEvent(new WheelEvent('wheel', {
+              deltaY: gDy, deltaMode: 0, bubbles: true, cancelable: true,
+            }));
+            if (++fired >= gN) clearInterval(iv);
+          }, gGap);
+        }, g0);
+      }
     }
     if (CAPTURE) {
       const wokeAt = performance.now();
@@ -1128,6 +1148,9 @@
     const clock = new THREE.Clock();
     renderer.setAnimationLoop(() => {
       const dt = clock.getDelta();
+      // size-changed rule (scale.js): re-frame BEFORE this frame renders,
+      // whatever the native resize event did or did not do yet.
+      if (sizeChanged(viewW(), viewH(), framedW, framedH)) syncViewport();
       if (DESKTOP && !manualFrame) {
         // render the zoom EVERY frame (glide + camera re-frame), and when
         // the wheel has been quiet for GESTURE_IDLE_MS ask the desktop to

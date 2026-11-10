@@ -11,6 +11,7 @@ import {
   GESTURE_HEADROOM, FOOT_MARGIN_PX, clampScale, stepScale,
   dollyDistance, approachScale, headroomWindow, GestureTracker,
   worldHalfHeight, pixelsPerMetre, framingDistance, feetAnchorTarget,
+  sizeChanged, controlsDistanceBand,
 } from './scale.js';
 
 test('clampScale: band, junk -> 1.0', () => {
@@ -196,6 +197,64 @@ test('framing invariant: feet sit FOOT_MARGIN_PX above the canvas bottom at any 
       const ndcFeet = (yFeet - yt) / half;
       const screenY = ((1 - ndcFeet) / 2) * H;
       assert.ok(Math.abs((H - screenY) - FOOT_MARGIN_PX) < 1e-6, `v=${v} H=${H}`);
+    }
+  }
+});
+
+test('size-changed rule: only a real canvas-size change re-frames the render', () => {
+  assert.equal(sizeChanged(500, 537, 500, 537), false);        // unchanged frame
+  assert.equal(sizeChanged(500.3, 537.2, 500, 537), false);    // sub-pixel jitter
+  assert.equal(sizeChanged(878, 942, 500, 537), true);         // headroom grow
+  assert.equal(sizeChanged(500, 538, 500, 537), true);         // 1 px WM nudge
+  assert.equal(sizeChanged(NaN, 537, 500, 537), false);        // junk: never re-frame
+  assert.equal(sizeChanged(500, 537, undefined, undefined), true);  // never framed yet
+});
+
+test('resize-frame rule: the controls distance band always contains THIS frame\'s framing distance', () => {
+  // The QA gesture's actual canvas sequence (base 537 px window, fit dist 3.43):
+  // a 2.457x headroom window framed at a small visual scale sits at ~8 units —
+  // OUTSIDE the stock 0.5..6 OrbitControls band, whose per-frame clamp is what
+  // yanked the camera to 6 and cropped her feet on the resize frames.
+  const fitDist = 3.43, baseH = 537;
+  const seq = [[537, 1.00], [942, 1.01], [1319, 1.06], [1319, 1.24], [1319, 1.45], [777, 1.45]];
+  for (const [H, v] of seq) {
+    const d = framingDistance(fitDist, H, baseH, v);
+    const [mn, mx] = controlsDistanceBand(d);
+    assert.ok(mn <= d && d <= mx, `H=${H} v=${v} dist=${d} band=[${mn}, ${mx}]`);
+  }
+  // small framings keep the stock band (user dolly stays at least as free)
+  assert.deepEqual(controlsDistanceBand(2.0), [0.5, 6]);
+  assert.deepEqual(controlsDistanceBand(0), [0.5, 6]);
+  assert.deepEqual(controlsDistanceBand(NaN), [0.5, 6]);
+});
+
+test('resize continuity: across grow, re-grow and fit, ppm AND feet-from-bottom are identical', () => {
+  // Same visual scale, canvas resized the way the compositor resizes it:
+  // nothing visible may change — pixels-per-metre must stay equal, and the
+  // foot must keep the SAME offset above the canvas bottom (the window's
+  // bottom edge is feet-anchored on screen, so a constant pixel offset from
+  // the canvas bottom is a constant SCREEN position through the resize).
+  // The QA acceptance rule, asserted here in exact math instead of PNGs.
+  const fitDist = 3.43, fov = 30, baseH = 537, yFeet = 0.02;
+  for (const v of [0.8, 1.0, 1.447, 2.3]) {
+    let prev = null;
+    for (const w of [1.0, 1.755, 2.457, v]) {   // base -> grow -> re-grow -> fit
+      const H = Math.round(baseH * w);
+      const d = framingDistance(fitDist, H, baseH, v);
+      const [mn, mx] = controlsDistanceBand(d);
+      const dEff = Math.min(mx, Math.max(mn, d));    // what controls.update() can leave
+      assert.equal(dEff, d, 'band must not move our framing');
+      const yt = feetAnchorTarget(yFeet, d, fov, H);
+      const half = worldHalfHeight(d, fov);
+      const footRow = ((1 - (yFeet - yt) / half) / 2) * H;
+      const ppm = pixelsPerMetre(H, d, fov);
+      const footFromBottom = H - footRow;
+      assert.ok(Math.abs(footFromBottom - FOOT_MARGIN_PX) < 1e-3, `v=${v} w=${w}`);
+      if (prev) {
+        assert.ok(Math.abs(ppm / prev.ppm - 1) < 1e-9, `v=${v} w=${w}: ppm jumped`);
+        assert.ok(Math.abs(prev.footFromBottom - footFromBottom) < 1e-3, `v=${v} w=${w}: feet moved`);
+      }
+      prev = { ppm, footFromBottom };
     }
   }
 });

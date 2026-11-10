@@ -105,7 +105,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not m:
             return self._json({"ok": True})
         kind, t = m.group(1), float(m.group(2))
-        stem = f"{self.scenario}-t{t:05.1f}s-{self.shots}"
+        stem = f"{self.scenario}-t{t:06.2f}s-{self.shots}"
         if kind == "capture":
             data = body.split(",", 1)[1] if "," in body[:64] else body
             name = stem + ".png"
@@ -164,8 +164,8 @@ def main():
     ap.add_argument("--gaze", default=None,
                     help="page ?gaze= offset 'yaw,pitch' in degrees (forced gaze)")
     ap.add_argument("--gestures", default=None,
-                    help="page ?gestures= 'startMs:count:deltaY:gapMs' — synthetic "
-                         "wheel gesture on the canvas (for the zoom scenario)")
+                    help="page ?gestures= 'startMs:count:deltaY:gapMs[;...]' — synthetic "
+                         "wheel gesture(s) on the canvas, ';' separates bursts (zoom scenario)")
     args = ap.parse_args()
 
     force, events = SCENARIOS[args.scenario]

@@ -179,3 +179,37 @@ export function feetAnchorTarget(yFeet, dist, fovDeg, canvasH, footMarginPx = FO
   const f = 1 - (2 * footMarginPx) / Math.max(1, Number(canvasH) || 1);
   return yFeet + half * f;
 }
+
+/**
+ * THE size-changed rule: a frame whose canvas client size differs from the
+ * size the renderer + camera were last framed for MUST be re-framed (and
+ * renderer.setSize'd) BEFORE it renders. A compositor resize can land in
+ * the same frame it is painted, and the native 'resize' event is not
+ * guaranteed to run before the next render — so the render loop compares
+ * sizes itself every frame instead of trusting the event. Non-finite or
+ * sub-pixel jitter counts as unchanged; anything else re-frames.
+ */
+export function sizeChanged(curW, curH, appliedW, appliedH) {
+  const w = Number(curW), h = Number(curH);
+  if (!Number.isFinite(w) || !Number.isFinite(h)) return false;
+  const a = Number(appliedW), b = Number(appliedH);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return true;   // never framed yet
+  return Math.abs(w - a) > 0.5 || Math.abs(h - b) > 0.5;
+}
+
+/**
+ * The OrbitControls [minDistance, maxDistance] band that lets THIS frame's
+ * framing distance through. controls.update() clamps the camera radius to
+ * that band EVERY frame and rewrites camera.position — with the stock
+ * 0.5..6 band, a headroom window's framing distance (fitDist x canvas/base,
+ * ~8 px at a 2.45x grow) got yanked back to 6 after applyScaleFrame set it,
+ * cropping her feet for every frame until the visual glide pulled the true
+ * distance back under the cap. The band grows to always contain dist with
+ * margin, and never shrinks below the stock defaults, so user dolly stays
+ * at least as free as before.
+ */
+export function controlsDistanceBand(dist, minDistance = 0.5, maxDistance = 6) {
+  const d = Number(dist);
+  if (!Number.isFinite(d) || d <= 0) return [minDistance, maxDistance];
+  return [Math.min(minDistance, d * 0.8), Math.max(maxDistance, d * 1.2)];
+}
