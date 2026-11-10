@@ -46,7 +46,8 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QApplication, QInputDialog, QLineEdit, QMenu,
                                QSystemTrayIcon)
 
-from riko import appstate, asr, avatar_scale, client_tools, hub_client, shortcuts, tts, viewer
+from riko import appstate, asr, avatar_scale, client_tools, hub_client, shortcuts, touch_desk
+from riko import tts, viewer
 from riko import roam as roam_state
 from riko.config import load_config
 from riko.music import oauth_local as music_oauth
@@ -58,6 +59,10 @@ APP_ID = "riko"  # Wayland app_id / X11 class; window rules match on these
 # Commands that need the Qt thread (they poke the page or the window). 'wave'
 # asks the page's director for a social wave (same one the W shortcut fires).
 PAGE_CMDS = {"type", "hide-input", "toggle", "show", "hide", "quit", "wave", "reset-size"}
+# kinds the page's recogniser may POST /control/touch with (docs/TOUCH.md;
+# sit/stand arrive from the sit-edge watcher, not the page)
+TOUCH_KINDS = {"pat", "poke", "tickle", "grab", "hold", "release", "action",
+               "sit", "stand"}
 WAVE_JS = "window.riko && riko.requestWave && riko.requestWave()"
 
 
@@ -127,6 +132,13 @@ class AvatarWindow(QWebEngineView):
         self.input_open = False
         self.approval_keys: Optional[Callable[[object], bool]] = None  # set by main(): answer approvals on RELEASE
         self._drag_target = None
+        # touch & posing (docs/TOUCH.md): pure press-arbitration machine
+        # (riko/touch_desk.py) + the latest /control/bbox post (parts rects,
+        # hips_y) + main()'s sit-edge poller arm hook.
+        self._arb = touch_desk.PressArbiter()
+        self.last_bbox: dict = {}
+        self.sit_state: dict = {"sitting": None}
+        self.sit_watch: Optional[Callable[[], None]] = None
         self.on_focus: Optional[Callable[[], None]] = None  # chat.read report on focus (docs/TIMERS.md D)
 
         self.setWindowTitle("Riko")
@@ -164,13 +176,48 @@ class AvatarWindow(QWebEngineView):
                 and self.approval_keys is not None
                 and self.approval_keys(event)):
             return True   # approval answered on key RELEASE (seat collision)
-        if (event.type() == QEvent.Type.MouseButtonPress
+        et = event.type()
+        if (et == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton
                 and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
                 and not getattr(self, "roam_strip", False)   # strip: drags move HER, not the window
                 and not (self.input_open and event.position().y() > self.height() - 80)):
-            self.windowHandle().startSystemMove()
-            return True
+            # press arbitration (docs/TOUCH.md): anywhere off a limb = the
+            # old instant window drag; on a limb the press goes THROUGH and
+            # we only escalate to a drag if the cursor moves > 6 px within
+            # 250 ms — a still hold >= 250 ms leaves the page a limb grab.
+            pos = event.position()
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                pass  # Ctrl+press = force the limb grab: the page's, no drag
+            else:
+                act = self._arb.press(
+                    pos.x(), pos.y(), touch_desk.now_ms(),
+                    inside_limb=touch_desk.limb_at(self.last_bbox,
+                                                   pos.x(), pos.y()) is not None)
+                if act == touch_desk.MOVE:
+                    if self.sit_watch:
+                        self.sit_watch()      # watch the edge for 3 s
+                    handle = self.windowHandle()
+                    if handle is not None:
+                        handle.startSystemMove()
+                        return True           # consumed: the page must NOT see it
+                # DEFER / PASS: pass the press through (limb grab or tap)
+        elif et == QEvent.Type.MouseMove and self._arb.pending:
+            pos = event.position()
+            if self._arb.motion(pos.x(), pos.y(),
+                                touch_desk.now_ms()) == touch_desk.MOVE:
+                if self.sit_watch:
+                    self.sit_watch()
+                handle = self.windowHandle()
+                if handle is not None:
+                    handle.startSystemMove()  # button still held: Qt allows it
+                    return True
+        elif (et == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton):
+            was_drag = self._arb.state == touch_desk.PressArbiter.MOVING
+            self._arb.release(touch_desk.now_ms())   # never consume it
+            if was_drag and self.sit_watch:
+                self.sit_watch()   # 3 more s of edge polling: the drop settles
         return super().eventFilter(obj, event)
 
     def js(self, code):
@@ -185,6 +232,83 @@ class AvatarWindow(QWebEngineView):
             except Exception as e:  # a hub hiccup must not eat the event
                 print(f"[hub] on_focus: {type(e).__name__}: {e}")
         super().changeEvent(event)
+
+
+def _hypr_json_rows():
+    """(clients, monitors) from two read-only `hyprctl ... -j` calls
+    (Hyprland sessions only; tests inject a fake runner with fixtures)."""
+    out = []
+    for what in ("clients", "monitors"):
+        cp = subprocess.run(["hyprctl", what, "-j"], capture_output=True,
+                            text=True, timeout=3)
+        out.append(json.loads(cp.stdout))
+    return out[0], out[1]
+
+
+class SitEdgeMonitor(QObject):
+    """Sit-on-screen-edge glue (docs/TOUCH.md) over touch_desk.SitWatcher.
+
+    Polls at 4 Hz ONLY for 3 s after a drag starts / a drop / at startup —
+    never continuously. The monitor's usable bottom edge comes from read-
+    only hyprctl rows on Hyprland (same logical space as the scroll-zoom
+    sizer; a floating window hanging off-screen is the sit case) and from
+    Qt's logical screen geometry everywhere else (X11/KDE). Verdicts leave
+    as `sit:<edge_y_css>` / `stand` through on_cmd (bridge.command), and
+    the Qt-thread rule is honoured exactly like every other tray worker.
+    """
+
+    def __init__(self, win, cfg: dict | None = None, runner=None, parent=None):
+        super().__init__(parent)
+        cfg = cfg or {}
+        self.win = win
+        self.enabled = bool(cfg.get("sit_detection", True))
+        self._runner = runner or _hypr_json_rows
+        self.watcher = touch_desk.SitWatcher(
+            sit_delta=float(cfg.get("sit_delta", touch_desk.SIT_DELTA)),
+            stand_gap=float(cfg.get("stand_gap", touch_desk.STAND_GAP)),
+            republish=float(cfg.get("republish_px", touch_desk.REPUBLISH_PX)))
+        self.on_cmd: Optional[Callable[[str], None]] = None
+        self._until = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(int(touch_desk.POLL_INTERVAL_S * 1000))
+        self._timer.timeout.connect(self._tick)
+
+    def arm(self, seconds: float = touch_desk.POLL_WINDOW_S):
+        """Poll for `seconds` from NOW (each drag event re-arms the window)."""
+        if not self.enabled:
+            return
+        self._until = time.monotonic() + float(seconds)
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _tick(self):
+        if time.monotonic() >= self._until:
+            self._timer.stop()
+            return
+        cmd = self.watcher.update(
+            (self.win.last_bbox or {}).get("hips_y"), self.edge_y_css())
+        if cmd and self.on_cmd:
+            self.on_cmd(cmd)
+
+    def edge_y_css(self):
+        """The sit line in window CSS px (px of window height above the
+        monitor's usable bottom), or None while unknown."""
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            try:
+                clients, monitors = self._runner()
+            except Exception:
+                clients = monitors = None
+            if clients is not None:
+                return touch_desk.edge_y_from_hypr(
+                    clients, monitors,
+                    lambda c: str(c.get("initialClass") or c.get("class") or "") == APP_ID)
+        handle = self.win.windowHandle()
+        screen = handle.screen() if handle is not None else None
+        if screen is None:
+            return None
+        # Qt's geometry is device-independent already (hyprctl's scale math
+        # was done in touch_desk/avatar_scale); CSS px == Qt logical px here.
+        return float(screen.geometry().bottom() + 1 - handle.frameGeometry().top())
 
 
 def _tray_icon():
@@ -1042,6 +1166,34 @@ def main():
     roamc.filter = _NativeFilter(roamc)   # RoamController keeps it alive: Qt does not own it
     app.installNativeEventFilter(roamc.filter)
 
+    # ── Touch & posing (docs/TOUCH.md) ─────────────────────────────────
+    # The page recognises pat/poke/tickle/grab and POSTs /control/touch;
+    # we forward to the hub OFF every HTTP/Qt thread and play whatever she
+    # decides to say like any other reply. The sit-edge watcher arms on
+    # drags and at startup only (4 Hz, 3 s — never continuously).
+    touch_cfg = (((cfg.get("desktop") or {}).get("touch")) or {})
+
+    def forward_touch(kind, part=None, hold_ms=None):
+        def worker():
+            try:
+                reply = hub_client.get().touch(kind, part=part, hold_ms=hold_ms)
+            except Exception as e:  # hub down / old hub: local reaction stands alone
+                print(f"[touch] forward {kind} failed: {type(e).__name__}: {e}",
+                      flush=True)
+                return
+            session.play_touch(reply)
+        threading.Thread(target=worker, daemon=True).start()
+
+    sit_edge = SitEdgeMonitor(win, touch_cfg)
+
+    def _sit_cmd(cmd):
+        bridge.command.emit(cmd)   # on_command forwards to the page (Qt thread)
+        forward_touch("sit" if cmd.startswith("sit:") else "stand")
+    sit_edge.on_cmd = _sit_cmd
+    win.sit_watch = sit_edge.arm
+    sit_edge.arm()                    # where is she sitting right now?
+    QTimer.singleShot(2500, sit_edge.arm)   # ... and once the page posts hips
+
     def show_window():
         if roamc.enabled and not roamc.in_strip:
             roamc.enter_strip()      # strip flags + size + bottom-edge placement
@@ -1098,6 +1250,18 @@ def main():
                 request_avatar_scale(float(parts[1]), float(parts[2]), parts[3] == "1")
             except (ValueError, IndexError):
                 pass
+        elif cmd.startswith("sit:") or cmd == "stand":
+            # sit-on-edge verdicts (docs/TOUCH.md): the page pins her hips
+            # to the line / blends back to standing
+            viewer.emit("command", cmd=cmd)
+            win.js(f"window.riko && riko.onCommand && riko.onCommand({json.dumps(cmd)})")
+        elif cmd.startswith("touch-mode:"):  # tray ▸ Touch reactions → page
+            mode = cmd.partition(":")[2]
+            act = touch_actions.get(mode)
+            if act is not None:
+                act.setChecked(True)
+            viewer.emit("command", cmd=cmd)
+            win.js(f"window.riko && riko.onCommand && riko.onCommand({json.dumps(cmd)})")
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
 
@@ -1338,11 +1502,33 @@ def main():
             return {"ok": True}
         elif cmd == "bbox":
             # her projected body box (page coords = window coords), ~10 Hz:
-            # desktop.py shapes the click-through input region from this
+            # desktop.py shapes the click-through input region from this,
+            # the press arbiter hit-tests args["parts"] limb rects from it
+            # and the sit watcher reads args["hips_y"] (docs/TOUCH.md)
+            win.last_bbox = args
             try:
                 roamc.update_bbox(args["x"], args["y"], args["w"], args["h"])
             except (KeyError, TypeError, ValueError):
                 return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
+            return {"ok": True}
+        elif cmd == "touch":
+            # the page's gesture recogniser (docs/TOUCH.md): forward to the
+            # hub on a worker thread — this HTTP thread never waits on it
+            kind = str(args.get("kind") or "")
+            if kind not in TOUCH_KINDS:
+                return {"ok": False, "error": f"unknown touch kind {kind!r}"}
+            part = args.get("part")
+            part = str(part)[:32] if part else None
+            hold = args.get("hold_ms")
+            hold_ms = (float(hold) if isinstance(hold, (int, float))
+                       and not isinstance(hold, bool) else None)
+            forward_touch(kind, part, hold_ms)
+            return {"ok": True}
+        elif cmd == "sit-state":
+            # the page finished blending the sit pose in/out (docs/TOUCH.md)
+            win.sit_state["sitting"] = bool(args.get("sitting"))
+            print(f"[touch] sit-state: {'sitting' if win.sit_state['sitting'] else 'standing'}",
+                  flush=True)
             return {"ok": True}
         elif cmd == "avatar-scale":
             # scroll over her = her zoom: the PAGE renders the visual zoom
@@ -1474,6 +1660,40 @@ def main():
     dictation_action = build_dictation_action(menu, typing_svc, _dictation_apply)
     stop_typing_action = build_stop_typing_action(menu, typing_svc, command_pack)
 
+    # ── Touch reactions (docs/TOUCH.md): Off / Quiet / Chatty ───────────
+    # Writes the hub's touch.mode — the SAME settings block the web
+    # Settings ▸ Touch card edits — then echoes `touch-mode:<m>` through
+    # the bridge: tray tick + page (instant reactions on/off) land on one
+    # truth. The hub owns the value: startup re-reads it below, so changes
+    # made in the web UI while we run stay honest after the next start.
+    touch_menu = QMenu("Touch reactions", menu)
+    touch_group = QActionGroup(touch_menu)
+    touch_actions: dict = {}
+    for _mode, _label in (("off", "Off"), ("quiet", "Quiet"), ("chatty", "Chatty")):
+        _act = touch_menu.addAction(_label)
+        _act.setCheckable(True)
+        _act.setActionGroup(touch_group)
+        _act.triggered.connect(lambda checked, m=_mode: set_touch_mode(m))
+        touch_actions[_mode] = _act
+
+    def set_touch_mode(mode):
+        def worker():   # hub PUT off the Qt thread
+            try:
+                hub_client.get().save_touch_mode(mode)
+            except Exception as e:
+                tray.showMessage("Riko", f"touch mode not saved: {e}", 6000)
+            bridge.command.emit(f"touch-mode:{mode}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def touch_sync():   # startup: the hub's mode -> tray tick + the page
+        try:
+            st = hub_client.get().settings() or {}
+            mode = str((st.get("touch") or {}).get("mode") or "quiet")
+        except Exception:
+            mode = "quiet"
+        bridge.command.emit(f"touch-mode:{mode if mode in touch_actions else 'quiet'}")
+    threading.Thread(target=touch_sync, daemon=True).start()
+
     # ── Music phase 1 (docs/SPOTIFY_NOTES.md) ───────────────────────────
     # spotifyd is the Spotify Connect device named after the persona
     # (default 'Riko') the hub's spotify_* tools steer. managed = Riko
@@ -1513,6 +1733,7 @@ def main():
     menu.addAction(sense_action)
     menu.addAction(dictation_action)
     menu.addAction(stop_typing_action)
+    menu.addMenu(touch_menu)
     for label, fn in ((f"Show / hide{hint('hide')}", toggle_window),
                       (f"Forget the chat{hint('forget')}", session.forget),
                       ("Reset size", lambda checked=None: on_command("reset-size")),

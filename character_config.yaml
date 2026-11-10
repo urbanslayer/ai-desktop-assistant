@@ -122,6 +122,18 @@ desktop:
                        # riding her startup wave). false = stay quiet until you
                        # talk to her.
 
+  # Touch & posing (docs/TOUCH.md). The page always does its instant local
+  # reactions, and press arbitration is always on: press still >= 250 ms on
+  # a limb grabs it, moving > 6 px within 250 ms drags the window, Ctrl+press
+  # forces the grab. Whether she SPEAKS about a touch is the hub's touch.mode
+  # (tray Touch reactions / web Settings > Touch), not something here.
+  touch:
+    sit_detection: true  # false = never watch the screen edge: no sit:/stand
+    # sit_delta: 8       # hips within this many CSS px of the monitor's
+                         # bottom edge -> she sits (sit:<edge_y> to the page)
+    # stand_gap: 40      # hips this far above the edge while sitting -> stand
+    # republish_px: 4    # edge moved by this much -> re-emit sit:<edge_y>
+
   # Music phase 1 (docs/SPOTIFY_NOTES.md): Spotify playback on this PC.
   # The hub only steers Spotify Connect (Web API); the sound here comes
   # from spotifyd, a headless Connect daemon. Riko NEVER installs it:

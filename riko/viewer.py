@@ -8,7 +8,9 @@ so the next turn only starts after she has finished talking.
 The desktop app and riko-ctl talk to the same server:
     POST /say            {"text": "..."}                you typed something
     POST /control/<cmd>  {"...": ...}                   talk / talk-start / talk-stop /
-                                                        type / forget / persona ...
+                                                        type / forget / persona /
+                                                        bbox (+parts, hips_y) /
+                                                        touch / sit-state (docs/TOUCH.md) ...
 
 GET /avatar.vrm streams the ACTIVE persona's avatar from the hub (cached on
 disk by id + version), so the page never talks to the hub or needs its key.

@@ -610,6 +610,23 @@ class Session:
                 self._hub_audio_down = True
             return None
 
+    def play_touch(self, reply):
+        """Play a POST /api/touch reaction exactly like a chat reply:
+        bubble + TTS + actions (docs/TOUCH.md). Runs on the touch-forward
+        worker thread — viewer.play waits for the clip. reacted=false
+        (off / cooldown / limit / busy / silent kind) returns at once."""
+        if not reply or not (reply.get("reacted") or reply.get("spoke")):
+            return
+        text = str(reply.get("text") or "").strip()
+        if not text:
+            return
+        try:
+            self._speak(text, audio_url=reply.get("audio_url"),
+                        emotion=reply.get("emotion") or "neutral",
+                        actions=reply.get("actions") or [])
+        except Exception as e:  # a torn-down hub must not kill the touch path
+            print(f"[touch] could not play her reaction: {type(e).__name__}: {e}")
+
     def _greeting_audio_url(self, persona):
         """Where the hub keeps a persona's greeting audio (only with tts: hub);
         None on an old hub without voice fields or when her voice is off."""
