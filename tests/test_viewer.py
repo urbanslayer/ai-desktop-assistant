@@ -63,7 +63,20 @@ def test_settings_returns_desktop_section_plus_active_persona(base_url, hub_conn
     defaults, _ = resolve(None, warn=False)
     body = requests.get(f"{base_url}/settings", timeout=5).json()
     assert body == {"width": 420, "height": 680, "bubble_seconds": 8,
-                    "shortcuts": defaults, "persona_name": "Riko", "roam_x": None}
+                    "shortcuts": defaults, "persona_name": "Riko", "roam_x": None,
+                    "avatar_scale": 1.0}  # nobody scrolled yet -> plain default
+
+
+def test_settings_echoes_saved_avatar_scale(base_url, hub_connected,
+                                            monkeypatch, tmp_path):
+    # scroll-to-size is remembered PER PERSONA: /settings carries the saved
+    # value so the page seeds its scale on load and on persona switches
+    from riko import appstate, hub_client
+    monkeypatch.setenv("RIKO_APP_STATE_DIR", str(tmp_path / "state"))
+    pid = (hub_client.active_persona() or {}).get("id")
+    assert appstate.save_scale(pid, 1.4) is True
+    body = requests.get(f"{base_url}/settings", timeout=5).json()
+    assert body["avatar_scale"] == 1.4
 
 
 def test_desktop_settings_resolves_and_warns(capsys):

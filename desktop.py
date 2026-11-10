@@ -15,7 +15,13 @@ desktop.shortcuts in character_config.yaml; defaults:
     Ctrl+Q                   quit (also in the tray menu)
 With the mouse:
     drag            move the window          right-drag  turn her around
-    shift-drag      move her inside it       scroll      zoom
+    shift-drag      move her inside it       scroll      size her up/down
+                                                  (the window grows with her,
+                                                   feet stay put, fits the
+                                                   monitor; remembered per
+                                                   persona)
+    Ctrl+scroll     camera close-up          dblclick    reset size + camera
+                                                  (the tray has Reset size too)
 
 Want the same from any window? Those are optional, not part of the app:
 bin/riko-ctl hits her local port from a keybind or script (see its --help),
@@ -40,7 +46,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QApplication, QInputDialog, QLineEdit, QMenu,
                                QSystemTrayIcon)
 
-from riko import asr, client_tools, hub_client, shortcuts, tts, viewer
+from riko import appstate, asr, avatar_scale, client_tools, hub_client, shortcuts, tts, viewer
 from riko import roam as roam_state
 from riko.config import load_config
 from riko.session import Session
@@ -49,7 +55,7 @@ APP_ID = "riko"  # Wayland app_id / X11 class; window rules match on these
 
 # Commands that need the Qt thread (they poke the page or the window). 'wave'
 # asks the page's director for a social wave (same one the W shortcut fires).
-PAGE_CMDS = {"type", "hide-input", "toggle", "show", "hide", "quit", "wave"}
+PAGE_CMDS = {"type", "hide-input", "toggle", "show", "hide", "quit", "wave", "reset-size"}
 WAVE_JS = "window.riko && riko.requestWave && riko.requestWave()"
 
 
@@ -109,7 +115,7 @@ class AvatarPage(QWebEnginePage):
 
 
 class AvatarWindow(QWebEngineView):
-    def __init__(self, cfg):
+    def __init__(self, cfg, scale: float = avatar_scale.SCALE_DEFAULT):
         super().__init__()
         # setPage() rather than the QWebEngineView(page) constructor: through the
         # constructor PySide6 keeps the view's own default page and our console
@@ -127,7 +133,11 @@ class AvatarWindow(QWebEngineView):
         # Without this the render widget gets its own native window, which breaks
         # the translucent background and leaves a black strip on resized Wayland windows.
         self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
-        self.resize(int(d.get("width", 420)), int(d.get("height", 680)))
+        # Open at the persona's saved scroll-to-size (avatar_scale.json):
+        # base window x scale, same mapping the page's wheel drives later.
+        s = avatar_scale.clamp_scale(scale)
+        self.resize(round(int(d.get("width", 420)) * s),
+                    round(int(d.get("height", 680)) * s))
 
         self.page().setBackgroundColor(Qt.GlobalColor.transparent)
         s = self.settings()
@@ -335,7 +345,7 @@ def _layer_shell_probe():
 class RoamController(QObject):
     """Owns strip placement + the click-through input region (docs/WALK_MEMORY.md W)."""
 
-    def __init__(self, win, cfg, tray=None):
+    def __init__(self, win, cfg, tray=None, scale: float = avatar_scale.SCALE_DEFAULT):
         super().__init__()
         d = cfg.get("desktop") or {}
         self.win = win
@@ -352,15 +362,38 @@ class RoamController(QObject):
         self._printed = False
         self._last_print = 0.0
         self.filter: object = None  # keepalive ref: Qt does NOT own the filter object
-        # strip size: full screen width, the configured window height (clamped
-        # to 60% of the screen so a tall monitor keeps a visible "band" feel)
+        self.on_leave: Optional[Callable[[], None]] = None  # main(): restore the scaled small window
+        # strip size: full screen width, the base window height x the avatar
+        # scale — bigger her, taller the band — clamped by
+        # riko/roam.strip_geometry (min height, 60% of the screen so a tall
+        # monitor keeps a visible "band" feel) and anchored to the bottom edge
+        self.base_h = int(d.get("height", 680))
+        self.scale = avatar_scale.clamp_scale(scale)
         scr = QGuiApplication.primaryScreen()
         geo = scr.availableGeometry()
-        self.strip_h = max(200, min(int(d.get("height", 680)), int(geo.height() * 0.6)))
-        self.strip_geom = (geo.x(), geo.y() + geo.height() - self.strip_h,
-                           geo.width(), self.strip_h)
+        self.strip_geom = roam_state.strip_geometry(
+            (geo.x(), geo.y(), geo.width(), geo.height()), self.base_h, self.scale)
+        self.strip_h = self.strip_geom[3]
         # native events (X11 ButtonPress forwarding) only matter on the xcb path
         self._bypass = False
+
+    def set_scale(self, scale):
+        """Avatar scale changed (scroll): the strip grows/shrinks with her —
+        full width, bottom edge anchored, height = base x scale (clamped).
+        walk bounds and the click-through mask follow on the next page
+        posts (the window resize itself re-triggers them)."""
+        self.scale = avatar_scale.clamp_scale(scale)
+        scr = QGuiApplication.primaryScreen()
+        geo = scr.availableGeometry()
+        self.strip_geom = roam_state.strip_geometry(
+            (geo.x(), geo.y(), geo.width(), geo.height()), self.base_h, self.scale)
+        self.strip_h = self.strip_geom[3]
+        if self.in_strip and self.backend == "xcb":
+            x, y, w, h = self.strip_geom
+            self.win.setFixedSize(w, h)
+            self.win.resize(w, h)
+            self._place(x, y, w, h)
+            self.apply_bbox()
 
     # ── method selection ──────────────────────────────────────────────
     def pick_backend(self):
@@ -436,6 +469,8 @@ class RoamController(QObject):
         self.win.setFixedSize(16777215, 16777215)   # QWIDGETSIZE_MAX: free resize again
         self._clear_region()
         self.win.show()
+        if self.on_leave:
+            self.on_leave()   # main(): back to the scaled small window, not full width
         print("[roam] back to the small window", flush=True)
 
     # ── X plumbing ─────────────────────────────────────────────────────
@@ -889,16 +924,22 @@ def main():
     # Ask the compositor to float/size/pin her before the window maps (Hyprland only;
     # mapping tiled and resizing afterwards leaves QtWebEngine's surface short).
     # In strip mode the window is override-redirect (unmanaged), so rules don't apply.
+    # The size is the base window x the persona's saved scroll-to-size, so the
+    # scroll = window-size feature starts from where the owner left off.
     d = cfg.get("desktop") or {}
-    ruled = False if _roam_wanted else _hyprland_rule(int(d.get("width", 420)), int(d.get("height", 680)))
-    win = AvatarWindow(cfg)
+    base_w, base_h = int(d.get("width", 420)), int(d.get("height", 680))
+    pid0 = (hub_client.active_persona() or {}).get("id") or "default"
+    scale0 = avatar_scale.clamp_scale(appstate.load_scale(pid0) or d.get("avatar_scale", 1.0))
+    win_w, win_h = round(base_w * scale0), round(base_h * scale0)
+    ruled = False if _roam_wanted else _hyprland_rule(win_w, win_h)
+    win = AvatarWindow(cfg, scale=scale0)
     win.on_focus = hub_client.note_chat_read  # focus = her chat was seen (docs/TIMERS.md D)
     # Approvals answered by a physical key in her window resolve on key
     # RELEASE (the injected Enter must not collide with the held approval
     # Enter on the Wayland seat — see make_approval_key_handler).
     win.approval_keys = make_approval_key_handler(win, runtime)
     bridge = Bridge()
-    roamc = RoamController(win, cfg)
+    roamc = RoamController(win, cfg, scale=scale0)
     win.roam_strip = False
     roamc.filter = _NativeFilter(roamc)   # RoamController keeps it alive: Qt does not own it
     app.installNativeEventFilter(roamc.filter)
@@ -950,8 +991,77 @@ def main():
             on = cmd.partition(":")[2] == "on"
             dictation_action.setChecked(on)
             tray.setToolTip("Riko — dictating" if on else "Riko")
+        elif cmd == "reset-size":  # tray Reset size: the page resets scale +
+            # camera and POSTs scale 1.0 back through /control/avatar-scale
+            win.js("window.riko && riko.resetSize && riko.resetSize()")
+        elif cmd.startswith("avatar-scale:"):  # scroll = size her (see below)
+            try:
+                request_avatar_scale(float(cmd.partition(":")[2]))
+            except ValueError:
+                pass
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
+
+    # ── Scroll = size her ────────────────────────────────────────────────
+    # The page owns the requested scale (plain wheel over her, 0.4–2.5,
+    # scale.js) and POSTs it to /control/avatar-scale at <= 20 Hz with the
+    # final value when the wheel stops; the page camera keeps its fit-to-body
+    # framing, so a bigger window is simply a bigger her — never a crop.
+    # Here the Qt thread resizes the real window with her FEET anchored
+    # (riko/avatar_scale.scaled_geometry) and persists per persona.
+    # A plain Qt resize covers X11/KDE (move works there); GNOME may refuse
+    # the move — the resize still happens. Under Hyprland Wayland clients
+    # can't size or place themselves, so resize AND move go through the
+    # compositor for HER OWN window only (Lua hl.dsp.window.* selected by
+    # address, legacy hyprlang by class — riko/avatar_scale picks the
+    # syntax with riko/desktop_sense's config-style detection). Each
+    # Hyprland apply costs reads + compositor dispatches that can stall, so
+    # requests COALESCE: apply right away when quiet, else keep the newest
+    # and re-apply on a 120 ms trailing timer — the page's final value
+    # always lands. Clamping to the monitor happens in the pure math: past
+    # the fit limit the size stops growing, nothing else changes.
+    scale_state = {"want": None, "applied": None, "cur": scale0}
+    scale_timer = QTimer()
+    scale_timer.setSingleShot(True)
+    scale_timer.setInterval(120)
+
+    def apply_avatar_scale(scale, persist=True):
+        """Qt thread: put the window (or the roam strip) at `scale`."""
+        s = avatar_scale.clamp_scale(scale)
+        scale_state["cur"] = s
+        if roamc.in_strip:
+            roamc.set_scale(s)   # band height follows, bottom edge anchored
+        elif os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):
+            res = avatar_scale.apply_hyprland_scale(s, base_w, base_h, APP_ID)
+            if not res.get("ok"):
+                print(f"[size] hyprland: {res.get('error')}", flush=True)
+        else:
+            scr = win.screen() or QGuiApplication.primaryScreen()
+            g = scr.availableGeometry()
+            x, y, w, h = avatar_scale.scaled_geometry(
+                (g.x(), g.y(), g.width(), g.height()),
+                (win.x(), win.y(), win.width(), win.height()), base_w, base_h, s)
+            win.resize(w, h)
+            win.move(x, y)   # grow upward from the feet where the WM allows it
+        if persist:
+            pid = (hub_client.active_persona() or {}).get("id") or "default"
+            appstate.save_scale(pid, s)
+
+    def request_avatar_scale(s):
+        """Newest requested scale (bridge thread == Qt thread here)."""
+        scale_state["want"] = s
+        if not scale_timer.isActive():
+            apply_avatar_scale(s)
+            scale_state["applied"] = s
+        scale_timer.start()   # trailing catch-up for anything newer
+
+    def _scale_timer_fire():
+        if scale_state["want"] != scale_state["applied"]:
+            apply_avatar_scale(scale_state["want"])
+            scale_state["applied"] = scale_state["want"]
+            scale_timer.start()   # newer still? keep catching up
+    scale_timer.timeout.connect(_scale_timer_fire)
+    roamc.on_leave = lambda: apply_avatar_scale(scale_state["cur"], persist=False)
 
     def control(cmd, args=None):  # runs on the HTTP thread; args is the JSON body
         args = args or {}
@@ -996,6 +1106,7 @@ def main():
             return {"ok": True, "recording": session.recorder.recording,
                     "visible": win.isVisible(), "listen_mode": session.listen_mode,
                     "name_gate": session.name_gate,
+                    "avatar_scale": scale_state["cur"],
                     "dictation": typing_svc.dictation.status() if typing_svc else None}
         elif cmd == "name-gate":
             # riko-ctl name-gate on|off (and the `riko-ctl listen name-gate`
@@ -1116,6 +1227,20 @@ def main():
             except (KeyError, TypeError, ValueError):
                 return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
             return {"ok": True}
+        elif cmd == "avatar-scale":
+            # scroll over her = her size: the page asks for a scale and the
+            # desktop resizes the window (feet anchored, monitor-clamped) and
+            # persists it per persona. Numbers only; the band clamp lives in
+            # riko/avatar_scale so page and desktop can't drift apart.
+            try:
+                s = float(args.get("scale"))
+            except (TypeError, ValueError):    # missing, None or text
+                return {"ok": False, "error": "avatar-scale: numeric scale (0.4 - 2.5)"}
+            if s != s or s in (float("inf"), float("-inf")):
+                return {"ok": False, "error": "avatar-scale: numeric scale (0.4 - 2.5)"}
+            s = avatar_scale.clamp_scale(s)
+            bridge.command.emit(f"avatar-scale:{s:.4f}")
+            return {"ok": True, "scale": s}
         elif cmd in PAGE_CMDS:  # type / hide-input / toggle / show / hide / quit / wave
             bridge.command.emit(cmd)
         else:
@@ -1220,8 +1345,13 @@ def main():
     menu.addAction(stop_typing_action)
     for label, fn in ((f"Show / hide{hint('hide')}", toggle_window),
                       (f"Forget the chat{hint('forget')}", session.forget),
+                      ("Reset size", lambda checked=None: on_command("reset-size")),
                       (f"Quit{hint('quit')}", app.quit)):
         action = QAction(label, menu)
+        if label == "Reset size":
+            action.setToolTip("back to normal size (plain scroll) and normal "
+                              "camera (Ctrl+scroll); double-clicking her does "
+                              "the same")
         action.triggered.connect(fn)
         menu.addAction(action)
     listen_action.setChecked(session.listen_mode == "always")
@@ -1300,7 +1430,7 @@ def main():
     show_window()
     roamc.tray = tray
     if not _roam_wanted:
-        QTimer.singleShot(400, lambda: _hyprland_setup(int(d.get("width", 420)), int(d.get("height", 680)), ruled))
+        QTimer.singleShot(400, lambda: _hyprland_setup(win_w, win_h, ruled))
 
     code = app.exec()
     if session.recorder.recording:

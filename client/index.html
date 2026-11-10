@@ -92,6 +92,7 @@
     import { gestureEnvelope } from './js/ik.js';
     import { AvatarMotion } from './js/motion.js';
     import { WalkDirector } from './js/walk.js';
+    import { clampScale, stepScale, dollyDistance, approachScale } from './js/scale.js';
 
     // desktop.py opens this page with ?desktop=1: see-through background, no click-to-start,
     // and the whole body in frame. In a normal browser it looks like it always did.
@@ -251,10 +252,46 @@
       window.__rikoGaze = (yaw, pitch) => motion.setGazeOverride(
         yaw == null ? null : { yaw, pitch });
 
-      // ── Gesture-aware framing: fit her whole body AND the wave/think
-      //    envelope (raised hand included, measured from THIS rig) inside the
-      //    window at its current aspect. This only sets the default view per
-      //    persona — scroll zoom and drag keep working over it (OrbitControls).
+      // Gesture-aware framing (see applyFraming below): her whole body and
+      // the wave/think envelope fit the window at its current aspect.
+      applyFraming();
+      rebuildClips();
+      // reply actions may name .vrma gestures: teach the director their timings
+      director.library(Object.fromEntries(Object.entries(clips)
+        .map(([n, c]) => [n, { loop: !!c.loop, duration: c.clip.duration }])));
+      reportBody();           // tell the desktop what this body can do right now
+      resumeLife();           // whatever the director had running, replay on this body
+    }
+
+    // ── Camera: drag to rotate, right-drag to move her. In a plain browser
+    //    tab scroll zooms the camera like it always did. On the desktop,
+    //    scroll sizes HER instead (see the scale block below) and only
+    //    Ctrl+scroll keeps the old camera dolly. ──
+    const controls = new OrbitControls(camera, renderer.domElement);
+    if (DESKTOP) {
+      // Roam: the left button drags HER along the strip (page-side handler
+      // below), not the window — desktop.py stops intercepting drags then.
+      controls.mouseButtons = ROAM
+        ? { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }
+        : { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+    } else {
+      controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    }
+    controls.minDistance = 0.5;
+    controls.maxDistance = 6;
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;  // lower = longer glide
+    addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // ── Gesture-aware framing: fit her whole body AND the wave/think
+    //    envelope (raised hand included, measured from THIS rig) inside the
+    //    window at its current aspect. This only sets the default view per
+    //    persona — window resizes keep the aspect ratio (scroll-to-size
+    //    scales width AND height), so the fit-to-body framing is constant
+    //    and she is never cropped by a bigger or smaller window. Also the
+    //    camera reset the double-click / tray Reset size runs.
+    function applyFraming() {
+      if (!vrm) return;
       const rig = motion.rig;
       if (rig) {
         const durs = Object.fromEntries(Object.entries(IK_ARM_GESTURES).map(([n, g]) => [n, g.duration]));
@@ -282,31 +319,53 @@
         camera.position.set(0, headY * 0.68, headY * 2.6);
         controls.target.set(0, headY * 0.62, 0);
       }
-      rebuildClips();
-      // reply actions may name .vrma gestures: teach the director their timings
-      director.library(Object.fromEntries(Object.entries(clips)
-        .map(([n, c]) => [n, { loop: !!c.loop, duration: c.clip.duration }])));
-      reportBody();           // tell the desktop what this body can do right now
-      resumeLife();           // whatever the director had running, replay on this body
     }
 
-    // ── Camera: drag to rotate, right-drag to move her, scroll to zoom.
-    //    Desktop: drag moves the window, right-drag rotates, shift-drag moves her, scroll zooms. ──
-    const controls = new OrbitControls(camera, renderer.domElement);
-    if (DESKTOP) {
-      // Roam: the left button drags HER along the strip (page-side handler
-      // below), not the window — desktop.py stops intercepting drags then.
-      controls.mouseButtons = ROAM
-        ? { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }
-        : { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
-    } else {
-      controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    // ── Scroll = size her (desktop): plain wheel changes the avatar SCALE
+    //    (0.4x–2.5x, ~8% steps, scale.js) and POSTs it to the desktop via
+    //    /control/avatar-scale; the desktop resizes the window to
+    //    base_size x scale with her feet anchored and clamps it to the
+    //    monitor (riko/avatar_scale.py). The page keeps its fit-to-body
+    //    framing — a bigger window shows a bigger her, never a crop. The
+    //    shown scale glides toward the wheel's target and POSTs at ≤ 20 Hz
+    //    from the render loop (final value included when the glide lands),
+    //    so the window grows smoothly instead of jumping per notch.
+    //    Ctrl+scroll keeps the OLD camera dolly (close-up crop); double
+    //    click (or the tray's Reset size) restores scale 1.0 + the camera.
+    let scaleTarget = clampScale(settings.avatar_scale);
+    let scaleShown = scaleTarget;
+    let scalePostAt = -1, scaleSent = null;
+    function postScale(value, force = false) {
+      if (!DESKTOP) return;
+      const v = Math.round(value * 1000) / 1000;
+      if (!force && v === scaleSent) return;
+      scaleSent = v;
+      fetch('/control/avatar-scale', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scale: v }),
+      }).catch(() => {});   // plain browser tab: no desktop to resize
     }
-    controls.minDistance = 0.5;
-    controls.maxDistance = 6;
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.08;  // lower = longer glide
-    addEventListener('contextmenu', (e) => e.preventDefault());
+    function resetAvatarSize() {
+      scaleTarget = 1.0;
+      scaleShown = 1.0;
+      postScale(1.0, true);
+      applyFraming();       // undo a Ctrl+scroll close-up too
+    }
+    if (DESKTOP) {
+      controls.enableZoom = false;  // the wheel is ours now; dolly is manual
+      renderer.domElement.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        if (e.ctrlKey) {    // old behaviour: camera dolly, scale untouched
+          const d = camera.position.distanceTo(controls.target);
+          const nd = dollyDistance(d, e.deltaY, controls.minDistance, controls.maxDistance);
+          camera.position.sub(controls.target).setLength(nd).add(controls.target);
+          return;
+        }
+        scaleTarget = stepScale(scaleTarget, e.deltaY);
+      }, { passive: false });
+      renderer.domElement.addEventListener('dblclick', () => resetAvatarSize());
+      postScale(scaleTarget, true);  // make the window match the saved scale
+    }
 
     // ── The director: decides what she does, motion.js does the moving ──
     const T = () => performance.now() / 1000;
@@ -852,8 +911,10 @@
       control(ok ? 'approve' : 'deny');
     }
 
-    window.riko = { openInput, closeInput, requestWave, motion, director,
-                    measure: () => window.rikoMeasure() };  // desktop.py calls these; motion/director/measure are for debugging, riko-ctl wave and the smoke test
+    window.riko = { openInput, closeInput, requestWave, resetSize: resetAvatarSize,
+                    motion, director, measure: () => window.rikoMeasure() };
+                    // desktop.py calls these; motion/director/measure are for debugging,
+                    // riko-ctl wave and the smoke test, resetSize for the tray's Reset size
 
     // ── Ask Python for her next line and UI events, tell it when a clip is done ──
     voice.onended = voice.onerror = () => fetch('/done', { method: 'POST' });
@@ -897,6 +958,17 @@
             attach(model);          // motion re-targets gestures + expression on the new bones
             attachedKey = key;
             feed(director.persona(T(), ev));
+            // ...and wear her saved SIZE: /settings answers for the NEW
+            // active persona, so re-read the scale and let the desktop
+            // resize the window (jump, no glide: it is a fresh start).
+            fetch('/settings').then((r) => r.json()).then((st) => {
+              const s = clampScale(st && st.avatar_scale);
+              if (Math.abs(s - scaleTarget) > 1e-6) {
+                scaleTarget = s;
+                scaleShown = s;
+                postScale(s, true);
+              }
+            }).catch(() => {});
           })
           .catch(() => location.reload());  // if her new body won't load, reload the page
       }
@@ -941,6 +1013,16 @@
     const clock = new THREE.Clock();
     renderer.setAnimationLoop(() => {
       const dt = clock.getDelta();
+      if (DESKTOP && scaleShown !== scaleTarget) {
+        // ease the window size toward the wheel's target: ≤ 20 Hz POSTs,
+        // and the exact final value goes out when the glide lands
+        scaleShown = approachScale(scaleShown, scaleTarget, dt);
+        const nowS = T();
+        if (nowS - scalePostAt >= 0.05) {
+          scalePostAt = nowS;
+          postScale(scaleShown, scaleShown === scaleTarget);
+        }
+      }
       feed(director.tick(T(), dt));  // idle gestures, endings, decay, roam schedule
       if (ROAM && director.walk && vrm) {
         // root motion: the scene carries her along the strip; the camera

@@ -27,7 +27,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import sounddevice as sd
 import soundfile as sf
 
-from riko import hub_client, roam, shortcuts
+from riko import appstate, hub_client, roam, shortcuts
 from riko.config import ROOT
 
 HOST = "127.0.0.1"  # 127.0.0.1, not localhost: behaves the same on Windows and Linux
@@ -80,6 +80,13 @@ class _Handler(SimpleHTTPRequestHandler):
             settings = dict(_settings)
             active = hub_client.active_persona() or {}
             settings["persona_name"] = active.get("name")
+            # the size the owner last scrolled her to FOR THIS PERSONA
+            # (~/.config/riko/avatar_scale.json); the page seeds its scale
+            # from this on load and after every persona switch, so the
+            # window, the page and the file always agree.
+            saved = appstate.load_scale(active.get("id"))
+            settings["avatar_scale"] = saved if saved is not None else \
+                float(settings.get("avatar_scale") or 1.0)
             return self._send(json.dumps(settings).encode(), "application/json")
         if self.path == "/animations.json":
             # Optional VRMA gesture clips the owner dropped into client/animations/:

@@ -47,6 +47,57 @@ def save_mode(mode: str) -> bool:
         return False
 
 
+def load_scale(persona_id) -> float | None:
+    """The avatar window scale saved for one persona, or None (never raises).
+
+    avatar_scale.json holds {persona_id: scale} — each persona opens at the
+    size the owner last scrolled her to. Values outside riko.avatar_scale's
+    band are ignored as if never saved.
+    """
+    key = str(persona_id or "default")
+    try:
+        data = json.loads(state_path("avatar_scale").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    from . import avatar_scale
+    value = data.get(key)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if avatar_scale.SCALE_MIN <= float(value) <= avatar_scale.SCALE_MAX:
+            return float(value)
+    return None
+
+
+def save_scale(persona_id, scale) -> bool:
+    """Persist one persona's scale. Bad values are ignored, not written."""
+    from . import avatar_scale
+    if isinstance(scale, bool):
+        return False
+    try:
+        s = float(scale)
+    except (TypeError, ValueError):
+        return False
+    if not avatar_scale.SCALE_MIN <= s <= avatar_scale.SCALE_MAX:
+        return False
+    key = str(persona_id or "default")
+    try:
+        path = state_path("avatar_scale")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            pass
+        data[key] = s
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
 def load_name_gate() -> bool | None:
     """The persisted always-listen name gate (riko/name_gate.py), or None
     when never chosen (never raises)."""

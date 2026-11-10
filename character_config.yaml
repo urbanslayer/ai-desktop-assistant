@@ -107,6 +107,15 @@ fish:
 desktop:
   width: 420           # window size in pixels; everything around her is see-through
   height: 680
+  # Plain scroll over her sizes HER: the window becomes width/height x this
+  # scale (0.4 - 2.5, ~8% per wheel notch), with her feet anchored, clamped
+  # so the window still fits the monitor. The page keeps its fit-to-body
+  # framing, so a bigger window shows a bigger her — never a crop. Ctrl+scroll
+  # keeps the old camera close-up; double-click (or the tray's Reset size)
+  # returns to normal. This value only seeds the INITIAL size: scrolling is
+  # remembered PER PERSONA in ~/.config/riko/avatar_scale.json and wins from
+  # then on. In roam strip mode the band's height follows the scale too.
+  avatar_scale: 1.0
   bubble_seconds: 8    # how long her speech bubble stays after she finishes
   greet_on_start: true # when the app starts and the avatar page is ready she
                        # says the active persona's greeting (bubble + her voice,

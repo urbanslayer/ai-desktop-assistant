@@ -432,7 +432,10 @@ Instead of a browser tab, she can live in a small borderless, transparent, alway
 | Do | With |
 |---|---|
 | Move her around the screen | Left-drag anywhere (under Hyprland) |
-| Pan / rotate / zoom the camera | Shift-drag / right-drag / scroll |
+| Size her up / down | Scroll over her — the window grows and shrinks with her, her feet staying put and the window clamped to the monitor (0.4×–2.5×, remembered per persona) |
+| Camera close-up | Ctrl+scroll (the old zoom: a crop for close-ups) |
+| Reset size + camera | Double-click her, or the tray's *Reset size* |
+| Pan / rotate the camera | Shift-drag / right-drag |
 
 **Keyboard shortcuts (in the window) — this is the way.** They are app-specific: they fire only while her window is focused, so they never fight your window manager. And they never touch the **Super/Meta/Win** key — that one is yours; a binding that uses it is rejected at startup with a warning. Change everything under `desktop.shortcuts:` in `character_config.yaml`.
 

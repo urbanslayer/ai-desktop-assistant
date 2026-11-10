@@ -21,6 +21,22 @@ def state_path() -> Path:
     return Path(base) / "riko" / "roam_x.json"
 
 
+def strip_geometry(geo, base_height, scale, min_h=200, max_frac=0.6):
+    """The strip rect (x, y, w, h) for an avatar scale (docs/WALK_MEMORY.md W).
+
+    geo: the screen's available area (x, y, w, h). The strip is always full
+    width and anchored to the BOTTOM edge; its height follows the scale
+    (base window height x scale) — bigger her, taller the band she lives in.
+    The height is clamped to [min_h, max_frac x screen height] so a tall
+    monitor keeps a visible "band" feel and a tiny scale never cuts her off.
+    """
+    x, y, w, h = geo
+    hh = max(min_h, min(int(int(base_height) * max(float(scale), 0.01)),
+                        int(h * max_frac)))
+    hh = min(hh, h)
+    return (x, y + h - hh, w, hh)
+
+
 def load_x() -> float | None:
     """The saved x in metres, or None (never raises)."""
     try:
