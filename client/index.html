@@ -129,6 +129,9 @@
     // at the canvas so a scroll-zoom gesture can be photographed frame by
     // frame (harness: client/tools/capture_frames.py --gestures).
     const WHEEL_ZOOM_QA = new URLSearchParams(location.search).get('wheelzoom');
+    // Scripted touch QA steps for the capture harness (docs/TOUCH.md): see
+    // runTouchSpec() for the step grammar.
+    const TOUCH_SPEC = new URLSearchParams(location.search).get('touch');
     // Headless capture with ?desktop=1 fakes the DESKTOP side inside the
     // page: /control/avatar-scale resizes the CANVAS here (window = base x
     // scale, like the real window resize does) instead of being POSTed, so
@@ -794,13 +797,85 @@
     // Left-drag along the strip: drag HER (not the window — desktop.py only
     // intercepts drags outside the walk region… in strip mode it never does).
     // desktop.py forwards real X clicks on her body here as synthetic events.
-    window.__rikoClick = (kind, x, y) => {
+    window.__rikoClick = (kind, x, y, ctrl = false) => {
       const el = document.elementFromPoint(x, y) || renderer.domElement;
       el.dispatchEvent(new PointerEvent(kind, {
         clientX: x, clientY: y, button: 0, buttons: kind === 'pointerdown' ? 1 : 0,
-        bubbles: true, cancelable: true, pointerId: 1, isPrimary: true,
+        bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, ctrlKey: ctrl,
       }));
     };
+    // ── scripted touch QA (capture harness): ?touch=step;step;... ──────
+    // Steps are anchored to wake like ?force=. Ops (x/y numbers, or a PART
+    // name token = that part rect's center, resolved when the step fires):
+    //   sit:<y>@ms | stand@ms | mode:<off|quiet|chatty>@ms
+    //   grab <part> <x> <y> <dx> <dy> <durMs>@ms     press, hold, drag, release
+    //   tap <x> <y>@ms                               one quick click
+    //   taps <x> <y> <n> <gapMs>@ms                  repeated quick clicks
+    //   stroke <x> <y> <x2> <y2> <n> <durMs>@ms      back-and-forth stroke
+    function runTouchSpec(spec) {
+      for (const step of spec.split(';')) {
+        if (!step.trim()) continue;
+        const [body, atStr] = step.split('@');
+        const at = parseFloat(atStr);
+        if (!Number.isFinite(at)) continue;
+        setTimeout(() => {
+          if (!vrm) return;
+          const tk = body.trim().split(/\s+/);
+          const xy = (ax, ay) => {   // part-name or literal px
+            const parts = computeParts() || {};
+            const one = (t) => {
+              const d = parseFloat(t);
+              if (Number.isFinite(d)) return d;
+              const r = parts[t];
+              return r ? r[0] + r[2] / 2 : NaN;
+            };
+            return [one(ax), one(ay)];
+          };
+          const op = tk[0];
+          if (op === 'sit' || op === 'stand' || op === 'mode') {
+            onCommand(op === 'sit' ? `sit:${tk[1]}` : op === 'stand' ? 'stand'
+                  : `touch-mode:${tk[1]}`);
+          } else if (op === 'grab') {
+            const [x, y] = xy(tk[2], tk[3]);
+            const dx = +tk[4], dy = +tk[5], dur = +tk[6] || 900;
+            window.__rikoClick('pointerdown', x, y);
+            const steps = 30, hold = 320;   // > HOLD_MS: the still-hold grabs
+            for (let i = 1; i <= steps; i++) {
+              setTimeout(() => window.__rikoClick(
+                'pointermove', x + dx * i / steps, y + dy * i / steps),
+              hold + dur * i / steps);
+            }
+            setTimeout(() => window.__rikoClick('pointerup', x + dx, y + dy),
+                       hold + dur + 40);
+          } else if (op === 'tap') {
+            const [x, y] = xy(tk[1], tk[2]);
+            window.__rikoClick('pointerdown', x, y);
+            setTimeout(() => window.__rikoClick('pointerup', x, y), 90);
+          } else if (op === 'taps') {
+            const [x, y] = xy(tk[1], tk[2]);
+            const n = +tk[3] || 2, gap = +tk[4] || 300;
+            for (let i = 0; i < n; i++) setTimeout(() => {
+              window.__rikoClick('pointerdown', x, y);
+              setTimeout(() => window.__rikoClick('pointerup', x, y), 90);
+            }, i * gap);
+          } else if (op === 'stroke') {
+            const [x, y] = xy(tk[1], tk[2]);
+            const p2 = (t, d) => { const v = parseFloat(t); return Number.isFinite(v) ? v : d; };
+            const x2 = p2(tk[3], x), y2 = p2(tk[4], y);
+            const n = +tk[5] || 3, dur = +tk[6] || 700;
+            const steps = n * 2 * 6;
+            for (let i = 0; i <= steps; i++) {
+              const f = i / steps;
+              const px = x + (x2 - x) * (1 - Math.cos(f * Math.PI * n)) / 2;
+              const py = y + (y2 - y) * f * 0.3;
+              setTimeout(() => window.__rikoClick(i === 0 ? 'pointerdown' : 'pointermove', px, py),
+                         dur * i / steps);
+            }
+            setTimeout(() => window.__rikoClick('pointerup', x2, y2), dur + 40);
+          }
+        }, at);
+      }
+    }
     if (DESKTOP) {
       renderer.domElement.addEventListener('pointerdown', (e) => {
         console.log(`[page] pointerdown button=${e.button} at ${Math.round(e.clientX)},${Math.round(e.clientY)}`);
@@ -1014,6 +1089,15 @@
           // touch/pose seams for the capture harness (docs/TOUCH.md)
           parts: computeParts(), hipsYpx: hipsPxY(), feetYpx: feetPxY(),
           pose: pose.debug(), touchMode,
+          leftHandPx: worldPx(bones.leftHand),
+          rightHandPx: worldPx(bones.rightHand),
+          grabTargetsPx: (() => {
+            const out = {};
+            for (const [id, g] of Object.entries(pose.debug().grabs || {})) {
+              if (g.target) out[id] = worldPx(g.target);
+            }
+            return out;
+          })(),
           headFootPx: headPx && footPx ? Math.round(footPx[1] - headPx[1]) : null,
           feetFromBottomPx: footPx ? Math.round(viewH() - footPx[1]) : null,
           visualScale: Math.round(scaleShown * 1000) / 1000,
@@ -1396,6 +1480,13 @@
       }
     }
     if (DESKTOP || CAPTURE) begin();  // capture mode: no click available in a headless run
+    if (TOUCH_SPEC) {
+      // Spec times are anchored to the moment the avatar exists (attach can
+      // lag page load by a few hundred ms; the harness budgets for that).
+      const kickTouch = () => (vrm ? runTouchSpec(TOUCH_SPEC)
+                                   : setTimeout(kickTouch, 100));
+      setTimeout(kickTouch, 200);
+    }
     else {
       start.textContent = 'Click to start';
       start.onclick = begin;

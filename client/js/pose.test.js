@@ -151,6 +151,9 @@ if (THREE) {
 
   test('head grab turns ONLY the head bone, inside the gaze envelope', need, () => {
     const { bones, motion, pose } = makePoseRig();
+    // freeze gaze: the head delta must then be PURELY the pose overlay —
+    // otherwise idle gaze wander makes the clamp/spring-back assertions race
+    motion.setGazeOverride({ yaw: 0, pitch: 0 });
     sim(motion, pose, 0.3);
     pose.setTarget('head', [-1.5, 1.8, 0.5]);    // far up-left: clamp test
     sim(motion, pose, 1.5);
@@ -231,6 +234,15 @@ if (THREE) {
     const { motion, pose } = makePoseRig();
     const dt = 1 / 60;
     const bad = [];
+    // chain bones that must be BACK on rest 0.6 s after each phase starts
+    // (the release happened at the previous phase's last frame; spring-back
+    // is 0.4 s, so by frame 40 of the next phase drift must be zero)
+    const RESTORED_BY = {
+      grabR: ['leftUpperArm', 'leftLowerArm'],
+      foot: ['rightUpperArm', 'rightLowerArm'],
+      head: ['leftUpperLeg', 'leftLowerLeg'],
+      pat: ['leftUpperLeg', 'leftLowerLeg', 'rightUpperLeg', 'rightLowerLeg'],
+    };
     let restWrist = null;
     for (let c = 0; c < 20; c++) {
       const phases = [
@@ -251,6 +263,23 @@ if (THREE) {
           t += dt;
           motion.update(dt);
           pose.apply(dt);
+          if (i === 40) {   // 0.667 s into the phase: previous grab fully released
+            for (const bn of RESTORED_BY[phase] || []) {
+              const ang = motion._rest.get(bn).angleTo(motion._node(bn).quaternion);
+              if (!(ang < 2e-4)) bad.push([+t.toFixed(1), 'not-restored', bn, +ang.toFixed(5)]);
+            }
+            // the head GRAB must be gone too — but gaze legitimately owns the
+            // head bone afterwards, so completion is checked at grab level
+            if (phase === 'sit' && (pose.grabbedIds().length !== 0 || pose.debug().sitting !== true)) {
+              bad.push([+t.toFixed(1), 'head-grab-stuck', pose.grabbedIds().join('+')]);
+            }
+            if (phase === 'pat') {   // stand happened at the phase switch
+              const hipsY = motion._node('hips').position.y;
+              if (!(Math.abs(hipsY - motion._restPos.y) < 1e-3)) {
+                bad.push([+t.toFixed(1), 'stand-slow', +hipsY.toFixed(5)]);
+              }
+            }
+          }
           if (i % 7 === 0) {
             for (const [bn, lim] of Object.entries(GRAB_LIMITS)) {
               const ang = motion._rest.get(bn).angleTo(motion._node(bn).quaternion);

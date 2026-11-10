@@ -48,6 +48,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -74,6 +75,11 @@ SCENARIOS = {
     # at gesture boundaries exactly like the real window does) and --gestures.
     # Frame times are RELATIVE TO WAKE; the gesture starts at its startMs.
     "zoom": (None, []),
+    # touch & posing QA (docs/TOUCH.md): drive the page with --touch specs
+    # (page runTouchSpec grammar) and capture mid-interaction.
+    "grab": (None, []),   # e.g. --touch "grab arm_l hand_l 0 0 -120 -140 900@2500"
+    "sit": (None, []),    # e.g. --touch "sit:476@1500;sit:578@9000"
+    "pat": (None, []),    # e.g. --touch "taps head head 3 300@2500"
 }
 
 
@@ -103,6 +109,12 @@ class Handler(SimpleHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n).decode() if n else ""
         if not m:
+            # record control-plane POSTs (/control/touch, /control/sit-state,
+            # /control/bbox …) so the harness run doubles as seam evidence
+            if self.path.startswith("/control/"):
+                with open(os.path.join(self.outdir, "touch-log.jsonl"), "a") as f:
+                    f.write(json.dumps({"t": round(time.monotonic() - self.t0, 2),
+                                        "path": self.path, "body": body[:2000]}) + "\n")
             return self._json({"ok": True})
         kind, t = m.group(1), float(m.group(2))
         stem = f"{self.scenario}-t{t:06.2f}s-{self.shots}"
@@ -166,6 +178,12 @@ def main():
     ap.add_argument("--gestures", default=None,
                     help="page ?gestures= 'startMs:count:deltaY:gapMs[;...]' — synthetic "
                          "wheel gesture(s) on the canvas, ';' separates bursts (zoom scenario)")
+    ap.add_argument("--touch", default=None,
+                    help="page ?touch= scripted touch QA steps (grab/tap/taps/stroke/sit/"
+                         "stand/mode ops, '@ms' anchors after avatar attach) — see runTouchSpec")
+    ap.add_argument("--roam", action="store_true",
+                    help="open the page with ?roam=1 (strip mode: walk director + "
+                         "/control/bbox housekeeping active)")
     args = ap.parse_args()
 
     force, events = SCENARIOS[args.scenario]
@@ -189,12 +207,16 @@ def main():
     url = f"http://127.0.0.1:{port}/?capture={args.secs}"
     if args.desktop or args.scenario == "zoom":
         url += "&desktop=1"
+    if args.roam:
+        url += "&roam=1"
     if force:
         url += f"&force={force}"
     if args.gaze:
         url += f"&gaze={args.gaze}"
     if args.gestures:
         url += f"&wheelzoom={args.gestures}"
+    if args.touch:
+        url += "&touch=" + urllib.parse.quote(args.touch, safe="")
     maxsec = max(float(s) for s in args.secs.split(","))
     dur = args.runtime if args.runtime else maxsec + 8
     cmd = [
