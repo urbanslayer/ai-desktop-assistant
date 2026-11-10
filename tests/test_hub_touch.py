@@ -59,9 +59,16 @@ def test_bad_body_400(client):
 
 def test_touch_settings_defaults_and_round_trip(client):
     st = client.get("/api/settings").json()
-    assert st["touch"] == {"mode": "quiet", "cooldown_s": 10, "max_per_10min": 6}
+    # docs/TOUCH.md defaults: quiet -> 45 s / 4 per 10 min
+    assert st["touch"] == {"mode": "quiet", "cooldown_s": 45, "max_per_10min": 4}
     assert all(v == "default" for v in st["touch_source"].values())
     assert st["defaults"]["touch"] == st["touch"]
+
+    # chatty with NO saved numbers gets the chatty defaults (15 s / 12)
+    r = client.put("/api/settings", json={"touch": {"mode": "chatty"}})
+    assert r.json()["touch"] == {"mode": "chatty", "cooldown_s": 15,
+                                 "max_per_10min": 12}
+    assert r.json()["touch_source"]["mode"] == "saved"
 
     r = client.put("/api/settings", json={"touch": {"mode": "chatty",
                                                     "cooldown_s": 2.5,
@@ -72,8 +79,8 @@ def test_touch_settings_defaults_and_round_trip(client):
     assert all(v == "saved" for v in r.json()["touch_source"].values())
     # reset returns to defaults
     r = client.post("/api/settings/reset", json={"touch": True})
-    assert r.json()["touch"] == {"mode": "quiet", "cooldown_s": 10,
-                                 "max_per_10min": 6}
+    assert r.json()["touch"] == {"mode": "quiet", "cooldown_s": 45,
+                                 "max_per_10min": 4}
 
 
 def test_touch_settings_validation(client):
@@ -89,8 +96,9 @@ def test_mode_off_is_fast_and_silent(client, fake_llm):
     client.put("/api/settings", json={"touch": {"mode": "off"}})
     for kind, kw in [("pat", {}), ("tickle", {}), ("release", {"held_ms": 9000})]:
         r = touch(client, kind, **kw).json()
-        assert r == {"ok": True, "spoke": False, "text": "", "emotion": "neutral",
-                     "actions": [], "audio_url": None, "reason": "mode_off",
+        assert r == {"ok": True, "reacted": False, "spoke": False, "text": "",
+                     "emotion": "neutral", "actions": [], "audio_url": None,
+                     "reason": "off", "detail": "mode_off",
                      "state_version": r["state_version"]}
     assert fake_llm.chat_requests == []
 
@@ -98,20 +106,26 @@ def test_mode_off_is_fast_and_silent(client, fake_llm):
 def test_grab_and_action_never_speak_even_chatty(client, fake_llm):
     client.put("/api/settings", json={"touch": {"mode": "chatty",
                                                 "cooldown_s": 0}})
-    for kind in ("grab", "action"):
+    for kind in ("grab", "action", "sit", "stand"):
         r = touch(client, kind).json()
-        assert r["spoke"] is False and r["reason"] == "silent_kind"
-    assert fake_llm.chat_requests == []
+        assert r["spoke"] is False and r["detail"] == "silent_kind"
+    # chatty: poke DOES speak (every kind but grab/action/sit/stand)
+    fake_llm.reply = "[surprise] Eek!"
+    r = touch(client, "poke").json()
+    assert r["reason"] == "llm" and r["spoke"] is True
+    assert len(fake_llm.chat_requests) == 1
 
 
 def test_quiet_speaks_only_pat_tickle_and_long_release(client, fake_llm):
     client.put("/api/settings", json={"touch": {"cooldown_s": 0}})
     r = touch(client, "release", held_ms=1000).json()   # short release: quiet -> silent
-    assert r["reason"] == "silent_kind"
-    r = touch(client, "stand").json()                   # quiet: sit/stand never speak
-    assert r["reason"] == "silent_kind"
+    assert r["reason"] == "quiet" and r["detail"] == "silent_kind"
+    r = touch(client, "stand").json()                   # sit/stand never speak
+    assert r["reason"] == "quiet" and r["detail"] == "silent_kind"
+    r = touch(client, "poke").json()                    # quiet: poke stays page-local
+    assert r["reason"] == "quiet"
     r = touch(client, "release", held_ms=3000).json()   # > 3 s, strictly
-    assert r["reason"] == "silent_kind"
+    assert r["reason"] == "quiet"
     assert fake_llm.chat_requests == []
     fake_llm.reply = "[happy] Finally, hands off!"
     r = touch(client, "release", held_ms=3001).json()
@@ -126,7 +140,7 @@ def test_cooldown_fast_path(client, fake_llm):
     assert touch(client, "pat").json()["reason"] == "llm"
     n = len(fake_llm.chat_requests)
     r = touch(client, "pat").json()                     # 60 s cooldown, now
-    assert r["reason"] == "cooldown" and r["spoke"] is False
+    assert r["reason"] == "cooldown" and r["reacted"] is False
     assert len(fake_llm.chat_requests) == n             # no second LLM call
     # silent kinds never reset or ride the cooldown: grab stays silent_kind
     assert touch(client, "grab").json()["reason"] == "silent_kind"
@@ -154,7 +168,7 @@ def test_busy_fast_path(client, fake_llm):
     assert lock.acquire(blocking=False)
     try:
         r = touch(client, "pat").json()
-        assert r["reason"] == "busy" and r["spoke"] is False
+        assert r["reason"] == "busy" and r["reacted"] is False
     finally:
         lock.release()
     assert fake_llm.chat_requests == []
@@ -171,7 +185,7 @@ def test_llm_failure_is_silent(client, fake_llm):
 def test_spoken_round_trip_history_and_prompt(client, fake_llm):
     fake_llm.reply = "[happy] Senpai! Careful with the hair!"
     r = touch(client, "pat").json()
-    assert r["ok"] and r["spoke"] and r["reason"] == "llm"
+    assert r["ok"] and r["reacted"] and r["spoke"] and r["reason"] == "llm"
     assert r["text"] == "Senpai! Careful with the hair!"
     assert r["emotion"] == "happy" and r["actions"] == []
     assert r["audio_url"] is None          # tts off by default (no base_url)
@@ -207,6 +221,7 @@ def test_silent_touch_still_lands_in_history(client, fake_llm):
     assert hist[0]["content"] == "owner touched: tickled her (off)"
     assert hist[1]["meta"]["touch"]["silent"] is True
     assert hist[1]["meta"]["touch"]["reason"] == "mode_off"
+    assert hist[0]["meta"]["touch"]["note"] is True
     assert fake_llm.chat_requests == []
 
 

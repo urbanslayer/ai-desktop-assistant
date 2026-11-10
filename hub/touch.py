@@ -12,24 +12,35 @@ from datetime import datetime, timedelta, timezone
 
 # contract enums (docs/TOUCH.md)
 MODES = ("off", "quiet", "chatty")
-KINDS = ("pat", "tickle", "grab", "hold", "release", "action", "sit", "stand")
+KINDS = ("pat", "poke", "tickle", "grab", "hold", "release", "action",
+         "sit", "stand")
 REASONS = ("llm", "silent_kind", "mode_off", "cooldown", "limit", "busy",
            "llm_error")
 
-# settings defaults (merged_settings / PUT /api/settings / web card)
-SETTINGS_DEFAULTS = {"mode": "quiet", "cooldown_s": 10, "max_per_10min": 6}
+# settings defaults (merged_settings / PUT /api/settings / web card).
+# docs/TOUCH.md: quiet (and off) default to a 45 s cooldown / 4 per 10 min;
+# chatty to 15 s / 12. A saved value always wins over the mode default.
+def defaults_for(mode: str) -> dict:
+    if mode == "chatty":
+        return {"mode": "chatty", "cooldown_s": 15.0, "max_per_10min": 12}
+    return {"mode": mode if mode in MODES else "quiet",
+            "cooldown_s": 45.0, "max_per_10min": 4}
+
+
+SETTINGS_DEFAULTS = defaults_for("quiet")
 RATE_WINDOW_S = 600          # max_per_10min
 HOLD_RELEASE_MS = 3000       # quiet speaks for `release` only after this hold
 
 # kinds that NEVER speak (any mode): a limb grab is the page's own squishy
 # play; `action` is a gesture the page already plays on its own.
-NEVER_SPEAK = ("grab", "action")
+NEVER_SPEAK = ("grab", "action", "sit", "stand")
 # quiet mode speaks only for these (release gated by HOLD_RELEASE_MS)
 QUIET_SPEAK = ("pat", "tickle", "release")
 
 # grey system-note text per kind (the trigger line stored in history)
 TRIGGER_NOTES = {
     "pat": "patted her head",
+    "poke": "poked her",
     "tickle": "tickled her",
     "grab": "grabbed a limb",
     "hold": "held her",
@@ -42,6 +53,7 @@ TRIGGER_NOTES = {
 # one-line model instruction (the last user turn describes the touch)
 _KIND_LINES = {
     "pat": "The owner just patted your head.",
+    "poke": "The owner just poked you.",
     "tickle": "The owner is tickling you.",
     "grab": "The owner grabbed one of your limbs.",
     "hold": "The owner is holding you.",
@@ -149,8 +161,26 @@ def silent_line(reason: str) -> str:
     return SILENT_LINES.get(reason, "(says nothing)")
 
 
-def silent_reply(reason: str, state_version) -> dict:
-    """The response body for every fast no-LLM path (docs/TOUCH.md shape)."""
-    return {"ok": True, "spoke": False, "text": "", "emotion": "neutral",
-            "actions": [], "audio_url": None, "reason": reason,
+CONTRACT_REASONS = {"mode_off": "off", "cooldown": "cooldown",
+                    "busy": "busy"}
+
+
+def contract_reason(reason: str, mode: str = "quiet") -> str:
+    """The reason name docs/TOUCH.md publishes (off|cooldown|quiet|busy);
+    our finer reasons (limit, silent_kind, llm_error) pass through."""
+    if reason == "silent_kind":
+        return "quiet" if mode == "quiet" else reason
+    return CONTRACT_REASONS.get(reason, reason)
+
+
+def touch_reply(reason: str, state_version, *, spoke=False, text="",
+                emotion="neutral", actions=None, audio_url=None,
+                mode="quiet") -> dict:
+    """Response body for BOTH paths (docs/TOUCH.md shape + extras the
+    desktop replay needs). `reason` carries the contract name; `detail`
+    our finer internal reason."""
+    return {"ok": True, "reacted": spoke, "spoke": spoke, "text": text,
+            "emotion": emotion, "actions": actions or [],
+            "audio_url": audio_url,
+            "reason": contract_reason(reason, mode), "detail": reason,
             "state_version": state_version}

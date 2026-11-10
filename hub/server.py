@@ -461,14 +461,13 @@ def create_app(data_dir, api_key: str | None = None,
         saved = store.get_json("touch", {})
         return dict(saved) if isinstance(saved, dict) else {}
 
-    def default_touch() -> dict:
-        return dict(TOUCH_SETTINGS_DEFAULTS)
+    def default_touch(mode: str = "quiet") -> dict:
+        return _touch.defaults_for(mode)
 
     def touch_settings() -> dict:
-        merged = default_touch()
         saved = stored_touch()
-        if saved.get("mode") in _touch.MODES:
-            merged["mode"] = saved["mode"]
+        mode = saved.get("mode") if saved.get("mode") in _touch.MODES else "quiet"
+        merged = default_touch(mode)          # per-mode defaults (docs/TOUCH.md)
         for key in ("cooldown_s", "max_per_10min"):
             raw = saved.get(key)
             if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
@@ -722,7 +721,9 @@ def create_app(data_dir, api_key: str | None = None,
                          "tools": default_tools(),
                          "memory": default_memory(),
                          "timers": default_timers(),
-                         "touch": default_touch(),
+                         "touch": default_touch(str(
+                             (store.get_json("touch", {}) or {}).get("mode")
+                             or "quiet")),
                          "mcp": {"servers": public_mcp_servers([preset])
                                  if preset else []},
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES),
@@ -1980,13 +1981,14 @@ def create_app(data_dir, api_key: str | None = None,
         bad = _touch.validate(kind_)
         if bad:
             return err(400, bad)
-        held = body.get("held_ms")
+        held = body.get("hold_ms", body.get("held_ms"))   # TOUCH.md: hold_ms
         held_ms = (float(held) if isinstance(held, (int, float))
                    and not isinstance(held, bool) else None)
         part = str(body.get("part") or "").strip() or None
 
         def work():
-            pid = str(body.get("persona") or "") or store.active()
+            pid = (str(body.get("persona") or "")
+                   or str(body.get("persona_id") or "") or store.active())
             if not store.persona_exists(pid):
                 return ("err", 404, f"no persona '{pid}'")
             cfg = touch_settings()
@@ -2025,8 +2027,8 @@ def create_app(data_dir, api_key: str | None = None,
                     max_per_10min=cfg.get("max_per_10min"),
                     busy=not have_lock)
                 if reason != "llm":
-                    return ("ok", _touch.silent_reply(
-                        reason, note_row(reason)))
+                    return ("ok", _touch.touch_reply(
+                        reason, note_row(reason), mode=mode))
 
                 # ── the one-sentence reaction turn (persona lock held) ──
                 persona = store.get_persona(pid)
@@ -2048,8 +2050,8 @@ def create_app(data_dir, api_key: str | None = None,
                 except Exception as e:
                     log.info("[touch] LLM failed persona=%s kind=%s: %s",
                              pid, kind_, e)
-                    return ("ok", _touch.silent_reply(
-                        "llm_error", note_row("llm_error")))
+                    return ("ok", _touch.touch_reply(
+                        "llm_error", note_row("llm_error"), mode=mode))
                 emotion, answer = _emotion.parse_emotion(raw)
                 body_actions = (clients_hub.body_actions()
                                 if persona.get("embodied", True) else [])
@@ -2079,10 +2081,10 @@ def create_app(data_dir, api_key: str | None = None,
                     # page plays it)
                     events.publish("action", persona_id=pid, emotion=emotion,
                                    actions=actions, touch=touch_meta)
-                return ("ok", {"ok": True, "spoke": True, "text": answer,
-                               "emotion": emotion, "actions": actions,
-                               "audio_url": audio_url, "reason": "llm",
-                               "state_version": store.version()})
+                return ("ok", _touch.touch_reply(
+                    "llm", store.version(), spoke=True, text=answer,
+                    emotion=emotion, actions=actions, audio_url=audio_url,
+                    mode=mode))
             finally:
                 if have_lock:
                     lock.release()
