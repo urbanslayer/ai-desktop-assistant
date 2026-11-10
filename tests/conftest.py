@@ -162,6 +162,57 @@ def _guarded_typing(fn):
 _subprocess.run = _guarded_typing(_subprocess.run)
 _subprocess.Popen = _guarded_typing(_subprocess.Popen)
 
+# ── No real commands (docs/COMMANDS.md testing rules) ──────────
+# run_command takes a runner= fake, so a test reaching the real
+# subprocess path INSIDE riko/commands is a bug: hard-fail it. A test that
+# genuinely wants to exec something harmless (a tmp fixture script) opts in
+# with RIKO_COMMANDS_ALLOW_REAL=<dir> and must launch an executable under
+# exactly that dir — nothing else (no model-chosen `df`, no ambient PATH
+# program) may run for real.
+_COMMANDS_ALLOW_ENV = "RIKO_COMMANDS_ALLOW_REAL"
+
+
+def _caller_in_commands_pkg():
+    import inspect
+    start = inspect.currentframe()
+    frame = start.f_back if start is not None else None
+    while frame is not None:
+        f = os.path.normcase(os.path.abspath(frame.f_code.co_filename))
+        if os.sep + "riko" + os.sep + "commands" + os.sep in f:
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _guarded_commands(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if _caller_in_commands_pkg():
+            argv = args[0] if args else kwargs.get("args") or kwargs.get("program")
+            allow = os.environ.get(_COMMANDS_ALLOW_ENV) or ""
+            first = ""
+            if isinstance(argv, (list, tuple)) and argv:
+                first = str(argv[0])
+            elif isinstance(argv, str):
+                first = argv.strip().split(" ")[0]
+            ok = bool(allow) and os.path.isabs(first) \
+                and os.path.normpath(first).startswith(
+                    os.path.normpath(allow) + os.sep)
+            if not ok:
+                raise RuntimeError(
+                    f"tests must not run real commands ({first!r}): inject a "
+                    f"fake runner (riko/commands runner=) or opt into a tmp "
+                    f"fixture binary via {_COMMANDS_ALLOW_ENV}=<dir> "
+                    f"(docs/COMMANDS.md testing rules).")
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+_subprocess.run = _guarded_commands(_subprocess.run)
+_subprocess.Popen = _guarded_commands(_subprocess.Popen)
+
 # ...and no Obsidian Local REST API either: any TCP connect to the plugin's
 # ports (127.0.0.1:27123/27124) raises; tests use a fake HTTP server on an
 # ephemeral port. The bare socket.connect guard leaks past the dial paths

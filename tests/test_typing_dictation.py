@@ -324,7 +324,7 @@ def test_tray_dictation_and_stop_actions():
     act.trigger()                                        # unticked again
     assert applied == [True, False] and not act.isChecked()
     stop = desktop.build_stop_typing_action(menu, svc)
-    assert stop.text() == "Stop typing"
+    assert stop.text() == "Stop typing / command"
     stop.trigger()
     assert "stop" in applied
     # no typing service (awareness never started): items exist but are dead

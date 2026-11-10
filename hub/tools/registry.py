@@ -218,6 +218,7 @@ def tools_prompt(spec_names: list[str], now_local: str = "",
         + _desktop_sense_line(spec_names)
         + _typing_line(spec_names)
         + _appedit_line(spec_names)
+        + _commands_line(spec_names)
         + f"Current date/time: {now} (UTC)." + local
     )
 
@@ -284,6 +285,25 @@ def _appedit_line(spec_names) -> str:
             "reloading them (kate_*), and find_file locates files under "
             "$HOME; obsidian_edit and kate_edit show the owner a real diff "
             "for approval before anything is written. ")
+
+
+def _commands_line(spec_names) -> str:
+    """One line while the command tool is offered (docs/COMMANDS.md): she
+    can run commands and read their output, read-only ones run at once,
+    the rest ask the owner, and elevated commands simply do not exist."""
+    names = [str(n) for n in (spec_names or [])]
+    if not any(n.endswith("run_command") or "__run_command" in n
+               for n in names):
+        return ""
+    return ("You can run commands on the owner's PC with run_command and "
+            "read the output: allowlisted read-only commands (ls, df, git "
+            "status, …) run right away; anything else asks the owner first, "
+            "who sees the exact command and directory. For questions about "
+            "this PC (disk space, memory, CPU, GPU, processes, services, "
+            "logs, network, packages) look up command_recipes and run the "
+            "read-only command; explain the result in plain words. "
+            "Elevated commands are refused outright — never suggest sudo "
+            "or running something as root. ")
 
 
 def now_iso_static() -> str:

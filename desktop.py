@@ -809,14 +809,21 @@ def build_name_gate_action(menu, session):
     return action
 
 
-def build_stop_typing_action(menu, typing_svc):
-    """'Stop typing' (docs/TYPING.md §5): aborts the keystroke batch in
-    progress at the next chunk; dictation mode itself is untouched."""
-    action = QAction("Stop typing", menu)
-    action.setToolTip("abort the keystroke batch in progress right away")
-    action.setEnabled(typing_svc is not None)
-    action.triggered.connect(
-        lambda checked=None: typing_svc.engine.stop() if typing_svc else None)
+def build_stop_typing_action(menu, typing_svc, command_pack=None):
+    """'Stop typing / command' (docs/TYPING.md §5 + docs/COMMANDS.md rule
+    10): aborts the keystroke batch in progress AND kills the command
+    running right now (whole process group); dictation mode is untouched."""
+    action = QAction("Stop typing / command", menu)
+    action.setToolTip("abort the keystroke batch in progress and kill the "
+                      "command running right now")
+    action.setEnabled(typing_svc is not None or command_pack is not None)
+
+    def _stop(checked=None):
+        if typing_svc is not None:
+            typing_svc.engine.stop()
+        if command_pack is not None:
+            command_pack.cancel()
+    action.triggered.connect(_stop)
     return action
 
 
@@ -891,6 +898,18 @@ def main():
             appedit.install(sense, runtime=runtime, bridge=browser)
         except Exception as e:  # noqa: BLE001 — app edit off must not kill the app
             print(f"[desktop] app-editing tools unavailable ({e})", flush=True)
+    # Command running (docs/COMMANDS.md): run_command on the PC, read-only
+    # allowlist auto-runs, everything else asks with the exact command +
+    # directory. Same register_extra hook, so it rides the awareness gate.
+    command_pack = None
+    if sense is not None and runtime is not None:
+        try:
+            from riko import commands as commands_mod
+            command_pack = commands_mod.install(sense, cfg=cfg,
+                                                runtime=runtime,
+                                                bridge=browser)
+        except Exception as e:  # noqa: BLE001 — commands off must not kill the app
+            print(f"[desktop] command tools unavailable ({e})", flush=True)
     hub_client.start_state_poller()  # notice switches made from the web page or another PC
     session.follow_hub_events()  # hub-fired timer replies reach her like normal turns (docs/TIMERS.md D)
     session.greet_on_start()  # she says hello once when the page is ready (desktop.greet_on_start)
@@ -1374,7 +1393,7 @@ def main():
     if typing_svc is not None:
         typing_svc.dictation.notice = _dictation_notice
     dictation_action = build_dictation_action(menu, typing_svc, _dictation_apply)
-    stop_typing_action = build_stop_typing_action(menu, typing_svc)
+    stop_typing_action = build_stop_typing_action(menu, typing_svc, command_pack)
 
     for label, fn in ((f"Type to her{hint('type')}", lambda: on_command("type")),
                       (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle)):

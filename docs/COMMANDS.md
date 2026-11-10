@@ -73,9 +73,33 @@ Defaults:
   is-active|is-enabled`, `systemctl status|list-units|is-active` (system, read-only verbs),
   `git status|log|diff|show|branch|remote -v` (no `-c` config overrides, no `--output`), `pacman -Q*` and
   `pacman -Ss|-Si`, `flatpak list`, `nvidia-smi` / `rocm-smi` / `radeontop -d - -l 1`, `uv --version`,
-  `python --version`, `node --version`, `docker ps|images|compose ls` (read verbs only).
+  `python --version`, `node --version`, `docker ps|images|compose ls` (read verbs only),
+  `findmnt` (show mounts), `checkupdates` (read-only), `systemctl --failed` /
+  `systemctl --user --failed` (a failed-unit listing is read-only).
 
 Everything else asks. Riko can't widen the allowlist herself.
+
+## Recipes
+
+Natural-language shortcuts so "how much space is free on the root volume?" becomes `df -h /`
+without her guessing flags. Defaults live in `riko/commands/recipes.py` (`DEFAULT_RECIPES`:
+~30 entries covering disk/memory/CPU/GPU/processes/services/logs/network/packages/git/docker —
+the owner's GPU is an AMD RX 9060 XT, so the GPU defaults are `rocm-smi` and `radeontop -d - -l 1`).
+The owner overrides/extends them in `character_config.yaml` `commands.recipes`: a list of
+`{ask, command, note?}` where an entry with the same `ask` replaces a default, new asks are
+appended, and `recipes: false` clears the catalogue.
+
+Honesty rule (enforced by `recipes.validate()` + a test): every recipe command either auto-runs
+under the allowlist exactly as written, or carries `asks: true` (shell pipes, `<placeholder>`
+templates — those pop the normal approval bubble; `templated: true` recipes must set `asks: true`).
+
+Two surfaces: (1) the `run_command` tool description carries a compact "common asks → command"
+block (≤ 900 chars, `compact_desc`); (2) a read-only client tool `command_recipes(query?)`
+returns ranked matches (simple keyword scoring, `recipes.lookup`) so she can look up the right
+command before running it. The hub prompt line tells her to look up recipes for any
+this-PC question and explain the result in plain words. A recipe never bypasses the policy:
+the looked-up command goes through `decide()` like any other command (secret paths still ask,
+refusals still refuse).
 
 ## Tests
 
@@ -84,3 +108,5 @@ Never execute real commands in tests: the runner is injectable and `tests/confte
 script). Cover: allowlist hits/misses (shell syntax, secret path, write flags, subcommands), refusals
 (sudo, power, compositor, mkfs/dd/rm), approval flow (exact command shown, deny → not run, hub
 approval alone not enough), env scrubbing, timeout kill, output cap, redaction, cwd rules, audit line.
+Recipes: lookup finds the owner's exact phrasings (root/home volume space, memory users, GPU heat),
+every default recipe auto-runs or is explicitly `asks: true`, and config override/extend behaves.

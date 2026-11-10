@@ -210,6 +210,26 @@ typing:
   # your desktop settles faster; 0 is not recommended.
   settle_ms: 350
 
+# Command running (docs/COMMANDS.md): run_command executes on THIS PC and
+# reads the output back. Allowlisted read-only commands (ls, cat, df, git
+# status, …) run at once; everything else asks you first, showing the exact
+# command and directory. She can NEVER run sudo/su/pkexec, compositors,
+# power controls or disk destroyers, whatever the approval says.
+commands:
+  enabled: true          # false: run_command is not registered at all
+  # Extra programs that may run WITHOUT asking (read-only only; empty is
+  # the built-in default). She cannot add to this list herself, and secret
+  # paths (~/.ssh, .env files, …) always still ask.
+  auto_allow: []         # e.g. ["cowsay", "git stash"]
+  # Natural-language recipes: phrasings you use -> the command that answers
+  # them. The built-in defaults (disk space, memory, GPU, services, logs,
+  # ports, updates, …) cover the common ones; list an entry with the SAME
+  # `ask` to override a default, or a new `ask` to add one. A command that
+  # is not on the read-only allowlist simply pops the normal approval
+  # bubble when run (that is fine — set `asks: true` on such entries).
+  # `recipes: false` clears the whole catalogue.
+  recipes: []            # e.g. [{ask: "disk space please", command: "df -h"}]
+
 # Always-listen name gate (riko/name_gate.py; tray "Only when I say her name",
 # riko-ctl listen name-gate on|off). Only ever bites in always mode:
 # push-to-talk and typed text are intent and always pass.
