@@ -63,13 +63,15 @@
     }
     #input.show { display: block; }
   </style>
+  <!-- Vendored libraries (offline: no CDN). See client/vendor/README.md;
+       tests/test_client_vendor.py guards versions, hashes and local paths. -->
   <script type="importmap">
     {
       "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.179.1/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.179.1/examples/jsm/",
-        "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.1/lib/three-vrm.module.min.js",
-        "@pixiv/three-vrm-animation": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm-animation@3.5.5/lib/three-vrm-animation.module.js"
+        "three": "./vendor/three/build/three.module.js",
+        "three/addons/": "./vendor/three/addons/",
+        "@pixiv/three-vrm": "./vendor/three-vrm/three-vrm.module.min.js",
+        "@pixiv/three-vrm-animation": "./vendor/three-vrm-animation/three-vrm-animation.module.js"
       }
     }
   </script>
@@ -170,12 +172,16 @@
     // must be re-framed for the NEW size BEFORE it renders, so a compositor
     // resize can never paint one frame with stale framing.
     let framedW = viewW(), framedH = viewH();
+    // A resize can land while init is still awaiting (local vendor files load
+    // fast): the hoisted updateWalkBounds() would then touch `director` in its
+    // TDZ. Bounds are recomputed at init anyway, so skip calls until then.
+    let walkBoundsReady = false;
     function syncViewport() {
       framedW = viewW(); framedH = viewH();
       camera.aspect = framedW / framedH;
       camera.updateProjectionMatrix();
       renderer.setSize(framedW, framedH);
-      if (typeof updateWalkBounds === 'function') updateWalkBounds();
+      if (walkBoundsReady) updateWalkBounds();
       // THE frame the compositor resized us: re-frame so pixels-per-metre
       // and the feet stay exactly where they were (scale.js invariant) —
       // this is what makes the gesture's grow/fit invisible.
@@ -469,6 +475,7 @@
     if (Number.isFinite(+settings.roam_speed)) walkOpts.speedMul = +settings.roam_speed;
     const walkDirector = ROAM ? new WalkDirector(walkOpts) : null;
     const director = new Director({ walk: walkDirector });
+    walkBoundsReady = true;
     if (walkDirector && Number.isFinite(+settings.roam_x)) walkDirector.setX(0, +settings.roam_x);
     let faceWant = 0;         // vrm.scene.rotation.y target (face travel direction)
     let lastXSent = null;

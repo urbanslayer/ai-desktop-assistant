@@ -216,8 +216,14 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 
 ## Quick wins
 
-6. **Works offline**: bundle three.js, three-vrm and three-vrm-animation under `client/vendor/`
-   (pinned versions, licence files) instead of loading them from the jsdelivr CDN.
+6. **Works offline** (done 2026-11-10): three.js 0.179.1, @pixiv/three-vrm 3.4.1 and
+   @pixiv/three-vrm-animation 3.5.5 are vendored under `client/vendor/` (pinned files, MIT
+   licence texts, SHA-256 manifest in `client/vendor/README.md`); the import map and every
+   module import now resolve locally — `tests/test_client_vendor.py` fails if a runtime URL
+   or a hash drifts back in. Still networked **on purpose**: weather (Open-Meteo), web
+   search, the LLM, Spotify (internet, via the hub) and the hub/TTS/ASR servers on the LAN
+   (eve). The avatar page itself, the VRM models and the fonts (system fonts, none to fetch)
+   need no network.
 7. **Hub backups**: nightly copy of `~/AI/Docker/riko-hub/data` (and `breeze-tts/data/voices`, the ASR
    model is re-downloadable) to the owner's Duplicati on Nemu, or a simple dated tarball with rotation. Owner to
    confirm the target.
