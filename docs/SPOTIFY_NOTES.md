@@ -41,6 +41,37 @@ Tidal later once developer access is approved.
   - The **full Player API is still available** (play/pause/next/prev/seek/volume/shuffle/repeat,
     devices, transfer, currently-playing, recently-played, queue) — everything this feature needs.
 
+## Managed spotifyd start (owner PC, verified 2026-11-10)
+
+The owner's live failure was `spotifyd exited right away (code 2)` — two
+independent causes, both fixed in `riko/music/spotifyd.py`:
+
+- **`--backend pipewire` is not a spotifyd backend.** Arch spotifyd 0.4.2
+  accepts exactly `rodio|alsa|pulseaudio|pipe|subprocess`; clap printed its
+  usage error and exited 2. PipeWire serves the PulseAudio protocol, so the
+  default (and the config value) is now `pulseaudio`; a leftover
+  `pipewire` is mapped to it with a one-line log note.
+- **The owner's `~/.config/spotifyd/spotifyd.conf` predates Riko** (ncspot
+  days): `cache_path = "cache_directory"` is RELATIVE, so
+  `spotifyd authenticate` run from `~` wrote credentials to
+  `~/cache_directory/oauth/credentials.json`, plus a junk
+  `on_song_change_hook` and an old username. Riko never reads that file:
+  managed mode writes its own minimal conf to `~/.config/riko/spotifyd.conf`
+  (0600, no hooks, `use_mpris = true`, `device_type = "computer"`,
+  bitrate 320) and passes `--config-path` + absolute `--cache-path`
+  (`~/.cache/riko/spotifyd`, config override `desktop.music.spotifyd_cache`)
+  with `cwd` = the cache dir, so no relative path can scatter files again.
+- **Credential migration is copy-only.** If `<cache>/oauth/credentials.json`
+  is missing, Riko looks in `~/.cache/spotifyd/oauth`, then
+  `~/cache_directory/oauth`, then `$XDG_CACHE_HOME/spotifyd/oauth` and
+  COPIES the first hit (0600, log line); owner files are never moved or
+  deleted. With no login anywhere Riko does not spawn and prints the exact
+  one-time command: `spotifyd authenticate --cache-path ~/.cache/riko/spotifyd`.
+- **Early exits report spotifyd's own output**, not a guess: stdout/stderr
+  are piped into a 20-line ring buffer (daemon drain thread), and the last
+  error line lands in the tray/terminal message. "Login missing" is only
+  said when the output actually mentions credentials/auth.
+
 ## Consequences for the plan
 
 - No batch-fetch shortcut when building now-playing/queue UI: fetch tracks individually (or rely on

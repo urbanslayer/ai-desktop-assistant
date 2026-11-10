@@ -889,6 +889,9 @@ def build_music_menu(menu, player, listener=None, notify=None):
         st = player.status()
         if st.get("setup_needed"):
             status_action.setText("player: spotifyd not installed")
+        elif st.get("login_needed"):
+            status_action.setText("player: no login yet — Start player "
+                                  "prints the authenticate command")
         elif st.get("running"):
             status_action.setText(f"player: running (pid {st.get('pid')})")
         elif st.get("mode") == "external":
