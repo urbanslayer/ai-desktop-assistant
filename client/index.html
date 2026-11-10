@@ -93,6 +93,10 @@
     import { GESTURES, vowelWeights, IK_ARM_GESTURES } from './js/gestures.js';
     import { gestureEnvelope } from './js/ik.js';
     import { AvatarMotion } from './js/motion.js';
+    import {
+      hitTest, PressTracker, TouchRecogniser, TouchPostGate, GRABBABLE,
+    } from './js/touch.js';
+    import { PoseLayer, GRAB_KIND } from './js/pose.js';
     import { WalkDirector } from './js/walk.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
              GestureTracker, framingDistance, feetAnchorTarget,
@@ -277,6 +281,8 @@
       vrm.scene.updateMatrixWorld(true);
 
       motion.attach(vrm);   // re-targets bones, gaze, and gestures onto the new body
+      pose.attach(vrm);     // the pose layer rides the same bone cache (docs/TOUCH.md)
+      resetTouchState();    // persona swap: no dangling grabs/sits on the old bones
       if (GAZE_PARAM) {
         const [gy, gp] = GAZE_PARAM.split(',').map(Number);
         motion.setGazeOverride({ yaw: (gy || 0) * Math.PI / 180,
@@ -507,6 +513,232 @@
       const lim = Math.max(0.2, halfW - margin);
       w.configure({ bounds: { min: -lim, max: lim }, height: rig.height });
     }
+    // ── Touch & posing (docs/TOUCH.md) ─────────────────────────────────
+    // The pose layer (limb-grab IK + sit pose, client/js/pose.js) rides on top
+    // of the life layer every frame; pointer presses are classified by the
+    // pure recogniser (client/js/touch.js) into window-drag / grab / tap /
+    // stroke -> pat / poke / tickle. The page reacts locally (expression +
+    // small move) and posts /control/touch (debounced) for the hub.
+    const pose = new PoseLayer(THREE, motion);
+    let touchMode = 'quiet';        // off | quiet | chatty (desktop touch-mode:<m>)
+    let sitReported = null;         // last /control/sit-state value posted
+    let touchBlocked = false;       // walk 'touch' block currently held
+    let grabId = null, grabDepth = null, grabDownAt = 0;
+    let _touchPress = new PressTracker();
+    let _touchRec = new TouchRecogniser();
+    const _touchGate = new TouchPostGate();
+    const _lastPt = { x: 0, y: 0 };
+    const _tp = new THREE.Vector3();
+    const PART_BONE = {
+      hand_l: 'leftHand', hand_r: 'rightHand',
+      arm_l: 'leftLowerArm', arm_r: 'rightLowerArm',
+      foot_l: 'leftFoot', foot_r: 'rightFoot', head: 'head',
+    };
+    function resetTouchState() {   // persona swap: the old bones are gone
+      _touchPress = new PressTracker();
+      _touchRec = new TouchRecogniser();
+      grabId = null; grabDepth = null; sitReported = null; touchBlocked = false;
+    }
+
+    // ── body-part screen rects (the bbox seam, docs/TOUCH.md §parts) ──
+    // Window CSS px, projected from the LIVE bones so they track sit/grab/roam
+    // exactly; ~6 px padded like the bbox itself.
+    function _pxOf(p) {
+      _tp.set(p[0], p[1], p[2]).project(camera);
+      return [(_tp.x * 0.5 + 0.5) * innerWidth, (-_tp.y * 0.5 + 0.5) * innerHeight];
+    }
+    function _rectOf(pts, pad) {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, ok = false;
+      for (const p of pts) {
+        const [px, py] = _pxOf(p);
+        if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+        ok = true;
+        x0 = Math.min(x0, px); x1 = Math.max(x1, px);
+        y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+      }
+      if (!ok) return null;
+      return [Math.round(x0 - pad), Math.round(y0 - pad),
+              Math.round(x1 - x0 + pad * 2), Math.round(y1 - y0 + pad * 2)];
+    }
+    function _boxAround(p, s, ys = s) {
+      const pts = [];
+      for (const dx of [-s, s]) for (const dy of [-ys, ys]) for (const dz of [-s, s]) {
+        pts.push([p.x + dx, p.y + dy, p.z + dz]);
+      }
+      return pts;
+    }
+    function computeParts() {
+      if (!vrm || !motion.rig) return null;
+      const bone = (b) => vrm.humanoid.getNormalizedBoneNode(b);
+      const wp = (b) => b ? b.getWorldPosition(new THREE.Vector3()) : null;
+      const rig = motion.rig;
+      const parts = {};
+      const head = bone('head');
+      if (head) parts.head = _rectOf(_boxAround(wp(head), (rig.headLen || 0.12) * 0.55), 6);
+      for (const [S, s] of [['l', 'left'], ['r', 'right']]) {
+        const hand = wp(bone(`${s}Hand`)), elb = wp(bone(`${s}LowerArm`)), foot = wp(bone(`${s}Foot`));
+        if (hand) parts[`hand_${S}`] = _rectOf(_boxAround(hand, 0.055), 6);
+        if (elb && hand) parts[`arm_${S}`] = _rectOf(
+          _boxAround(elb, 0.05).concat(_boxAround(hand, 0.05)), 6);
+        if (foot) parts[`foot_${S}`] = _rectOf(_boxAround(foot, 0.07, 0.05), 6);
+      }
+      const hips = bone('hips'), chest = bone('chest') || bone('upperChest') || bone('spine');
+      const hipsW = wp(hips), chestW = wp(chest);
+      const half = (rig.shoulderWidth || 0.3) * 0.5;
+      if (hipsW && chestW) parts.torso = _rectOf(
+        _boxAround([hipsW.x, (hipsW.y + chestW.y) / 2, hipsW.z], half * 0.85, (chestW.y - hipsW.y) / 2 + 0.05), 6);
+      if (hipsW) parts.hips = _rectOf(_boxAround(hipsW, half * 0.8, 0.09), 6);
+      for (const k of Object.keys(parts)) if (!parts[k]) delete parts[k];
+      return parts;
+    }
+    function hipsPxY() {
+      if (!vrm) return null;
+      const b = vrm.humanoid.getNormalizedBoneNode('hips');
+      return b ? _pxOf(b.getWorldPosition(new THREE.Vector3()))[1] : null;
+    }
+    function feetPxY() {
+      if (!vrm) return null;
+      let low = null;
+      for (const s of ['left', 'right']) {
+        const toe = vrm.humanoid.getNormalizedBoneNode(`${s}Toes`);
+        const foot = vrm.humanoid.getNormalizedBoneNode(`${s}Foot`);
+        const p = toe ? toe.getWorldPosition(new THREE.Vector3())
+          : foot ? foot.getWorldPosition(new THREE.Vector3()).add(new THREE.Vector3(0, -0.05, 0)) : null;
+        if (!p) continue;
+        const y = _pxOf(p.toArray())[1];
+        low = low === null ? y : Math.max(low, y);
+      }
+      return low;
+    }
+
+    // ── grab plumbing ──
+    function _grabWorldPoint(x, y, depth) {
+      _tp.set((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1, 0.5).unproject(camera);
+      return camera.position.clone().addScaledVector(_tp.sub(camera.position).normalize(), depth);
+    }
+    function startGrab(part, x, y) {
+      const b = vrm?.humanoid.getNormalizedBoneNode(PART_BONE[part]);
+      if (!b) return;
+      const w0 = b.getWorldPosition(new THREE.Vector3());
+      pose.setTarget(part, w0.toArray());   // blend in from where it actually is
+      grabDepth = camera.position.distanceTo(w0);
+      grabId = part; grabDownAt = performance.now();
+      postTouch(part, 'grab', x, y);
+    }
+    function endGrab(x, y) {
+      if (!grabId) return;
+      const holdMs = Math.round(performance.now() - grabDownAt);
+      // long grab -> she shakes the arm out on release (docs/TOUCH.md)
+      pose.release(grabId, { shake: holdMs > 2000 && part2arm(grabId) });
+      postTouch(grabId, 'release', x, y, { hold_ms: holdMs });
+      grabId = null; grabDepth = null;
+    }
+    const part2arm = (id) => id.startsWith('hand') || id.startsWith('arm');
+
+    function postTouch(part, kind, x, y, extra = {}) {
+      if (touchMode === 'off') return;
+      if (!_touchGate.allow(part, kind)) return;
+      fetch('/control/touch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ part, kind, x: Math.round(x), y: Math.round(y), ...extra }),
+      }).catch(() => {});
+    }
+    function postSitState(sitting) {
+      fetch('/control/sit-state', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sitting }),
+      }).catch(() => {});
+    }
+    function flashEmotion(name, value) {   // instant local reaction, no network
+      motion.applyEmotion(name, value);
+      setTimeout(() => {
+        if (lastExpression) applyAction(lastExpression);   // hand back to the director
+        else motion.applyEmotion(null, 0);
+      }, 2600);
+    }
+    function reactTo(ev) {
+      if (touchMode === 'off') return;
+      const parts = computeParts();
+      const hx = parts?.head ? parts.head[0] + parts.head[2] / 2 : innerWidth / 2;
+      const side = Math.sign(_lastPt.x - hx) || 1;   // +1: touched right of her face
+      if (ev.kind === 'pat') {           // happy/relaxed + lean into the pat
+        pose.react('headTilt', { side });
+        flashEmotion('happy', 0.7);
+      } else if (ev.kind === 'poke') {   // surprise + flinch away from that side
+        pose.react('flinch', { dir: side });
+        motion.lookAway(0.8);
+        flashEmotion('surprised', 0.8);
+      } else if (ev.kind === 'tickle') { // happy + giggle wiggle
+        pose.react('giggle');
+        flashEmotion('happy', 0.6);
+      }
+    }
+
+    // pointer capture phase (runs BEFORE the roam strip-drag handler)
+    addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || !vrm || !motion.rig || e.target !== renderer.domElement) return;
+      _lastPt.x = e.clientX; _lastPt.y = e.clientY;
+      _touchPress.down(e.clientX, e.clientY, e.timeStamp || performance.now());
+      const gs = _touchPress.setPart(hitTest(computeParts(), e.clientX, e.clientY));
+      if (gs) startGrab(gs.part, e.clientX, e.clientY);
+    }, true);
+    addEventListener('pointermove', (e) => {
+      _lastPt.x = e.clientX; _lastPt.y = e.clientY;
+      const ms = e.timeStamp || performance.now();
+      if (grabId) {                       // drive the IK in the grab plane
+        pose.setTarget(grabId, _grabWorldPoint(e.clientX, e.clientY, grabDepth ?? 2));
+        return;
+      }
+      const ev = _touchPress.move(e.clientX, e.clientY, ms);
+      if (ev?.type === 'grab-start') startGrab(ev.part, e.clientX, e.clientY);
+    }, true);
+    addEventListener('pointerup', (e) => {
+      const ms = e.timeStamp || performance.now();
+      const end = _touchPress.up(ms);
+      if (grabId) { endGrab(e.clientX, e.clientY); return; }
+      if (!end) return;
+      _touchRec.expire(ms);
+      if (e.target !== renderer.domElement || !vrm || !motion.rig) return;
+      const ev = end.kind === 'tap' ? _touchRec.tap(end.part, ms)
+        : end.kind === 'stroke' ? _touchRec.stroke(end.part, end.holdMs, end.reversals)
+        : null;
+      if (!ev) return;
+      postTouch(ev.part, ev.kind, e.clientX, e.clientY,
+                end.kind === 'stroke' ? { strokes: end.reversals } : {});
+      reactTo(ev);
+    }, true);
+
+    // every frame: still-hold deadline, walk freeze, sit-state seam
+    function touchFrame(dt) {
+      if (_touchPress.active && !grabId) {
+        const ev = _touchPress.move(_lastPt.x, _lastPt.y, performance.now());
+        if (ev?.type === 'grab-start') startGrab(ev.part, _lastPt.x, _lastPt.y);
+      }
+      _touchRec.expire(performance.now());
+      const block = pose.active || !!pose.sitState;
+      if (block !== touchBlocked) {
+        touchBlocked = block;
+        if (director?.walk) feed(director.walk.setBlocked(T(), 'touch', block));
+      }
+      if (pose.sitBlendDone && sitReported !== true) { sitReported = true; postSitState(true); }
+      if (sitReported === true && pose.standBlendDone) { sitReported = false; postSitState(false); }
+    }
+
+    // Desktop bridge commands (docs/TOUCH.md §Desktop → page)
+    function onCommand(cmd) {
+      if (typeof cmd !== 'string') return;
+      if (cmd.startsWith('sit:')) {
+        const y = parseFloat(cmd.slice(4));
+        if (Number.isFinite(y)) pose.sit(y, viewH());
+      } else if (cmd === 'stand') {
+        pose.stand();
+      } else if (cmd.startsWith('touch-mode:')) {
+        const m = cmd.slice('touch-mode:'.length);
+        if (m === 'off' || m === 'quiet' || m === 'chatty') touchMode = m;
+      }
+      // press-hint:<limb|none> is optional in the contract; nothing to do yet
+    }
+
     const _bboxV = new THREE.Vector3();
     let bboxAt = 0, xPostAt = 0;
     function postBbox() {
@@ -530,9 +762,18 @@
       const x = Math.max(0, Math.round(x0 - pad)), y = Math.max(0, Math.round(y0 - pad));
       const bw = Math.min(innerWidth - x, Math.round(x1 - x0 + pad * 2));
       const bh = Math.min(innerHeight - y, Math.round(y1 - y0 + pad * 2));
+      // touch seams (docs/TOUCH.md): body-part rects + hips/feet line, CSS px.
+      // Desktop ignores unknown keys; absent fields mean unknown.
+      const parts = computeParts();
+      const hy = hipsPxY(), fy = feetPxY();
       fetch('/control/bbox', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ x, y, w: bw, h: bh }),
+        body: JSON.stringify({
+          x, y, w: bw, h: bh,
+          ...(parts ? { parts } : {}),
+          ...(hy != null ? { hips_y: Math.round(hy) } : {}),
+          ...(fy != null ? { feet_y: Math.round(fy) } : {}),
+        }),
       }).catch(() => {});
     }
     function walkHousekeeping(now) {
@@ -568,6 +809,7 @@
         feed(w.setBlocked(T(), 'dragging', true));
         let lastPx = e.clientX;
         const move = (ev) => {
+          if (grabId) return;   // a limb grab owns this pointer (docs/TOUCH.md)
           const dx = (ev.clientX - lastPx) * stripGeometry().mPerPx;
           lastPx = ev.clientX;
           w.x = Math.min(w.bounds.max, Math.max(w.bounds.min, w.x + dx));
@@ -586,6 +828,10 @@
     function applyAction(a) {
       // one bad action must not kill the rest of this event batch
       try {
+        // grabbed or sitting: no roaming, no idle gestures (gaze keeps going)
+        if (pose.active && (a.type === 'gesture' || a.type === 'walk_start' || a.type === 'walk_turn')) {
+          return;
+        }
         if (TIMING && (a.type === 'gesture' || a.type === 'gesture_stop')) {
           (window.__actionTimeline = window.__actionTimeline || []).push(
             { t: T(), type: a.type, name: a.name });
@@ -765,6 +1011,9 @@
           leftHandInCanvas: inCanvas(lHandNdc),
           leftElbowInCanvas: inCanvas(lElbowNdc),
           gazeDbg: motion.__debug(),
+          // touch/pose seams for the capture harness (docs/TOUCH.md)
+          parts: computeParts(), hipsYpx: hipsPxY(), feetYpx: feetPxY(),
+          pose: pose.debug(), touchMode,
           headFootPx: headPx && footPx ? Math.round(footPx[1] - headPx[1]) : null,
           feetFromBottomPx: footPx ? Math.round(viewH() - footPx[1]) : null,
           visualScale: Math.round(scaleShown * 1000) / 1000,
@@ -1048,6 +1297,11 @@
 
     window.riko = { openInput, closeInput, requestWave, resetSize: resetAvatarSize,
                     motion, director, measure: () => window.rikoMeasure(),
+                    onCommand,                     // desktop bridge commands (TOUCH.md)
+                    pose: () => pose,              // QA/item-6 handle on the pose layer
+                    touchDebug: () => ({ mode: touchMode, grab: grabId, sitReported,
+                                         parts: computeParts(), hips_y: hipsPxY(),
+                                         feet_y: feetPxY(), pose: pose.debug() }),
                     scale: () => ({ shown: scaleShown, target: scaleTarget, window: windowScale }),
                     wheel: (deltaY, deltaMode = 0) => renderer.domElement.dispatchEvent(
                       new WheelEvent('wheel', { deltaY, deltaMode, bubbles: true, cancelable: true })),
@@ -1171,17 +1425,23 @@
         if (fit !== null) postScale(scaleTarget, fit, false);
       }
       feed(director.tick(T(), dt));  // idle gestures, endings, decay, roam schedule
+      touchFrame(dt);                // press deadlines, walk freeze, sit-state (TOUCH.md)
       if (ROAM && director.walk && vrm) {
         // root motion: the scene carries her along the strip; the camera
         // stays put so the visible canvas IS the strip width, and turns her
         // toward the direction of travel (and back to the viewer on stop)
-        vrm.scene.position.x = director.walk.x;
+        vrm.scene.position.x = director.walk.x + pose.flinchX;
         const ry = vrm.scene.rotation.y;
         vrm.scene.rotation.y = ry + (faceWant - ry) * (1 - Math.exp(-dt / 0.16));
         walkHousekeeping(T());
+      } else if (vrm && pose.flinchX !== 0) {
+        vrm.scene.position.x = pose.flinchX;   // poke flinch outside roam mode too
+      } else if (vrm && vrm.scene.position.x !== 0 && !ROAM) {
+        vrm.scene.position.x = 0;
       }
       feedVowel();
       motion.update(dt);
+      pose.apply(dt, { viewH: viewH() });   // pose layer on TOP of the life layer
       vrm.update(dt);
       controls.update();  // runs the glide
       renderer.render(scene, camera);
