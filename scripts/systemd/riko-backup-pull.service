@@ -1,0 +1,13 @@
+# Pull hub backups from eve onto the PC — systemd USER service on the PC.
+# The destination ~/Backups/riko-hub is what the owner's Duplicati on Nemu
+# should watch (Nemu cannot ssh to eve with current keys). See docs/BACKUPS.md.
+[Unit]
+Description=Pull Riko hub backups from eve (docs/BACKUPS.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+# Checkout path on the PC; adjust if the repo lives elsewhere.
+ExecStart=%h/Development/riko_project/scripts/backup_pull.sh

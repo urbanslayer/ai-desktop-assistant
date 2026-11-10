@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Riko hub data backup timer (eve)
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=900
+Persistent=true
+Unit=riko-backup.service
+
+[Install]
+WantedBy=timers.target

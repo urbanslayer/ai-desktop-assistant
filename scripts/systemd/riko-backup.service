@@ -1,0 +1,15 @@
+# Nightly Riko hub data backup — runs as a SYSTEMD USER service on eve.
+# Install: see docs/BACKUPS.md (copy scripts/backup_hub.sh to ~/.local/bin/
+# on eve, then install this unit + riko-backup.timer under ~/.config/systemd/user/).
+[Unit]
+Description=Nightly Riko hub data backup (docs/BACKUPS.md)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600
+# Installed copy of scripts/backup_hub.sh (docs/BACKUPS.md step 1)
+ExecStart=%h/.local/bin/backup_hub.sh

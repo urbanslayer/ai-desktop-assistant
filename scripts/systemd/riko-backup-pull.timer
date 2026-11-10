@@ -1,0 +1,10 @@
+[Unit]
+Description=Pull Riko hub backups from eve, nightly timer (PC)
+
+[Timer]
+OnCalendar=*-*-* 04:40:00
+Persistent=true
+Unit=riko-backup-pull.service
+
+[Install]
+WantedBy=timers.target
