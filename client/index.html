@@ -553,19 +553,34 @@
     // Touch HUD (docs/TOUCH.md visual checks), drawn into the MAIN render as
     // children of the camera (a 2D overlay at fixed depth), so ?capture
     // screenshots contain it: sit edge line + grab-target ring.
-    const _hudRoot = new THREE.Group();
     const _edgeMesh = new THREE.Mesh(
       new THREE.PlaneGeometry(1, 1),
       new THREE.MeshBasicMaterial({ color: 0x78beff, transparent: true, opacity: 0.6, depthTest: false }));
-    const _ringMesh = new THREE.Mesh(
-      new THREE.RingGeometry(0.78, 1, 28),
-      new THREE.MeshBasicMaterial({ color: 0xffaa50, transparent: true, opacity: 0.95, depthTest: false }));
+    const _ringMesh = new THREE.Group();
+    {
+      const mat = new THREE.MeshBasicMaterial({ color: 0xffaa50, transparent: true, opacity: 0.95, depthTest: false });
+      const barH = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+      const barV = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+      barH.frustumCulled = barV.frustumCulled = false;
+      barH.name = 'barH'; barV.name = 'barV';
+      _ringMesh.add(barH, barV);
+    }
     for (const m of [_edgeMesh, _ringMesh]) { m.renderOrder = 999; m.frustumCulled = false; }
     _edgeMesh.visible = _ringMesh.visible = false;
-    _hudRoot.add(_edgeMesh, _ringMesh);
-    scene.add(camera);
-    camera.add(_hudRoot);
+    scene.add(_edgeMesh, _ringMesh);
+    const _hudV = new THREE.Vector3();
+    /* World-space pose of a flat overlay drawn at viewport pixel (px, py),
+       at a fixed camera distance: unproject maps that pixel's ray, so it is
+       exact whatever the camera's aspect/fov/orbit are. */
+    function _hudPlace(obj, px, py, dist) {
+      _hudV.set((px / innerWidth) * 2 - 1, -(py / innerHeight) * 2 + 1, 0.5).unproject(camera);
+      _hudV.sub(camera.position).normalize();
+      obj.position.copy(camera.position).addScaledVector(_hudV, dist);
+      obj.quaternion.copy(camera.quaternion);
+      return (2 * dist * Math.tan((camera.fov * Math.PI) / 360)) / innerHeight;  // world units per px
+    }
     let _specFace = null;      // empirically-detected "facing camera" yaw
+    let _specOrbitAz = null;   // QA orbit azimuth (rad), pinned while set
     function specFaceWant() {
       if (_specFace != null) return _specFace;
       try {
@@ -761,25 +776,29 @@
       // Overlays (docs/TOUCH.md visual checks): edge line under the sitting
       // hips + crosshair at the live grab target. Drawn into the WEBGL canvas
       // (a HUD pass), not the DOM, so ?capture screenshots include them.
+      if (TOUCH_SPEC && _specOrbitAz != null) {
+        controls.setAzimuthalAngle(_specOrbitAz);
+        controls.update();
+      }
       {
-        const W = innerWidth, H = innerHeight, D = 0.5;
-        const halfH = Math.tan((camera.fov * Math.PI) / 360) * D;
-        const halfW = halfH * (W / H);
+        const D = 0.6;   // overlay plane distance from camera (in front of the avatar)
         const s = pose.sitState;
         if (s && s.edgePx != null && s.w > 0.01) {
           _edgeMesh.visible = true;
-          _edgeMesh.position.set(0, (0.5 - s.edgePx / H) * 2 * halfH, -D);
-          _edgeMesh.scale.set(2 * halfW, 2 * halfH * (2 / H), 1);
+          const u = _hudPlace(_edgeMesh, innerWidth / 2, s.edgePx, D);
+          _edgeMesh.scale.set(innerWidth * u, 2 * u, 1);   // full-width 2 px line
           _edgeMesh.material.opacity = 0.6 * Math.min(1, s.w);
         } else _edgeMesh.visible = false;
         let shown = false;
         for (const [, g] of pose.grabs) {
-          if (g.state === 'in' && g.cur) {
+          if (g.state !== 'out' && g.cur) {
             const [px, py] = _pxOf(g.cur);
             if (Number.isFinite(px) && Number.isFinite(py)) {
               _ringMesh.visible = true;
-              _ringMesh.position.set((px / W * 2 - 1) * halfW, (0.5 - py / H) * 2 * halfH, -D);
-              _ringMesh.scale.setScalar(7 * 2 * halfH / H);   // ~7 px radius
+              const u = _hudPlace(_ringMesh, px, py, D);
+              const bar = _ringMesh.getObjectByName('barH'), bar2 = _ringMesh.getObjectByName('barV');
+              bar.scale.set(15 * u, 1.6 * u, 1);          // 15 px x 1.6 px crosshair bars
+              bar2.scale.set(1.6 * u, 15 * u, 1);
               shown = true;
               break;
             }
@@ -910,6 +929,8 @@
                   : `touch-mode:${opArg}`);
           } else if (op === 'face') {
             _specFace = (+opArg || 0) * Math.PI / 180;   // explicit facing pin
+          } else if (op === 'orbit') {
+            _specOrbitAz = (+opArg || 0) * Math.PI / 180;  // QA: view azimuth (deg)
           } else if (op === 'grab') {
             const [x, y] = xy(tk[2], tk[3]);
             const dx = +tk[4], dy = +tk[5], dur = +tk[6] || 900;
