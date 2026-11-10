@@ -1073,16 +1073,17 @@ curl -s -H "$AUTH" "$HUB/api/spotify/status"
 
 curl -s -H "$AUTH" "$HUB/api/spotify/connect-url"          # ?redirect_uri=… optional
 # {"url":"https://accounts.spotify.com/authorize?…","state":"…",
-#  "code_verifier":"…","redirect_uri":"http://127.0.0.1:8911/callback"}
-# the hub keeps this PKCE pair single-use for 15 min
+#  "redirect_uri":"http://127.0.0.1:8911/callback","expires_in":900}
+# the PKCE verifier never leaves the hub; the handshake is single-use, 15 min
 
 curl -s -H "$AUTH" -X POST "$HUB/api/spotify/connect" -d \
   '{"code":"…","redirect_uri":"http://127.0.0.1:8911/callback","state":"…"}'
 # from the desktop listener; OR the Settings page paste-back box:
 #   {"paste":"http://127.0.0.1:8911/callback?code=…&state=…"}
-# a bare code or a bare query string also parse. code_verifier falls back
-# to the stored handshake. Returns the status object. 400/409 with a plain
-# message when the state mismatches or no client id is set.
+# a bare code or a bare query string also parse. The hub uses its stored
+# PKCE verifier; a state that isn't the pending one, or a handshake older than
+# 15 min, is rejected before any token exchange. Returns the status object;
+# 400/409 with a plain message on state mismatch, expiry, or no client id.
 
 curl -s -H "$AUTH" -X POST "$HUB/api/spotify/disconnect"   # drop tokens, keep settings
 curl -s -H "$AUTH" "$HUB/api/spotify/now-playing"

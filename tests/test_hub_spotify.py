@@ -90,6 +90,9 @@ def test_parse_redirect_paste_forms():
 def test_connect_with_explicit_pkce_fields(hub_app, fake):
     app, client = hub_app
     info = client.get("/api/spotify/connect-url").json()
+    # the PKCE verifier stays on the hub — never handed to clients
+    assert "code_verifier" not in info
+    verifier = app.state.store.get_json("spotify_pending", {})["verifier"]
     assert info["url"].startswith(fake.base + "/authorize?")
     assert f"client_id={CID}" in info["url"]
     assert "code_challenge_method=S256" in info["url"]
@@ -97,23 +100,24 @@ def test_connect_with_explicit_pkce_fields(hub_app, fake):
         in info["url"]
     r = client.post("/api/spotify/connect", json={
         "code": "CODE-OK", "redirect_uri": info["redirect_uri"],
-        "code_verifier": info["code_verifier"]})
+        "code_verifier": verifier})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["connected"] and body["connected_as"] == "Owner Person"
     tok = fake.last("POST", "/api/token")
     assert tok["form"]["grant_type"] == "authorization_code"
-    assert tok["form"]["code_verifier"] == info["code_verifier"]
+    assert tok["form"]["code_verifier"] == verifier
     assert tok["form"]["client_id"] == CID and "client_secret" not in tok["form"]
     # handshake is single use
     assert client.post("/api/spotify/connect", json={
         "code": "CODE-OK", "redirect_uri": REDIRECT,
-        "code_verifier": info["code_verifier"]}).status_code == 200  # explicit verifier still works
+        "code_verifier": verifier}).status_code == 200  # explicit verifier still works
 
 
 def test_connect_paste_back(hub_app, fake):
     app, client = hub_app
     info = client.get("/api/spotify/connect-url").json()
+    verifier = app.state.store.get_json("spotify_pending", {})["verifier"]
     r = client.post("/api/spotify/connect",
                     json={"paste": f"{REDIRECT}?code=PASTED&state={info['state']}"})
     assert r.status_code == 200 and r.json()["connected"]
@@ -121,8 +125,30 @@ def test_connect_paste_back(hub_app, fake):
     assert tok["form"]["code"] == "PASTED"
     assert tok["form"]["redirect_uri"] == REDIRECT
     # the stored PKCE verifier was used — the paste carried none
-    assert tok["form"]["code_verifier"] == info["code_verifier"]
+    assert tok["form"]["code_verifier"] == verifier
     assert client.get("/api/spotify/status").json()["connected"]
+
+
+def test_connect_rejects_foreign_state(hub_app, fake):
+    app, client = hub_app
+    client.get("/api/spotify/connect-url")
+    r = client.post("/api/spotify/connect",
+                    json={"paste": f"{REDIRECT}?code=EVIL&state=not-ours"})
+    assert r.status_code >= 400 and "state mismatch" in r.text
+    assert not client.get("/api/spotify/status").json()["connected"]
+    assert not fake.last("POST", "/api/token")   # no token exchange attempted
+
+
+def test_connect_rejects_expired_handshake(hub_app, fake):
+    app, client = hub_app
+    info = client.get("/api/spotify/connect-url").json()
+    pending = app.state.store.get_json("spotify_pending", {})
+    pending["created"] -= 10_000
+    app.state.store.set_json("spotify_pending", pending)
+    r = client.post("/api/spotify/connect", json={
+        "code": "CODE-OK", "state": info["state"], "redirect_uri": REDIRECT})
+    assert r.status_code >= 400 and "expired" in r.text
+    assert not fake.last("POST", "/api/token")   # no token exchange attempted
 
 
 def test_connect_requires_client_id(hub_app):

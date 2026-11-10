@@ -525,8 +525,9 @@ class SpotifyHub:
                             state, challenge,
                             accounts_base=(str(self.settings().get("accounts_url") or "")
                                            .strip() or DEFAULT_ACCOUNTS_BASE))
+        # The PKCE verifier stays on the hub: it is never sent to clients.
         return {"url": url, "state": state, "redirect_uri": redirect_uri,
-                "code_verifier": verifier, "expires_in": PENDING_TTL_S}
+                "expires_in": PENDING_TTL_S}
 
     def connect(self, payload: dict) -> dict:
         """Exchange a code (+ PKCE verifier) for tokens, or accept the full
@@ -537,6 +538,7 @@ class SpotifyHub:
         redirect_uri = str(payload.get("redirect_uri") or "").strip()
         code = str(payload.get("code") or "").strip()
         verifier = str(payload.get("code_verifier") or "").strip()
+        state = str(payload.get("state") or "").strip()
         if not code and not verifier:
             paste = payload.get("paste")
             if paste is None:
@@ -544,7 +546,20 @@ class SpotifyHub:
                                    "or {paste: <the redirected URL>}")
             parsed = parse_redirect_paste(str(paste))
             code = parsed["code"]
+            state = state or str(parsed.get("state") or "")
             redirect_uri = redirect_uri or parsed["redirect_uri"]
+        if not verifier:
+            # Using the hub-held PKCE pair: the handshake must be fresh and,
+            # when Spotify's redirect carried a state, it must be ours (stops
+            # a stale or foreign authorization code being bound to this hub).
+            if pending and time.time() - float(pending.get("created") or 0) > PENDING_TTL_S:
+                self.store.del_json("spotify_pending")
+                raise SpotifyError("that Connect attempt expired — press "
+                                   "Connect again")
+            if pending and state and state != pending.get("state"):
+                raise SpotifyError("the sign-in reply doesn't match the "
+                                   "Connect attempt in progress (state "
+                                   "mismatch) — press Connect again")
         if not redirect_uri:
             redirect_uri = str(pending.get("redirect_uri") or "").strip()
         if not redirect_uri:
