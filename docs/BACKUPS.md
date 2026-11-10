@@ -16,7 +16,7 @@ PC   ~/Backups/riko-hub/            ← the folder the owner's Duplicati on
                                        Nemu (192.0.2.101) should watch
 ```
 
-Nemu cannot currently ssh to eve with this PC's keys, so the third copy is
+Nemu cannot currently ssh to eve with this PC's keys, so the third copy is (and the PC has no `Host eve` ssh alias, so `backup_pull.sh` defaults to the literal `user@192.0.2.51:` — override with `RIKO_BACKUP_REMOTE` if you add one)
 **pulled from the PC**, not pushed from eve. Point Duplicati at the PC's
 `~/Backups/riko-hub`.
 

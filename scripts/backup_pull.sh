@@ -12,7 +12,9 @@ set -Eeuo pipefail
 umask 077
 
 BACKUP_HOME="${RIKO_BACKUP_HOME:-${HOME:?HOME unset; set RIKO_BACKUP_HOME}}"
-REMOTE="${RIKO_BACKUP_REMOTE:-eve:Backups/riko-hub/}"
+# No `Host eve` entry in ~/.ssh/config on this PC, so default to the literal
+# address (the gpubox key is authorised for that user).
+REMOTE="${RIKO_BACKUP_REMOTE:-${RIKO_BACKUP_USER:-user}@192.0.2.51:Backups/riko-hub/}"
 DEST="${RIKO_BACKUP_PULL_DIR:-$BACKUP_HOME/Backups/riko-hub}"
 SSH_KEY="${RIKO_BACKUP_SSH_KEY:-$BACKUP_HOME/.ssh/gpubox}"
 LOG_FILE="${RIKO_BACKUP_PULL_LOG:-$BACKUP_HOME/.local/state/riko-backup-pull.log}"
