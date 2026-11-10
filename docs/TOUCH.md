@@ -26,10 +26,13 @@ animations) follows after T1 is merged and tested, and reuses the posing code bu
 
 ### Page → desktop (`riko/viewer.py` `POST /control/<cmd>`, JSON body)
 
-- **`/control/bbox`** (existing, posted every 100 ms) gains an optional field
+- **`/control/bbox`** (existing) gains an optional field
   `parts: {head, hand_l, hand_r, arm_l, arm_r, foot_l, foot_r, torso, hips}` → each `[x, y, w, h]` in window CSS px
   (projected screen rect of that body part, padded ~6 px), plus `hips_y` (CSS px of the hips bone) and
   `feet_y` (lowest foot). Absent fields = unknown. Desktop must ignore unknown keys.
+  Cadence: roam strip posts every 100 ms (walk housekeeping); NON-roam desktop mode samples at 10 Hz and
+  posts only when the seam moved ≥ 2 px or once per second — the floating window needs the same
+  `parts`/`hips_y` seam for limb-grab arbitration and the sit watcher, without walk state.
 - **`/control/touch`** `{part, kind, x, y, hold_ms?, strokes?}` — `part` ∈ the names above; `kind` ∈
   `pat|poke|tickle|grab|release`. Posted once per recognised touch (page debounces: same part+kind ≤ 1 per 1.5 s,
   except `grab`/`release` which always post).

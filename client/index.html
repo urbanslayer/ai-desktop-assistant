@@ -582,6 +582,7 @@
       return (2 * dist * Math.tan((camera.fov * Math.PI) / 360)) / innerHeight;  // world units per px
     }
     let _specFace = null;      // empirically-detected "facing camera" yaw
+    let _qaMark = null;        // QA: {x, y, until} ring on the last recognised press
     let _specOrbitAz = null;   // QA orbit azimuth (rad), pinned while set
     const _orbitOff = new THREE.Vector3();
     const _orbitSph = new THREE.Spherical();
@@ -780,6 +781,11 @@
       if (!ev) return;
       postTouch(ev.part, ev.kind, e.clientX, e.clientY,
                 end.kind === 'stroke' ? { strokes: end.reversals } : {});
+      // QA evidence (TOUCH_SPEC runs only): ring the recognised press spot
+      // for a moment so ?capture frames show WHERE the touch landed even
+      // for instant gestures (pat/tickle) that leave no persistent pose.
+      if (TOUCH_SPEC) _qaMark = { x: e.clientX, y: e.clientY,
+                                  until: performance.now() / 1000 + 1.5 };
       reactTo(ev);
     }, true);
 
@@ -822,6 +828,17 @@
               break;
             }
           }
+        }
+        if (!shown && _qaMark) {
+          // transient press marker for instant gestures (QA runs only)
+          if (performance.now() / 1000 < _qaMark.until) {
+            _ringMesh.visible = true;
+            const u = _hudPlace(_ringMesh, _qaMark.x, _qaMark.y, D);
+            const bh = _ringMesh.getObjectByName('barH'), bv = _ringMesh.getObjectByName('barV');
+            bh.scale.set(15 * u, 1.6 * u, 1);
+            bv.scale.set(1.6 * u, 15 * u, 1);
+            shown = true;
+          } else _qaMark = null;
         }
         if (!shown) _ringMesh.visible = false;
       }
