@@ -115,6 +115,7 @@
     <button data-tab="history">History</button>
     <button data-tab="memory">Memory</button>
     <button data-tab="timers">Timers</button>
+    <button data-tab="animations">Animations</button>
     <button data-tab="settings">Settings</button>
     <button data-tab="chat">Chat test</button>
   </nav>
@@ -268,6 +269,25 @@
         reply marked with ⏰. cancel_on timers also die when you message her or open the chat.
         The hub speaks times in its configured timezone (Settings → Timezone / TZ env).</p>
       <div class="err" id="terr"></div>
+    </div>
+  </section>
+
+  <!-- ──────────────────────────── animations ── -->
+  <section id="tab-animations" hidden>
+    <div class="card">
+      <h2>Animations <span class="chip" id="acount"></span></h2>
+      <div class="row" style="align-items:end">
+        <div><label>Persona</label><select id="apick"></select></div>
+        <div><label>&nbsp;</label><button class="btn" id="areload">Reload</button></div>
+      </div>
+      <div id="alist" style="margin-top:10px"></div>
+      <p class="hint">Moves she invented herself — just ask in Chat ("make up a little victory
+        dance"). Animations belong to one VRM model: rows tagged <b>other model</b> were made for
+        a different avatar and only become playable when she wears it again (ask her to
+        <b>adapt</b> one). <b>Keep</b> makes a draft permanent so she can use it any time
+        (<code>[act:name]</code>); <b>Preview</b> tells the connected clients to perform it right
+        now and needs a client build with custom-animation playback.</p>
+      <div class="err" id="aerr"></div>
     </div>
   </section>
 
@@ -590,6 +610,7 @@ function show(tab) {
   if (tab === "history") loadHistory();
   if (tab === "memory") loadMemory();
   if (tab === "timers") loadTimers();
+  if (tab === "animations") loadAnimations();
   if (tab === "chat") eventsLoop();  // restart if it died (key set later, hub was down)
 }
 
@@ -604,10 +625,12 @@ async function poll() {
       $("hver").textContent = state.version;
       renderPersonas();
       renderPicker();
+      renderAnimPicker();
       $("cpersona").textContent = state.active.name;
       if (!$("tab-history").hidden && $("hauto").checked) loadHistory();
       if (!$("tab-memory").hidden) loadMemory();
       if (!$("tab-timers").hidden) loadTimers();
+      if (!$("tab-animations").hidden) loadAnimations();
     }
   } catch (e) {
     $("status").textContent = e.message.startsWith("401") ? "key needed" : "hub unreachable";
@@ -1701,6 +1724,8 @@ function applyEvent(e) {
       e.type === "timer_fired" || e.type === "timer_retry" || e.type === "timer_failed") {
     if (!$("tab-timers").hidden) loadTimers();   // docs/TIMERS.md H live list
   }
+  if (e.type === "animations_changed" && !$("tab-animations").hidden)
+    loadAnimations();                             // docs/SELF_ANIMATION.md
   if ($("tab-chat").hidden) return;
   if (e.type === "turn_finished" && e.origin === "timer") {
     // a timer fired while this page was watching: her proactive reply
@@ -1759,6 +1784,62 @@ function tickCountdowns() {
 }
 $("treloadtimers").onclick = loadTimers;
 setInterval(() => { if (!$("tab-timers").hidden) tickCountdowns(); }, 1000);
+
+/* ── custom animations (docs/SELF_ANIMATION.md) ────────────────────── */
+function renderAnimPicker() {
+  if (!state) return;
+  const sel = $("apick");
+  const want = sel.value || state.active.id;
+  sel.innerHTML = state.personas.map((p) =>
+    `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  if (state.personas.some((p) => p.id === want)) sel.value = want;
+}
+async function loadAnimations() {
+  if (!state) return;
+  if (!$("apick").options.length) renderAnimPicker();
+  const pid = $("apick").value || state.active.id;
+  try {
+    const r = await api(`/api/personas/${pid}/animations?model=all`);
+    $("aerr").textContent = "";
+    $("acount").textContent = r.animations.length
+      ? `${r.animations.length} total · ${r.animations.filter((a) => a.status === "kept").length} kept` : "";
+    $("alist").innerHTML = r.animations.map((a) => {
+      const m = encodeURIComponent(a.model_sha256 || "");
+      return `<div class="msg ai">🕺 <b>${esc(a.name)}</b>` +
+        ` <span class="chip">${esc(a.status)}</span>` +
+        (a.model_sha256 === r.model_sha256 ? ""
+          : ` <span class="chip">other model ${esc((a.model_sha256 || "").slice(0, 8))}</span>`) +
+        `<div class="meta">${esc(a.description || "")} · ${esc(a.duration_s)}s` +
+        (a.loop ? " · loops" : "") + ` · model ${esc((a.model_sha256 || "").slice(0, 12))}</div>` +
+        `<button class="btn small apreview" data-name="${esc(a.name)}" data-model="${m}">Preview</button> ` +
+        (a.status === "draft"
+          ? `<button class="btn small akeep" data-name="${esc(a.name)}" data-model="${m}">Keep</button> ` : "") +
+        `<button class="btn small arename" data-name="${esc(a.name)}" data-model="${m}">Rename</button> ` +
+        `<button class="btn small danger adelete" data-name="${esc(a.name)}" data-model="${m}">Delete</button>` +
+        `</div>`;
+    }).join("") ||
+      `<p class="hint">no custom moves yet — ask her in Chat to "make up a little victory dance"</p>`;
+    const act = async (fn) => {
+      try { await fn(); await poll(); loadAnimations(); }
+      catch (e) { $("aerr").textContent = e.message; }
+    };
+    $("alist").querySelectorAll(".apreview").forEach((b) => b.onclick = () =>
+      act(() => api(`/api/personas/${pid}/animations/${encodeURIComponent(b.dataset.name)}/preview?model=${b.dataset.model}`, { method: "POST" })));
+    $("alist").querySelectorAll(".akeep").forEach((b) => b.onclick = () =>
+      act(() => api(`/api/personas/${pid}/animations/${encodeURIComponent(b.dataset.name)}?model=${b.dataset.model}`, { method: "PUT", json: { status: "kept" } })));
+    $("alist").querySelectorAll(".arename").forEach((b) => b.onclick = () => {
+      const nn = window.prompt("New name (lowercase, digits, underscores):", b.dataset.name);
+      if (nn && nn !== b.dataset.name) act(() =>
+        api(`/api/personas/${pid}/animations/${encodeURIComponent(b.dataset.name)}?model=${b.dataset.model}`, { method: "PUT", json: { name: nn.trim() } }));
+    });
+    $("alist").querySelectorAll(".adelete").forEach((b) => b.onclick = () => {
+      if (window.confirm(`Delete animation "${b.dataset.name}"?`)) act(() =>
+        api(`/api/personas/${pid}/animations/${encodeURIComponent(b.dataset.name)}?model=${b.dataset.model}`, { method: "DELETE" }));
+    });
+  } catch (e) { $("aerr").textContent = e.message; }
+}
+$("areload").onclick = loadAnimations;
+$("apick").onchange = loadAnimations;
 
 /* ── boot ─────────────────────────────────────────────────────────── */
 $("keysave").onclick = () => setKey($("hubtoken").value.trim());

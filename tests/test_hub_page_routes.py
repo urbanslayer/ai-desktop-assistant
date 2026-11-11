@@ -193,3 +193,20 @@ def test_history_tab_has_selection_controls():
     assert ("POST", "/api/history/{p}/remember") in pairs
     assert "before=" in script          # 'load older' paging param
     assert "history_changed" in script  # live refresh on deletes
+
+
+def test_animations_tab_controls():
+    """The Animations tab (docs/SELF_ANIMATION.md) exists and wires every
+    action to a real model-scoped route with the right method."""
+    html = PAGE.read_text(encoding="utf-8")
+    for el in ("tab-animations", "apick", "areload", "alist", "acount"):
+        assert f'id="{el}"' in html, f"animations control {el} missing"
+    for token in ("Preview", "Keep", "Rename", "Delete",
+                  "animations_changed"):
+        assert token in html, f"animations UI token {token!r} missing"
+    calls, _ = page_calls()
+    pairs = {(m, p) for m, p, _ in calls}
+    assert ("GET", "/api/personas/{p}/animations") in pairs
+    assert ("POST", "/api/personas/{p}/animations/{p}/preview") in pairs
+    assert ("PUT", "/api/personas/{p}/animations/{p}") in pairs
+    assert ("DELETE", "/api/personas/{p}/animations/{p}") in pairs
