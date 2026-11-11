@@ -1,0 +1,32 @@
+# Template for character_config.local.yaml — your PRIVATE overrides.
+#
+# Copy this next to character_config.yaml as `character_config.local.yaml`
+# and put your real addresses there. The app deep-merges it over
+# character_config.yaml at startup (dicts merge key by key, lists and
+# scalars replace wholesale), so you only list what differs from the
+# shipped example. The local file is gitignored — never committed — so the
+# public repo stays clean while your machine keeps its real hosts.
+#
+# Anything else character_config.yaml supports works here too (any block,
+# as deep as you like); the addresses below are just the usual suspects.
+# See docs/CONFIG.md.
+#
+# Hosts below use RFC 5737 documentation addresses (192.0.2.0/24) — they
+# are EXAMPLES; replace them with your own.
+
+# The hub: her brain, memory and personas
+hub:
+  url: http://192.0.2.51:8002
+
+# Local-mode brain seed (ignored when the hub runs in remote mode; still
+# handy if you keep a local hub on another box)
+llm:
+  base_url: http://192.0.2.51:8000/v1
+
+# Her ears (Faster-Whisper / any OpenAI-compatible STT on your LAN)
+remote_asr:
+  url: http://192.0.2.51:8001/v1
+
+# Her voice (Kokoro-FastAPI, speaches, any OpenAI-compatible /audio/speech)
+openai_tts:
+  url: http://192.0.2.51:8880/v1

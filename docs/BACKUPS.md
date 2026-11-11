@@ -16,7 +16,7 @@ PC   ~/Backups/riko-hub/            ← the folder the owner's Duplicati on
                                        Nemu (192.0.2.101) should watch
 ```
 
-Nemu cannot currently ssh to eve with this PC's keys, so the third copy is (and the PC has no `Host eve` ssh alias, so `backup_pull.sh` defaults to the literal `user@192.0.2.51:` — override with `RIKO_BACKUP_REMOTE` if you add one)
+Nemu cannot currently ssh to eve with this PC's keys, so the third copy is
 **pulled from the PC**, not pushed from eve. Point Duplicati at the PC's
 `~/Backups/riko-hub`.
 
@@ -99,9 +99,23 @@ systemctl --user list-timers riko-backup.timer
 
 ### PC (pull, 04:40)
 
+`backup_pull.sh` has **no hardcoded remote** (the repo ships no personal
+LAN address): you must tell it where the backup box is. Add one `Environment=`
+line to the INSTALLED unit before enabling the timer — for the owner's box
+that is exactly:
+
+```
+Environment=RIKO_BACKUP_REMOTE=user@192.0.2.51:Backups/riko-hub/
+```
+
+(under `[Service]` in `~/.config/systemd/user/riko-backup-pull.service`,
+then `systemctl --user daemon-reload`; or set `RIKO_BACKUP_HOST`
+[+`RIKO_BACKUP_USER`] in the unit/environment instead).
+
 ```bash
 install -m 644 -D scripts/systemd/riko-backup-pull.service ~/.config/systemd/user/riko-backup-pull.service
 install -m 644 -D scripts/systemd/riko-backup-pull.timer   ~/.config/systemd/user/riko-backup-pull.timer
+# edit ~/.config/systemd/user/riko-backup-pull.service: add the Environment= line above
 systemctl --user daemon-reload
 systemctl --user enable --now riko-backup-pull.timer
 # smoke test:
@@ -113,10 +127,12 @@ The pull unit's `ExecStart` assumes the repo at `~/Development/riko_project`
 on the PC; edit if yours lives elsewhere. `backup_pull.sh` mirrors with
 `--delete`, so the PC copy rotates exactly like eve's.
 
-## Env overrides (all optional)
+## Env overrides
 
 `RIKO_BACKUP_DIR`, `RIKO_BACKUP_HOME`, `RIKO_BACKUP_KEEP` (eve);
-`RIKO_BACKUP_REMOTE`, `RIKO_BACKUP_PULL_DIR`, `RIKO_BACKUP_SSH_KEY` (PC);
+`RIKO_BACKUP_REMOTE` (**required** on the PC; `RIKO_BACKUP_HOST`
++ `RIKO_BACKUP_USER` build the standard path instead),
+`RIKO_BACKUP_PULL_DIR`, `RIKO_BACKUP_SSH_KEY` (PC);
 plus `RIKO_HUB_DIR`/`RIKO_BREEZE_DIR`/`RIKO_BACKUP_CONTAINER`/
 `RIKO_BACKUP_TIMESTAMP`/log paths. Tests use these plus PATH shims so they
 never touch the real `$HOME` and never ssh to eve.

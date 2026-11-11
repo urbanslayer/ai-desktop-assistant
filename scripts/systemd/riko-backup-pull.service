@@ -1,8 +1,15 @@
-# Pull hub backups from eve onto the PC — systemd USER service on the PC.
-# The destination ~/Backups/riko-hub is what the owner's Duplicati on Nemu
-# should watch (Nemu cannot ssh to eve with current keys). See docs/BACKUPS.md.
+# Pull hub backups from the backup box onto the PC — systemd USER service.
+# The destination ~/Backups/riko-hub is what the owner's second-copy tool
+# should watch. See docs/BACKUPS.md.
+#
+# REQUIRED: backup_pull.sh has no personal default host. Before enabling
+# the timer, add your remote to THIS INSTALLED unit
+# (~/.config/systemd/user/riko-backup-pull.service), e.g.:
+#   [Service]
+#   Environment=RIKO_BACKUP_REMOTE=user@backupbox:Backups/riko-hub/
+# (docs/BACKUPS.md has the copy-paste line for the owner's setup.)
 [Unit]
-Description=Pull Riko hub backups from eve (docs/BACKUPS.md)
+Description=Pull Riko hub backups over ssh (docs/BACKUPS.md)
 After=network-online.target
 Wants=network-online.target
 

@@ -1,6 +1,11 @@
 # your API keys
 .env
 
+# your private config overrides (real hub/LLM/ASR/TTS addresses).
+# Load order and rules: docs/CONFIG.md; template: character_config.local.example.yaml
+character_config.local.yaml
+*.local.yaml
+
 # runtime files
 chat_history.json
 client/audio/

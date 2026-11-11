@@ -1,23 +1,36 @@
 #!/usr/bin/env bash
-# riko-backup-pull: mirror the hub backups from eve onto this PC.
+# riko-backup-pull: mirror the hub backups from the backup box onto this PC.
 #
 # Runs on the PC (systemd user timer riko-backup-pull.timer; see
 # docs/BACKUPS.md). The destination folder is the copy the owner's Duplicati
-# on Nemu (192.0.2.101) should watch — Nemu cannot ssh into eve with
-# today's keys, so the second hop is pulled FROM this PC.
+# on the second LAN box should watch — that box cannot ssh into the backup
+# box with today's keys, so the second hop is pulled FROM this PC.
 #
 # All env vars are overridable so tests never touch the real $HOME or ssh
-# to eve.
+# to the backup box.
 set -Eeuo pipefail
 umask 077
 
 BACKUP_HOME="${RIKO_BACKUP_HOME:-${HOME:?HOME unset; set RIKO_BACKUP_HOME}}"
-# No `Host eve` entry in ~/.ssh/config on this PC, so default to the literal
-# address (the gpubox key is authorised for that user).
-REMOTE="${RIKO_BACKUP_REMOTE:-${RIKO_BACKUP_USER:-user}@192.0.2.51:Backups/riko-hub/}"
 DEST="${RIKO_BACKUP_PULL_DIR:-$BACKUP_HOME/Backups/riko-hub}"
 SSH_KEY="${RIKO_BACKUP_SSH_KEY:-$BACKUP_HOME/.ssh/gpubox}"
 LOG_FILE="${RIKO_BACKUP_PULL_LOG:-$BACKUP_HOME/.local/state/riko-backup-pull.log}"
+
+# The remote is NOT hardcoded: the repo must not carry anyone's LAN layout.
+# Either give the whole rsync source (RIKO_BACKUP_REMOTE, e.g.
+# user@host:Backups/riko-hub/ — this is what the systemd unit should set),
+# or just the host (+ user) and we build the standard hub-backup path.
+REMOTE="${RIKO_BACKUP_REMOTE:-}"
+if [[ -z "$REMOTE" ]]; then
+  if [[ -n "${RIKO_BACKUP_HOST:-}" ]]; then
+    REMOTE="${RIKO_BACKUP_USER:-${USER:?USER unset; set RIKO_BACKUP_REMOTE}}@${RIKO_BACKUP_HOST}:Backups/riko-hub/"
+  else
+    echo "riko-backup-pull: no remote configured — set RIKO_BACKUP_REMOTE" \
+         "(e.g. RIKO_BACKUP_REMOTE=user@backupbox:Backups/riko-hub/) or" \
+         "RIKO_BACKUP_HOST [+RIKO_BACKUP_USER]. See docs/BACKUPS.md." >&2
+    exit 1
+  fi
+fi
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
 fail() { log "ERROR: $*"; echo "riko-backup-pull: $*" >&2; exit 1; }

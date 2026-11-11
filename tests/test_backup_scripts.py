@@ -210,20 +210,32 @@ class TestBackupPull:
         _write_shim(shim, "ssh", f'printf "%s\\n" "$@" >> "{ssh_log}"; exit 0')
         return shim, rsync_log, ssh_log
 
+    def _pull_env(self, tmp_path, shim, monkeypatch, **extra):
+        """Base env for backup_pull.sh: shims on PATH + the RIKO_BACKUP_*
+        vars stripped (the remote must come from the test, never from the
+        developer's shell) + fake $HOME."""
+        env = dict(os.environ)
+        env["PATH"] = f"{shim}{os.pathsep}{env['PATH']}"
+        env["HOME"] = str(tmp_path / "fakehome")
+        for var in ("RIKO_BACKUP_REMOTE", "RIKO_BACKUP_HOST", "RIKO_BACKUP_USER"):
+            env.pop(var, None)
+        env["RIKO_BACKUP_PULL_DIR"] = str(tmp_path / "dest")
+        env["RIKO_BACKUP_SSH_KEY"] = str(tmp_path / "nokey")
+        env["RIKO_BACKUP_PULL_LOG"] = str(tmp_path / "pull.log")
+        monkeypatch.setenv("HOME", env["HOME"])
+        env.update(extra)
+        return env
+
     def test_pull_uses_remote_path_and_identity_file(self, tmp_path, pull_shims, monkeypatch):
         shim, rsync_log, ssh_log = pull_shims
         key = tmp_path / "fakehome" / ".ssh" / "gpubox"
         key.parent.mkdir(parents=True)
         key.write_text("fake-key\n")
         dest = tmp_path / "pc-backups"
-        env = dict(os.environ)
-        env["PATH"] = f"{shim}{os.pathsep}{env['PATH']}"
-        env["HOME"] = str(tmp_path / "fakehome")
-        env["RIKO_BACKUP_REMOTE"] = "eve:Backups/riko-hub/"
-        env["RIKO_BACKUP_PULL_DIR"] = str(dest)
-        env["RIKO_BACKUP_SSH_KEY"] = str(key)
-        env["RIKO_BACKUP_PULL_LOG"] = str(tmp_path / "pull.log")
-        monkeypatch.setenv("HOME", env["HOME"])
+        env = self._pull_env(tmp_path, shim, monkeypatch,
+                             RIKO_BACKUP_REMOTE="eve:Backups/riko-hub/",
+                             RIKO_BACKUP_SSH_KEY=str(key),
+                             RIKO_BACKUP_PULL_DIR=str(dest))
         r = _run(PULL_SCRIPT, env)
         assert r.returncode == 0, r.stderr
         argv = rsync_log.read_text()
@@ -235,16 +247,34 @@ class TestBackupPull:
         # the shim never invoked a real ssh itself
         assert not ssh_log.exists()
 
+    def test_pull_builds_remote_from_host_and_user(self, tmp_path, pull_shims, monkeypatch):
+        """No RIKO_BACKUP_REMOTE: RIKO_BACKUP_HOST (+ RIKO_BACKUP_USER)
+        builds the standard hub-backup source."""
+        shim, rsync_log, _ = pull_shims
+        env = self._pull_env(tmp_path, shim, monkeypatch,
+                             RIKO_BACKUP_HOST="backupbox",
+                             RIKO_BACKUP_USER="user")
+        r = _run(PULL_SCRIPT, env)
+        assert r.returncode == 0, r.stderr
+        assert "user@backupbox:Backups/riko-hub/" in rsync_log.read_text()
+
+    def test_pull_requires_a_remote_env(self, tmp_path, pull_shims, monkeypatch):
+        """No personal default left in the repo: unset remote -> clear error
+        naming the env vars, before rsync is ever called."""
+        shim, rsync_log, _ = pull_shims
+        env = self._pull_env(tmp_path, shim, monkeypatch)
+        r = _run(PULL_SCRIPT, env)
+        assert r.returncode != 0
+        assert "RIKO_BACKUP_REMOTE" in r.stderr
+        assert not rsync_log.exists()
+
     def test_pull_fails_when_rsync_fails(self, tmp_path, pull_shims, monkeypatch):
         shim, _, _ = pull_shims
         (shim / "rsync").write_text("#!/bin/sh\nexit 255\n")
         (shim / "rsync").chmod(0o755)
-        env = dict(os.environ)
-        env["PATH"] = f"{shim}{os.pathsep}{env['PATH']}"
-        env["HOME"] = str(tmp_path)
-        env["RIKO_BACKUP_PULL_DIR"] = str(tmp_path / "dest")
+        env = self._pull_env(tmp_path, shim, monkeypatch,
+                             RIKO_BACKUP_REMOTE="eve:Backups/riko-hub/")
         env["RIKO_BACKUP_SSH_KEY"] = str(tmp_path / "nokey")
-        env["RIKO_BACKUP_PULL_LOG"] = str(tmp_path / "pull.log")
         r = _run(PULL_SCRIPT, env)
         assert r.returncode != 0
         assert "rsync failed" in r.stderr
