@@ -116,3 +116,33 @@ surface the user's own (especially private) playlists**. Fixed in
 - **New tool `spotify_playlists(query?)`** (risk `read`, permission default
   `always`): the owner's playlist names + track counts, so "what playlists
   do I have?" has an honest, quota-cheap answer (cached list).
+
+## 2026-11-11 live incident: silent player, "Restriction violated" 403s
+
+Symptoms: tray player online as a Spotify Connect device, hub `play` answers
+"Restriction violated" (403) on a *fresh* device, then play "succeeds" but no
+audio ever reaches PulseAudio and Spotify auto-skips every ~8 s.
+
+Diagnosis (all live-proven):
+- The 403 on the first play attempt to a just-registered device is transient
+  (transfer-then-play or a retry succeeds). Hub should NOT blame Premium.
+- The silence is librespot failing to fetch audio decryption keys:
+  `error audio key 0 1` + `Unable to load key, continuing without
+  decryption` -> encrypted bytes hit the decoder -> "invalid mpeg audio
+  header"/"skipping junk" thousands of times -> "Deadline expired" -> skip.
+- Reproduced on BOTH Arch spotifyd 0.4.2 (old librespot) AND Arch
+  librespot 0.8.0 (2026-10-28 build), fresh cache, `--cache-task never`,
+  single instance, healthy network (800 Mbps, no proxies), same account.
+  The official desktop app played fine ~20 min earlier on the same network.
+  => Spotify-side key-service problem for librespot-style sessions (or a
+  regression spanning librespot versions), NOT this machine or the config.
+
+What to try when it's silent again (in order):
+1. Just retry in 30-60 min — if Spotify's key service recovered, everything
+   else (config, cache, device name) is already right.
+2. `RUST_LOG=info spotifyd --config-path ~/.config/riko/spotifyd.conf
+   --no-daemon` and grep for `audio key` — that line is the fingerprint.
+3. Only if it persists for days: try the official desktop app as the
+   Connect device (flatpak com.spotify.Client) or a newer librespot build.
+Audio cache is disposable: safe to delete everything under
+~/.cache/riko/spotifyd EXCEPT the `oauth/` folder.
