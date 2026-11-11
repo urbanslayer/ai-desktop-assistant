@@ -531,3 +531,28 @@ test('action names normalize like the hub\'s', () => {
   const acts = d.say(0, { seconds: 1, actions: [{ name: 'Shake-Head', at: 0 }] });
   assert.deepEqual(names(acts), ['shake_head']);
 });
+
+test('custom keyframe animations registered by setCustomAnimations are director-legal', () => {
+  // regression for the live bug "[director] unknown action 'cheeky_swayer'
+  // — ignored": validated owner animations (keyframes.js shape) are pushed
+  // into the director library by the page, so reply actions naming them
+  // schedule, play, and stop like any gesture (docs/SELF_ANIMATION.md).
+  const anim = { name: 'cheeky_swayer', loop: true, duration_s: 3.2 };
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    const d = new Director({ random: seq() });
+    d.library(Object.fromEntries([[anim.name, { loop: !!anim.loop, duration: anim.duration_s }]]));
+    const acts = d.say(0, { seconds: 2, actions: [{ name: anim.name, at: 0 }] });
+    assert.ok(names(acts).includes(anim.name), 'the reply action plays instead of being dropped');
+    assert.equal(d.gesture.loop, true);
+    assert.equal(d.gesture.endsAt, anim.duration_s);
+    const stop = d.tick(6.1);  // LOOP_ACTION_HOLD = 6 s ends her looped dance
+    assert.deepEqual(stop.filter((a) => a.type === 'gesture_stop').map((a) => a.name),
+                    [anim.name]);
+  } finally {
+    console.warn = orig;
+  }
+  assert.deepEqual(warns, [], 'no unknown-action warning for a registered custom');
+});

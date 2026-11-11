@@ -95,6 +95,19 @@ models on eve: MoMask / T2M-GPT / MotionGPT / HY-Motion → VRMA) stays **plan o
 Shared test fixture: `tests/fixtures/animation_victory.json` — **A6-hub creates it** (a valid animation in the format
 above); A6-page creates its own copy at `client/js/fixtures/animation_victory.json` (no shared file).
 
+## Reply-action wiring (live bug fix, 2026-11)
+
+A keyframe animation is only playable from a hub reply when the director knows its name:
+`director.say()` validates reply actions against `director.gestures` BEFORE the page's `applyAction`
+custom branch can play it. `setCustomAnimations` therefore registers every validated animation with
+`director.library({name: {loop, duration_s}})` (same seam the `.vrma` drop-ins use), and the `gesture`
+branch of `applyAction` additionally checks `customAnims` (director replays actions on emotion change
+without the `custom` flag); `gesture_stop` ends a looping custom animation. Regression: the
+`cheeky_swayer` case in `client/js/director.test.js` (unknown-action warning must stay silent) and the
+`custom_say` capture scenario (`capture_frames.py custom_say <out> <secs>`: a queued `say` event whose
+`actions[0].name` names the served animation; the `custom-gate` lines must PASS and the event-driven
+kfwatch frames must show a real mid-pose).
+
 ## Rules for both children
 
 - Never start a compositor/WM/X server; never query the owner's live session (`hyprctl`, `swaymsg`, `qdbus`,

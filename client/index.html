@@ -97,7 +97,7 @@
       hitTest, PressTracker, TouchRecogniser, TouchPostGate, GRABBABLE,
       SeamPostPolicy,
     } from './js/touch.js';
-    import { PoseLayer, GRAB_KIND, GRAB_LIMITS } from './js/pose.js';
+    import { PoseLayer, GRAB_KIND, GRAB_LIMITS, clampGrabTarget } from './js/pose.js';
     import { validateAnimation } from './js/keyframes.js';
     import { WalkDirector } from './js/walk.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
@@ -700,6 +700,42 @@
       _tp.set((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1, 0.5).unproject(camera);
       return camera.position.clone().addScaledVector(_tp.sub(camera.position).normalize(), depth);
     }
+    // IK target for a cursor drag (docs/TOUCH.md live-issue notes): the
+    // fixed-depth cursor point is usually far outside the limb's reach
+    // sphere, and IK's along-ray clamp parks the hand nowhere near the
+    // cursor (measured: 198 px drag -> hand moved 43 px). Re-aim the CURSOR
+    // RAY at the reach sphere around the LIVE joint instead, so a clamped
+    // hand keeps tracking the cursor while the arm is fully extended.
+    // QA still records the raw cursor point as the ground-truth baseline.
+    function _grabIKTarget(part, raw) {
+      const kind = GRAB_KIND[part];
+      if (!kind || (kind.chain !== 'arm' && kind.chain !== 'leg')) return raw.toArray();
+      const jointN = vrm?.humanoid?.getNormalizedBoneNode(
+        `${kind.side}${kind.chain === 'arm' ? 'UpperArm' : 'UpperLeg'}`);
+      if (!jointN) return raw.toArray();
+      let l1 = 0, l2 = 0;
+      if (kind.chain === 'arm') {
+        const arm = motion.rig?.arms?.[kind.side];
+        if (!arm) return raw.toArray();
+        l1 = arm.l1; l2 = arm.l2;
+      } else {
+        const leg = pose._legRest?.[kind.side];
+        if (!leg) return raw.toArray();
+        l1 = leg.l1; l2 = leg.l2;
+      }
+      const out = clampGrabTarget(camera.position.toArray(),
+                             raw.clone().sub(camera.position).toArray(),
+                             jointN.getWorldPosition(new THREE.Vector3()).toArray(),
+                             (l1 + l2) * 0.999, raw.toArray());
+      if (CAPTURE) {
+        const v3 = (v) => `[${v.map((x) => x.toFixed(3)).join(',')}]`;
+        console.log(`[grab-clamp] ${part} raw=${v3(raw.toArray())} out=${v3(out)} ` +
+                    `C=${v3(camera.position.toArray())} ` +
+                    `J=${v3(jointN.getWorldPosition(new THREE.Vector3()).toArray())} ` +
+                    `r=${((l1 + l2) * 0.999).toFixed(4)}`);
+      }
+      return out;
+    }
     function startGrab(part, x, y) {
       const b = vrm?.humanoid.getNormalizedBoneNode(PART_BONE[part]);
       if (!b) return;
@@ -767,7 +803,14 @@
 
     // pointer capture phase (runs BEFORE the roam strip-drag handler)
     addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 || !vrm || !motion.rig || e.target !== renderer.domElement) return;
+      if (e.button !== 0 || !vrm || !motion.rig) return;
+      // The speech bubble covers the top of the window with pointer-events
+      // while she talks (live bug: pats/grabs on her head or raised hands
+      // died silently mid-line — the canvas never saw the press). Bubble
+      // presses pass through to touch; the canvas stays the only other source.
+      const tgt = e.target;
+      if (tgt !== renderer.domElement &&
+          !(tgt instanceof Element && tgt.closest('#bubble'))) return;
       _lastPt.x = e.clientX; _lastPt.y = e.clientY;
       _touchPress.down(e.clientX, e.clientY, e.timeStamp || performance.now());
       const _hp = computeParts();
@@ -786,7 +829,7 @@
       const ms = e.timeStamp || performance.now();
       if (grabId) {                       // drive the IK in the grab plane
         const w = _grabWorldPoint(e.clientX, e.clientY, grabDepth ?? 2);
-        pose.setTarget(grabId, w);
+        pose.setTarget(grabId, _grabIKTarget(grabId, w));
         const qa = _grabQA.get(grabId);   // RAW cursor px + world for the QA
         if (qa) { qa.cursorPx = [e.clientX, e.clientY]; qa.rawWorld = w.toArray(); }
         return;
@@ -1014,6 +1057,7 @@
     // Steps are anchored to wake like ?force=. Ops (x/y numbers, or a PART
     // name token = that part rect's center, resolved when the step fires):
     //    sit:<y>@ms | stand@ms | face:<deg>@ms | mode:<off|quiet|chatty>@ms
+    //   say:<text>@ms                              raise the speech bubble
     //   grab <part> <x> <y> <dx> <dy> <durMs>@ms     press, hold, drag, release
     //   tap <x> <y>@ms                               one quick click
     //   taps <x> <y> <n> <gapMs>@ms                  repeated quick clicks
@@ -1052,6 +1096,12 @@
             applyAction({ type: 'gesture_stop', custom: true });
           } else if (op === 'face') {
             _specFace = (+opArg || 0) * Math.PI / 180;   // explicit facing pin
+          } else if (op === 'say') {
+            // QA: raise the speech bubble while later steps run — regression
+            // for the live bug where head pats / raised-hand grabs died
+            // silently while the bubble covered them (docs/TOUCH.md).
+            handle({ type: 'say', text: body.slice(4) || 'bubble up!',
+                     emotion: 'neutral', seconds: 6 });
           } else if (op === 'orbit') {
             _specOrbitAz = (+opArg || 0) * Math.PI / 180;  // QA: view azimuth (deg)
           } else if (op === 'grab') {
@@ -1131,6 +1181,14 @@
         if (a && typeof a.name === 'string'
             && validateAnimation(a).length === 0) customAnims.set(a.name, a);
       }
+      // Reply actions from the hub name these by name (docs/SELF_ANIMATION.md,
+      // live bug: "[director] unknown action 'cheeky_swayer' — ignored"): the
+      // director validates say() actions against its library, so customs must
+      // be registered there too — same seam the .vrma drop-ins use above.
+      // A name the director already knows (built-in or .vrma) keeps its own
+      // timing; the applyAction custom branch below still plays the keyframes.
+      director.library(Object.fromEntries([...customAnims.values()]
+        .map((a) => [a.name, { loop: !!a.loop, duration: a.duration_s }])));
     }
     async function loadCustomAnimations() {
       try {
@@ -1165,7 +1223,17 @@
             { t: T(), type: a.type, name: a.name });
         }
         if (a.type === 'gesture') {
-          if (a.custom) return;   // handled above (custom keyframes)
+          if (a.custom) return;                    // the queued start below does it
+          // A gesture named by the DIRECTOR (say actions / resumeLife) can be a
+          // custom keyframe animation: it replays {type:'gesture'} without the
+          // custom flag, and clips/motion don't know the name.
+          const kanim = customAnims.get(a.name);
+          if (kanim) {
+            motion.stopGesture();
+            vrm.lookAt.autoUpdate = true;          // keyframes own the head
+            pose.playKeyframes(kanim);
+            return;
+          }
           const c = clips[a.name];
           if (c) {  // a VRMA clip the owner dropped in takes over the body bones
             vrm.lookAt.autoUpdate = !c.tracker;
@@ -1680,6 +1748,25 @@
           } catch { /* harness gone */ }
         }, 100);
       } else {
+        // custom_say evidence (scenario 'custom_say'): a reply action that
+        // NAMES a custom animation must play it through the director — shoot
+        // it at keyframe-progress fractions, event-driven, because load
+        // latency slides the queued 'say' away from any fixed capture second.
+        const kfF = String(new URLSearchParams(location.search).get('kfwatch') || '')
+          .split(',').map(Number).filter((n) => n > 0 && n < 1);
+        if (kfF.length) {
+          const shots = new Set();
+          setInterval(async () => {
+            try {
+              const kf = window.rikoMeasure().metrics.keyframeQA;
+              if (!kf || !kf.name || kf.out) return;
+              for (const f of kfF) {
+                const key = `${kf.name}@${f}`;
+                if (kf.w >= f && !shots.has(key)) { shots.add(key); await postShot(); }
+              }
+            } catch { /* harness gone */ }
+          }, 100);
+        }
         for (const s of String(CAPTURE).split(',').map(Number).filter((n) => n > 0)) {
           setTimeout(async () => {
             try {
@@ -1876,6 +1963,8 @@
         feed(director.status(T(), ev.state));
       } else if (ev.type === 'say') {
         flash(bubble, ev.text, (ev.seconds || 0) + BUBBLE_SECONDS);
+        if (CAPTURE) setTimeout(() => console.log(
+          `[capture] bubble bottom=${Math.round(bubble.getBoundingClientRect().bottom)}`), 350);
         if (TIMING && Array.isArray(ev.actions) && ev.actions.length) {
           (window.__actionTimeline = window.__actionTimeline || []).push(
             { t: T(), type: 'say', actions: ev.actions, seconds: ev.seconds || 0 });
