@@ -454,7 +454,11 @@ class FakeHub:
         # Voice knobs the tests flip:
         self.tts_enabled = True       # False -> every audio_url is null
         self.tts_reachable = True     # GET /api/tts/status reports this
-        self.has_tts_status = True    # False -> an OLD hub: /api/tts/status is 404
+        self.has_tts_status = True     # False -> an OLD hub: /api/tts/status is 404
+        # Custom keyframe animations (docs/SELF_ANIMATION.md):
+        self.animations = {}            # persona_id -> [animation dict, ...]
+        self.animation_requests = []    # (id, model, status) of every list GET
+        self.has_animations = True      # False -> an OLD hub: list GET is 404
         self.audio_mode = "ok"        # "ok" | "error" (503) | "missing" (404)
         self.personas = {
             "riko": persona("riko", "Riko", "riko", "Riko here. Miss me, senpai?"),
@@ -516,6 +520,16 @@ class FakeHub:
                     outer.avatar_requests.append((p["id"], p["avatar_version"]))
                     return self._send(avatar_bytes(p["id"], p["avatar_version"]),
                                       content_type="model/gltf-binary")
+                if m := re.fullmatch(r"/api/personas/([\w-]+)/animations", path):
+                    p = outer.personas.get(m[1])
+                    if not p:
+                        return self._send({"detail": "no such persona"}, 404)
+                    if not outer.has_animations:
+                        return self._send({"detail": "Not Found"}, 404)  # old hub
+                    qp = self._query()
+                    outer.animation_requests.append(
+                        (m[1], qp.get("model", [""])[0], qp.get("status", [""])[0]))
+                    return self._send({"animations": list(outer.animations.get(m[1], []))})
                 if path == "/api/history":
                     return self._send({"persona": outer.active, "messages": list(outer.messages)})
                 if path == "/api/tts/status":

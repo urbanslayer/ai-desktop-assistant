@@ -102,6 +102,14 @@ class _Handler(SimpleHTTPRequestHandler):
                 key=lambda a: a["name"],
             )
             return self._send(json.dumps({"animations": anims}).encode(), "application/json")
+        if self.path == "/custom-animations.json":
+            # Custom keyframe animations (docs/SELF_ANIMATION.md): the
+            # desktop's cache of the ACTIVE persona's hub list — refreshed at
+            # startup, on persona switches and on `animations_changed`. The
+            # page re-requests it when the bridge sends custom-animations:reload.
+            return self._send(json.dumps(
+                {"animations": hub_client.custom_animations()}).encode(),
+                "application/json")
         if self.path != "/next":
             return super().do_GET()  # the page and the voice clip, from client/
         _page_last_seen = time.monotonic()

@@ -1884,7 +1884,9 @@
         flash(status, ev.label ? `using ${ev.label}` : 'using a tool…', 20, 'thinking');
       } else if (ev.type === 'open_input') openInput();
       else if (ev.type === 'close_input') closeInput();
-      else if (ev.type === 'persona') {
+      else if (ev.type === 'command') {
+        onCommand(ev.cmd || '');   // desktop bridge commands (TOUCH.md, SELF_ANIMATION.md)
+      } else if (ev.type === 'persona') {
         // Someone switched the persona (web page, riko-ctl, or she switched herself):
         // fetch her new body and swap without reloading; her greeting arrives as a 'say'.
         // Duplicated events for the SAME persona+version are ignored — the hub

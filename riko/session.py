@@ -344,6 +344,9 @@ class Session:
         if kind == "timer_fired":
             self._timer_notice(ev)
             return
+        if kind == "animations_changed":
+            self._on_animations_changed(ev)  # custom animations list refreshed
+            return
         if kind != "turn_finished" or ev.get("origin") != "timer":
             return  # a normal turn (no origin) was spoken by its own /api/chat
         if str(ev.get("persona_id") or ev.get("persona") or "") != self._active_id():
@@ -372,6 +375,13 @@ class Session:
                 self.on_timer_notice(self._persona_name(persona_id), label)
             except Exception as e:
                 print(f"[timer] notice failed: {type(e).__name__}: {e}")
+
+    def _on_animations_changed(self, ev):
+        active = hub_client.active_persona() or {}
+        pid = str(ev.get("persona_id") or ev.get("persona") or "")
+        if pid and pid != str(active.get("id") or ""):
+            return  # another persona's upload: the active list did not change
+        hub_client.refresh_custom_animations()  # follower thread, never Qt
 
     def _persona_name(self, persona_id):
         active = hub_client.active_persona() or {}
