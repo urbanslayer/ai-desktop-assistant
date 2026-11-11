@@ -212,6 +212,26 @@ def test_action_preview_redelivery_is_deduped(anim_env):
         s.close()
 
 
+def test_touch_action_event_is_not_replayed(anim_env):
+    # /api/touch publishes 'action' too, but the touch reply already played
+    # those actions on this desktop — forwarding them would double-play.
+    cfg, url, fake_hub, notified = anim_env
+    s = session.Session(cfg, source="desktop")
+    try:
+        touch_ev = {"seq": 50, "time": "2026-11-03T00:00:02Z", "type": "action",
+                    "persona_id": "riko", "emotion": "happy",
+                    "touch": {"kind": "pat"},
+                    "actions": [{"name": "nod", "at": 0.0, "type": "gesture"}]}
+        s._on_hub_event("action", touch_ev)
+        no_preview = {"seq": 51, "time": "2026-11-03T00:00:03Z", "type": "action",
+                      "persona_id": "riko", "emotion": None,
+                      "actions": [{"name": "nod", "at": 0.0, "type": "gesture"}]}
+        s._on_hub_event("action", no_preview)
+        assert [e for e in drain(url) if e["type"] == "actions"] == []
+    finally:
+        s.close()
+
+
 # ── page-side glue (index.html inline script; assert the wiring exists) ──
 INDEX_HTML = (pathlib.Path(__file__).parent.parent
               / "client" / "index.html").read_text()

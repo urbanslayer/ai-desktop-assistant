@@ -383,6 +383,13 @@ class Session:
         actions = ev.get("actions")
         if not isinstance(actions, list) or not actions:
             return
+        # Only Preview-button actions. /api/touch ALSO publishes 'action'
+        # (with a `touch` payload) but its reply already carried those
+        # actions to this desktop (play_touch_reply) — forwarding them again
+        # would play every touch gesture twice.
+        if ev.get("touch") or not any(
+                isinstance(a, dict) and a.get("preview") for a in actions):
+            return
         key = (ev.get("seq"), ev.get("time"))
         with self._action_lock:
             if key in self._action_played:  # ring replay / double delivery
