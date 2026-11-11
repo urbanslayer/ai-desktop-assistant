@@ -7,6 +7,8 @@ no real network, and a fake HOME so the manager's real file writes
 owner's home dir."""
 import io
 import os
+import pathlib
+import re
 import urllib.request
 
 import pytest
@@ -287,6 +289,16 @@ def test_device_name_defaults_to_riko():
     assert SpotifydPlayer({}, device_name="Riko-chan").device_name == "Riko-chan"
     # bad mode strings collapse to off (config typo safety)
     assert SpotifydPlayer({"spotifyd": "managd"}).mode == "off"
+
+
+def test_desktop_never_names_the_player_after_the_persona():
+    # Live bug 2026-11-11: desktop.py passed the persona name, so the tray
+    # player showed up as "Furina" while the hub prompt said the desktop
+    # player is named "Riko" — she denied her own player was online.
+    src = (pathlib.Path(__file__).resolve().parents[1] / "desktop.py").read_text()
+    call = re.search(r"SpotifydPlayer\(([^)]*)\)", src)
+    assert call and call.group(1)
+    assert "persona" not in call.group(1).lower(), call.group(1)
 
 
 # ── ducking (fake props-bus; silent no-op without it) ────────────────────────

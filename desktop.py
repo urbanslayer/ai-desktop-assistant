@@ -1730,12 +1730,12 @@ def main():
     # 127.0.0.1:8911 catches Spotify's redirect for the hub (loopback is
     # the only plain-HTTP redirect Spotify allows).
     music_cfg = (cfg.get("desktop") or {}).get("music") or {}
-    try:
-        music_persona = str((hub_client.active_persona() or {}).get("name") or "")
-    except Exception:
-        music_persona = ""
+    # The Connect name must match what the hub's prompt and Settings teach
+    # ("the device named Riko is the desktop player"). Persona-named
+    # players confused the LLM live 2026-11-11: it saw "Furina" online,
+    # insisted the Riko player was offline, and had to be told to use it.
     music_player = music_spotifyd.SpotifydPlayer(
-        music_cfg, str(music_cfg.get("device_name") or music_persona or "Riko"))
+        music_cfg, str(music_cfg.get("device_name") or "Riko"))
     music_duck = music_spotifyd.MprisDuck(
         music_cfg.get("duck_volume", music_spotifyd.DEFAULT_DUCK_FRACTION))
     if music_player.mode != "off":
