@@ -506,3 +506,66 @@ def test_animations_auto_keep_setting(hub):
     r = hub.post("/api/settings/reset", json={"animations": True})
     assert r.status_code == 200
     assert r.json()["animations"] == {"auto_keep": False}
+
+
+# ── [act:<name>] action tags (docs/BODY.md + SELF_ANIMATION.md) ─────────────
+
+def test_act_tag_only_resolves_for_kept_custom_names():
+    kept = {"victory_dance"}
+    clean, actions, ignored = _body.parse_actions(
+        "Look! [act:victory_dance] wasn't that cool?", [], kept)
+    assert clean == "Look! wasn't that cool?"
+    assert actions[0]["name"] == "victory_dance"
+    assert actions[0]["type"] == "gesture" and actions[0]["custom"] is True
+    assert abs(actions[0]["at"] - 6 / len(clean)) < 0.05
+    assert ignored == []
+
+    # draft / unknown names: stripped + ignored, never played
+    _, actions, ignored = _body.parse_actions("[act:somedance] hi", [], kept)
+    assert actions == [] and ignored == ["somedance"]
+
+    # bare tag naming a kept animation works too; built-ins keep their shape
+    _, actions, _ = _body.parse_actions("hi [victory_dance] [wave]",
+                                        ["wave"], kept)
+    assert actions[1] == {"name": "wave", "at": 1.0}
+    assert actions[0]["custom"] is True
+
+    # [action:x] also reaches the custom set
+    _, actions, _ = _body.parse_actions("[action:victory_dance]", [], kept)
+    assert actions and actions[0]["custom"] is True
+
+
+def test_body_prompt_lists_custom_moves():
+    p = _body.body_prompt(["wave"], custom_actions=["victory_dance"])
+    assert "victory_dance" in p and "[act:<name>]" in p
+    assert "[act:" not in _body.body_prompt(["wave"])
+
+
+def test_chat_turn_custom_tag_only_when_kept_on_current_model(tmp_path):
+    from test_hub_tools import ScriptedLLM
+    reply = "Ta-da! [act:victory_dance]"
+    llm = ScriptedLLM([{"content": reply}])
+    client = TestClient(create_app(
+        tmp_path / "hubdata", api_key=None,
+        llm_defaults={"base_url": llm.base_url, "model": "auto"},
+        tools_defaults={"searxng_url": ""}))
+    assert client.post("/api/personas",
+                       json={"name": "Riko"}).status_code in (200, 201, 409)
+    r = client.post("/api/personas/riko/animations", json=fixture_doc())
+    assert r.status_code == 201
+    res = client.post("/api/chat", json={"text": "show me something"}).json()
+    assert "victory_dance" not in res["reply"]
+    assert res["actions"] == []                 # draft: not taggable yet
+
+    assert client.put("/api/personas/riko/animations/victory_dance",
+                      json={"status": "kept"}).status_code == 200
+    res = client.post("/api/chat", json={"text": "again!"}).json()
+    assert any(a["name"] == "victory_dance" and a.get("custom") is True
+               and a.get("type") == "gesture" for a in res["actions"])
+
+    # upload a different avatar → the kept animation is on another model:
+    # the tag no longer resolves
+    client.put("/api/personas/riko/avatar",
+               files={"file": ("x.vrm", VRM_BYTES, "model/gltf-binary")})
+    res = client.post("/api/chat", json={"text": "again!"}).json()
+    assert res["actions"] == []

@@ -74,9 +74,18 @@ def normalize_action_name(raw) -> str:
     return re.sub(r"[\s\-]+", "_", str(raw or "").strip().lower()).strip("_")
 
 
-def body_prompt(actions: list[str]) -> str:
-    """The embodiment prompt block naming the current body set."""
-    return PROMPT_TEMPLATE.format(names=", ".join(actions))
+def body_prompt(actions: list[str],
+                custom_actions: list[str] | None = None) -> str:
+    """The embodiment prompt block naming the current body set (plus the
+    persona's KEPT custom animations, docs/SELF_ANIMATION.md)."""
+    out = PROMPT_TEMPLATE.format(names=", ".join(actions))
+    names = [n for n in (custom_actions or []) if n]
+    if names:
+        out += ("\nYour custom moves (animations you made): "
+                + ", ".join(names)
+                + " — play one with the tag [act:<name>], exactly that "
+                "spelling. Built-in moves keep their normal [tag].")
+    return out
 
 
 # ── asked-for requests (docs/BODY.md §3 fallback) ────────────────────────────
@@ -213,61 +222,85 @@ _BRACKET = re.compile(r"\[\s*([^\[\]\n]{1,40}?)\s*\]")
 _ASTERISK = re.compile(r"\*{1,2}([^*\n]{1,40}?)\*{1,2}")
 
 
-def _classify_bracket(inner: str, body_set: set[str]) -> tuple[str, bool] | None:
-    """(canonical_name, playable) for a bracket tag body, or None to keep it.
+def _classify_bracket(inner: str, body_set: set[str],
+                      custom_set: frozenset[str] = frozenset(),
+                      ) -> tuple[str, bool, bool] | None:
+    """(canonical_name, playable, custom) for a bracket tag body, None to keep.
 
-    playable=True means the name is in the body set: strip + record. An
-    explicit `[action:x]` or a bare tag naming a KNOWN gesture that the
-    online clients cannot do is a request that cannot play: strip + ignore.
-    Any other word (`[sad]`, `[note]`) is not an action request and stays in
-    the text — that is how a mid-text emotion tag survives.
+    playable=True means the name is in the body set (or, for custom moves,
+    among the persona's KEPT animations for the current model): strip +
+    record. An explicit `[action:x]`/`[act:x]` or a bare tag naming a KNOWN
+    gesture that the online clients cannot do is a request that cannot play:
+    strip + ignore. Any other word (`[sad]`, `[note]`) is not an action
+    request and stays in the text — that is how a mid-text emotion tag
+    survives.
     """
     text = inner.strip()
+    m = re.match(r"^act\s*[:\-]\s*(.+)$", text, re.IGNORECASE)
+    if m:  # explicit `[act:name]`: always a custom-animation request
+        name = normalize_action_name(m.group(1))
+        if not name:
+            return None
+        return name, name in custom_set, True
     m = re.match(r"^action\s*[:\-]\s*(.+)$", text, re.IGNORECASE)
     if m:  # explicit `[action:name]`: always an action request
         name = normalize_action_name(m.group(1))
         if not name:
             return None
         canon = ACTION_VERBS.get(" ".join(name.split("_")), name)
-        return canon, canon in body_set
+        if canon in body_set:
+            return canon, True, False
+        if canon in custom_set:
+            return canon, True, True
+        return canon, False, False
     name = normalize_action_name(text)
     if not name:
         return None
     if name in body_set:
-        return name, True
+        return name, True, False
+    if name in custom_set:
+        return name, True, True
     if name in GESTURE_VOCAB:
-        return name, False
+        return name, False, False
     return None
 
 
-def parse_actions(text: str, body_actions: list[str]) -> tuple[str, list[dict], list[str]]:
+def parse_actions(text: str, body_actions: list[str],
+                  custom_actions: list[str] | set[str] | None = None,
+                  ) -> tuple[str, list[dict], list[str]]:
     """Split action tags out of an emotion-stripped reply.
 
     Returns (clean_text, actions, ignored). Each action is
     {"name": str, "at": float} with `at` the 0..1 fraction of the CLEANED
-    reply's length where the tag sat. Unknown bracket tags that are not
-    action requests stay untouched; action requests for names outside the
-    body set are stripped into `ignored`.
+    reply's length where the tag sat; custom animation actions additionally
+    carry {"type": "gesture", "custom": true} (docs/SELF_ANIMATION.md).
+    `custom_actions` are the persona's KEPT animation names for the model
+    the client is wearing. Unknown bracket tags that are not action requests
+    stay untouched; action requests for names outside the body set are
+    stripped into `ignored`.
     """
     body_set = {normalize_action_name(a) for a in body_actions or []}
+    custom_set = frozenset(normalize_action_name(c)
+                           for c in (custom_actions or set())
+                           if normalize_action_name(c))
     raw = text or ""
     kept: list[str] = []   # kept chars, in order
-    spans: list[tuple[int, str]] = []  # (cleaned offset, action name)
     ignored: list[str] = []
 
-    pieces: list[tuple[int, int, str | None]] = []  # (start, end, name|None|'ignore')
+    # (start, end, name|None, custom) — name None == strip + ignore
+    pieces: list[tuple[int, int, str | None, bool]] = []
     for m in _BRACKET.finditer(raw):
         if raw[m.end():m.end() + 1] == "(":      # markdown link — hands off
             continue
-        verdict = _classify_bracket(m.group(1), body_set)
+        verdict = _classify_bracket(m.group(1), body_set, custom_set)
         if verdict is None:
             continue
-        name, playable = verdict
+        name, playable, custom = verdict
         if playable:
-            pieces.append((m.start(), m.end(), name))
+            pieces.append((m.start(), m.end(), name, custom))
         else:
             ignored.append(name)
-            pieces.append((m.start(), m.end(), None))
+            pieces.append((m.start(), m.end(), None, False))
 
     def verb_hit(inner: str) -> tuple[str, bool] | None:
         key = " ".join(str(inner or "").strip().lower().split()).rstrip(" .!")
@@ -276,7 +309,7 @@ def parse_actions(text: str, body_actions: list[str]) -> tuple[str, list[dict], 
             return None
         return canon, canon in body_set
 
-    bracket_spans = {(s, e) for s, e, _ in pieces}
+    bracket_spans = {(s, e) for s, e, _, _ in pieces}
     for m in _ASTERISK.finditer(raw):
         if any(s < m.end() and m.start() < e for s, e in bracket_spans):
             continue                              # overlaps a bracket tag
@@ -285,28 +318,33 @@ def parse_actions(text: str, body_actions: list[str]) -> tuple[str, list[dict], 
             continue                              # *smiles* stays verbatim
         canon, playable = hit
         if playable:
-            pieces.append((m.start(), m.end(), canon))
+            pieces.append((m.start(), m.end(), canon, False))
         else:
             ignored.append(canon)
-            pieces.append((m.start(), m.end(), None))
+            pieces.append((m.start(), m.end(), None, False))
 
     pieces.sort(key=lambda p: p[0])
+    spans: list[tuple[int, str, bool]] = []
     pos = 0
-    for start, end, name in pieces:
+    for start, end, name, custom in pieces:
         kept.append(raw[pos:start])
         if name is not None:
-            spans.append((sum(len(k) for k in kept), name))
+            spans.append((sum(len(k) for k in kept), name, custom))
         pos = end
     kept.append(raw[pos:])
     clean = _tidy("".join(kept))
 
     actions: list[dict] = []
-    for offset, name in spans:
+    for offset, name, custom in spans:
         at = round(offset / len(clean), 3) if clean else 0.0
         at = min(1.0, max(0.0, at))
         if actions and actions[-1]["name"] == name:
             continue                              # adjacent duplicate: merged
-        actions.append({"name": name, "at": at})
+        entry = {"name": name, "at": at}
+        if custom:
+            entry["type"] = "gesture"
+            entry["custom"] = True
+        actions.append(entry)
     return clean, actions[:MAX_ACTIONS], ignored
 
 

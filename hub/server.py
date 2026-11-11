@@ -1504,8 +1504,13 @@ def create_app(data_dir, api_key: str | None = None,
         # AND the persona is embodied; the appearance line always (text-only
         # chats can describe her too).
         body_actions = clients_hub.body_actions()
+        # kept custom animations on the model the clients are wearing
+        # (docs/SELF_ANIMATION.md): [act:<name>] tags resolve against these
+        custom_moves = sorted(r["name"] for r in store.list_animations(
+            pid, anim_sha(pid), status="kept"))
         if persona.get("embodied", True) and body_actions:
-            system += "\n\n" + _body.body_prompt(body_actions)
+            system += "\n\n" + _body.body_prompt(body_actions,
+                                                  custom_actions=custom_moves)
             # one-line nudge when this very message asks for a gesture:
             # cheap and raises tag compliance
             asked_for = _body.detect_action_request(text, body_actions)
@@ -1834,7 +1839,8 @@ def create_app(data_dir, api_key: str | None = None,
         emotion, answer = _emotion.parse_emotion(out["text"])
         # body actions are parsed from the FINAL reply only (the tool loop
         # may have streamed several model turns)
-        answer, actions, ignored = _body.parse_actions(answer, body_actions)
+        answer, actions, ignored = _body.parse_actions(
+            answer, body_actions, custom_actions=custom_moves)
         if ignored:
             log.info("ignored_actions persona=%s names=%s", pid, ",".join(ignored))
         # docs/BODY.md §3 asked-for fallback: tag emission is stochastic
@@ -2090,7 +2096,10 @@ def create_app(data_dir, api_key: str | None = None,
                 emotion, answer = _emotion.parse_emotion(raw)
                 body_actions = (clients_hub.body_actions()
                                 if persona.get("embodied", True) else [])
-                answer, actions, ignored = _body.parse_actions(answer, body_actions)
+                answer, actions, ignored = _body.parse_actions(
+                    answer, body_actions,
+                    custom_actions=[r["name"] for r in store.list_animations(
+                        pid, anim_sha(pid), status="kept")])
                 if ignored:
                     log.info("[touch] ignored_actions persona=%s names=%s",
                              pid, ",".join(ignored))
