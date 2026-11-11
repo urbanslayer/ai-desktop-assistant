@@ -16,6 +16,7 @@ import os
 import pathlib
 import stat
 import tarfile
+import time
 from datetime import date, timedelta
 
 import pytest
@@ -838,3 +839,184 @@ def test_cache_size_below_soloist_minimum_is_raised_to_100():
         p = SoloistPlayer({"player": "soloist", "soloist": {"cache_size_mb": given}})
         argv = p.argv("K")
         assert argv[argv.index("-z") + 1] == want, (given, argv)
+
+
+# ── ticker fast path: the playback-event feed (docs/SPOTIFY_NOTES.md) ───────
+
+def _ws_item(uri="spotify:track:A", name="Bohemian Rhapsody",
+             artists=("Queen",), album="A Night at the Opera",
+             duration=354000):
+    """An entity envelope shaped like the official WS docs' `item`."""
+    return {"uri": uri, "entity_type": "track",
+            "decorations": {
+                "identity": {"name": name},
+                "playback": {"duration_ms": duration},
+                "creators": [{"entity": {"entity_type": "artist",
+                                         "decorations":
+                                         {"identity": {"name": a}}}}
+                             for a in artists],
+                "parent": {"entity": {"entity_type": "album",
+                                      "decorations":
+                                      {"identity": {"name": album}}}}}}
+
+
+def _feed(tmp_path, msgs, **kw):
+    """A feed on a fake connection: ws endpoint files + the connect seam
+    deliver `msgs` (dicts) then go quiet. Returns (feed, beats, conn)."""
+    import threading
+
+    class FakeConn:
+        def __init__(self):
+            self.closed = False
+            self.sent = []
+            self._q = list(msgs)
+            self._lock = threading.Lock()
+
+        def send(self, data):
+            self.sent.append(data)
+
+        def recv(self, timeout=None):
+            with self._lock:
+                if self._q:
+                    return json.dumps(self._q.pop(0))
+            raise TimeoutError            # quiet, like the real seam
+
+        def close(self):
+            self.closed = True
+
+    data_dir = tmp_path / "wsfeed"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "ws.addr").write_text("127.0.0.1")
+    (data_dir / "ws.port").write_text("59999")
+    conns = []
+
+    def connect(uri):
+        conn = FakeConn()
+        conns.append(conn)
+        return conn
+    beats = []
+    ws = SoloistWs(data_dir, connect=connect)
+    feed = so.SoloistFeed(ws, beats.append, log=lambda *a: None,
+                          retry_s=0.05, recv_timeout=0.05, **kw)
+    return feed, beats, conns
+
+
+def test_feed_snapshot_maps_the_official_entity_shapes(tmp_path):
+    beats = []
+    feed = so.SoloistFeed(None, beats.append, log=lambda *a: None)
+    assert feed.feed({"type": "auth_state", "logged_in": True,
+                      "is_active": True, "device_name": "Riko"}) is False
+    assert feed.feed({"type": "playback_state", "status": "playing",
+                      "item": _ws_item(),
+                      "context": {"uri": "spotify:album:X"},
+                      "position": {"position_ms": 4200}}) is True
+    snap = beats[-1]
+    assert snap == {"playing": True, "uri": "spotify:track:A",
+                    "track": "Bohemian Rhapsody", "artists": "Queen",
+                    "album": "A Night at the Opera", "duration_ms": 354000,
+                    "position_ms": 4200, "device": "Riko",
+                    "context_uri": "spotify:album:X"}
+    # quiet events never repaint the ticker
+    assert feed.feed({"type": "position_sync",
+                      "position": {"position_ms": 9000}}) is False
+    assert feed.feed({"type": "volume_changed", "volume": 40}) is False
+    # same uri again (a stray repeat of playback_state): deduped
+    assert feed.feed({"type": "playback_state", "status": "playing",
+                      "item": _ws_item(), "position": {}}) is False
+    # pause paints (paused-with-track keeps the bar visible)
+    assert feed.feed({"type": "playback_changed",
+                      "status": "paused"}) is True
+    assert beats[-1]["playing"] is False and beats[-1]["uri"] == "spotify:track:A"
+    # idle = the hub's hide signal
+    assert feed.feed({"type": "playback_changed", "status": "idle"}) is True
+    assert beats[-1]["uri"] == "" and beats[-1]["playing"] is False
+    # resume: playback_changed(playing) repaints the still-loaded item
+    assert feed.feed({"type": "playback_changed", "status": "playing"}) is True
+    assert beats[-1]["uri"] == "spotify:track:A"
+    # granular track_changed carries the new item
+    assert feed.feed({"type": "track_changed", "item": _ws_item(
+        uri="spotify:track:B", name="Under Pressure",
+        artists=("Queen", "Bowie"))}) is True
+    assert beats[-1]["uri"] == "spotify:track:B"
+    assert beats[-1]["artists"] == "Queen, Bowie"
+    # a track_changed while idle does NOT paint (the hub's shape rule:
+    # idle means empty; the real player follows with playback_changed)
+    idle_feed = so.SoloistFeed(None, beats.append, log=lambda *a: None)
+    idle_feed.feed({"type": "auth_state", "logged_in": True,
+                    "is_active": True, "device_name": "Riko"})
+    idle_feed.feed({"type": "playback_state", "status": "playing",
+                    "item": _ws_item()})
+    idle_feed.feed({"type": "playback_changed", "status": "idle"})
+    n = len(beats)
+    assert idle_feed.feed({"type": "track_changed",
+                           "item": _ws_item(uri="spotify:track:C")}) is False
+    assert len(beats) == n
+
+
+def test_feed_stays_silent_while_another_device_is_active(tmp_path):
+    beats = []
+    feed = so.SoloistFeed(None, beats.append, log=lambda *a: None)
+    feed.feed({"type": "auth_state", "logged_in": True,
+               "is_active": False, "device_name": "Riko"})
+    assert feed.feed({"type": "playback_state", "status": "idle",
+                      "item": None}) is False       # not our device to paint
+    feed.feed({"type": "device_changed", "is_active": True,
+               "device_name": "Riko"})
+    assert feed.feed({"type": "playback_state", "status": "playing",
+                      "item": _ws_item()}) is True  # transfer IN: now we paint
+
+
+def test_feed_thread_drives_page_from_playback_events(tmp_path):
+    """Fake WS connection pushing the official event sequence: the feed
+    thread fires the callback for real changes only (the desktop closure
+    turns a beat into a page paint + hub nudge)."""
+    msgs = [{"type": "auth_state", "logged_in": True, "is_active": True,
+             "device_name": "Riko"},
+            {"type": "playback_state", "status": "playing",
+             "item": _ws_item(), "position": {"position_ms": 10}},
+            {"type": "volume_changed", "volume": 11},
+            {"type": "track_changed", "item": _ws_item(
+                uri="spotify:track:B", name="I Want It All")}]
+    feed, beats, conns = _feed(tmp_path, msgs)
+    feed.start()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and len(beats) < 2:
+        time.sleep(0.02)
+    feed.stop()
+    assert [b["uri"] for b in beats] == ["spotify:track:A", "spotify:track:B"]
+    assert conns and conns[0].closed is True        # stop closed the socket
+
+
+def test_feed_survives_dropped_connections_and_missing_files(tmp_path):
+    import threading
+
+    data_dir = tmp_path / "wsfeed2"
+    data_dir.mkdir(parents=True, exist_ok=True)      # NO ws.addr/ws.port yet
+    seen = {"opens": 0}
+
+    class Boom:
+        def send(self, data):
+            pass
+
+        def recv(self, timeout=None):
+            raise ConnectionError("soloist restarted")
+
+        def close(self):
+            pass
+
+    def connect(uri):
+        seen["opens"] += 1
+        return Boom()
+    ws = SoloistWs(data_dir, connect=connect)
+    feed = so.SoloistFeed(ws, lambda s: None, log=lambda *a: None,
+                          retry_s=0.02, recv_timeout=0.02)
+    feed.start()                                     # endpoint down: no crash
+    time.sleep(0.1)
+    assert seen["opens"] == 0                        # nothing to open yet
+    (data_dir / "ws.addr").write_text("127.0.0.1")
+    (data_dir / "ws.port").write_text("59998")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and seen["opens"] < 2:
+        time.sleep(0.02)                             # reconnect loop churns
+    feed.stop()
+    assert seen["opens"] >= 2                        # never fatal, keeps trying

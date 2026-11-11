@@ -172,7 +172,7 @@ Owner steps (once, see docs/SOLOIST.md for the details):
 
 "Small ticker at the bottom of her window showing the currently playing
 song, with a play/pause button." Data is the hub's existing now-playing
-state — nothing new is polled:
+state:
 
 - **Data path:** the hub's `now_playing` event (events long-poll, deduped
   state changes) → `riko/session.py` follower thread → viewer command
@@ -181,6 +181,50 @@ state — nothing new is polled:
   starts (`_seed_now_playing`, best effort — 409 stays dark). The idle
   snapshot (`playing:false, uri:""`) is forwarded too: it is exactly what
   tells the page to hide the bar.
+- **Live detection (2026-11-11 live-bug round):** the poller used to sleep
+  with ZERO API calls the moment state was paused/idle and only
+  `wake()`d on Riko-initiated play/resume/transfer — so playback started
+  from the phone (or already running across a hub restart) never produced
+  an event and the ticker stayed hidden. Now:
+  - *Hub idle watch:* while connected+enabled and NOT fast-polling, the
+    poller fetches currently-playing every `spotify.idle_poll_s`
+    (default 30 s, floor 15 s, `0` disables) — but only while someone
+    cares: a desktop client is online in `clients_hub` (wired as
+    `interest_hook`) OR some client fetched `GET /api/spotify/now-playing`
+    within `PAGE_INTEREST_S` (120 s — a ticker page that just opened
+    always seeds itself, so "page is up" ≈ "page has been asking"; an
+    unwatched hub burns zero calls). Never during a quota back-off. A
+    noticed play hands over to the fast poll (wake).
+  - *Hub start snapshot:* `startup_snapshot()` — one immediate fetch when
+    the poller thread starts (connected + no back-off), so state after a
+    hub redeploy/restart is right without waiting for a wake or an idle
+    period.
+  - *Desktop fast path:* when WE manage the player and it is Soloist,
+    `music/soloist.py::SoloistFeed` keeps a long-lived connection to its
+    local WS API (`auth_state`, `playback_state`, `track_changed`,
+    `playback_changed`, `context_changed`, `device_changed`,
+    `position_sync` — names verified against the official WS docs, not
+    guessed). On a real (uri, playing) change **while Soloist is the
+    active device** it GETs `now-playing`, forwards the hub's own
+    snapshot to the page as `music:state`, and posts
+    `POST /api/spotify/wake` (`session.music_local` does the last step) —
+    the hub stays the single source of truth for what the
+    ticker paints (the WS `item` envelope is only used for change
+    detection, never mapped into ticker fields; hub unreachable is the
+    one local-paint fallback). `session.music_local`
+    records the forwarded snapshot; a hub `now_playing` event that merely
+    confirms it (same uri+playing, < 5 s later) is skipped — newer state
+    always wins, no double-paint/flicker. When playback lives on another
+    device the feed stays silent and the hub paths are the only painter.
+  - *Latency (phone started it):* same-device (Soloist is the player):
+    WS event → page ~0.3-1 s (nudge + one hub GET). Phone on another
+    device / spotifyd builds: within one idle period, ≤ ~30 s.
+    Already-playing across a hub restart: at hub start.
+  - *Extra Spotify budget:* idle watch ≤ 1 currently-playing GET per 30 s
+    while idle+watched = ≤ 120 calls/h worst case (0 when nobody is
+    online/asking, 0 when `idle_poll_s: 0`); +1 call per hub start; the
+    fast path itself costs 1 extra GET per playback change (the nudge POST
+    costs zero). Fast-poll budget while playing is unchanged.
 - **Button path:** page button → viewer `POST /control/music-control`
   `{action:"toggle"}` → desktop → `POST /api/spotify/control` → hub's
   `SpotifyHub.control` (new `toggle` branch: reads the young cache or one

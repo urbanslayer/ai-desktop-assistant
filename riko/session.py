@@ -22,6 +22,7 @@ from riko import appstate, asr, client_tools, hub_client, name_gate, tts, viewer
 ECHO_TAIL_MS_DEFAULT = 200  # VAD stays paused this long after her voice ends
                             # (echo guard); override: desktop.always_listen.echo_tail_ms
 LISTEN_MODES = ("push_to_talk", "always")
+MUSIC_RECONCILE_S = 5.0     # fast-path hub-confirm dedupe window (ticker)
 
 
 class Session:
@@ -71,6 +72,11 @@ class Session:
         # str) replaces the text for the normal chat turn (vocative strip).
         self.dictation_filter: Optional[Callable[[str], tuple]] = None
         self._events_stop = None     # stop Event of the events follower thread
+        # song ticker fast path (docs/SPOTIFY_NOTES.md): (uri, playing,
+        # wall-clock) of the last snapshot forwarded from the desktop's
+        # local Soloist listener; hub events matching it within the
+        # reconcile window are confirmations, not new states (no flicker).
+        self._music_fast = None
         self._timer_lock = threading.Lock()
         self._timer_played = collections.deque(maxlen=512)   # message_ids already queued to speak
         self._timer_noticed = collections.deque(maxlen=512)  # message_ids already sent to the tray
@@ -357,8 +363,33 @@ class Session:
     def _on_now_playing(self, ev):
         """now_playing event (follower thread) -> page ticker command.
         Forwarded even when empty: the idle snapshot (uri '') is exactly
-        what tells the page to hide the ticker now."""
+        what tells the page to hide the ticker now. A hub event that
+        CONFIRMS the fast path's last local Soloist snapshot (same uri +
+        playing, inside MUSIC_RECONCILE_S) is skipped — the page already
+        painted that state; re-sending it would double-paint, and the
+        hub is by definition the slower witness of the same change."""
+        fast = self._music_fast
+        if fast is not None and \
+                time.time() - fast[2] < MUSIC_RECONCILE_S and \
+                str(ev.get("uri") or "") == fast[0] and \
+                bool(ev.get("playing")) == fast[1]:
+            return
         self._emit_music_state(ev)
+
+    def music_local(self, snap):
+        """FAST PATH (docs/SPOTIFY_NOTES.md): the desktop's Soloist
+        listener saw a local playback change. Forward it to the page at
+        once (sub-second ticker, zero Spotify calls) and nudge the hub's
+        fast poll so its authoritative now_playing event confirms or
+        replaces this snapshot — newer state always wins. Called from the
+        listener thread (never Qt); the nudge is best effort."""
+        self._music_fast = (str(snap.get("uri") or ""),
+                            bool(snap.get("playing")), time.time())
+        self._emit_music_state(snap)
+        try:
+            self.hub.spotify_wake()
+        except Exception:
+            pass  # old hub / offline: the idle watch still notices
 
     # keys the ticker understands; the event envelope keys stay behind
     _MUSIC_KEYS = ("playing", "uri", "track", "artists", "album",

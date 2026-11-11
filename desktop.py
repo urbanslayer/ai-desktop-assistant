@@ -1903,6 +1903,24 @@ def main():
                      push_cmd=lambda cmd: bridge.command.emit(cmd))
     bridge.command.emit(f"music:ticker:{1 if ticker_on else 0}")
     app.aboutToQuit.connect(music_player.stop)
+    # song ticker fast path (docs/SPOTIFY_NOTES.md): when WE manage the
+    # player and it is Soloist, its local WS pushes playback events —
+    # treat one as a beat: nudge the hub's fast poll, then paint from the
+    # hub's OWN now-playing answer (single source of truth for ticker
+    # fields; the WS envelope only proves "something changed"). Hub
+    # unreachable: paint the local snapshot, better than staying dark.
+    music_feed = None
+    if isinstance(music_player, music_soloist.SoloistPlayer):
+        def playback_beat(local_snap):
+            try:
+                snap = session.hub.spotify_now_playing()
+            except Exception:
+                snap = local_snap
+            session.music_local(snap)   # emits music:state + nudges the hub
+        music_feed = music_soloist.SoloistFeed(
+            music_player.ws, playback_beat, log=print)
+        music_feed.start()
+        app.aboutToQuit.connect(music_feed.stop)
 
     # Soloist builds expire 90 days after their build date: check at start
     # and every 6 h, ALWAYS off the Qt thread (downloads + version probes).

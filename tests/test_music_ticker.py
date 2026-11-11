@@ -146,3 +146,164 @@ def test_music_ticker_appstate_roundtrip(monkeypatch, tmp_path):
     assert appstate.load_music_ticker() is True
     assert appstate.save_music_ticker("yes") is False    # non-bools ignored
     assert appstate.load_music_ticker() is True
+
+
+# ── fast path: desktop-local Soloist beat → page paint + hub nudge ──────────
+# (docs/SPOTIFY_NOTES.md, 2026-11-11 live-bug round)
+
+def collect_music(url, seconds):
+    """All music:state payloads seen on the page queue for `seconds`."""
+    out, deadline = [], time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        evs = requests.get(f"{url}/next", timeout=5).json().get("events") or []
+        out += [json.loads(e["cmd"][len("music:state "):])
+                for e in evs
+                if str(e.get("cmd", "")).startswith("music:state ")]
+        time.sleep(0.05)
+    return out
+
+
+def test_music_local_paints_and_nudges(ticker_env, monkeypatch):
+    """The Soloist feed's beat: forward at once + nudge the hub's fast poll.
+    A hub event that merely CONFIRMS the same state is not repainted (no
+    flicker); newer hub state always wins."""
+    cfg, url, fake_hub = ticker_env
+    nudges = []
+    monkeypatch.setattr(hub_client.HubClient, "spotify_wake",
+                        lambda self: nudges.append(1))
+    s = session.Session(cfg, source="desktop")
+    s.follow_hub_events(wait=1)
+    try:
+        s.music_local(dict(SNAP))
+        got = collect_music(url, 0.6)
+        assert got and got[-1]["uri"] == SNAP["uri"]
+        assert len(nudges) == 1                       # hub fast poll nudged
+        # the hub's confirming event (same uri+playing): skipped, no repaint
+        fake_hub.push_event("now_playing", **SNAP)
+        assert collect_music(url, 1.0) == []
+        # newer hub state inside the same window: forwarded, newest wins
+        other = dict(SNAP, uri="spotify:track:next", track="Next Song")
+        fake_hub.push_event("now_playing", **other)
+        got = collect_music(url, 3.0)
+        assert got and got[-1]["uri"] == "spotify:track:next"
+        assert len(nudges) == 1                       # events never re-nudge
+    finally:
+        s.close()
+
+
+def test_music_local_stale_confirmation_forwards(ticker_env, monkeypatch):
+    """Outside the reconcile window the hub event is NOT a confirmation:
+    it forwards again (the page policy is idempotent, hiding wins)."""
+    cfg, url, fake_hub = ticker_env
+    monkeypatch.setattr(hub_client.HubClient, "spotify_wake",
+                        lambda self: None)
+    s = session.Session(cfg, source="desktop")
+    s.follow_hub_events(wait=1)
+    try:
+        s.music_local(dict(SNAP))
+        assert collect_music(url, 0.6)
+        s._music_fast = (SNAP["uri"], True, time.time() - 60.0)  # window gone
+        fake_hub.push_event("now_playing", **SNAP)
+        got = collect_music(url, 3.0)
+        assert got and got[-1]["uri"] == SNAP["uri"]
+    finally:
+        s.close()
+
+
+class _FakeFeedConn:
+    """One quiet fake of the Soloist WS seam: auth + one playing event,
+    then silence (TimeoutError, like the real sync client)."""
+
+    def __init__(self):
+        self.msgs = [{"type": "auth_state", "logged_in": True,
+                      "is_active": True, "device_name": "Riko"},
+                     {"type": "playback_state", "status": "playing",
+                      "item": {"uri": "spotify:track:soloist-x",
+                               "entity_type": "track",
+                               "decorations": {
+                                   "identity": {"name": "Soloist Song"}}}}]
+
+    def send(self, data):
+        pass
+
+    def recv(self, timeout=None):
+        if self.msgs:
+            return json.dumps(self.msgs.pop(0))
+        raise TimeoutError
+
+    def close(self):
+        pass
+
+
+class _FakeFeedWs:
+    def open(self):
+        return _FakeFeedConn()
+
+
+def _beat_closure(s):
+    """The desktop.py closure, verbatim logic."""
+    def beat(local):
+        try:
+            snap = s.hub.spotify_now_playing()
+        except Exception:
+            snap = local
+        s.music_local(snap)
+    return beat
+
+
+def test_feed_beat_closure_reaches_page_end_to_end(ticker_env, monkeypatch):
+    """Soloist WS event → desktop beat closure → hub now-playing GET → page
+    music:state: painted from the HUB's answer (single source of truth),
+    never from the locally-mapped WS snapshot."""
+    from riko.music.soloist import SoloistFeed
+
+    cfg, url, fake_hub = ticker_env
+    hub2 = dict(SNAP, uri="spotify:track:hub-truth", track="Hub Truth")
+    calls = []
+
+    def np(self):
+        calls.append(1)
+        return dict(SNAP) if len(calls) == 1 else dict(hub2)
+    monkeypatch.setattr(hub_client.HubClient, "spotify_wake",
+                        lambda self: None)
+    monkeypatch.setattr(hub_client.HubClient, "spotify_now_playing", np)
+    s = session.Session(cfg, source="desktop")
+    s.follow_hub_events(wait=1)          # the seed paints SNAP first
+    feed = SoloistFeed(_FakeFeedWs(), _beat_closure(s), log=lambda *a: None,
+                       retry_s=0.05, recv_timeout=0.05)
+    feed.start()
+    try:
+        got = collect_music(url, 2.0)
+        # beat → hub GET (call 2) → HUB answer painted, not the local map
+        assert got and got[-1]["uri"] == "spotify:track:hub-truth"
+        assert all(g["uri"] != "spotify:track:soloist-x" for g in got)
+    finally:
+        feed.stop()
+        s.close()
+
+
+def test_beat_paints_local_snapshot_when_hub_unreachable(ticker_env,
+                                                         monkeypatch):
+    """Hub down mid-beat: painting the locally-mapped Soloist snapshot is
+    better than leaving the page dark (docs/SPOTIFY_NOTES.md)."""
+    from riko.music.soloist import SoloistFeed
+
+    cfg, url, fake_hub = ticker_env
+
+    def flaky(self):
+        raise hub_client.HubUnreachable("hub is down")
+    monkeypatch.setattr(hub_client.HubClient, "spotify_wake",
+                        lambda self: None)
+    monkeypatch.setattr(hub_client.HubClient, "spotify_now_playing", flaky)
+    s = session.Session(cfg, source="desktop")
+    s.follow_hub_events(wait=1)          # seed fails silently (hub down)
+    feed = SoloistFeed(_FakeFeedWs(), _beat_closure(s), log=lambda *a: None,
+                       retry_s=0.05, recv_timeout=0.05)
+    feed.start()
+    try:
+        got = collect_music(url, 2.0)
+        assert got and got[-1]["uri"] == "spotify:track:soloist-x"
+        assert got[-1]["track"] == "Soloist Song"
+    finally:
+        feed.stop()
+        s.close()

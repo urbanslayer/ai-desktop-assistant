@@ -736,3 +736,159 @@ def test_status_full_consent_has_no_missing_scopes(hub_app, fake):
     # not connected → nothing to flag
     client.post("/api/spotify/disconnect")
     assert client.get("/api/spotify/status").json()["missing_scopes"] == []
+
+
+# ── idle watch + hub-start snapshot (2026-11-11 live-bug round) ─────────────
+# The ticker stayed hidden for playback started on the phone: the poller
+# slept with zero API calls after pause/idle and wake()d only on
+# Riko-initiated actions. The slow, interest-gated idle watch and the
+# hub-start snapshot fix that (docs/SPOTIFY_NOTES.md).
+
+def test_idle_watch_detects_external_play(hub_app, fake):
+    """Phone started playback — nothing called wake(). One idle tick
+    notices it, publishes the event, and hands over to the fast poll."""
+    app, client = hub_app
+    seed_tokens(app)
+    hub = app.state.spotify
+    hub._wake.clear()
+    hub._np_requested = hub._clock()      # a ticker page recently asked
+    after = client.get("/api/events?after=0&wait=0").json()["last"]
+    fake.now = playing_snapshot()
+    snap = hub.idle_tick()
+    assert snap and snap["playing"] is True
+    assert hub._wake.is_set()             # fast poll owns the next stretch
+    evs = events_of(client, after)
+    assert len(evs) == 1 and evs[0]["uri"] == TRACK["uri"]
+    hub._wake.clear()                     # simulate the next idle period
+    hub.idle_tick()                       # same state: still no event spam
+    assert len(events_of(client, after)) == 1
+
+
+def test_idle_watch_silent_when_nobody_watches(hub_app, fake):
+    """Zero watched time = zero Spotify calls; a desktop client coming
+    online flips the interest hook, and a plain now-playing GET counts as
+    page interest on its own."""
+    app, client = hub_app
+    seed_tokens(app)
+    hub = app.state.spotify
+    hub._wake.clear()
+    hub._np_requested = 0.0
+    fake.now = playing_snapshot()
+    before = len(fake.log)
+    assert hub.interested() is False
+    assert hub.idle_tick() is None
+    assert len(fake.log) == before                  # NO API calls
+    r = client.post("/api/clients/pc1/register",
+                    json={"name": "PC", "kind": "desktop", "tools": []})
+    assert r.status_code == 200
+    assert hub.interested() is True                 # desktop online → watch
+    assert hub.idle_tick() is not None
+    assert fake.hits("GET", "/v1/me/player/currently-playing") >= 1
+    client.delete("/api/clients/pc1")               # desktop goes away
+    hub._np_requested = 0.0
+    assert hub.interested() is False
+    # a page that fetched now-playing recently is "someone watching"
+    assert client.get("/api/spotify/now-playing").status_code == 200
+    assert hub.interested() is True
+    hub._wake.clear()
+    hub._np_requested = hub._clock() - 5.0          # 5 s ago, still inside window
+    assert hub.idle_tick() is not None
+
+
+def test_idle_watch_respects_quota_backoff(hub_app, fake):
+    app, client = hub_app
+    seed_tokens(app)
+    hub = app.state.spotify
+    hub._wake.clear()
+    hub._np_requested = hub._clock()
+    fake.now = playing_snapshot()
+    hub._note_quota(60.0)                           # a 429 just happened
+    before = len(fake.log)
+    assert hub.idle_tick() is None                  # window: zero calls
+    assert len(fake.log) == before
+    hub._quota_until = 0.0                          # cooled down
+    assert hub.idle_tick() is not None              # watch is back
+
+
+def test_idle_watch_disabled_and_settings_validation(hub_app, fake):
+    app, client = hub_app
+    hub = app.state.spotify
+    assert hub.idle_poll_s() == 30.0                # default
+    got = client.get("/api/settings").json()["spotify"]["idle_poll_s"]
+    assert got == 30.0
+    assert client.put("/api/settings",
+                      json={"spotify": {"idle_poll_s": 5}}).status_code == 200
+    assert hub.idle_poll_s() == 15.0                # quota-discipline floor
+    assert client.put("/api/settings",
+                      json={"spotify": {"idle_poll_s": 0}}).status_code == 200
+    assert hub.idle_poll_s() == 0.0                 # 0 disables
+    seed_tokens(app)
+    hub._wake.clear()
+    hub._np_requested = hub._clock()
+    fake.now = playing_snapshot()
+    before = len(fake.log)
+    assert hub.idle_tick() is None                  # disabled even when watched
+    assert len(fake.log) == before
+    for bad in (-1, "30", True, 1e9):
+        assert client.put("/api/settings",
+                          json={"spotify": {"idle_poll_s": bad}}).status_code == 422
+    assert hub.idle_poll_s() == 0.0                 # the rejects changed nothing
+
+
+def test_hub_start_snapshot_fixes_restart(hub_app, fake):
+    """Playback that started while the hub was DOWN must be correct AT hub
+    start: one snapshot, one event, fast poll takes over."""
+    app, client = hub_app
+    seed_tokens(app)
+    hub = app.state.spotify
+    hub.stop()                                      # the thread as before restart
+    hub._wake.clear()
+    hub._np_requested = 0.0
+    fake.now = playing_snapshot()
+    after = client.get("/api/events?after=0&wait=0").json()["last"]
+    snap = hub.startup_snapshot()
+    assert snap["playing"] is True and snap["uri"] == TRACK["uri"]
+    assert len(events_of(client, after)) == 1
+    assert hub._wake.is_set()
+    # quota cooling at start: the snapshot waits, zero API calls
+    hub._note_quota(60.0)
+    fake.now = playing_snapshot(uri="spotify:track:OTHER")
+    before = len(fake.log)
+    assert hub.startup_snapshot() is None
+    assert len(fake.log) == before
+    hub._quota_until = 0.0
+    # the real restart path: start() itself snapshots, no wake needed
+    hub.start()
+    deadline = time.time() + 3.0
+    got = []
+    while time.time() < deadline:
+        got = events_of(client, after)
+        if len(got) >= 2:
+            break
+        time.sleep(0.05)
+    hub.stop()
+    assert len(got) >= 2 and got[-1]["uri"] == "spotify:track:OTHER"
+
+
+def test_wake_route_nudges_the_fast_poll(hub_app):
+    app, client = hub_app
+    hub = app.state.spotify
+    hub.stop()                                      # deterministic: no thread
+    hub._wake.clear()
+    r = client.post("/api/spotify/wake")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "polling": True}
+    assert hub._wake.is_set()
+    hub._stop.clear()                               # fixture teardown hygiene
+    hub.start()
+
+
+def test_status_exposes_idle_watch_state(hub_app):
+    app, client = hub_app
+    seed_tokens(app)
+    st = client.get("/api/spotify/status").json()
+    assert st["idle_poll_s"] == 30.0
+    assert st["idle_watch"] is False                # nobody online/asking yet
+    client.post("/api/clients/pc1/register",
+                json={"name": "PC", "kind": "desktop", "tools": []})
+    assert client.get("/api/spotify/status").json()["idle_watch"] is True

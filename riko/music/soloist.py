@@ -323,6 +323,18 @@ class SoloistWs:
     def playback_state(self) -> dict | None:
         return self._exchange("playback_state", {"command": "get_state"})
 
+    def open(self):
+        """Open a LONG-LIVED connection to the local API (the ticker's
+        event feed needs one; _exchange is single-shot). None when the
+        endpoint files are missing/not loopback — same no-fatal contract."""
+        ep = self.endpoint()
+        if ep is None:
+            return None
+        try:
+            return self._open(ep)
+        except Exception:
+            return None
+
     def auth_state(self) -> dict | None:
         return self._exchange("auth_state", {"command": "get_auth_state"})
 
@@ -362,6 +374,196 @@ class SoloistWs:
             except Exception:
                 pass
         return False
+
+
+# ── ticker fast path: the local playback-event feed ─────────────────────────
+
+def _entity_name(entity) -> str:
+    """decorations.identity.name of an entity envelope ('' when absent)."""
+    if not isinstance(entity, dict):
+        return ""
+    return str(((entity.get("decorations") or {}).get("identity") or {})
+               .get("name") or "")
+
+
+def _entity_field(entity, *path, default):
+    node = entity
+    for key in path:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(key)
+    return node if node is not None else default
+
+
+def soloist_snapshot(state: dict) -> dict:
+    """Accumulated Soloist WS state → the compact now_playing shape the
+    hub's now_playing event uses (docs/SPOTIFY_NOTES.md ticker section).
+    status idle empties the track fields (that is the hub's hide signal);
+    paused/buffering keep the item so the bar can show the paused icon."""
+    status = str(state.get("status") or "idle")
+    item = state.get("item") if status != "idle" else None
+    item = item if isinstance(item, dict) else {}
+    dec = item.get("decorations") or {}
+    artists = ", ".join(
+        n for n in (_entity_name((c or {}).get("entity"))
+                    for c in (dec.get("creators") or [])) if n)
+    album = ""
+    parent = ((dec.get("parent") or {}).get("entity") or {})
+    if isinstance(parent, dict) and parent.get("entity_type") == "album":
+        album = _entity_name(parent)
+    duration = _entity_field(item, "decorations", "playback",
+                             "duration_ms", default=0)
+    position = state.get("position") or {}
+    context = state.get("context") or {}
+    return {
+        "playing": status == "playing",
+        "uri": str(item.get("uri") or ""),
+        "track": str(_entity_field(item, "decorations", "identity",
+                                   "name", default="")),
+        "artists": artists,
+        "album": album,
+        "duration_ms": int(duration or 0),
+        "position_ms": int((position or {}).get("position_ms") or 0),
+        "device": str(state.get("device_name") or ""),
+        "context_uri": str((context or {}).get("uri") or ""),
+    }
+
+
+class SoloistFeed:
+    """Long-lived listener on Soloist's WebSocket API for the ticker's
+    FAST path (docs/SOLOIST.md + the official WS reference).
+
+    Message names verified against the official docs (not guessed): the
+    server pushes `auth_state` on connect, `playback_state` (full
+    snapshot) when logged in, then granular events — `track_changed`
+    {item}, `playback_changed` {status}, `context_changed` {context},
+    `device_changed` {is_active, device_name}, `position_sync` {position}
+    — plus volume/options/queue events this feed ignores.
+
+    Accumulated state becomes a now_playing-shaped snapshot
+    (`soloist_snapshot`) and `on_snapshot(snapshot)` fires ONLY on a real
+    change (uri/playing dedupe) and ONLY while Soloist is the active
+    Connect device — when playback lives on another device the hub's own
+    path is the truth and a local 'idle' would flicker the ticker. The
+    caller (the desktop session) forwards to the page and nudges the hub.
+
+    Daemon thread; `ws` is a SoloistWs (endpoint discovery + the
+    injectable `connect` seam its tests feed). Everything is best-effort:
+    no endpoint, dropped connection or protocol noise = silent retry,
+    never fatal, never touches Qt."""
+
+    def __init__(self, ws, on_snapshot, *, log=print, retry_s: float = 2.0,
+                 recv_timeout: float = 2.0):
+        self.ws = ws
+        self.on_snapshot = on_snapshot
+        self.log = log
+        self.retry_s = float(retry_s)
+        self.recv_timeout = float(recv_timeout)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._state: dict = {}
+        self._sig: tuple | None = None
+
+    # -- state machine (pure enough to drive straight from tests) ----------
+    def reset(self) -> None:
+        self._state = {}
+
+    def feed(self, msg) -> bool:
+        """One server message; True when on_snapshot fired. Public so
+        tests drive the exact official message shapes."""
+        if not isinstance(msg, dict):
+            return False
+        kind = str(msg.get("type") or "")
+        st = self._state
+        if kind == "auth_state":
+            st["logged_in"] = bool(msg.get("logged_in"))
+            st["is_active"] = bool(msg.get("is_active"))
+            st["device_name"] = str(msg.get("device_name")
+                                    or st.get("device_name") or "")
+            if not st["logged_in"]:
+                st["status"] = "idle"
+                st["item"] = None
+                st["context"] = None
+            return False
+        if kind == "device_changed":
+            st["is_active"] = bool(msg.get("is_active"))
+            st["device_name"] = str(msg.get("device_name")
+                                    or st.get("device_name") or "")
+            return False     # transfers belong to the hub path; no local paint
+        if kind == "playback_state":
+            st["status"] = str(msg.get("status") or "idle")
+            st["item"] = msg.get("item")
+            st["context"] = msg.get("context")
+            st["position"] = msg.get("position")
+            if "is_active" in msg:
+                st["is_active"] = bool(msg.get("is_active"))
+        elif kind == "track_changed":
+            st["item"] = msg.get("item")
+        elif kind == "playback_changed":
+            st["status"] = str(msg.get("status") or "idle")
+        elif kind == "context_changed":
+            st["context"] = msg.get("context")
+        elif kind == "position_sync":
+            st["position"] = msg.get("position")
+        else:
+            return False     # volume/options/queue/command_result/error: mute
+        if not st.get("is_active"):
+            return False     # another device holds playback: the hub paints
+        snap = soloist_snapshot(st)
+        sig = (snap["uri"], snap["playing"])
+        if sig == self._sig:
+            return False
+        self._sig = sig
+        try:
+            self.on_snapshot(dict(snap))
+        except Exception as e:
+            try:
+                self.log(f"[music] soloist ticker feed callback failed: {e}")
+            except Exception:
+                pass
+        return True
+
+    # -- thread lifecycle ----------------------------------------------------
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self.run,
+                                            name="soloist-ticker-feed",
+                                            daemon=True)
+            self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            conn = self.ws.open() if hasattr(self.ws, "open") else None
+            if conn is None:
+                self.reset()           # no player: state unknown until next connect
+                self._stop.wait(self.retry_s)
+                continue
+            try:
+                while not self._stop.is_set():
+                    try:
+                        raw = conn.recv(timeout=self.recv_timeout)
+                    except TimeoutError:
+                        continue       # quiet is normal; poll the stop flag
+                    except Exception:
+                        break          # dropped connection: reconnect
+                    try:
+                        msg = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    self.feed(msg)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self.reset()               # fresh auth_state/playback_state after
+                                       # a reconnect; _sig survives (no re-paint)
 
 
 class SoloistDuck:

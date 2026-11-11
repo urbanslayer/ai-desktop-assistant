@@ -1078,12 +1078,14 @@ only, no client secret, so the hub can hold the flow safely.
 Settings block (GET /api/settings projection `spotify` — schema keys only;
 tokens live in the store under a write-only key, mirror of the api_key
 rule): `{enabled, client_id, device_name (default "Riko"), accounts_url,
-api_url}`. `accounts_url`/`api_url` default to the real Spotify hosts;
-`RIKO_SPOTIFY_ACCOUNTS_URL` / `RIKO_SPOTIFY_API_URL` override them (tests
-point them at the in-repo fake server). PUT accepts the same keys plus
-`clear_client_id`; a blank `client_id` never wipes a saved one. Resetting
-settings drops stored settings but keeps the tokens (disconnect drops
-those).
+api_url, idle_poll_s}`. `accounts_url`/`api_url` default to the real Spotify
+hosts; `RIKO_SPOTIFY_ACCOUNTS_URL` / `RIKO_SPOTIFY_API_URL` override them
+(tests point them at the in-repo fake server). `idle_poll_s` is the slow
+now_playing watch while NOT playing — seconds between checks, default 30,
+floor 15, `0` disables (docs/SPOTIFY_NOTES.md song-ticker section). PUT
+accepts the same keys plus `clear_client_id`; a blank `client_id` never
+wipes a saved one. Resetting settings drops stored settings but keeps the
+tokens (disconnect drops those).
 
 Developer Dashboard app (one-time, owner): create an app at
 https://developer.spotify.com/dashboard, add redirect URI
@@ -1125,6 +1127,13 @@ curl -s -H "$AUTH" "$HUB/api/spotify/now-playing"
 # {"playing":true,"uri":"spotify:track:…","track":"…","artists":"…",
 #  "album":"…","duration_ms":354000,"position_ms":12345,"device":"Riko",
 #  "context_uri":"…"}    // 409 not connected, 429 inside quota back-off
+# the call is ALSO the page-interest signal for the idle watch: a client
+# that asks within the last 2 min keeps the slow watch alive
+curl -s -H "$AUTH" -X POST "$HUB/api/spotify/wake"
+# {"ok":true,"polling":true} — desktop fast-path nudge: the desktop's
+# Soloist listener saw a local playback event, switch the poller to the
+# FAST cadence now instead of waiting for the next idle-watch tick.
+# Harmless when idle/disconnected; costs zero Spotify calls by itself.
 curl -s -H "$AUTH" -X POST "$HUB/api/spotify/control" \
      -H 'content-type: application/json' -d '{"action":"toggle"}'
 # {"ok":true,"action":"pause","now_playing":{…fresh snapshot…}}
@@ -1166,9 +1175,11 @@ Spotify to allow playlists/liked songs" until the owner Disconnects + Connects
 once.
 
 `now_playing` event: published on the events long-poll ONLY on a real state
-change (uri/playing/device), while the hub polls ≤ every 5 s — and only
-after something started playing; paused or idle stops polling entirely
-(`spotify_hub.wake()` restarts it after play/resume/transfer). Late clients
+change (uri/playing/device). While playing the hub polls ≤ every 5 s; while
+NOT playing it keeps the interest-gated SLOW watch (`spotify.idle_poll_s`,
+default 30 s) so a play started on the phone/another app still arrives
+within one idle period, and takes one immediate snapshot on hub start
+(`spotify_hub.wake()` still cuts to the fast poll instantly). Late clients
 catch up with `GET /api/spotify/now-playing`.
 
 ## Touch reactions (docs/TOUCH.md)
@@ -1768,8 +1779,9 @@ animation is created, kept, renamed or deleted (docs/SELF_ANIMATION.md) —
 refresh your animations view on it. `now_playing` (music phase 1, docs/SPOTIFY_NOTES.md) fires ONLY on a real
 playback state change — `{playing, uri, track, artists, album, duration_ms,
 position_ms, device, context_uri}` (fields as in
-`GET /api/spotify/now-playing`); the hub stops polling while paused/idle, so
-a paused→playing change arrives when the next play wakes the poller.
+`GET /api/spotify/now-playing`); while paused/idle the hub's slow idle watch
+(default 30 s, interest-gated) still notices external play, so a
+paused→playing change arrives within one idle period at worst.
 
 ## Client tool channel (desktop / Android tools the model can call)
 

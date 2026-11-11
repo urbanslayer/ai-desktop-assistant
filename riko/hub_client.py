@@ -273,6 +273,18 @@ class HubClient:
         HubError(status=409) while Spotify is not connected."""
         return self._json("GET", "/api/spotify/now-playing")
 
+    def spotify_wake(self):
+        """POST /api/spotify/wake: nudge the hub's fast now_playing poll
+        (the desktop's Soloist listener saw a local playback event —
+        docs/SPOTIFY_NOTES.md). Best effort: an old hub without the route
+        (404) answers None, anything else raises HubError."""
+        try:
+            return self._call("POST", "/api/spotify/wake", timeout=5).json()
+        except HubError as e:
+            if e.status == 404:
+                return None
+            raise
+
     def spotify_control(self, action, timeout=20):
         """POST /api/spotify/control {action}: play|pause|toggle|next|
         previous. Returns {ok, action, now_playing}; the HTTP thread that

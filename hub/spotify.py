@@ -27,8 +27,16 @@ write-only like the LLM api_key: GET /api/settings never returns them;
 /api/spotify/status only reports booleans/expiry/scope.
 
 `now_playing` polling (event + GET for late clients): while playing, poll at
-most every POLL_S (5 s); the poller sleeps with NO API calls the moment
-state is paused/idle and wakes on the next play/resume/transfer.
+most every POLL_S (5 s). While NOT playing the poller keeps a SLOW idle
+watch (settings `spotify.idle_poll_s`, default 30 s, 0 disables, floor
+MIN_IDLE_POLL_S) so playback started from a phone / another Spotify app is
+noticed too — but only while someone cares (see `interested`), and never
+during a quota back-off. The fast poll (POLL_S) resumes the moment a poll
+reports playing; hub start takes one immediate snapshot so state after a
+restart is right. Interest heuristic: a desktop client is registered+online
+(hub/server.py wires clients_hub), OR a client fetched
+GET /api/spotify/now-playing within the last PAGE_INTEREST_S (a page that
+just opened the ticker asks; a page nobody opened never asks).
 """
 from __future__ import annotations
 
@@ -65,6 +73,10 @@ LIKED_SCOPES = ("user-library-read",)
 SEARCH_LIMIT_MAX = 10          # dev-mode hard cap (docs/SPOTIFY_NOTES.md)
 POLL_S = 5.0                   # now_playing poll ceiling while playing
 MIN_POLL_S = 1.0               # test floor
+IDLE_POLL_S = 30.0             # slow watch while NOT playing (0 disables)
+MIN_IDLE_POLL_S = 15.0         # quota floor for the idle watch
+PAGE_INTEREST_S = 120.0        # a now-playing GET keeps the idle watch alive
+                               # this long (a ticker page that just opened asks)
 QUOTA_FALLBACK_S = 30.0        # 429 without a usable Retry-After
 REFRESH_SLACK_S = 60.0         # refresh this long before expiry
 DEVICE_CACHE_S = 60.0          # device list cache (quota discipline)
@@ -594,14 +606,21 @@ def track_snapshot(cp: dict | None) -> dict:
 
 class SpotifyHub:
     """Owns tokens, quota back-off, the device cache, the now_playing poller
-    and the event publishing. The routes and the tools are thin shells."""
+    and the event publishing. The routes and the tools are thin shells.
+
+    `interest_hook` (optional callable) says whether a DESKTOP client is
+    online right now — hub/server.py wires clients_hub into it. Together
+    with the in-hub now-playing-request window (see `interested`) it gates
+    the idle watch, so a hub nobody watches burns zero Spotify calls."""
 
     def __init__(self, store, events, settings_fn, *, defaults: dict | None = None,
-                 on_change=None):
+                 on_change=None, interest_hook=None, clock=time.monotonic):
         self.store = store
         self.events = events
         self.settings_fn = settings_fn      # -> merged spotify settings dict
         self.on_change = on_change          # bump_state hook (connect/disconnect)
+        self.interest_hook = interest_hook  # () -> bool: a desktop is online
+        self._clock = clock                 # fake-clock seam (idle cadence)
         d = dict(defaults or {})
         self.poll_s = max(MIN_POLL_S, float(d.get("poll_s") or POLL_S))
         self._quota_until = 0.0             # monotonic deadline after a 429
@@ -611,9 +630,10 @@ class SpotifyHub:
         self._playlists_cache: tuple[float, list] = (0.0, [])
         self._now_cache: dict | None = None
         self._last_sig: tuple | None = None
-        self._wake = threading.Event()      # set = poll (something is playing)
+        self._wake = threading.Event()      # set = fast poll (something is playing)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._np_requested = 0.0            # last GET now-playing (clock)
 
     # -- settings / state -------------------------------------------------
     def settings(self) -> dict:
@@ -680,7 +700,7 @@ class SpotifyHub:
 
     # -- quota discipline ---------------------------------------------------
     def _quota_guard(self) -> None:
-        left = self._quota_until - time.monotonic()
+        left = self._quota_until - self._clock()
         if left > 0:
             raise SpotifyQuota(
                 f"Spotify's dev-mode quota is still cooling down — wait "
@@ -690,12 +710,12 @@ class SpotifyHub:
 
     def _note_quota(self, retry_after: float) -> None:
         with self._lock:
-            self._quota_until = time.monotonic() + retry_after
+            self._quota_until = self._clock() + retry_after
             self._quota_left = retry_after
 
     def quota_backoff(self) -> float:
         """Seconds left of the current back-off window (0 = clear)."""
-        return max(0.0, self._quota_until - time.monotonic())
+        return max(0.0, self._quota_until - self._clock())
 
     def call(self, fn, *args, **kwargs):
         """Run one API op under the quota window; record 429s. Tool and route
@@ -829,6 +849,9 @@ class SpotifyHub:
             "token_expires_at": float(tokens.get("expires_at") or 0) or None,
             "now_playing": self._now_cache,
             "polling": bool(self._wake.is_set()),
+            # slow idle watch: period (0 = off) + whether it is live now
+            "idle_poll_s": self.idle_poll_s(),
+            "idle_watch": bool(self.idle_poll_s() > 0 and self.interested()),
         }
 
     # -- devices / playback ---------------------------------------------------
@@ -1084,7 +1107,10 @@ class SpotifyHub:
 
     def now_playing(self, force: bool = False) -> dict:
         """Fresh-enough snapshot for late clients: the cache when young, else
-        one API call (also refreshes the cache + wakes the poller if playing)."""
+        one API call (also refreshes the cache + wakes the poller if playing).
+        The call itself is a page-interest signal: a ticker page that asks is
+        a page that wants the idle watch (see `interested`)."""
+        self._np_requested = self._clock()
         self.require()
         if not force and self._now_cache is not None and \
                 time.monotonic() - float(self._now_cache.get("_fetched") or 0) < 5.0:
@@ -1118,15 +1144,97 @@ class SpotifyHub:
 
     # -- now_playing poller ---------------------------------------------------
     def wake(self) -> None:
-        """Something may be playing now (play/resume/transfer/connect):
-        start polling again."""
+        """Something may be playing now (play/resume/transfer/connect, or a
+        desktop Soloist nudge): switch back to the FAST poll."""
         self._wake.set()
 
+    def idle_poll_s(self) -> float:
+        """Slow-watch period from settings `spotify.idle_poll_s`:
+        0 = disabled; anything else floors at MIN_IDLE_POLL_S (quota
+        discipline — this watch exists to be cheap, not fast)."""
+        try:
+            v = float(self.settings().get("idle_poll_s", IDLE_POLL_S))
+        except (TypeError, ValueError):
+            v = IDLE_POLL_S
+        if v <= 0:
+            return 0.0
+        return max(MIN_IDLE_POLL_S, v)
+
+    def interested(self) -> bool:
+        """Does anyone care about a now_playing change right now? Either a
+        desktop client is online (interest_hook, wired to clients_hub by
+        hub/server.py) or some client fetched GET /api/spotify/now-playing
+        within the last PAGE_INTEREST_S — the ticker's seed fetch happens
+        when a page opens, so a recent ask means a ticker page is up."""
+        if self._clock() - self._np_requested < PAGE_INTEREST_S:
+            return True
+        try:
+            return bool(self.interest_hook and self.interest_hook())
+        except Exception:
+            return False
+
+    def _publish_change(self, snap: dict) -> None:
+        """Publish now_playing ONLY on a real state change (dedupe):
+        (uri, playing, device) is the signature the ticker flips on."""
+        sig = (snap.get("uri", ""), snap.get("playing", False),
+               snap.get("device", ""))
+        if sig == self._last_sig:
+            return
+        self._last_sig = sig
+        payload = {k: v for k, v in snap.items() if not k.startswith("_")}
+        self.events.publish("now_playing", **payload)
+
+    def startup_snapshot(self) -> dict | None:
+        """One immediate snapshot when the poller starts (if connected):
+        playback that began while the hub was down must be reflected right
+        away, not one idle period later. Also the hub-restart answer to
+        'is anything playing?' — the cache and (if playing) the fast poll
+        come up correct."""
+        if not self.connected() or not self.configured() or not self.enabled():
+            return None
+        if self.quota_backoff() > 0:
+            return None                # cooling down: the idle watch retries
+        try:
+            snap = self._fetch_snapshot()
+        except SpotifyError:
+            return None                # auth/network: nothing to seed from
+        self._publish_change(snap)
+        if snap.get("playing"):
+            self._wake.set()
+        return snap
+
+    def idle_tick(self) -> dict | None:
+        """One SLOW-watch cycle (public so tests drive it directly): runs
+        only while NOT fast-polling, the watch is enabled
+        (idle_poll_s > 0), someone is interested, and no quota back-off is
+        cooling. One currently-playing fetch; publishes on change; a
+        play/resume noticed here hands over to the fast poll (wake). A
+        fetch failure does NOT switch the watch off — the next period
+        tries again (unlike the fast poll, the watch has no flag to lose)."""
+        if self._wake.is_set():
+            return None                # the fast poll owns this moment
+        if not self.connected() or not self.configured() or not self.enabled():
+            return None
+        if self.idle_poll_s() <= 0 or not self.interested():
+            return None                # disabled, or nobody watching
+        if self.quota_backoff() > 0:
+            return None                # respect the back-off window
+        try:
+            snap = self._fetch_snapshot()
+        except SpotifyError:
+            return None                # a poll hiccup must never spam events
+        self._publish_change(snap)
+        if snap.get("playing"):
+            self._wake.set()           # playing now: POLL_S cadence from here
+        return snap
+
     def poll_tick(self) -> dict | None:
-        """One poll cycle (public so tests drive it directly). The wake flag
-        IS the throttle: no flag → NO API calls at all (paused/idle).
+        """One FAST poll cycle (public so tests drive it directly). The wake
+        flag IS the fast-poll throttle: no flag → NO fast API calls
+        (the idle watch is a separate, slower budget: `idle_tick`).
         Publishes now_playing ONLY on a real state change (dedupe), and
-        clears the flag when state is paused/idle — the loop then rests."""
+        clears the flag when state is paused/idle — the loop then rests on
+        the idle watch."""
         if not self.connected() or not self.configured() or not self.enabled():
             self._wake.clear()
             return None
@@ -1139,18 +1247,14 @@ class SpotifyHub:
         except SpotifyError:
             self._wake.clear()         # auth died: stop until the next play
             return None            # a poll hiccup must never spam events
-        sig = (snap.get("uri", ""), snap.get("playing", False),
-               snap.get("device", ""))
-        if sig != self._last_sig:
-            self._last_sig = sig
-            payload = {k: v for k, v in snap.items() if not k.startswith("_")}
-            self.events.publish("now_playing", **payload)
+        self._publish_change(snap)
         if not snap.get("playing"):
-            self._wake.clear()     # paused/idle: stop polling entirely
+            self._wake.clear()     # paused/idle: fall back to the slow watch
         return snap
 
     def start(self) -> None:
         if self._thread is None:
+            self._stop.clear()        # a restarted poller must not inherit stop
             self._thread = threading.Thread(target=self._loop,
                                             name="spotify-poller", daemon=True)
             self._thread.start()
@@ -1163,15 +1267,28 @@ class SpotifyHub:
             self._thread = None
 
     def _loop(self) -> None:
+        # hub start = one immediate snapshot: state after a restart is
+        # correct even when playback began while the hub was down
+        try:
+            self.startup_snapshot()
+        except Exception:
+            pass
         while not self._stop.is_set():
-            if not self._wake.is_set():
-                # paused / idle / disconnected: NO Spotify calls at all
-                self._wake.wait(1.0)
+            if self._wake.is_set():
+                # poll_tick owns the flag: clears it on pause/idle/auth
+                # death, keeps it set while playing (next tick after POLL_S).
+                try:
+                    self.poll_tick()
+                except Exception:
+                    pass
+                self._stop.wait(self.poll_s)
                 continue
-            # poll_tick owns the flag: clears it on pause/idle/auth death,
-            # keeps it set while playing (next tick after the gap).
+            # not playing: the SLOW idle watch (external play/resume is
+            # noticed within one idle_poll_s); a wake() cuts it short at
+            # once — a hub-initiated play must hit the API immediately.
             try:
-                snap = self.poll_tick()
+                self.idle_tick()
             except Exception:
-                snap = None
-            self._stop.wait(self.poll_s)
+                pass
+            period = self.idle_poll_s()
+            self._wake.wait(period if period > 0 else 1.0)

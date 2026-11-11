@@ -169,6 +169,9 @@ SPOTIFY_DEFAULTS = {
     "device_name": "Riko",      # the Spotify Connect device = desktop player
     "accounts_url": "",         # blank = https://accounts.spotify.com
     "api_url": "",              # blank = https://api.spotify.com/v1
+    # slow now_playing watch while NOT playing (external play detection,
+    # docs/SPOTIFY_NOTES.md): seconds; 0 disables, floor 15 s
+    "idle_poll_s": _spotify.IDLE_POLL_S,
 }
 
 # Seed persona: the system prompt copied from character_config.yaml at build
@@ -643,9 +646,17 @@ def create_app(data_dir, api_key: str | None = None,
                 merged[key] = saved[key]
         return merged
 
+    def _spotify_desktop_online() -> bool:
+        """Idle-watch interest (docs/SPOTIFY_NOTES.md): a registered desktop
+        client heartbeated within the offline window — the ticker only
+        matters to someone when the avatar's machine is on the hub."""
+        return any(c.get("kind") == "desktop"
+                   for c in clients_hub.online_clients())
+
     spotify_hub = _spotify.SpotifyHub(store, events, spotify_settings,
                                       defaults=spotify_defaults,
-                                      on_change=bump_state)
+                                      on_change=bump_state,
+                                      interest_hook=_spotify_desktop_online)
 
     def spotify_error_response(e: Exception) -> JSONResponse:
         """Route-side mapping of hub/spotify.py errors (docs/API.md)."""
@@ -2682,6 +2693,16 @@ def create_app(data_dir, api_key: str | None = None,
                 if not isinstance(sp["enabled"], bool):
                     return err(422, "spotify.enabled must be a boolean")
                 saved_sp["enabled"] = sp["enabled"]
+            if "idle_poll_s" in sp:
+                # slow now_playing watch (docs/SPOTIFY_NOTES.md): seconds;
+                # 0 disables; the hub floors anything else at 15 s itself
+                v = sp["idle_poll_s"]
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or v != v or v < 0 or v > 86400:
+                    return err(422, "spotify.idle_poll_s must be a number "
+                                    "of seconds >= 0 (0 disables the "
+                                    "idle watch)")
+                saved_sp["idle_poll_s"] = float(v)
             store.set_json("spotify", saved_sp)
             if sp.get("enabled"):
                 spotify_hub.wake()   # re-check playback right after enabling
@@ -3212,6 +3233,17 @@ def create_app(data_dir, api_key: str | None = None,
         except _spotify.SpotifyError as e:
             return spotify_error_response(e)
 
+    @app.post("/api/spotify/wake")
+    def post_spotify_wake():
+        """Desktop fast-path nudge (docs/SPOTIFY_NOTES.md): the desktop's
+        Soloist listener just saw a local playback event, so start the
+        FAST now_playing poll immediately instead of waiting for the idle
+        watch. Harmless when idle/disconnected — poll_tick clears the flag
+        again on the first not-playing answer; auth is the hub's usual
+        api_key."""
+        spotify_hub.wake()
+        return {"ok": True, "polling": True}
+
     @app.get("/api/spotify/devices")
     async def get_spotify_devices():
         """[{id, name, type, active, volume}] — cached 60 s (quota
@@ -3525,11 +3557,14 @@ def create_app(data_dir, api_key: str | None = None,
         timer_scheduler.start()
 
     # ── spotify now_playing poller (music phase 1) ──────────────────────
-    # Daemon thread like the timer scheduler: polls currently-playing at
-    # most every 5 s WHILE PLAYING, publishes now_playing on state changes,
-    # and makes NO Spotify calls while paused/idle. Like the timers,
-    # create_app() does not start the thread (tests drive poll_tick());
-    # main() passes start=True.
+    # Daemon thread like the timer scheduler: FAST polls currently-playing
+    # ≤ every 5 s WHILE PLAYING, keeps the slow interest-gated idle watch
+    # (spotify.idle_poll_s, default 30 s) while NOT playing so external
+    # play/resume is noticed, takes one snapshot at start (correct state
+    # after a restart), and publishes now_playing only on state changes.
+    # main() passes start=True; tests pass poll_s (the thread runs but
+    # stays interest-gated, so their manual poll_tick()/idle_tick() drives
+    # the cadence without competing API calls).
     app.state.spotify = spotify_hub
     if spotify_defaults.get("start") or spotify_defaults.get("poll_s") is not None:
         spotify_hub.start()
