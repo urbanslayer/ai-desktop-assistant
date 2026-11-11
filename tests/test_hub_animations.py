@@ -342,3 +342,167 @@ def test_model_sha_resolver(tmp_path):
     assert r("riko") == hashlib.sha256(b"glTF-fake-vrm").hexdigest()
     (tmp_path / "riko.vrm").write_bytes(b"glTF-fake-vrm-v2")
     assert r("riko") == hashlib.sha256(b"glTF-fake-vrm-v2").hexdigest()
+
+
+# ── routes + animations_changed event + preview + auto_keep ─────────────────
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+VRM_BYTES = b"glTF" + b"-test-vrm-" + b"\0" * 16
+
+
+@pytest.fixture
+def hub(tmp_path):
+    client = TestClient(create_app(tmp_path / "hubdata", api_key=None))
+    ids = {p["id"] for p in client.get("/api/personas").json()}
+    if "riko" not in ids:
+        assert client.post("/api/personas",
+                           json={"name": "Riko"}).status_code == 201
+    client._ring = 0   # last seen event seq
+    return client
+
+
+def new_events(client, types=("animations_changed", "action")):
+    out = client.get("/api/events", params={"after": client._ring,
+                                            "wait": 0}).json()
+    client._ring = out["last"]
+    return [e for e in out["events"] if e["type"] in types]
+
+
+def test_animations_routes_crud_event_and_preview(hub):
+    doc = fixture_doc()
+    r = hub.post("/api/personas/riko/animations", json=doc)
+    assert r.status_code == 201, r.text
+    row = r.json()["animation"]
+    assert r.json()["clamped"] == []
+    assert row["status"] == "draft" and row["model_sha256"] == "default"
+    assert row["keyframes"][-1]["t"] == 2.4
+    evs = new_events(hub)
+    assert evs and evs[-1]["type"] == "animations_changed"
+    assert evs[-1]["persona_id"] == "riko"
+    assert evs[-1]["model_sha256"] == "default"
+
+    g = hub.get("/api/personas/riko/animations").json()
+    assert g["model_sha256"] == "default"
+    assert [a["name"] for a in g["animations"]] == ["victory_dance"]
+    assert hub.get("/api/personas/riko/animations?status=kept"
+                   ).json()["animations"] == []
+    assert len(hub.get("/api/personas/riko/animations?status=draft"
+                       ).json()["animations"]) == 1
+    assert hub.get("/api/personas/nobody/animations").status_code == 404
+    assert hub.get("/api/personas/riko/animations?status=zz"
+                   ).status_code == 422
+
+    # keep + rename + description through PUT
+    r = hub.put("/api/personas/riko/animations/victory_dance",
+                json={"status": "kept"})
+    assert r.status_code == 200 and r.json()["animation"]["status"] == "kept"
+    r = hub.put("/api/personas/riko/animations/victory_dance",
+                json={"name": "big_win", "description": "fists + hop"})
+    assert r.json()["animation"]["name"] == "big_win"
+    assert r.json()["animation"]["description"] == "fists + hop"
+    assert hub.put("/api/personas/riko/animations/ghost",
+                   json={"status": "kept"}).status_code == 404
+    assert hub.put("/api/personas/riko/animations/big_win",
+                   json={"status": "frozen"}).status_code == 422
+    assert hub.put("/api/personas/riko/animations/big_win",
+                   json={"name": "wave"}).status_code == 422   # reserved
+    assert hub.put("/api/personas/riko/animations/big_win",
+                   json={"dance": 1}).status_code == 422       # unknown key
+
+    # preview rides the same action channel replies/actions use
+    hub.get("/api/events", params={"after": hub._ring, "wait": 0})  # drain
+    r = hub.post("/api/personas/riko/animations/big_win/preview")
+    assert r.status_code == 200 and r.json()["ok"] is True
+    acts = [e for e in new_events(hub, types=("action",))][-1]
+    assert acts["persona_id"] == "riko"
+    assert acts["actions"] == [{"name": "big_win", "at": 0.0,
+                                "type": "gesture", "custom": True,
+                                "preview": True}]
+    assert hub.post("/api/personas/riko/animations/ghost/preview"
+                    ).status_code == 404
+
+    # delete (204) then 404
+    assert hub.delete("/api/personas/riko/animations/big_win").status_code == 204
+    assert hub.get("/api/personas/riko/animations").json()["animations"] == []
+    assert hub.delete("/api/personas/riko/animations/big_win").status_code == 404
+    assert len(new_events(hub)) == 1   # the delete published one
+
+
+def test_animations_route_validation_and_clamp_notes(hub):
+    bad = simple_doc(name="Bad Name")
+    r = hub.post("/api/personas/riko/animations", json=bad)
+    assert r.status_code == 422
+    assert "animation_error" in r.json()["detail"]
+
+    doc = simple_doc(keyframes=[
+        {"t": 0.0, "bones": {}, "expression": {}},
+        {"t": 0.5, "bones": {"spine": [90, 0, 0]}, "expression": {}},
+        {"t": 1.0, "bones": {}, "expression": {}}])
+    r = hub.post("/api/personas/riko/animations", json=doc)
+    assert r.status_code == 201
+    body = r.json()
+    assert any("spine.x 90 clamped to 15" in n for n in body["clamped"])
+    assert body["animation"]["keyframes"][1]["bones"]["spine"] == [15, 0, 0]
+
+    # duplicate name on the same model → 409; rename collision too
+    assert hub.post("/api/personas/riko/animations",
+                    json=simple_doc()).status_code == 409
+
+
+def test_animations_are_scoped_to_the_current_avatar_model(hub):
+    hub.post("/api/personas/riko/animations", json=fixture_doc())
+    # upload an avatar: the persona's current model changes
+    r = hub.put("/api/personas/riko/avatar",
+                files={"file": ("furina.vrm", VRM_BYTES, "model/gltf-binary")})
+    assert r.status_code == 200
+    import hashlib
+    sha = hashlib.sha256(VRM_BYTES).hexdigest()
+
+    g = hub.get("/api/personas/riko/animations").json()
+    assert g["model_sha256"] == sha
+    assert g["animations"] == []                       # old rows are other-model
+    g_all = hub.get("/api/personas/riko/animations?model=all").json()
+    assert [a["model_sha256"] for a in g_all["animations"]] == ["default"]
+    g_lit = hub.get(f"/api/personas/riko/animations?model={sha}").json()
+    assert g_lit["animations"] == []
+    g_lit2 = hub.get("/api/personas/riko/animations?model=default").json()
+    assert len(g_lit2["animations"]) == 1
+
+    # same name allowed on the new model
+    r = hub.post("/api/personas/riko/animations", json=fixture_doc())
+    assert r.status_code == 201 and r.json()["animation"]["model_sha256"] == sha
+    # PUT/DELETE address ONE model each: the row on 'default' stays untouched
+    # when the current model is addressed
+    assert hub.put(f"/api/personas/riko/animations/victory_dance?model={sha}",
+                   json={"status": "kept"}).status_code == 200
+    assert hub.delete("/api/personas/riko/animations/victory_dance"
+                      ).status_code == 204          # current model
+    assert hub.get(f"/api/personas/riko/animations?model={sha}"
+                   ).json()["animations"] == []
+    assert len(hub.get("/api/personas/riko/animations?model=default"
+                       ).json()["animations"]) == 1  # default row survived
+
+
+def test_animations_auto_keep_setting(hub):
+    s = hub.get("/api/settings").json()
+    assert s["animations"] == {"auto_keep": False}
+    assert s["defaults"]["animations"] == {"auto_keep": False}
+    assert s["animations_source"] == {"auto_keep": "default"}
+
+    r = hub.put("/api/settings", json={"animations": {"auto_keep": True}})
+    assert r.status_code == 200
+    assert r.json()["animations"] == {"auto_keep": True}
+    assert r.json()["animations_source"] == {"auto_keep": "saved"}
+
+    r = hub.post("/api/personas/riko/animations", json=fixture_doc())
+    assert r.json()["animation"]["status"] == "kept"
+
+    assert hub.put("/api/settings",
+                   json={"animations": {"auto_keep": "yes"}}).status_code == 422
+    assert hub.put("/api/settings",
+                   json={"animations": []}).status_code == 422
+
+    r = hub.post("/api/settings/reset", json={"animations": True})
+    assert r.status_code == 200
+    assert r.json()["animations"] == {"auto_keep": False}

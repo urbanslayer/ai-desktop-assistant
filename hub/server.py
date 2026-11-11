@@ -27,6 +27,7 @@ from fastapi.concurrency import run_in_threadpool  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
 
 try:  # package import (repo root: `from hub.server import create_app`)
+    from . import animations as _animations
     from . import body as _body
     from . import brain as _brain
     from . import clients as _clients
@@ -51,6 +52,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from .scheduler import TimerScheduler, TimerPermanent
     from .store import Store, default_voice, now_iso
 except ImportError:  # standalone: modules sit next to this file (Docker: /app)
+    import animations as _animations  # type: ignore[no-redef]
     import body as _body  # type: ignore[no-redef]
     import brain as _brain  # type: ignore[no-redef]
     import clients as _clients  # type: ignore[no-redef]
@@ -146,6 +148,11 @@ TIMER_SETTINGS_DEFAULTS = {
 # POST /api/touch — mode off|quiet|chatty, seconds between spoken reactions,
 # spoken reactions per rolling 10 minutes (counted per persona).
 TOUCH_SETTINGS_DEFAULTS = dict(_touch.SETTINGS_DEFAULTS)
+
+# Custom animation settings (docs/SELF_ANIMATION.md): auto_keep saves a
+# create_animation result directly as kept, skipping the ask-the-owner-
+# whether-to-keep step.
+ANIMATION_SETTINGS_DEFAULTS = {"auto_keep": False}
 
 # Music phase 1 settings (docs/SPOTIFY_NOTES.md): ONE Spotify connection
 # under the owner's Developer Dashboard app (client id only, PKCE — no
@@ -474,6 +481,28 @@ def create_app(data_dir, api_key: str | None = None,
                 merged[key] = raw
         return merged
 
+    # ── custom animation settings (docs/SELF_ANIMATION.md) ──────────────
+    # auto_keep False (default): create_animation saves a draft and she asks
+    # the owner whether to keep it; True: it goes straight to kept.
+    def stored_animations() -> dict:
+        saved = store.get_json("animations_settings", {})
+        return dict(saved) if isinstance(saved, dict) else {}
+
+    def default_animations() -> dict:
+        return dict(ANIMATION_SETTINGS_DEFAULTS)
+
+    def animations_settings() -> dict:
+        merged = default_animations()
+        saved = stored_animations()
+        if isinstance(saved.get("auto_keep"), bool):
+            merged["auto_keep"] = saved["auto_keep"]
+        return merged
+
+    # model identity for animations: sha256 of the persona's stored VRM bytes
+    # (the exact file GET /api/personas/{id}/avatar serves), 'default' without
+    # an uploaded avatar. Lazily hashed, cached by (mtime, size).
+    anim_sha = _animations.ModelShaResolver(avatars_dir)
+
     # ── location settings (weather round, docs/API.md "Weather") ────────
     # Saved place wins; blank/reset falls back to the RIKO_LOCATION env
     # default (a plain place name geocoded lazily at first use, cached in
@@ -697,6 +726,9 @@ def create_app(data_dir, api_key: str | None = None,
         saved_touch = stored_touch()
         touch_source = {k: ("saved" if k in saved_touch else "default")
                         for k in TOUCH_SETTINGS_DEFAULTS}
+        saved_anim = stored_animations()
+        animations_source = {k: ("saved" if k in saved_anim else "default")
+                             for k in ANIMATION_SETTINGS_DEFAULTS}
         return {
             "llm": public_llm(llm_settings()),
             "tts": tts_settings(),
@@ -704,6 +736,7 @@ def create_app(data_dir, api_key: str | None = None,
             "memory": memory_settings(),
             "timers": timers_settings(),
             "touch": touch_settings(),
+            "animations": animations_settings(),
             "mcp": {"servers": public_mcp_servers(mcp_servers())},
             "switch_phrases": switch_phrases(),
             "timezone": stored_timezone(),
@@ -724,6 +757,7 @@ def create_app(data_dir, api_key: str | None = None,
                          "touch": default_touch(str(
                              (store.get_json("touch", {}) or {}).get("mode")
                              or "quiet")),
+                         "animations": default_animations(),
                          "mcp": {"servers": public_mcp_servers([preset])
                                  if preset else []},
                          "switch_phrases": list(_brain.DEFAULT_SWITCH_PHRASES),
@@ -736,6 +770,7 @@ def create_app(data_dir, api_key: str | None = None,
             "memory_source": memory_source,
             "timers_source": timers_source,
             "touch_source": touch_source,
+            "animations_source": animations_source,
             "mcp_source": {"servers": "saved" if has_mcp
                            else ("env" if preset else "default")},
         }
@@ -2146,6 +2181,130 @@ def create_app(data_dir, api_key: str | None = None,
         rows = cancel_timers_on_event(pid, "chat.read", "chat_read")
         return {"cancelled": [r["id"] for r in rows]}
 
+    # ── custom animation routes (docs/SELF_ANIMATION.md) ─────────────────
+    def anim_resolve_sha(persona_id: str, model: str) -> str:
+        """`model` query: '' / 'current' → this persona's live avatar model;
+        anything else is a literal model_sha256 (e.g. 'default')."""
+        m = str(model or "").strip().lower()
+        return anim_sha(persona_id) if m in ("", "current") else m
+
+    @app.get("/api/personas/{persona_id}/animations")
+    def get_animations(persona_id: str, model: str = "current",
+                       status: str = "all"):
+        if not store.persona_exists(persona_id):
+            return err(404, f"no persona '{persona_id}'")
+        if status not in ("all", "kept", "draft"):
+            return err(422, "status must be all, kept or draft")
+        if model not in ("", "current", "all"):
+            sha = anim_resolve_sha(persona_id, model)
+            rows = store.list_animations(persona_id, model_sha256=sha,
+                                         status=None if status == "all" else status)
+            return {"model_sha256": sha, "animations": rows}
+        current = anim_sha(persona_id)
+        rows = store.list_animations(
+            persona_id,
+            model_sha256=None if model == "all" else current,
+            status=None if status == "all" else status)
+        return {"model_sha256": current, "animations": rows}
+
+    @app.post("/api/personas/{persona_id}/animations", status_code=201)
+    async def post_animations(persona_id: str, request: Request):
+        if not store.persona_exists(persona_id):
+            return err(404, f"no persona '{persona_id}'")
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        try:
+            clean, notes = _animations.validate_animation(body)
+        except ValueError as e:
+            return err(422, str(e))
+        sha = anim_sha(persona_id)
+        status = "kept" if animations_settings().get("auto_keep") else "draft"
+        row = store.add_animation(persona_id, sha, clean, status=status)
+        if row is None:
+            return err(409, f"an animation named '{clean['name']}' already "
+                            "exists on this model")
+        events.publish("animations_changed", persona_id=persona_id,
+                       model_sha256=sha)
+        return {"animation": row, "clamped": notes}
+
+    @app.put("/api/personas/{persona_id}/animations/{name}")
+    async def put_animation(persona_id: str, name: str, request: Request,
+                            model: str = ""):
+        if not store.persona_exists(persona_id):
+            return err(404, f"no persona '{persona_id}'")
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        unknown = [k for k in body if k not in ("name", "description", "status")]
+        if unknown:
+            return err(422, "only name, description and status are editable")
+        sha = anim_resolve_sha(persona_id, model)
+        if store.get_animation(persona_id, name, sha) is None:
+            return err(404, f"no animation '{name}' on this model")
+        new_name = body.get("name")
+        if new_name is not None:
+            if not isinstance(new_name, str) or \
+                    not _animations.NAME_RE.match(new_name):
+                return err(422, "name must match ^[a-z][a-z0-9_]{1,31}$")
+            if new_name in _animations.reserved_names():
+                return err(422, f"name '{new_name}' is reserved (built-in "
+                                "gesture/action name)")
+            new_name = None if new_name == name else new_name
+        description = body.get("description")
+        if description is not None:
+            if not isinstance(description, str):
+                return err(422, "description must be a string")
+            description = description.strip()[:_animations.MAX_DESCRIPTION_CHARS]
+        status = body.get("status")
+        if status is not None and status not in ("kept", "draft"):
+            return err(422, 'status must be "kept" or "draft"')
+        row, cerr = store.update_animation(persona_id, name, sha,
+                                           new_name=new_name,
+                                           description=description,
+                                           status=status)
+        if cerr == "conflict":
+            return err(409, f"an animation named '{body.get('name')}' "
+                            "already exists on this model")
+        if cerr == "missing" or row is None:
+            return err(404, f"no animation '{name}' on this model")
+        events.publish("animations_changed", persona_id=persona_id,
+                       model_sha256=sha)
+        return {"animation": row}
+
+    @app.delete("/api/personas/{persona_id}/animations/{name}",
+                status_code=204)
+    def delete_animation_route(persona_id: str, name: str, model: str = ""):
+        if not store.persona_exists(persona_id):
+            return err(404, f"no persona '{persona_id}'")
+        sha = anim_resolve_sha(persona_id, model)
+        if store.delete_animation(persona_id, name, sha) is None:
+            return err(404, f"no animation '{name}' on this model")
+        events.publish("animations_changed", persona_id=persona_id,
+                       model_sha256=sha)
+        return Response(status_code=204)
+
+    @app.post("/api/personas/{persona_id}/animations/{name}/preview")
+    def preview_animation(persona_id: str, name: str, model: str = ""):
+        """Publishes the play action through the same event channel chat
+        replies/actions ride, so the page and desktop preview it right away."""
+        if not store.persona_exists(persona_id):
+            return err(404, f"no persona '{persona_id}'")
+        sha = anim_resolve_sha(persona_id, model)
+        row = store.get_animation(persona_id, name, sha)
+        if row is None:
+            return err(404, f"no animation '{name}' on this model")
+        events.publish("action", persona_id=persona_id, emotion=None,
+                       actions=[{"name": name, "at": 0.0,
+                                  "type": "gesture", "custom": True,
+                                  "preview": True}])
+        return {"ok": True, "persona_id": persona_id, "name": name,
+                "model_sha256": sha}
+
 
 
     @app.get("/api/settings")
@@ -2353,6 +2512,16 @@ def create_app(data_dir, api_key: str | None = None,
                                     "between 0 and 100")
                 saved_tch["max_per_10min"] = int(raw)
             store.set_json("touch", saved_tch)
+        if "animations" in body:
+            an = body["animations"]
+            if not isinstance(an, dict):
+                return err(422, "animations must be an object")
+            saved_an = stored_animations()
+            if "auto_keep" in an:
+                if not isinstance(an["auto_keep"], bool):
+                    return err(422, "animations.auto_keep must be a boolean")
+                saved_an["auto_keep"] = an["auto_keep"]
+            store.set_json("animations_settings", saved_an)
         if "mcp" in body:
             mcp = body["mcp"]
             if not isinstance(mcp, dict):
@@ -2478,6 +2647,8 @@ def create_app(data_dir, api_key: str | None = None,
             changed |= store.del_json("timers_settings")
         if body.get("touch"):
             changed |= store.del_json("touch")
+        if body.get("animations"):
+            changed |= store.del_json("animations_settings")
         if body.get("mcp"):
             changed |= store.del_json("mcp")
             mcp_manager.sync(mcp_servers())
@@ -2493,9 +2664,10 @@ def create_app(data_dir, api_key: str | None = None,
                 or body.get("memory") or body.get("mcp") or body.get("timers")
                 or body.get("switch_phrases") or body.get("timezone")
                 or body.get("location") or body.get("spotify")
-                or body.get("touch")):
+                or body.get("touch") or body.get("animations")):
             return err(422, 'set "llm", "tts", "tools", "memory", "mcp", '
-                            '"timers", "touch", "switch_phrases", "timezone", '
+                            '"timers", "touch", "animations", '
+                            '"switch_phrases", "timezone", '
                             '"location" and/or "spotify" to true')
         if changed:
             bump_state()
