@@ -60,6 +60,7 @@ import subprocess
 import tarfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -428,6 +429,12 @@ def _default_http(url: str, method: str = "GET", timeout: float = 30.0):
     req = urllib.request.Request(url, method=method,
                                  headers={"User-Agent": "riko-desktop/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # urllib follows redirects: the FINAL url must still be the official
+        # CDN over https, or nothing from it is trusted (docs/SOLOIST.md).
+        final = urllib.parse.urlparse(resp.geturl())
+        if final.scheme != "https" or final.hostname != CDN_HOST:
+            raise OSError(f"redirected off the official CDN to "
+                          f"{final.scheme}://{final.hostname}")
         status = getattr(resp, "status", 200)
         headers = {k.lower(): v for k, v in dict(resp.headers).items()}
         data = b""
@@ -709,7 +716,9 @@ class SoloistPlayer:
                "-k", key,
                "-D", str(self.data_dir),
                "-C", str(_cache_dir()),
-               "-z", str(max(0, self.cache_size_mb)),
+               # Soloist accepts 0 (unlimited) or >= 100 MB only
+               "-z", str(0 if self.cache_size_mb <= 0
+                         else max(100, self.cache_size_mb)),
                "-w", "127.0.0.1:0"]
         if str(self.initial_volume) != "":
             cmd += ["-i", str(self.initial_volume)]

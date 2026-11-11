@@ -806,3 +806,35 @@ def test_desktop_never_names_the_player_after_the_persona():
         idx = src.index("music_player = ")
         seg = src[idx:idx + 1200]
         assert "persona" not in seg.lower(), call
+
+
+# ── reviewer hardening (2026-11-11) ──────────────────────────────────────────
+
+def test_default_http_refuses_a_redirect_off_the_official_cdn(monkeypatch):
+    import urllib.request as ur
+    from riko.music import soloist as so
+
+    class Resp:
+        status = 200
+        headers = {}
+        def geturl(self):
+            return "https://evil.example/soloist_release_x86_64.tar.gz"
+        def read(self, n=-1):
+            return b"x"
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(ur, "urlopen", lambda req, timeout=0: Resp())
+    with pytest.raises(OSError, match="off the official CDN"):
+        so._default_http(so.archive_url() if hasattr(so, "archive_url")
+                         else f"https://{so.CDN_HOST}/x.tar.gz", "HEAD")
+
+
+def test_cache_size_below_soloist_minimum_is_raised_to_100():
+    from riko.music.soloist import SoloistPlayer
+    for given, want in ((50, "100"), (0, "0"), (500, "500")):
+        p = SoloistPlayer({"player": "soloist", "soloist": {"cache_size_mb": given}})
+        argv = p.argv("K")
+        assert argv[argv.index("-z") + 1] == want, (given, argv)
