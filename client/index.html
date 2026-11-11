@@ -98,6 +98,7 @@
       SeamPostPolicy,
     } from './js/touch.js';
     import { PoseLayer, GRAB_KIND, GRAB_LIMITS } from './js/pose.js';
+    import { validateAnimation } from './js/keyframes.js';
     import { WalkDirector } from './js/walk.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
              GestureTracker, framingDistance, feetAnchorTarget,
@@ -703,6 +704,7 @@
       const b = vrm?.humanoid.getNormalizedBoneNode(PART_BONE[part]);
       if (!b) return;
       if (CAPTURE) console.log(`[touch] GRAB ${part} at ${Math.round(x)},${Math.round(y)}`);
+      pose.stopKeyframes();               // a grab interrupts a custom animation
       const w0 = b.getWorldPosition(new THREE.Vector3());
       pose.setTarget(part, w0.toArray());   // blend in from where it actually is
       _grabQA.set(part, {
@@ -900,12 +902,18 @@
       if (typeof cmd !== 'string') return;
       if (cmd.startsWith('sit:')) {
         const y = parseFloat(cmd.slice(4));
-        if (Number.isFinite(y)) pose.sit(y, viewH());
+        if (Number.isFinite(y)) { pose.stopKeyframes(); pose.sit(y, viewH()); }
       } else if (cmd === 'stand') {
         pose.stand();
       } else if (cmd.startsWith('touch-mode:')) {
         const m = cmd.slice('touch-mode:'.length);
         if (m === 'off' || m === 'quiet' || m === 'chatty') touchMode = m;
+      } else if (cmd === 'custom-animations:reload') {
+        loadCustomAnimations();       // desktop refreshed /custom-animations.json
+      } else if (cmd.startsWith('custom-animations:set ')) {
+        // QA harness injection: full payload straight from the command
+        try { setCustomAnimations(JSON.parse(cmd.slice('custom-animations:set '.length)).animations); }
+        catch { /* junk payload: keep what we had */ }
       }
       // press-hint:<limb|none> is optional in the contract; nothing to do yet
     }
@@ -1037,6 +1045,11 @@
           if (op === 'sit' || op === 'stand' || op === 'mode') {
             onCommand(op === 'sit' ? `sit:${opArg}` : op === 'stand' ? 'stand'
                   : `touch-mode:${opArg}`);
+          } else if (op === 'custom') {
+            // custom keyframe animation by name (capture harness)
+            applyAction({ type: 'gesture', custom: true, name: opArg });
+          } else if (op === 'customstop') {
+            applyAction({ type: 'gesture_stop', custom: true });
           } else if (op === 'face') {
             _specFace = (+opArg || 0) * Math.PI / 180;   // explicit facing pin
           } else if (op === 'orbit') {
@@ -1107,6 +1120,24 @@
       });
     }
     let lastExpression = null;
+    // ── custom keyframe animations (docs/SELF_ANIMATION.md) ───────────
+    // The desktop owns the list (hub cache -> /custom-animations.json); the
+    // page only validates what it gets and plays them through the pose
+    // layer — never through the gesture library / motion clips.
+    const customAnims = new Map();
+    function setCustomAnimations(list) {
+      customAnims.clear();
+      for (const a of Array.isArray(list) ? list : []) {
+        if (a && typeof a.name === 'string'
+            && validateAnimation(a).length === 0) customAnims.set(a.name, a);
+      }
+    }
+    async function loadCustomAnimations() {
+      try {
+        const res = await fetch('/custom-animations.json', { cache: 'no-store' });
+        if (res.ok) setCustomAnimations((await res.json()).animations);
+      } catch { /* no desktop / offline: no customs today */ }
+    }
     function applyAction(a) {
       // one bad action must not kill the rest of this event batch
       try {
@@ -1119,6 +1150,18 @@
             { t: T(), type: a.type, name: a.name });
         }
         if (a.type === 'gesture') {
+          if (a.custom) {
+            // custom keyframe animation (docs/SELF_ANIMATION.md): the pose
+            // layer owns it; idle gestures are already frozen (pose.active)
+            // and walk is blocked by the touchBlocked seam. Same name twice
+            // is a no-op (the guard above or playKeyframes' idempotence).
+            const anim = customAnims.get(a.name);
+            if (!anim) return;
+            motion.stopGesture();             // whatever gesture was on, off
+            vrm.lookAt.autoUpdate = true;     // gaze keeps following (head bone)
+            pose.playKeyframes(anim);
+            return;
+          }
           const c = clips[a.name];
           if (c) {  // a VRMA clip the owner dropped in takes over the body bones
             vrm.lookAt.autoUpdate = !c.tracker;
@@ -1129,6 +1172,7 @@
             motion.playGesture(a.name);
           }
         } else if (a.type === 'gesture_stop') {
+          if (a.custom) { pose.stopKeyframes(); return; }
           motion.stopGesture(a.name);
           vrm.lookAt.autoUpdate = true;
         } else if (a.type === 'expression') {
@@ -1173,6 +1217,7 @@
       catch { start.textContent = 'Waiting for her avatar...'; await new Promise((r) => setTimeout(r, 2000)); }
     }
     feed(director.start(T()));
+    loadCustomAnimations();   // custom keyframe list (docs/SELF_ANIMATION.md)
 
     // ── keyboard QA hook (?wavetest=1, with ?desktop=1): press the W shortcut
     //    for real at fixed seconds after she woke up — during the greeting
@@ -1442,6 +1487,39 @@
           visualScale: Math.round(scaleShown * 1000) / 1000,
           windowScale: Math.round(windowScale * 1000) / 1000,
           canvasH: viewH(),
+          // Custom keyframe evidence (docs/SELF_ANIMATION.md): per keyed
+          // bone the live rest-relative offset quaternion AND the local-rest
+          // parent chain, so the harness can compose its own independent
+          // expected world rotation from the fixture + reported t
+          // (capture_frames.py evaluate_custom_gates, 3° gate at key times).
+          keyframeQA: (() => {
+            const dbg = pose.debug();
+            if (!dbg.keyframes) return null;
+            const qa = { ...dbg.keyframes, bones: dbg.kfBones || {},
+                         hipsY: dbg.kfHipsY ?? 0, chain: {}, localRest: {} };
+            const qv = (q) => [+q.x.toFixed(6), +q.y.toFixed(6),
+                               +q.z.toFixed(6), +q.w.toFixed(6)];
+            for (const bone of Object.keys(qa.bones)) {
+              const n0 = motion._node(bone)
+                || vrm.humanoid?.getNormalizedBoneNode?.(bone);
+              if (!n0) continue;
+              qa.bones[bone].world = qv(n0.getWorldQuaternion(new THREE.Quaternion()));
+              const chain = [];
+              for (let n = n0; n && n !== vrm.scene; n = n.parent) {
+                if (n.name) {
+                  chain.push(n.name);
+                  if (!(n.name in qa.localRest)) {
+                    const cached = motion._rest && motion._rest.get(n.name);
+                    // unkeyed raw ancestors never move: reading them live is
+                    // the same number their rest always had
+                    qa.localRest[n.name] = qv(cached || n.quaternion);
+                  }
+                }
+              }
+              qa.chain[bone] = chain.reverse();   // hips-side first
+            }
+            return qa;
+          })(),
           // world pos of the eyes node (VRM0 rigs have no normalized eye
           // bones): ground truth for where the face points in renders
           eyesWorld: (() => {
@@ -1762,6 +1840,7 @@
 
     window.riko = { openInput, closeInput, requestWave, resetSize: resetAvatarSize,
                     motion, director, measure: () => window.rikoMeasure(),
+                    customAnims: () => [...customAnims.keys()],   // QA: loaded customs
                     onCommand,                     // desktop bridge commands (TOUCH.md)
                     pose: () => pose,              // QA/item-6 handle on the pose layer
                     touchDebug: () => ({ mode: touchMode, grab: grabId, sitReported,
