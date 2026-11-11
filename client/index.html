@@ -98,6 +98,7 @@
       SeamPostPolicy,
     } from './js/touch.js';
     import { PoseLayer, GRAB_KIND, GRAB_LIMITS, clampGrabTarget } from './js/pose.js';
+    import { registerInlineAnimations } from './js/inline_anim.js';
     import { validateAnimation } from './js/keyframes.js';
     import { WalkDirector } from './js/walk.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
@@ -485,7 +486,8 @@
     }
     if (Number.isFinite(+settings.roam_speed)) walkOpts.speedMul = +settings.roam_speed;
     const walkDirector = ROAM ? new WalkDirector(walkOpts) : null;
-    const director = new Director({ walk: walkDirector });
+    const director = new Director({ walk: walkDirector,
+                                    onUnknownAction: (name) => rescueCustomAnimation(name) });
     walkBoundsReady = true;
     if (walkDirector && Number.isFinite(+settings.roam_x)) walkDirector.setX(0, +settings.roam_x);
     let faceWant = 0;         // vrm.scene.rotation.y target (face travel direction)
@@ -1195,6 +1197,25 @@
         const res = await fetch('/custom-animations.json', { cache: 'no-store' });
         if (res.ok) setCustomAnimations((await res.json()).animations);
       } catch { /* no desktop / offline: no customs today */ }
+    }
+    // Safety net (docs/SELF_ANIMATION.md, live curtsey_twirl bug): a reply
+    // action naming an animation we do not know yet means the desktop's
+    // animations_changed refresh is still in flight — re-read the list ONCE,
+    // give it ~2 s, and play the name if it turns up. (The primary fix is
+    // the hub's inline `animation` field, registered in handle('say') below.)
+    const _rescueAsked = new Set();
+    async function rescueCustomAnimation(name) {
+      if (_rescueAsked.has(name)) return;   // one rescue attempt per name
+      _rescueAsked.add(name);
+      const deadline = performance.now() + 2000;
+      await loadCustomAnimations();
+      while (!customAnims.has(name) && performance.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      if (customAnims.has(name) && vrm) {
+        console.log(`[custom] rescued late animation '${name}' — playing it`);
+        applyAction({ type: 'gesture', custom: true, name });
+      }
     }
     function applyAction(a) {
       // one bad action must not kill the rest of this event batch
@@ -1965,6 +1986,14 @@
         flash(bubble, ev.text, (ev.seconds || 0) + BUBBLE_SECONDS);
         if (CAPTURE) setTimeout(() => console.log(
           `[capture] bubble bottom=${Math.round(bubble.getBoundingClientRect().bottom)}`), 350);
+        // register reply-carried inline custom animations BEFORE the
+        // director validates the names (SELF_ANIMATION.md preview race)
+        if (Array.isArray(ev.actions) && ev.actions.length) {
+          registerInlineAnimations(ev.actions, {
+            customAnims, validateAnimation,
+            library: (extra) => director.library(extra),
+          });
+        }
         if (TIMING && Array.isArray(ev.actions) && ev.actions.length) {
           (window.__actionTimeline = window.__actionTimeline || []).push(
             { t: T(), type: 'say', actions: ev.actions, seconds: ev.seconds || 0 });

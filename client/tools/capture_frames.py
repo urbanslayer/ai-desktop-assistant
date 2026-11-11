@@ -106,6 +106,11 @@ SCENARIOS = {
     # EVENT-DRIVEN off keyframe progress (&kfwatch=0.35,0.8), so the frame
     # always shows her mid-pose regardless of model load latency.
     "custom_say": (None, []),
+    # the same run with the animation delivered ONLY inline on the reply
+    # action (the live curtsey_twirl fix): /custom-animations.json serves an
+    # empty list, so the custom gate can only pass if the page registers the
+    # inline copy before director.say() validates the name.
+    "custom_say_inline": (None, []),
 }
 
 
@@ -384,6 +389,7 @@ class Handler(SimpleHTTPRequestHandler):
     vrm_path = DEFAULT_VRM
     anim_path = str(REPO / "client" / "js" / "fixtures" / "animation_victory.json")
     anim_doc = {"animations": []}
+    serve_custom = True   # False -> /custom-animations.json serves an empty list
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -392,6 +398,10 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/animations.json":
             return self._json({"animations": []})
         if path == "/custom-animations.json":
+            if not self.serve_custom:
+                # custom_say_inline: the desktop cache never saw the dance —
+                # the reply action's inline copy is the only source
+                return self._json({"animations": []})
             with open(self.anim_path) as f:
                 anim = json.load(f)
             return self._json(anim if "animations" in anim else {"animations": [anim]})
@@ -505,19 +515,24 @@ def main():
     with open(Handler.anim_path) as f:
         _anim_raw = json.load(f)
     Handler.anim_doc = _anim_raw if "animations" in _anim_raw else {"animations": [_anim_raw]}
-    if args.scenario == "custom_say":
+    if args.scenario in ("custom_say", "custom_say_inline"):
         # prove the DIRECTOR path: the hub's reply action names the custom
-        _first = Handler.anim_doc["animations"][0]["name"]
+        _first = Handler.anim_doc["animations"][0]
         # long text on purpose: the bubble then really covers her head band,
         # so the same run doubles as bubble context for touch QA (TOUCH.md)
         _text = ("Look what I made! This reply line is deliberately long so "
                  "the speech bubble stretches well past her head, the way a "
                  "wordy answer does in the real desktop window: press a part "
                  "under it and the bubble should not eat your click anymore.")
+        _action = {"name": _first["name"], "at": 0.2}
+        if args.scenario == "custom_say_inline":
+            Handler.serve_custom = False
+            _action.update({"type": "gesture", "custom": True,
+                            "preview": True, "animation": _first})
         Handler.queue = [
             (6.0, {"type": "status", "state": "speaking"}),
             (6.5, {"type": "say", "text": _text, "emotion": "happy",
-                   "seconds": 3, "actions": [{"name": _first, "at": 0.2}]}),
+                   "seconds": 3, "actions": [_action]}),
         ]
     Handler.t0 = time.monotonic()  # server clock vs page clock differ a bit; fine
     with socket.socket() as s:
@@ -541,7 +556,7 @@ def main():
         url += f"&wheelzoom={args.gestures}"
     if args.touch:
         url += "&touch=" + urllib.parse.quote(args.touch, safe="")
-    if args.scenario == "custom_say":
+    if args.scenario in ("custom_say", "custom_say_inline"):
         url += "&kfwatch=0.35,0.8"
     maxsec = max(float(s) for s in args.secs.split(","))
     dur = args.runtime if args.runtime else maxsec + 8
@@ -569,7 +584,7 @@ def main():
     srv.shutdown()
     shots = sorted(p for p in os.listdir(args.outdir) if p.endswith(".png"))
     gate_fails = evaluate_touch_gates(args.outdir)
-    if args.scenario in ("custom", "custom_say"):
+    if args.scenario in ("custom", "custom_say", "custom_say_inline"):
         gate_fails += evaluate_custom_gates(args.outdir, Handler.anim_doc["animations"])
     print(f"[harness] scenario={args.scenario} shots={len(shots)} touch-gate-fails={gate_fails}")
     for s in shots:

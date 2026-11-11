@@ -130,9 +130,13 @@ const ACTION_QUEUE_S = 3;        // a natural action waits at most this long for
 const LOOP_ACTION_HOLD = 6;      // a loop that came from a reply stops after this long
 
 export class Director {
-  constructor({ random = Math.random, walk = null } = {}) {
+  constructor({ random = Math.random, walk = null, onUnknownAction = null } = {}) {
     this.random = random;
     this.walk = walk;         // optional WalkDirector (roam: strip); null = no walking
+    // page hook (docs/SELF_ANIMATION.md): called when say() drops an action
+    // whose name the library does not know — the page reloads its custom
+    // animation list once and plays the name if it appears within ~2 s.
+    this.onUnknownAction = onUnknownAction;
     this.state = 'boot';
     this.gesture = null;        // {name, loop, endsAt}
     this.pending = null;        // {name, priority, expiresAt}
@@ -356,6 +360,9 @@ export class Director {
       if (!name) continue;
       if (!this.gestures[name]) {
         console.warn(`[director] unknown action '${name}' — ignored`);
+        if (this.onUnknownAction) {
+          try { this.onUnknownAction(name); } catch { /* the hook is never fatal */ }
+        }
         continue;
       }
       const frac = Number.isFinite(a.at) ? Math.min(Math.max(a.at, 0), 1) : 0;

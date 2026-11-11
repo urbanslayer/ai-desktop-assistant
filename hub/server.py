@@ -1472,7 +1472,7 @@ def create_app(data_dir, api_key: str | None = None,
                 {"sha": lambda: anim_sha(pid),
                  "auto_keep": lambda: bool(
                      animations_settings().get("auto_keep"))},
-                anim_capture)
+                anim_capture, events=events)
             hub_specs += _timers.build_timer_specs(store, pid, turn_timers_api,
                                                    lambda: timer_capture)
             # music phase 1 (docs/SPOTIFY_NOTES.md): the spotify_* player
@@ -2332,10 +2332,17 @@ def create_app(data_dir, api_key: str | None = None,
         row = store.get_animation(persona_id, name, sha)
         if row is None:
             return err(404, f"no animation '{name}' on this model")
+        action = {"name": name, "at": 0.0,
+                  "type": "gesture", "custom": True, "preview": True}
+        # carry the animation inline too (SELF_ANIMATION.md): the page may
+        # not have refreshed its cache since this animation appeared
+        inline = _anim_tools.inline_animation_doc({
+            k: row[k] for k in ("name", "description", "duration_s", "loop",
+                                "ease", "keyframes") if k in row})
+        if inline is not None:
+            action["animation"] = inline
         events.publish("action", persona_id=persona_id, emotion=None,
-                       actions=[{"name": name, "at": 0.0,
-                                  "type": "gesture", "custom": True,
-                                  "preview": True}])
+                       actions=[action])
         return {"ok": True, "persona_id": persona_id, "name": name,
                 "model_sha256": sha}
 

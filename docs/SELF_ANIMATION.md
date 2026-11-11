@@ -108,6 +108,38 @@ without the `custom` flag); `gesture_stop` ends a looping custom animation. Regr
 `actions[0].name` names the served animation; the `custom-gate` lines must PASS and the event-driven
 kfwatch frames must show a real mid-pose).
 
+## Tool-made animations + the same-turn preview race (live bug fix, 2026-11)
+
+Second live failure: she invented `curtsey_twirl` with `create_animation`, replied "shall I keep
+it?", and the page logged `[director] unknown action 'curtsey_twirl' — ignored` anyway. Two causes:
+
+1. **The tools never published `animations_changed`.** Only the HTTP animation routes did, so the
+   desktop chain (`_on_animations_changed` -> `refresh_custom_animations` ->
+   `/custom-animations.json` cache -> page reload) never learned about tool-created dances.
+   `build_animation_specs` now takes the hub `events` bus and publishes
+   `animations_changed {persona_id, model_sha256}` after every successful
+   create/keep/delete/adapt mutation (failed mutations publish nothing).
+2. **The reply races the refresh.** The preview play action ships in the same reply as the tool
+   call — seconds before the async refresh can land. The preview action is now self-contained: the
+   hub attaches the validated animation JSON inline (`{type:'gesture', custom:true, name,
+   preview:true, animation:{…}}`, capped at 32 KB via `animation_tools.inline_animation_doc`;
+   oversized docs ride the refresh path only). The page registers inline copies
+   (`registerInlineAnimations` in `client/js/inline_anim.js`: `validateAnimation` ->
+   `customAnims` -> `director.library`) BEFORE calling `director.say()`, so the name validates and
+   the dance plays this same turn. A status `draft` is perfectly playable as a preview; only
+   `kept` animations are offered for later `[act:]` tags (the contract is unchanged).
+   Safety net: `Director` gained an `onUnknownAction` hook — when `say()` would still drop an
+   unknown name the page runs one `loadCustomAnimations()` and plays the name if it appears
+   within ~2 s (covers a kept animation referenced later while the cache lags).
+
+Regression: `test_tool_mutations_publish_animations_changed` (+ bus-crash and size-cap cases), the
+updated `test_chat_turn_create_animation_reply_carries_preview` (inline `animation` field +
+`animations_changed` on `/api/events`), `client/js/inline_anim.test.js` (say with an inline custom
+animation plays with zero unknown-action warnings; hook fires exactly when the name is unknown),
+and the `custom_say_inline` capture scenario (`capture_frames.py custom_say_inline <out> <secs>`:
+`/custom-animations.json` serves an EMPTY list — the animation exists only inline on the reply
+action — and the `custom-gate` lines must still PASS mid-pose).
+
 ## Rules for both children
 
 - Never start a compositor/WM/X server; never query the owner's live session (`hyprctl`, `swaymsg`, `qdbus`,

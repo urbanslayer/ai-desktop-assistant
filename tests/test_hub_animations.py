@@ -416,9 +416,12 @@ def test_animations_routes_crud_event_and_preview(hub):
     assert r.status_code == 200 and r.json()["ok"] is True
     acts = [e for e in new_events(hub, types=("action",))][-1]
     assert acts["persona_id"] == "riko"
-    assert acts["actions"] == [{"name": "big_win", "at": 0.0,
-                                "type": "gesture", "custom": True,
-                                "preview": True}]
+    assert len(acts["actions"]) == 1
+    act0 = acts["actions"][0]
+    assert {k: v for k, v in act0.items() if k != "animation"} == {
+        "name": "big_win", "at": 0.0, "type": "gesture", "custom": True,
+        "preview": True}
+    assert act0["animation"]["name"] == "big_win"      # self-contained replay
     assert hub.post("/api/personas/riko/animations/ghost/preview"
                     ).status_code == 404
 
@@ -577,11 +580,12 @@ from hub.tools import animation_tools as _AT  # noqa: E402
 from hub.tools.registry import permission_for  # noqa: E402
 
 
-def _specs(store_obj, pid="riko", sha="shaAAA", auto_keep=False):
+def _specs(store_obj, pid="riko", sha="shaAAA", auto_keep=False, events=None):
     capture: dict = {}
     specs = _AT.build_animation_specs(
         store_obj, pid,
-        {"sha": lambda: sha, "auto_keep": lambda: auto_keep}, capture)
+        {"sha": lambda: sha, "auto_keep": lambda: auto_keep}, capture,
+        events=events)
     return {s.name: s for s in specs}, capture
 
 
@@ -603,7 +607,11 @@ def test_create_tool_drafts_clamps_and_prepares_preview_action(store):
     assert out["ok"] is True and out["status"] == "draft"
     assert any("spine.x" in n for n in out["clamped"])
     assert "draft" in out["note"] and "keep" in out["note"]
-    assert capture["preview_action"] == {
+    pa = capture["preview_action"]
+    # the validated doc rides the preview action INLINE (SELF_ANIMATION.md)
+    assert pa["animation"]["name"] == "wiggle"
+    assert pa["animation"]["keyframes"][1]["bones"] == {"spine": [15, 0, 0]}
+    assert {k: v for k, v in pa.items() if k != "animation"} == {
         "name": "wiggle", "at": 0.0, "type": "gesture", "custom": True,
         "preview": True}
     row = store.get_animation("riko", "wiggle", "shaAAA")
@@ -675,6 +683,72 @@ def test_animation_tool_permissions_and_descriptions(store):
     assert "victory_dance" in specs["create_animation"].description
 
 
+class _EventRecorder:
+    """Stand-in event bus for tool tests: records publish(kind, **fields)."""
+
+    def __init__(self):
+        self.published = []
+
+    def publish(self, kind, **fields):
+        self.published.append((kind, fields))
+
+
+def test_tool_mutations_publish_animations_changed(store):
+    # the live curtsey_twirl bug: tools wrote the store but the desktop only
+    # learns about new animations through animations_changed — without the
+    # event an invented dance never reaches the live page
+    ev = _EventRecorder()
+    specs, capture = _specs(store, events=ev)
+    out = _payload(specs["create_animation"],
+                   {"animation": simple_doc(name="Bad Name")})
+    assert "error" in out
+    assert ev.published == []                       # failed create: no event
+    out = _payload(specs["create_animation"],
+                   {"animation": simple_doc(name="curtsey_twirl")})
+    assert out["ok"]
+    assert ev.published == [("animations_changed",
+                             {"persona_id": "riko", "model_sha256": "shaAAA"})]
+    # the preview action carries the animation inline for the same-turn play
+    assert capture["preview_action"]["animation"]["name"] == "curtsey_twirl"
+    out = _payload(specs["keep_animation"], {"name": "nope"})
+    assert "error" in out and len(ev.published) == 1
+    out = _payload(specs["keep_animation"], {"name": "curtsey_twirl"})
+    assert out["ok"] and len(ev.published) == 2
+    out = _payload(specs["keep_animation"], {"name": "curtsey_twirl"})
+    assert out["ok"] and "already" in out["note"] and len(ev.published) == 2
+    out = _payload(specs["delete_animation"], {"name": "curtsey_twirl"})
+    assert out["ok"] and len(ev.published) == 3
+    out = _payload(specs["delete_animation"], {"name": "curtsey_twirl"})
+    assert "error" in out and len(ev.published) == 3
+    # adapt onto this model is a store mutation too
+    store.add_animation("riko", "shazzz", _clean_doc(name="bow"))
+    out = _payload(specs["adapt_animation"], {"name": "bow",
+                                              "from_model": "shazzz"})
+    assert out["ok"]
+    assert ev.published[-1] == ("animations_changed",
+                                {"persona_id": "riko",
+                                 "model_sha256": "shaAAA"})
+
+
+def test_events_bus_crash_does_not_eat_the_tool(store):
+    class Boom:
+        def publish(self, *a, **k):
+            raise RuntimeError("bus down")
+
+    specs, _ = _specs(store, events=Boom())
+    out = _payload(specs["create_animation"],
+                   {"animation": simple_doc(name="wiggle")})
+    assert out["ok"] is True
+    assert store.get_animation("riko", "wiggle", "shaAAA") is not None
+
+
+def test_inline_animation_doc_is_size_bounded():
+    big = simple_doc(name="wiggle")
+    big["keyframes"] = [{"t": 0.0, "bones": {}, "expression": {}}] * 4000
+    assert _AT.inline_animation_doc(simple_doc(name="wiggle")) is not None
+    assert _AT.inline_animation_doc(big) is None
+
+
 def test_chat_turn_create_animation_reply_carries_preview(tmp_path):
     from test_hub_tools import ScriptedLLM, call_step
     llm = ScriptedLLM([
@@ -689,9 +763,19 @@ def test_chat_turn_create_animation_reply_carries_preview(tmp_path):
                        json={"name": "Riko"}).status_code in (200, 201, 409)
     res = client.post("/api/chat",
                       json={"text": "make up a victory dance"}).json()
-    assert res["actions"] == [{"name": "victory_dance", "at": 0.0,
-                               "type": "gesture", "custom": True,
-                               "preview": True}]
+    assert len(res["actions"]) == 1
+    act = res["actions"][0]
+    assert {k: v for k, v in act.items() if k != "animation"} == {
+        "name": "victory_dance", "at": 0.0, "type": "gesture",
+        "custom": True, "preview": True}
+    # the reply action is self-contained: the page can register the dance
+    # and play it this same turn, before any cache refresh lands
+    assert act["animation"]["name"] == "victory_dance"
+    assert act["animation"]["keyframes"]
+    # and the mutation hit the event bus the desktop long-polls
+    kinds = [(e["type"], e.get("persona_id"))
+             for e in client.get("/api/events?after=0&wait=0").json()["events"]]
+    assert ("animations_changed", "riko") in kinds
     g = client.get("/api/personas/riko/animations").json()
     assert [(a["name"], a["status"]) for a in g["animations"]] == \
         [("victory_dance", "draft")]

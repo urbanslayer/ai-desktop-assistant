@@ -10,6 +10,16 @@ copies a named animation from another model onto this one, re-clamped).
 Validation + clamping live in hub/animations.py; a rejected animation comes
 back as {"error": "<what to fix>"} so the model can repair and retry in the
 same turn.
+
+Every store mutation publishes `animations_changed` through the hub event
+bus (the HTTP routes do the same): the desktop follows that event to
+refresh its /custom-animations.json cache, and without it tool-made
+animations stay invisible to the avatar page until the next persona switch.
+The create_animation preview action also carries the validated animation
+JSON INLINE (docs/SELF_ANIMATION.md): the reply and the async cache refresh
+race, so the page registers the inline copy before director.say() sees the
+name — bounded by MAX_INLINE_ANIMATION_CHARS, larger docs ride the refresh
+path only.
 """
 from __future__ import annotations
 
@@ -20,6 +30,10 @@ try:  # package import (repo root)
     from .. import animations as _animations
 except (ImportError, SystemError):  # standalone: hub/ is on sys.path (Docker)
     import animations as _animations  # type: ignore[no-redef]
+
+# reply-carried inline animation cap (the validated doc is a few KB; this
+# only guards against a pathological keyframe blob eating the chat payload)
+MAX_INLINE_ANIMATION_CHARS = 32000
 
 
 def _animation_doc_description() -> str:
@@ -63,17 +77,39 @@ TOOL_DESCRIPTIONS = {
 }
 
 
+def inline_animation_doc(clean: dict) -> dict | None:
+    """The validated animation JSON the preview reply carries inline, or None
+    when it is too big (then only the cache-refresh path can deliver it)."""
+    try:
+        if len(json.dumps(clean)) > MAX_INLINE_ANIMATION_CHARS:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return clean
+
+
 def build_animation_specs(store: Any, persona_id: str,
                           anim_api: Mapping[str, Callable[..., Any]],
-                          capture: dict) -> list:
+                          capture: dict, events: Any = None) -> list:
     """The five animation tools for one turn. `anim_api` binds 'sha'
     (current model sha256) and 'auto_keep' (bool). `capture` is the turn's
     mutable dict: create_animation stores the reply-carried preview play
-    action under 'preview_action' (docs/SELF_ANIMATION.md)."""
+    action under 'preview_action' (docs/SELF_ANIMATION.md). `events` is the
+    hub event bus: every store mutation publishes `animations_changed`
+    there, exactly like the /api/personas/.../animations routes — the
+    desktop follows that event to refresh its custom-animation cache."""
     from .registry import ToolSpec
 
     sha = anim_api["sha"]
     auto_keep = anim_api["auto_keep"]
+
+    def publish_changed(model_sha: str) -> None:
+        if events is not None:
+            try:
+                events.publish("animations_changed", persona_id=persona_id,
+                               model_sha256=model_sha)
+            except Exception:  # a dead event bus must not eat the tool turn
+                pass
 
     def find(raw: Any):
         n = _animations.normalize_name(raw)
@@ -103,6 +139,13 @@ def build_animation_specs(store: Any, persona_id: str,
         capture["preview_action"] = {"name": clean["name"], "at": 0.0,
                                      "type": "gesture", "custom": True,
                                      "preview": True}
+        # the preview action carries the animation INLINE: the page registers
+        # it before director.say() validates the name (the cache refresh for
+        # this same mutation lands seconds later — too late for this reply)
+        inline = inline_animation_doc(clean)
+        if inline is not None:
+            capture["preview_action"]["animation"] = inline
+        publish_changed(sha())
         out = {"ok": True, "name": row["name"], "status": row["status"],
                "duration_s": row["duration_s"]}
         if notes:
@@ -129,6 +172,7 @@ def build_animation_specs(store: Any, persona_id: str,
         if upd is None:
             return json.dumps({"error": msg or "keep failed"},
                               ensure_ascii=False)
+        publish_changed(sha())
         return json.dumps({"ok": True, "name": upd["name"],
                            "status": "kept",
                            "note": "the owner keeps it: tag it [act:" +
@@ -141,6 +185,7 @@ def build_animation_specs(store: Any, persona_id: str,
             return json.dumps({"error": msg}, ensure_ascii=False)
         if store.delete_animation(persona_id, row["name"], sha()) is None:
             return json.dumps({"error": msg}, ensure_ascii=False)
+        publish_changed(sha())
         return json.dumps({"ok": True, "deleted": row["name"]},
                           ensure_ascii=False)
 
@@ -197,6 +242,7 @@ def build_animation_specs(store: Any, persona_id: str,
         if row is None:
             return json.dumps({"error": f"'{n}' already exists on the "
                               "current model"}, ensure_ascii=False)
+        publish_changed(current)
         out = {"ok": True, "name": row["name"], "status": row["status"],
                "from_model": src["model_sha256"],
                "note": "copied onto this model and re-checked; preview it "
