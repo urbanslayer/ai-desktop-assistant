@@ -569,3 +569,145 @@ def test_chat_turn_custom_tag_only_when_kept_on_current_model(tmp_path):
                files={"file": ("x.vrm", VRM_BYTES, "model/gltf-binary")})
     res = client.post("/api/chat", json={"text": "again!"}).json()
     assert res["actions"] == []
+
+
+# ── tools: create/keep/delete/list/adapt (docs/SELF_ANIMATION.md) ───────────
+
+from hub.tools import animation_tools as _AT  # noqa: E402
+from hub.tools.registry import permission_for  # noqa: E402
+
+
+def _specs(store_obj, pid="riko", sha="shaAAA", auto_keep=False):
+    capture: dict = {}
+    specs = _AT.build_animation_specs(
+        store_obj, pid,
+        {"sha": lambda: sha, "auto_keep": lambda: auto_keep}, capture)
+    return {s.name: s for s in specs}, capture
+
+
+def _payload(spec, args):
+    import json as _json
+    return _json.loads(spec.run(args))
+
+
+def test_create_tool_drafts_clamps_and_prepares_preview_action(store):
+    specs, capture = _specs(store)
+    doc = simple_doc(keyframes=[
+        {"t": 0.0, "bones": {}, "expression": {}},
+        {"t": 0.5, "bones": {"neck": [10, 0, 0]}, "expression": {}},
+        {"t": 1.0, "bones": {}, "expression": {}}])
+    out = _payload(specs["create_animation"], {"animation": doc})
+    assert "error" in out and "neck" in out["error"]      # structural error
+    doc["keyframes"][1]["bones"] = {"spine": [90, 0, 0]}
+    out = _payload(specs["create_animation"], {"animation": doc})
+    assert out["ok"] is True and out["status"] == "draft"
+    assert any("spine.x" in n for n in out["clamped"])
+    assert "draft" in out["note"] and "keep" in out["note"]
+    assert capture["preview_action"] == {
+        "name": "wiggle", "at": 0.0, "type": "gesture", "custom": True,
+        "preview": True}
+    row = store.get_animation("riko", "wiggle", "shaAAA")
+    assert row["status"] == "draft"
+    assert row["keyframes"][1]["bones"]["spine"] == [15, 0, 0]
+    # duplicate → fixable error, auto_keep flips the saved status
+    out = _payload(specs["create_animation"], {"animation": doc})
+    assert "already exists" in out["error"]
+    specs2, _ = _specs(store, sha="shaBBB", auto_keep=True)
+    out = _payload(specs2["create_animation"], {"animation": fixture_doc()})
+    assert out["status"] == "kept"
+
+
+def test_keep_delete_list_tools(store):
+    specs, _ = _specs(store)
+    store.add_animation("riko", "shaAAA", _clean_doc(), status="draft")
+    store.add_animation("riko", "shaZZZ", _clean_doc(
+        name="old_move"), status="kept")
+    out = _payload(specs["keep_animation"], {"name": "victory_dance"})
+    assert out["ok"] and store.get_animation(
+        "riko", "victory_dance", "shaAAA")["status"] == "kept"
+    out = _payload(specs["keep_animation"], {"name": "ghost"})
+    assert "no animation 'ghost'" in out["error"]
+    assert "victory_dance" in out["error"]        # lists what exists
+    out = _payload(specs["delete_animation"], {"name": "ghost"})
+    assert "error" in out
+    out = _payload(specs["delete_animation"], {"name": "victory_dance"})
+    assert out["ok"] and store.get_animation("riko", "victory_dance",
+                                             "shaAAA") is None
+    out = _payload(specs["list_animations"], {})
+    assert out["model_sha256"] == "shaAAA"
+    flags = {a["name"]: a["on_current_model"] for a in out["animations"]}
+    assert flags == {"old_move": False}
+
+
+def test_adapt_tool_reclamps_and_scopes(store):
+    specs, _ = _specs(store)
+    doc = _clean_doc()
+    doc["keyframes"][1]["bones"]["spine"] = [90, 0, 0]
+    store.add_animation("riko", "shaZZZ", doc, status="kept")
+    out = _payload(specs["adapt_animation"], {"name": "victory_dance"})
+    assert out["ok"] and out["from_model"] == "shaZZZ"
+    assert out["status"] == "draft"
+    assert any("spine.x" in n for n in out["clamped"])
+    row = store.get_animation("riko", "victory_dance", "shaAAA")
+    assert row["keyframes"][1]["bones"]["spine"] == [15, 0, 0]
+    assert "already exists" in _payload(
+        specs["adapt_animation"], {"name": "victory_dance"})["error"]
+    # ambiguous source models need from_model
+    store.add_animation("riko", "shayyy", _clean_doc(name="bow"))
+    store.add_animation("riko", "shazzz", _clean_doc(name="bow"))
+    out = _payload(specs["adapt_animation"], {"name": "bow"})
+    assert "from_model" in out["error"]
+    out = _payload(specs["adapt_animation"],
+                   {"name": "bow", "from_model": "shayyy"})
+    assert out["ok"] and out["from_model"] == "shayyy"
+
+
+def test_animation_tool_permissions_and_descriptions(store):
+    specs, _ = _specs(store)
+    assert specs["delete_animation"].permission_default == "ask"
+    assert (permission_for("delete_animation", "hub", "danger", {},
+                           default="ask") == "ask")
+    assert (permission_for("delete_animation", "hub", "danger",
+                           {"delete_animation": "always"}) == "always")
+    assert permission_for("create_animation", "hub", "act", {}) == "always"
+    for name, spec in specs.items():
+        assert len(spec.description) <= 1500, (name, len(spec.description))
+    assert "victory_dance" in specs["create_animation"].description
+
+
+def test_chat_turn_create_animation_reply_carries_preview(tmp_path):
+    from test_hub_tools import ScriptedLLM, call_step
+    llm = ScriptedLLM([
+        call_step("create_animation", {"animation": fixture_doc()}),
+        {"content": "Ta-da! A little victory dance!"},
+    ])
+    client = TestClient(create_app(
+        tmp_path / "hubdata", api_key=None,
+        llm_defaults={"base_url": llm.base_url, "model": "auto"},
+        tools_defaults={"searxng_url": ""}))
+    assert client.post("/api/personas",
+                       json={"name": "Riko"}).status_code in (200, 201, 409)
+    res = client.post("/api/chat",
+                      json={"text": "make up a victory dance"}).json()
+    assert res["actions"] == [{"name": "victory_dance", "at": 0.0,
+                               "type": "gesture", "custom": True,
+                               "preview": True}]
+    g = client.get("/api/personas/riko/animations").json()
+    assert [(a["name"], a["status"]) for a in g["animations"]] == \
+        [("victory_dance", "draft")]
+
+
+def test_invent_guard_retries_once_without_tool_call(tmp_path):
+    from test_hub_tools import ScriptedLLM
+    llm = ScriptedLLM([{"content": "Dancing is not really for me."}])
+    client = TestClient(create_app(
+        tmp_path / "hubdata", api_key=None,
+        llm_defaults={"base_url": llm.base_url, "model": "auto"},
+        tools_defaults={"searxng_url": ""}))
+    assert client.post("/api/personas",
+                       json={"name": "Riko"}).status_code in (200, 201, 409)
+    res = client.post("/api/chat",
+                      json={"text": "make up a little dance for me"}).json()
+    assert res["reply"]
+    assert len(llm.chat_requests) >= 2       # the nudge retry happened
+    assert "create_animation" in str(llm.chat_requests[1])

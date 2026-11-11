@@ -84,6 +84,11 @@ def gesture_names() -> list[str]:
     return list(GESTURE_NAMES)
 
 
+def normalize_name(raw) -> str:
+    """`Victory Dance` / `Victory-Dance` -> `victory_dance` ('' when empty)."""
+    return _body.normalize_action_name(raw)
+
+
 def reserved_names() -> frozenset:
     """Names a custom animation may never take: built-in gesture names, every
     action-tag target (ACTION_VERBS values) and VRMA clips known to the hub."""

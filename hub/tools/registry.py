@@ -62,7 +62,7 @@ def permission_for(name: str, source: str, risk: str, permissions: dict,
     if explicit in PERMISSIONS:
         return explicit
     if source == "hub":
-        return "always"
+        return default if default in PERMISSIONS else "always"
     if default in PERMISSIONS:
         return default
     return "always" if risk == "read" else "ask"
@@ -220,8 +220,21 @@ def tools_prompt(spec_names: list[str], now_local: str = "",
         + _appedit_line(spec_names)
         + _commands_line(spec_names)
         + _music_line(spec_names)
+        + _animation_line(spec_names)
         + f"Current date/time: {now} (UTC)." + local
     )
+
+
+def _animation_line(spec_names) -> str:
+    """One line while the custom-animation tools are offered
+    (docs/SELF_ANIMATION.md)."""
+    if not any(n in spec_names for n in ("create_animation",
+                                         "adapt_animation")):
+        return ""
+    return ("When the owner asks you to invent/make up a move or dance, use "
+            "create_animation, perform it as a preview, and ask whether to "
+            "keep it (keep_animation) — never claim a move you did not "
+            "actually create. ")
 
 
 def _desktop_sense_line(spec_names) -> str:
@@ -338,18 +351,26 @@ def hub_tool_info(tools_cfg: dict, permissions: dict) -> list[dict]:
     always listed (their permissions must stay editable in Settings even
     while memory is off); a turn only offers them when the memory settings
     enable them (docs/WALK_MEMORY.md M)."""
+    from .animation_tools import TOOL_DESCRIPTIONS as ANIMATION_TOOL_DESCRIPTIONS
     out = []
     for s in build_hub_specs(tools_cfg):
         out.append({"name": s.name, "display": s.display, "source": "hub",
                     "risk": s.risk, "available": s.available,
                     "description": s.description,
                     "permission": permission_for(s.name, "hub", s.risk, permissions)})
-    for name, risk in (("remember", "act"), ("recall", "read"),
-                       ("forget_fact", "act"),
-                       ("timer", "act"), ("list_timers", "read"),
-                       ("cancel_timer", "act")):
+    for name, risk, pdef in (("remember", "act", ""), ("recall", "read", ""),
+                             ("forget_fact", "act", ""),
+                             ("timer", "act", ""), ("list_timers", "read", ""),
+                             ("cancel_timer", "act", ""),
+                             ("create_animation", "act", ""),
+                             ("keep_animation", "act", ""),
+                             ("delete_animation", "danger", "ask"),
+                             ("list_animations", "read", ""),
+                             ("adapt_animation", "act", "")):
         out.append({"name": name, "display": name, "source": "hub",
                     "risk": risk, "available": True,
-                    "description": HUB_TOOL_DESCRIPTIONS[name],
-                    "permission": permission_for(name, "hub", risk, permissions)})
+                    "description": HUB_TOOL_DESCRIPTIONS.get(
+                        name) or ANIMATION_TOOL_DESCRIPTIONS.get(name, ""),
+                    "permission": permission_for(name, "hub", risk,
+                                                 permissions, default=pdef)})
     return out

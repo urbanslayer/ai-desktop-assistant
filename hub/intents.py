@@ -342,6 +342,12 @@ PROMISE_NUDGE = ("You said you would check but didn't call a tool. Call "
                  "the appropriate tool now, then answer.")
 
 
+INVENT_NUDGE = ("The owner asked you to invent a move or dance. Call "
+                "create_animation now with real keyframes (start and end at "
+                "rest pose), then tell them what you made and ask whether "
+                "to keep it.")
+
+
 def promises_action(reply: str) -> bool:
     """True when a final reply announces an action it did not take yet
     ('Let me check…', 'One moment', 'I'll look that up'…). Checked by the

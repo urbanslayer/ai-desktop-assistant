@@ -49,6 +49,7 @@ try:  # package import (repo root: `from hub.server import create_app`)
     from .tools.registry import build_hub_specs, hub_tool_info, permission_for, tools_prompt
     from .tools.spotify_tools import build_spotify_specs
     from .tools import timers as _timers
+    from .tools import animation_tools as _anim_tools
     from .scheduler import TimerScheduler, TimerPermanent
     from .store import Store, default_voice, now_iso
 except ImportError:  # standalone: modules sit next to this file (Docker: /app)
@@ -76,6 +77,7 @@ except ImportError:  # standalone: modules sit next to this file (Docker: /app)
                                 permission_for, tools_prompt)
     from tools.spotify_tools import build_spotify_specs  # type: ignore[no-redef]
     from tools import timers as _timers  # type: ignore[no-redef]
+    from tools import animation_tools as _anim_tools  # type: ignore[no-redef]
     from scheduler import TimerScheduler, TimerPermanent  # type: ignore[no-redef]
     from store import Store, default_voice, now_iso  # type: ignore[no-redef]
 
@@ -1444,6 +1446,9 @@ def create_app(data_dir, api_key: str | None = None,
         turn_tool_ids: list = []
         timer_capture: dict = {"settings": settings, "memory": mem_cfg,
                                "tool_ids": []}
+        # create_animation drops its preview play action here (server adds
+        # it to the reply's actions — docs/SELF_ANIMATION.md)
+        anim_capture: dict = {}
         if tools_cfg.get("enabled"):
             permissions = tools_cfg.get("permissions") or {}
             hub_specs = build_hub_specs(
@@ -1462,6 +1467,12 @@ def create_app(data_dir, api_key: str | None = None,
             # timer_capture is filled in once the turn's offered tool ids
             # are known; a timer set during this turn stores it as `captured`.
             # turn_timers_api also records creations for the fallback.
+            hub_specs += _anim_tools.build_animation_specs(
+                store, pid,
+                {"sha": lambda: anim_sha(pid),
+                 "auto_keep": lambda: bool(
+                     animations_settings().get("auto_keep"))},
+                anim_capture)
             hub_specs += _timers.build_timer_specs(store, pid, turn_timers_api,
                                                    lambda: timer_capture)
             # music phase 1 (docs/SPOTIFY_NOTES.md): the spotify_* player
@@ -1821,6 +1832,13 @@ def create_app(data_dir, api_key: str | None = None,
                 guard_nudge, guard_why = (
                     _intents.TOOL_TALK_NUDGE,
                     "cited tool results without a tool call")
+            # invent twin (docs/SELF_ANIMATION.md): "make up a dance"
+            # answered in words while create_animation sat offered.
+            elif (timer is None and "create_animation" in offered_names
+                  and _animations.detect_invent_request(text)):
+                guard_nudge, guard_why = (
+                    _intents.INVENT_NUDGE,
+                    "invent request without create_animation")
         if guard_nudge:
             log.info("[turn] nudged: %s persona=%s", guard_why, pid)
             retry_msgs = messages + [
@@ -1840,7 +1858,14 @@ def create_app(data_dir, api_key: str | None = None,
         # body actions are parsed from the FINAL reply only (the tool loop
         # may have streamed several model turns)
         answer, actions, ignored = _body.parse_actions(
-            answer, body_actions, custom_actions=custom_moves)
+            answer, body_actions,
+            custom_actions=[r["name"] for r in store.list_animations(
+                pid, anim_sha(pid), status="kept")])
+        pv = anim_capture.get("preview_action")
+        if (pv and len(actions) < _body.MAX_ACTIONS
+                and all(a.get("name") != pv["name"] for a in actions)):
+            actions.insert(0, pv)   # the reply carries the preview play
+
         if ignored:
             log.info("ignored_actions persona=%s names=%s", pid, ",".join(ignored))
         # docs/BODY.md §3 asked-for fallback: tag emission is stochastic
