@@ -134,34 +134,54 @@ desktop:
     # stand_gap: 40      # hips this far above the edge while sitting -> stand
     # republish_px: 4    # edge moved by this much -> re-emit sit:<edge_y>
 
-  # Music phase 1 (docs/SPOTIFY_NOTES.md): Spotify playback on this PC.
+  # Spotify playback on this PC (docs/SPOTIFY_NOTES.md + docs/SOLOIST.md).
   # The hub only steers Spotify Connect (Web API); the sound here comes
-  # from spotifyd, a headless Connect daemon. Riko NEVER installs it:
-  # missing binary -> the tray says exactly what to do (sudo pacman -S
-  # spotifyd, then one-time
-  # 'spotifyd authenticate --cache-path ~/.cache/riko/spotifyd').
-  # Managed mode is self-contained: Riko writes its own minimal config to
-  # ~/.config/riko/spotifyd.conf and NEVER reads ~/.config/spotifyd/
-  # spotifyd.conf (the old one carries a relative cache_path from ncspot
-  # days). An existing spotifyd login is found and COPIED into the Riko
-  # cache; none found -> the tray prints the authenticate command above.
+  # from the player named by `player` below. DEFAULT: Spotify Soloist —
+  # Spotify's official headless Connect player, which Riko installs and
+  # auto-updates from Spotify's own CDN (builds expire after 90 days). One-
+  # time owner setup: create ~/.config/riko/soloist.key (mode 0600, see
+  # docs/SOLOIST.md), Start player, pick "Riko" in a Spotify app once.
+  # `player: spotifyd` keeps the legacy path: Riko NEVER installs spotifyd;
+  # missing binary -> the tray prints the exact setup (sudo pacman -S
+  # spotifyd + one-time 'spotifyd authenticate --cache-path
+  # ~/.cache/riko/spotifyd'). Managed spotifyd mode is self-contained: Riko
+  # writes its own config to ~/.config/riko/spotifyd.conf and copies an
+  # existing login into the Riko cache when one is found.
   music:
-    spotifyd: managed    # off | managed (Riko starts/stops it) | external (you do)
+    player: soloist      # off | soloist (default, docs/SOLOIST.md) | spotifyd
+                         # (legacy librespot path) | external (you run the
+                         # player yourself; Riko only uses it)
+                         # Legacy `spotifyd: managed|external|off` below
+                         # still works when `player` is absent.
     # device_name: ""    # Spotify Connect name; default "Riko" — the SAME
                          # name the hub's Settings > Spotify and her prompt
                          # use (persona names confuse which device is hers)
-    backend: pulseaudio  # spotifyd audio backend. spotifyd knows ONLY
+    soloist:             # Spotify's official headless Connect player
+      cache_size_mb: 500 # download cache cap (-z; 0 = unlimited, else >= 100)
+      auto_update: true  # check Spotify's official CDN at start + every 6 h
+                         # (builds expire 90 days after their build date;
+                         # tray: Music > Update Soloist now for a manual one)
+      # initial_volume: 60    # -i 0..100 (omit = the audio system's default)
+      # pipewire_device: ""   # -d PipeWire node name/ID (omit = default out)
+      # API key (a secret, owner-written, never logged or sent to the hub):
+      #   ~/.config/riko/soloist.key, mode 0600 — see docs/SOLOIST.md
+    backend: pulseaudio  # spotifyd audio backend (legacy player: spotifyd).
+                         # spotifyd knows ONLY
                          # rodio|alsa|pulseaudio|pipe|subprocess — there is
                          # no 'pipewire' backend (clap rejects it, exit 2).
                          # PipeWire serves the PulseAudio protocol, so
                          # pulseaudio is right on PipeWire desktops too;
                          # a leftover 'pipewire' here is mapped to
                          # pulseaudio with a log note.
-    # spotifyd_cache: ~/.cache/riko/spotifyd  # cache/login dir override;
-                         # managed mode runs spotifyd with cwd = this dir
+    # spotifyd_cache: ~/.cache/riko/spotifyd  # legacy spotifyd cache/login
+                         # dir override; managed mode runs spotifyd with
+                         # cwd = this dir
+    spotifyd: managed    # LEGACY key, back-compat only (used when `player`
+                         # is absent); `player: soloist` above wins today
     oauth_port: 8911     # 127.0.0.1 OAuth listener for Spotify's redirect
     duck_volume: 0.15    # player volume multiplier while she speaks
-                         # (best-effort over D-Bus/MPRIS; no-op without them)
+                         # (Soloist: loopback WebSocket; spotifyd: D-Bus/
+                         # MPRIS; both silent no-ops when unavailable)
 
   # Ears: how you talk to her.
   #   push_to_talk = the classic: hold Space, the 'listening…' pill shows,

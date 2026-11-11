@@ -1136,7 +1136,12 @@ Dev-mode rules baked into `hub/spotify.py` (docs/SPOTIFY_NOTES.md): search
 `PUT /me/library?uris=…`, a 429 `QUOTA_EXCEEDED` arms a back-off for the
 advertised `Retry-After` window during which every music action answers
 "cooling down" instantly (no hammering), and a 403/404 on any player call
-answers "is Premium still active?" (`GET /me` no longer reports Premium).
+answers "is Premium still active?" (`GET /me` no longer reports Premium) —
+EXCEPT a 403 whose body says `Player command failed: Restriction violated`
+on a command that targets a device: that's Spotify's transient answer to
+the FIRST play aimed at a just-registered device, so the hub transfers
+playback to that device and retries once; Premium is only blamed when the
+body says something else or the retry also fails (docs/SOLOIST.md).
 Item lists from Spotify may interleave `null` entries — always filtered.
 
 Owner library first (2026-11-10 live-bug round): catalogue `/search` does

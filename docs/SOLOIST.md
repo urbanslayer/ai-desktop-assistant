@@ -123,3 +123,38 @@ key, write the key file, Start player, pick "Riko" once on the phone.
    key, Enter, Ctrl-D.
 3. Restart desktop.py -> tray Music -> Start player.
 4. On the phone's Spotify app pick "Riko" once.
+
+## Implementation notes (where the build differs from the contract, and why)
+
+- **WebSocket client**: stdlib has none, and `websockets>=17.4` is already a
+  project dependency (used by the hub bridge) — so `SoloistWs` uses
+  `websockets.sync` (connect → `auth_state` hello → command → wait for the
+  matching reply type, 2 s budget, never blocks speech).
+- **Checks never "force" a re-download**: the tray's `Update Soloist now`,
+  the at-Start check and the 6 h check all compare HEAD etag/last-modified
+  first, so a same-build check is one cheap request (the contract: download
+  ONLY on change). The exit-10 recovery is the one `force=True` path: an
+  expired binary must be replaced even if the CDN still reports our cached
+  etag.
+- **Threads**: the Qt thread never touches the network or spawns. The Start
+  click, `Update Soloist now`, the boot check and the 6 h check all run on
+  daemon worker threads; the 6-hour promise itself lives in
+  `SoloistPlayer.due()` behind an injectable clock (the QTimer only polls
+  and asks).
+- **`status()`** is a strict superset of `SpotifydPlayer.status()` (same
+  mode/running/pid/binary/device_name/setup_needed/login_needed keys) plus
+  `kind`, `version`, `expiry`, `days_left`, `key_error` — the tray treats
+  both players alike and adds Soloist lines when `kind == "soloist"`. The
+  WS login probe only runs while the player is running (menu refresh is a
+  Qt-thread callback and must never wait on a dead endpoint).
+- **Ducking chain**: desktop wires `CompositeDuck(SoloistDuck, MprisDuck)` —
+  the WS duck first (the contract), the legacy MPRIS duck as fallback (an
+  `external` owner may still run any MPRIS player); both silent no-ops.
+- **Unknown `player:` value → off**, mirroring the legacy typo-safety of
+  `desktop.music.spotifyd`.
+- **First-pair hint** is detected via the WS `auth_state` message (the
+  contract allows watching the data dir; the live probe is exact and needs
+  no file-watcher).
+- **`external` mode** expects you to run soloist yourself; Riko reaches its
+  API via the same `<data-dir>/ws.addr`+`ws.port` discovery files the daemon
+  writes (or `soloist.ws_port` if you point `-D` somewhere else).

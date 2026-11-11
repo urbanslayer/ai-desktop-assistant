@@ -51,6 +51,7 @@ from riko import tts, viewer
 from riko import roam as roam_state
 from riko.config import load_config
 from riko.music import oauth_local as music_oauth
+from riko.music import soloist as music_soloist
 from riko.music import spotifyd as music_spotifyd
 from riko.session import Session
 
@@ -973,14 +974,19 @@ def build_stop_typing_action(menu, typing_svc, command_pack=None):
 
 
 def build_music_menu(menu, player, listener=None, notify=None):
-    """Music submenu (music phase 1, docs/SPOTIFY_NOTES.md): Start/Stop the
-    spotifyd desktop player, its status, and Connect Spotify (the local
-    loopback OAuth listener catches the redirect and hands the code to the
-    hub). With desktop.music.spotifyd: off the whole submenu is omitted.
-    Messages land as tray notifications (no modal boxes from the tray)."""
+    """Music submenu (music phase 1 + docs/SOLOIST.md): Start/Stop the
+    desktop player (Soloist by default, spotifyd on legacy configs), its
+    status, and Connect Spotify (the local loopback OAuth listener catches
+    the redirect and hands the code to the hub). With
+    desktop.music.player: off the whole submenu is omitted. Soloist gets
+    two extra items: the status line 'Soloist <ver>, expires <date>' (warn
+    when < 7 days) and 'Update Soloist now'; a missing key file shows its
+    fix-it text instead of pretending the player can start. Messages land
+    as tray notifications (no modal boxes from the tray)."""
     if player is None or player.mode == "off":
         return None
     music_menu = QMenu("Music", menu)
+    is_soloist = getattr(player, "kind", "") == "soloist"
 
     def _notify(title, body):
         if notify is not None:
@@ -998,10 +1004,23 @@ def build_music_menu(menu, player, listener=None, notify=None):
     start_action = QAction("Start player", music_menu)
 
     def _start(checked=None):
-        result = player.start()
-        _notify("Music", result.get("message", ""))
-        if not result.get("ok"):
-            print(f"[music] start: {result.get('message', '')}", flush=True)
+        # off the Qt thread: the first Start installs Soloist from the CDN
+        # (a 14 MB download), and the contract wants a fresh update check at
+        # every player Start when auto-update is on.
+        def worker():
+            result = player.start()
+            _notify("Music", result.get("message", ""))
+            if not result.get("ok"):
+                print(f"[music] start: {result.get('message', '')}", flush=True)
+            elif is_soloist and getattr(player, "auto_update", False):
+                try:
+                    up = player.check_update()
+                    if up.get("updated"):
+                        _notify("Soloist updated",
+                                f"installed {up.get('version', '?')}")
+                except Exception as exc:                   # noqa: BLE001
+                    print(f"[music] update check: {exc}", flush=True)
+        threading.Thread(target=worker, daemon=True).start()
     start_action.triggered.connect(_start)
 
     stop_action = QAction("Stop player", music_menu)
@@ -1014,12 +1033,30 @@ def build_music_menu(menu, player, listener=None, notify=None):
     music_menu.addAction(start_action)
     music_menu.addAction(stop_action)
 
+    if is_soloist:
+        # manual update: same idle-restart rule as the periodic check;
+        # downloads run off the Qt thread (tray + avatar must not freeze)
+        update_action = QAction("Update Soloist now", music_menu)
+
+        def _update(checked=None):
+            def worker():
+                try:
+                    res = player.update_now()
+                except Exception as e:
+                    res = {"ok": False, "message": f"update crashed: {e}"}
+                _notify("Music", res.get("message") or res.get("reason") or "")
+            threading.Thread(target=worker, daemon=True,
+                             name="soloist-update-now").start()
+        update_action.triggered.connect(_update)
+        music_menu.addAction(update_action)
+
     connect_action = QAction("Connect Spotify…", music_menu)
 
     def _connect(checked=None):
         if listener is None:
             _notify("Music", "no local OAuth listener — set "
-                             "desktop.music.spotifyd to managed/external")
+                             "desktop.music.player to soloist/spotifyd/"
+                             "external")
             return
         try:
             listener.connect()
@@ -1030,6 +1067,33 @@ def build_music_menu(menu, player, listener=None, notify=None):
 
     def _refresh():
         st = player.status()
+        start_action.setEnabled(not st.get("running"))
+        stop_action.setEnabled(bool(st.get("running")))
+        if st.get("kind") == "soloist":
+            if st.get("key_error"):
+                # exact fix-it text is one Start click away (the click
+                # notifies it); the menu line stays readable
+                status_action.setText("player: Soloist key missing — "
+                                      "Start player shows how to create it")
+            elif not st.get("binary"):
+                status_action.setText("player: Soloist not installed yet "
+                                      "(Start installs it from Spotify's CDN)")
+            elif st.get("version"):
+                line = (f"Soloist {st['version']}, "
+                        f"expires {st.get('expiry') or '?'}")
+                dl = st.get("days_left")
+                if isinstance(dl, int) and dl < 7:
+                    line += f" ⚠ {dl}d left"
+                if st.get("update_pending"):
+                    line += " · update staged, restart pending"
+                status_action.setText(line + (" · stopped"
+                                              if not st.get("running")
+                                              else ""))
+            elif st.get("running"):
+                status_action.setText(f"player: running (pid {st.get('pid')})")
+            else:
+                status_action.setText("player: stopped")
+            return
         if st.get("setup_needed"):
             status_action.setText("player: spotifyd not installed")
         elif st.get("login_needed"):
@@ -1041,8 +1105,6 @@ def build_music_menu(menu, player, listener=None, notify=None):
             status_action.setText("player: external (you manage spotifyd)")
         else:
             status_action.setText("player: stopped")
-        start_action.setEnabled(not st.get("running"))
-        stop_action.setEnabled(bool(st.get("running")))
     music_menu.aboutToShow.connect(lambda: _refresh())
     _refresh()
     menu.addMenu(music_menu)
@@ -1721,23 +1783,36 @@ def main():
         bridge.command.emit(f"touch-mode:{mode if mode in touch_actions else 'quiet'}")
     threading.Thread(target=touch_sync, daemon=True).start()
 
-    # ── Music phase 1 (docs/SPOTIFY_NOTES.md) ───────────────────────────
-    # spotifyd is the Spotify Connect device named after the persona
-    # (default 'Riko') the hub's spotify_* tools steer. managed = Riko
-    # starts/stops the child process; external = you run it; off = no
-    # submenu, no listener, no ducking. While she speaks the player's MPRIS
-    # volume dips (silent no-op without dbus/MPRIS). The OAuth listener on
+    # ── Music phase 1 + Soloist (docs/SPOTIFY_NOTES.md, docs/SOLOIST.md) ──
+    # The Connect device keeps the fixed name "Riko" (never the persona —
+    # persona-named players confused the LLM live 2026-11-11). Default
+    # player: Spotify's official headless Soloist (librespot players lost
+    # audio keys 2026-11-11); `player: spotifyd` keeps the legacy path and
+    # legacy `spotifyd: managed|external|off` still works when `player` is
+    # absent. spotifyd and Soloist are never both managed. While she speaks
+    # the player's volume dips (Soloist over its loopback WebSocket, else
+    # MPRIS — both silent no-ops when unavailable). The OAuth listener on
     # 127.0.0.1:8911 catches Spotify's redirect for the hub (loopback is
     # the only plain-HTTP redirect Spotify allows).
     music_cfg = (cfg.get("desktop") or {}).get("music") or {}
     # The Connect name must match what the hub's prompt and Settings teach
-    # ("the device named Riko is the desktop player"). Persona-named
-    # players confused the LLM live 2026-11-11: it saw "Furina" online,
-    # insisted the Riko player was offline, and had to be told to use it.
-    music_player = music_spotifyd.SpotifydPlayer(
-        music_cfg, str(music_cfg.get("device_name") or "Riko"))
-    music_duck = music_spotifyd.MprisDuck(
-        music_cfg.get("duck_volume", music_spotifyd.DEFAULT_DUCK_FRACTION))
+    # ("the device named Riko is the desktop player").
+    music_device = str(music_cfg.get("device_name") or "Riko")
+    music_kind = music_soloist.select_player(music_cfg)
+    if music_kind == "spotifyd":
+        # legacy path: SpotifydPlayer reads desktop.music.spotifyd, so
+        # hand it the mode this selection implies
+        music_player = music_spotifyd.SpotifydPlayer(
+            {**music_cfg, "spotifyd": "managed"}, music_device)
+        music_duck = music_spotifyd.MprisDuck(
+            music_cfg.get("duck_volume", music_spotifyd.DEFAULT_DUCK_FRACTION))
+    else:
+        music_player = music_soloist.SoloistPlayer(music_cfg, music_device)
+        _duck_fraction = music_cfg.get(
+            "duck_volume", music_soloist.DEFAULT_DUCK_FRACTION)
+        music_duck = music_soloist.CompositeDuck(
+            music_soloist.SoloistDuck(_duck_fraction, ws=music_player.ws),
+            music_spotifyd.MprisDuck(_duck_fraction))
     if music_player.mode != "off":
         session.on_speak = music_duck.on_speak
         music_listener = music_oauth.OAuthListener(
@@ -1749,6 +1824,33 @@ def main():
     build_music_menu(menu, music_player, music_listener,
                      notify=lambda title, body: tray.showMessage(title, body))
     app.aboutToQuit.connect(music_player.stop)
+
+    # Soloist builds expire 90 days after their build date: check at start
+    # and every 6 h, ALWAYS off the Qt thread (downloads + version probes).
+    # The restart decision (idle-only unless < 3 days to expiry) lives in
+    # SoloistPlayer.check_update; failures log once and never touch audio.
+    if isinstance(music_player, music_soloist.SoloistPlayer) \
+            and music_player.mode == "managed" and music_player.auto_update:
+        def music_update_check():
+            try:
+                res = music_player.check_update()
+                if res.get("updated"):
+                    line = (f"Soloist updated to {res.get('version')}"
+                            + (" (restarted)" if res.get("restarted") else
+                               " (restart deferred while playing)"
+                               if res.get("deferred") else ""))
+                    print(f"[music] {line}", flush=True)
+            except Exception as e:
+                print(f"[music] soloist update check failed: {e}", flush=True)
+        threading.Thread(target=music_update_check, daemon=True,
+                         name="soloist-update-check").start()
+        music_update_timer = QTimer(menu)
+        music_update_timer.setInterval(music_soloist.CHECK_INTERVAL_S * 1000)
+        music_update_timer.timeout.connect(
+            lambda: threading.Thread(target=music_update_check, daemon=True,
+                                     name="soloist-update-check").start()
+            if music_player.due() else None)
+        music_update_timer.start()
 
     for label, fn in ((f"Type to her{hint('type')}", lambda: on_command("type")),
                       (f"Talk / stop talking{hint('talk', 'hold ')}", session.talk_toggle)):

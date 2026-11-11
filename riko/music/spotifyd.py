@@ -120,6 +120,8 @@ class SpotifydPlayer:
     A binary that exists is REQUIRED before any spawn — we run what's
     there, we never fetch what isn't."""
 
+    kind = "spotifyd"
+
     def __init__(self, music_cfg: dict | None, device_name: str = DEFAULT_DEVICE_NAME,
                  *, which=shutil.which, popen=subprocess.Popen, log=print):
         cfg = dict(music_cfg or {})

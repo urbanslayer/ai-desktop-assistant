@@ -306,6 +306,64 @@ def test_player_403_answers_premium(hub_app, fake):
         app.state.spotify.control("pause")
 
 
+# ── 403 'Restriction violated': transfer + retry once (docs/SOLOIST.md) ─────
+
+RESTRICTION = {"error": {"status": 403,
+                         "message": "Player command failed: Restriction violated"}}
+
+
+def _play_tool(hub):
+    return next(s for s in build_spotify_specs(hub) if s.name == "spotify_play")
+
+
+def test_restriction_violated_transfers_then_retries_once(hub_app, fake):
+    # the real incident: first play aimed at the just-registered desktop
+    # player answers 403 'Restriction violated' — NOT a lapsed Premium.
+    # The hub must transfer to the target device and retry ONCE, and the
+    # tool must succeed without ever mentioning Premium.
+    app, client = hub_app
+    seed_tokens(app)
+    fake.one_shot("PUT", "/v1/me/player/play", 403, dict(RESTRICTION))
+    out = _play_tool(app.state.spotify).run({"query": "bohemian rhapsody"})
+    assert "Bohemian Rhapsody" in out
+    assert "Premium" not in out
+    plays = [e for e in fake.log if e["method"] == "PUT"
+             and e["path"] == "/v1/me/player/play"]
+    assert len(plays) == 2                             # refused once, retried once
+    transfers = [e for e in fake.log if e["method"] == "PUT"
+                 and e["path"] == "/v1/me/player"]
+    assert len(transfers) == 1                         # exactly one transfer
+    assert transfers[0]["json"]["device_ids"] == [DEVICE_RIKO["id"]]
+    # the transfer happened BETWEEN the refusal and the retry
+    paths = [(e["method"], e["path"]) for e in fake.log]
+    first_play = paths.index(("PUT", "/v1/me/player/play"))
+    transfer_i = paths.index(("PUT", "/v1/me/player"))
+    assert first_play < transfer_i < len(paths) - paths[::-1].index(
+        ("PUT", "/v1/me/player/play"))
+
+
+def test_restriction_violated_retry_still_failing_blames_premium(hub_app, fake):
+    app, client = hub_app
+    seed_tokens(app)
+    fake.one_shot("PUT", "/v1/me/player/play", 403, dict(RESTRICTION))
+    fake.one_shot("PUT", "/v1/me/player/play", 403, dict(RESTRICTION))
+    with pytest.raises(SpotifyPremium, match="is Premium still active"):
+        _play_tool(app.state.spotify).run({"query": "bohemian rhapsody"})
+
+
+def test_restriction_violated_without_target_device_skips_premium(hub_app, fake):
+    # pause carries no device: there is nothing to transfer to, so the hub
+    # says what actually happened instead of blaming the subscription.
+    app, client = hub_app
+    seed_tokens(app)
+    fake.one_shot("PUT", "/v1/me/player/pause", 403, dict(RESTRICTION))
+    with pytest.raises(SpotifyError) as ei:
+        app.state.spotify.control("pause")
+    assert "Restriction violated" in str(ei.value)
+    assert not isinstance(ei.value, SpotifyPremium)
+    assert fake.hits("PUT", "/v1/me/player") == 0      # no transfer guessed
+
+
 # ── like current: PUT /me/library (the dev-mode rule) ───────────────────────
 
 def test_like_current_uses_me_library(hub_app, fake):

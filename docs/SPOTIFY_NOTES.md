@@ -146,3 +146,24 @@ What to try when it's silent again (in order):
    Connect device (flatpak com.spotify.Client) or a newer librespot build.
 Audio cache is disposable: safe to delete everything under
 ~/.cache/riko/spotifyd EXCEPT the `oauth/` folder.
+
+## Resolution (2026-11-11): Spotify Soloist replaces spotifyd
+
+The key outage persisted, so the owner chose Spotify's **official** headless
+Connect player — **Spotify Soloist** — with Riko managing it (tray Start/Stop,
+auto-update from Spotify's own CDN before builds expire). The full contract,
+file layout and design live in **docs/SOLOIST.md**; the hub now also
+transfer-retries the transient `Restriction violated` 403 once before ever
+mentioning Premium (hub/spotify.py, tests/test_hub_spotify.py). spotifyd
+remains selectable via `desktop.music.player: spotifyd` (legacy).
+
+Owner steps (once, see docs/SOLOIST.md for the details):
+1. https://developer.spotify.com/dashboard/soloist → generate a Soloist API
+   key (Premium account).
+2. In a terminal (the key never goes into chat):
+   `install -D -m 600 /dev/stdin ~/.config/riko/soloist.key` → paste the key,
+   Enter, Ctrl-D.
+3. Restart desktop.py → tray Music → Start player (Riko installs Soloist
+   herself from the official CDN on the first start).
+4. On the phone's Spotify app pick "Riko" in the device list once — the
+   session is stored and restored on every later start.

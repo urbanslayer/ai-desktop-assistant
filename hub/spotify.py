@@ -248,6 +248,33 @@ def parse_redirect_paste(paste: str) -> dict:
 
 # ── the Web API client ──────────────────────────────────────────────────────
 
+def _error_message(r) -> str:
+    """Spotify's error body message ('Player command failed: Restriction
+    violated'), '' when the body isn't JSON or has no message."""
+    try:
+        return str((r.json().get("error") or {}).get("message") or "")
+    except ValueError:
+        return ""
+
+
+def _restriction_violated(r) -> bool:
+    """The 403 Spotify sends to the FIRST play aimed at a just-registered
+    device — a Connect race, not a lapsed Premium subscription."""
+    return "restriction violated" in _error_message(r).lower()
+
+
+def _target_device(params: dict | None, body: dict | None) -> str:
+    """The device the command targets (play passes ?device_id=, transfer
+    passes body.device_ids[0]); '' when the command names none."""
+    dev = str((params or {}).get("device_id") or "").strip()
+    if dev:
+        return dev
+    ids = (body or {}).get("device_ids")
+    if isinstance(ids, list) and ids:
+        return str(ids[0] or "").strip()
+    return ""
+
+
 class SpotifyClient:
     """One logged-in user's Web API calls. `settings` is the merged spotify
     settings block; `tokens` the stored token object; `save(tokens)` (optional)
@@ -355,7 +382,14 @@ class SpotifyClient:
             body: dict | None = None, player: bool = False):
         """One Web API call. Returns the parsed JSON body (None for 204).
         401 → refresh once + retry; 429 → SpotifyQuota; player 403/404 →
-        SpotifyPremium; other non-2xx → SpotifyError."""
+        SpotifyPremium; other non-2xx → SpotifyError.
+
+        Exception (docs/SOLOIST.md): a player-command 403 whose body says
+        'Restriction violated' is Spotify's known first-play-to-a-
+        just-registered-device answer, NOT a lapsed subscription — the hub
+        transfers playback to the target device and retries ONCE before
+        raising. Premium is only blamed when the body says something else
+        or that retry also fails."""
         url = self.api_base.rstrip("/") + path
         headers = {"Authorization": f"Bearer {self.access_token()}",
                    "User-Agent": USER_AGENT}
@@ -363,6 +397,23 @@ class SpotifyClient:
         if r.status_code == 401:
             # a rotated/revoked token: refresh once, retry once
             headers["Authorization"] = f"Bearer {self.refresh()}"
+            r = self._send(method, url, headers, params, body)
+        if player and r.status_code == 403 and _restriction_violated(r):
+            device = _target_device(params, body)
+            if not device:
+                raise SpotifyError(
+                    "Spotify refused the player command: 'Player command "
+                    "failed: Restriction violated' (HTTP 403) and the hub "
+                    "has no target device to transfer to — start the "
+                    "desktop player (tray Music > Start player) or name a "
+                    "device explicitly")
+            # first play to a just-registered device: activate it, retry once
+            try:
+                self._send("PUT", self.api_base.rstrip("/") + "/me/player",
+                           headers, None, {"device_ids": [device],
+                                           "play": False})
+            except SpotifyError:
+                pass            # surface the original refusal via the retry
             r = self._send(method, url, headers, params, body)
         return self._result(method, path, r, player)
 
