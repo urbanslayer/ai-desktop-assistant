@@ -23,8 +23,12 @@
 // taken from motion, never re-derived, so both layers share one truth).
 
 import { solveTwoBoneIK, sub, add, mul, dot, len, norm } from './ik.js';
+import {
+  sample as sampleKeyframes, clampAnimation, KF_BLEND, KEYFRAME_LIMITS,
+} from './keyframes.js';
 
 const EASE = (x) => x * x * (3 - 2 * x);
+const RAD = Math.PI / 180;
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const smoothK = (dt, tau) => 1 - Math.exp(-dt / tau);
 
@@ -99,12 +103,15 @@ export class PoseLayer {
     this.grabs = new Map();     // id -> state
     this.sitState = null;       // {edgePx|edgeWorldY, w, out, offset, blend}
     this.reacts = new Map();    // name -> {t, opts}
+    this.kf = null;             // keyframe player state (docs/SELF_ANIMATION.md)
+    this._kfRest = new Map();   // rest quats for bones the motion cache lacks
     this.flinchX = 0;
     this.torso = { a: [0, 1.0, 0], b: [0, 1.35, 0], r: 0.22 };  // refreshed each frame
     this._legRest = null;       // per-side hip/knee/ankle rest lengths (probed)
     // scratch
     this._q1 = new THREE.Quaternion();
     this._q2 = new THREE.Quaternion();
+    this._kq = new THREE.Quaternion();
     this._e1 = new THREE.Euler();
     this._v1 = new THREE.Vector3();
     this._v2 = new THREE.Vector3();
@@ -116,6 +123,8 @@ export class PoseLayer {
     this.grabs.clear();
     this.sitState = null;
     this.reacts.clear();
+    this.kf = null;             // a new skeleton does not inherit a dance
+    this._kfRest.clear();
     this.flinchX = 0;
     this._patPeakDeg = 0;
     const T = this.THREE;
@@ -216,6 +225,45 @@ export class PoseLayer {
   // pose no longer owns ANY sit write (w<=0 covers the final zero-weight frame)
   get standBlendDone() { return !this.sitState || this.sitState.w <= 0; }
 
+  // ── keyframe player (item 6, docs/SELF_ANIMATION.md) ────────
+  /** Play a custom keyframe animation (the docs/SELF_ANIMATION.md format).
+   *  The same animation already playing is idempotent (a duplicate action
+   *  must not restart it); anything else takes over behind the 0.25 s
+   *  blend-in. Values are re-clamped here — defence in depth, the hub is the
+   *  authority. */
+  playKeyframes(anim, { preview = false } = {}) {
+    if (!this.vrm || !this.motion || !this.motion.rig || !anim) return false;
+    if (!Array.isArray(anim.keyframes) || anim.keyframes.length < 2) return false;
+    if (this.kf && !this.kf.out && this.kf.anim.name === anim.name) {
+      this.kf.preview = !!preview;   // duplicate action: keep the running copy
+      return true;
+    }
+    const c = clampAnimation(anim);
+    if (c.changes.length) console.warn('[keyframes] clamped:', c.changes.join('; '));
+    // replacing a running copy: capture its bones as a ghost so the swap
+    // crossfades (ghost -> rest while the new pose blends in) instead of
+    // snapping through rest
+    let ghost = null;
+    if (this.kf) {
+      ghost = new Map();
+      for (const bone of this.kf.bones) {
+        const nb = this._kfBone(bone);
+        if (nb) ghost.set(bone, nb.node.quaternion.clone());
+      }
+    }
+    this.kf = { anim: c.anim, t: 0, w: 0, out: false, preview: !!preview,
+                bones: new Set(), hipsY: !!(this.kf && this.kf.hipsY),
+                expr: new Set(), ghost };
+    return true;
+  }
+
+  /** Blend back to rest over the remaining blend window. A limb grab or a
+   *  sit calls this: from the next frame the grab/sit layer (which applies
+   *  AFTER keyframes) owns the bones outright. */
+  stopKeyframes() { if (this.kf) this.kf.out = true; }
+
+  get isPlaying() { return !!this.kf && !this.kf.out; }
+
   // ── reactions (instant local touch feedback, item 6 reuses these) ──
   react(name, opts = {}) {
     if (!REACTIONS[name]) return false;
@@ -223,12 +271,13 @@ export class PoseLayer {
     return true;
   }
 
-  /** True while any grab/sit/reaction owns part of the body — the page
-   *  freezes idle gestures and roaming while this holds. */
+  /** True while any grab/sit/reaction/custom animation owns part of the
+   *  body — the page freezes idle gestures and roaming while this holds. */
   get active() {
     if (this.grabs.size) return true;
     if (this.sitState && this.sitState.w > 0) return true;
     if (this.reacts.size) return true;
+    if (this.kf) return true;
     return false;
   }
 
@@ -263,7 +312,7 @@ export class PoseLayer {
       r.t += dt;
       if (r.t >= REACTIONS[name].dur) this.reacts.delete(name);
     }
-    if (!this.grabs.size && !this.sitState && !this.reacts.size) {
+    if (!this.grabs.size && !this.sitState && !this.reacts.size && !this.kf) {
       this.flinchX = 0;
       return;
     }
@@ -279,6 +328,10 @@ export class PoseLayer {
       this.torso.b = chestN.getWorldPosition(this._v1).toArray();
     }
     this.torso.r = (m.rig.shoulderWidth || 0.3) * 0.42 + (m.rig.headLen || 0.12) * 0.25;
+
+    // ── custom keyframes: writes BEFORE sit/grabs so a grab or a sit
+    //    interrupts it cleanly (whichever writes last owns the bone) ──
+    if (this.kf) this._keyframeLayer(dt);
 
     // ── sit: pose offsets + hips pinned to the edge line ──
     if (this.sitState) this._sitLayer(dt);
@@ -327,6 +380,116 @@ export class PoseLayer {
       }
     }
     void T;
+  }
+
+  // ── keyframe player internals ───────────────────────────────
+  // One blended frame of the running animation. Weight ramps linearly in /
+  // out over KF_BLEND (0.25 s) so a stop at ANY point reaches rest within
+  // 0.25 s; EASE() shapes the visible motion. Bones the rig does not have
+  // stay at rest; a bone absent from the sample is never touched (feet stay
+  // planted unless a leg bone is keyed).
+  _keyframeLayer(dt) {
+    const m = this.motion, k = this.kf;
+    const dur = Math.max(0.4, Number(k.anim.duration_s) || 0.4);
+    k.t += dt;
+    if (!k.anim.loop && k.t >= dur) { k.t = dur; k.out = true; }
+    if (k.out) k.w = Math.max(0, k.w - dt / KF_BLEND);
+    else k.w = Math.min(1, k.w + dt / KF_BLEND);
+    const s = sampleKeyframes(k.anim, k.anim.loop ? k.t : Math.min(k.t, dur));
+    const e = EASE(k.w);
+    if (k.ghost) {
+      for (const [bone, q0] of k.ghost) {
+        const nb = this._kfBone(bone);
+        if (!nb) continue;
+        k.bones.add(bone);                       // the final frame resets it too
+        nb.node.quaternion.copy(q0).slerp(nb.rest, e);
+      }
+      if (e >= 1) k.ghost = null;
+    }
+    for (const [bone, off] of Object.entries(s.bones)) {
+      const nb = this._kfBone(bone);
+      if (!nb) continue;                       // rig without this bone: rest
+      k.bones.add(bone);
+      // target = rest * offset (offsets are REST-RELATIVE, XYZ-local); the
+      // blend is the slerp geodesic rest -> rest*off, so rest⁻¹*current is
+      // exactly off^e and the per-axis clamp below reads the right numbers
+      const target = this._q2.copy(nb.rest).multiply(this._kq.set(off.x, off.y, off.z, off.w));
+      nb.node.quaternion.copy(nb.rest).slerp(target, e);
+      // slerp arcs between two clamped corners can bulge a hair past a
+      // per-axis box; re-clamp the blended offset so the limits hold EVERY
+      // frame (mirrors motion._boundBone for the gaze chain)
+      const lim = KEYFRAME_LIMITS[bone];
+      if (lim) {
+        const rel = this._q1.copy(nb.rest).conjugate().multiply(nb.node.quaternion);
+        this._e1.setFromQuaternion(rel);       // XYZ, same order as the format
+        const x = clamp(this._e1.x, lim.x[0] * RAD, lim.x[1] * RAD);
+        const y = clamp(this._e1.y, lim.y[0] * RAD, lim.y[1] * RAD);
+        const z = clamp(this._e1.z, lim.z[0] * RAD, lim.z[1] * RAD);
+        if (x !== this._e1.x || y !== this._e1.y || z !== this._e1.z) {
+          this._e1.set(x, y, z);
+          rel.setFromEuler(this._e1);
+          nb.node.quaternion.copy(nb.rest).multiply(rel);
+        }
+      }
+    }
+    if (s.hips_y || k.hipsY) {
+      const hips = m._node('hips');
+      if (hips && m._restPos) {
+        hips.position.y = m._restPos.y + s.hips_y * e;
+        k.hipsY = true;
+      }
+    }
+    const em = this.vrm.expressionManager;
+    if (em) {
+      for (const [name, v] of Object.entries(s.expression)) {
+        if (!(v > 0)) continue;
+        k.expr.add(name);
+        try { em.setValue(name, v * e); } catch { /* persona without it */ }
+      }
+    }
+    if (k.out && k.w <= 0) this._kfFinalFrame(k);
+  }
+
+  // motion-cached bone (rest from motion._rest) or a bone nothing else ever
+  // writes (left-hand fingers …): its live quaternion IS the rest — snapshot.
+  _kfBone(bone) {
+    const m = this.motion;
+    const node = m._node(bone);
+    if (node) {
+      const rest = m._rest.get(bone);
+      return rest ? { node, rest } : null;
+    }
+    const n2 = this.vrm.humanoid?.getNormalizedBoneNode?.(bone) || null;
+    if (!n2) return null;
+    let r = this._kfRest.get(bone);
+    if (!r) { r = n2.quaternion.clone(); this._kfRest.set(bone, r); }
+    return { node: n2, rest: r };
+  }
+
+  // ONE exact ew=0 frame, then let go (the grab-release rule): every bone
+  // this layer wrote returns to EXACTLY rest, hips_y to the rest position,
+  // and each expression goes back to whatever the life layer itself holds
+  // (zero for anything it no longer drives) so the handover cannot pop.
+  _kfFinalFrame(k) {
+    const m = this.motion;
+    for (const bone of k.bones) {
+      const nb = this._kfBone(bone);
+      if (nb) nb.node.quaternion.copy(nb.rest);
+    }
+    if (k.hipsY) {
+      const hips = m._node('hips');
+      if (hips && m._restPos) hips.position.y = m._restPos.y;
+    }
+    const em = this.vrm.expressionManager;
+    if (em) {
+      for (const name of k.expr) {
+        const mine = m._expr?.[name]?.current;
+        const v = Number.isFinite(mine) ? mine
+          : (m._vowel && Number.isFinite(m._vowel[name]) ? m._vowel[name] : 0);
+        try { em.setValue(name, v); } catch { /* persona without it */ }
+      }
+    }
+    this.kf = null;
   }
 
   // sit legs/spine offsets blend on top of whatever the life layer wrote;
@@ -547,10 +710,30 @@ export class PoseLayer {
     const T = this.THREE;
     const out = { grabs: {}, sitting: !!this.sitState, sitEdge: null, hipsOffset: null,
                   reacts: [...this.reacts.keys()], flinchX: this.flinchX,
+                  keyframes: null,
                   torso: { ...this.torso }, legAngles: {},
                   // honest per-frame evidence for the grab QA (raw cursor-space
                   // target vs the eased/clamped one, per-bone deviation vs rest)
                   patPeakRollDeg: +(this._patPeakDeg || 0).toFixed(2), boneAngles: {} };
+    if (this.kf) {
+      const k = this.kf;
+      out.keyframes = { name: k.anim.name || '', t: +k.t.toFixed(3),
+                        w: +k.w.toFixed(3), out: k.out, preview: !!k.preview };
+      out.kfBones = {};
+      for (const bone of k.bones) {
+        const nb = this._kfBone(bone);
+        if (!nb) continue;
+        // rest-relative offset of the live bone: quaternion + angle (QA gate:
+        // the harness compares this against its own independent sample)
+        const off = this._q1.copy(nb.rest).conjugate().multiply(nb.node.quaternion);
+        out.kfBones[bone] = { deg: +(nb.rest.angleTo(nb.node.quaternion) * 180 / Math.PI).toFixed(3),
+                              q: [+off.x.toFixed(6), +off.y.toFixed(6),
+                                  +off.z.toFixed(6), +off.w.toFixed(6)] };
+      }
+      const hipsN = m._node('hips');
+      out.kfHipsY = (k.hipsY && hipsN && m._restPos)
+        ? +(hipsN.position.y - m._restPos.y).toFixed(4) : 0;
+    }
     for (const bn of Object.keys(GRAB_LIMITS)) {
       const n = m._node(bn), r = m._rest.get(bn);
       if (n && r) out.boneAngles[bn] = +(r.angleTo(n.quaternion) * 180 / Math.PI).toFixed(2);
