@@ -319,23 +319,38 @@ def evaluate_custom_gates(outdir, anims):
             err = qang(want, tuple(e["q"]))
             worst = max(worst, err)
             checks.append((f"{bone}-offset<=3deg", err <= 3.0))
-            world, chain = e.get("world"), qa.get("chain", {}).get(bone)
-            if world and chain:        # compose the expected WORLD rotation
-                cur = ID
-                for n in chain:        # hips-side first
-                    lr = qa.get("localRest", {}).get(n)
-                    if not lr:
-                        cur = None
-                        break
-                    local = qnorm(tuple(lr))
-                    bone_off = off_q.get(n)
-                    if bone_off:
-                        local = qmul(local, qslerp(ID, bone_off, blend))
-                    cur = qmul(cur, local)
-                if cur is not None:
-                    werr = qang(qnorm(cur), tuple(world))
-                    worst = max(worst, werr)
-                    checks.append((f"{bone}-world<=3deg", werr <= 3.0))
+            # WORLD check without any matrix decompose: the page reports the
+            # live LOCAL quaternion of every ancestor up to vrm.scene
+            # (chainQ, hips-side first). Actual = product of those; expected
+            # = same product with keyed nodes replaced by rest * offset — a
+            # limb's rest-relative angle must survive the whole parent chain
+            # (a wrong spine would throw the arm off). Live local rotations
+            # are immune to the negative bone scales Unity rigs carry, which
+            # scramble getWorldQuaternion decompose (measured on Furina).
+            chain = (qa.get("chain") or {}).get(bone)
+            chainq = (qa.get("chainQ") or {}).get(bone)
+            if chain and chainq and len(chain) == len(chainq):
+                node_as_bone = {}
+                for b2, e2 in (qa.get("bones") or {}).items():
+                    c2 = (qa.get("chain") or {}).get(b2)
+                    if c2:
+                        node_as_bone[c2[-1]] = b2
+                act = exp = ID
+                for idx, node in enumerate(chain):
+                    live = qnorm(tuple(chainq[idx]))
+                    act = qmul(act, live)
+                    b2 = node_as_bone.get(node)
+                    if b2 is None:
+                        exp = qmul(exp, live)   # unkeyed: live is its own rest
+                        continue
+                    r = (qa["bones"][b2] or {}).get("rest")
+                    base = qnorm(tuple(r)) if r else ID
+                    o = off_q.get(b2)
+                    exp = qmul(exp, base if o is None
+                               else qmul(base, qslerp(ID, o, blend)))
+                werr = qang(exp, act)
+                worst = max(worst, werr)
+                checks.append((f"{bone}-world<=3deg", werr <= 3.0))
         got_hips = float(qa.get("hipsY") or 0.0)
         checks.append((f"hipsY={hips * blend:.3f}",
                        abs(got_hips - hips * blend) <= 0.011))

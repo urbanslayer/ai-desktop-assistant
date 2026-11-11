@@ -25,6 +25,7 @@
 import { solveTwoBoneIK, sub, add, mul, dot, len, norm } from './ik.js';
 import {
   sample as sampleKeyframes, clampAnimation, KF_BLEND, KEYFRAME_LIMITS,
+  clampRelEuler,
 } from './keyframes.js';
 
 const EASE = (x) => x * x * (3 - 2 * x);
@@ -417,18 +418,18 @@ export class PoseLayer {
       nb.node.quaternion.copy(nb.rest).slerp(target, e);
       // slerp arcs between two clamped corners can bulge a hair past a
       // per-axis box; re-clamp the blended offset so the limits hold EVERY
-      // frame (mirrors motion._boundBone for the gaze chain)
+      // frame (mirrors motion._boundBone for the gaze chain). Branch-aware:
+      // the euler box is per-ROTATION, not per-canonical-decomposition — a
+      // hinge spin past 90° on Y canonically reads X/Z=±180° and must not
+      // be clamped from that branch (sample.deg says which branch is meant).
       const lim = KEYFRAME_LIMITS[bone];
       if (lim) {
         const rel = this._q1.copy(nb.rest).conjugate().multiply(nb.node.quaternion);
-        this._e1.setFromQuaternion(rel);       // XYZ, same order as the format
-        const x = clamp(this._e1.x, lim.x[0] * RAD, lim.x[1] * RAD);
-        const y = clamp(this._e1.y, lim.y[0] * RAD, lim.y[1] * RAD);
-        const z = clamp(this._e1.z, lim.z[0] * RAD, lim.z[1] * RAD);
-        if (x !== this._e1.x || y !== this._e1.y || z !== this._e1.z) {
-          this._e1.set(x, y, z);
-          rel.setFromEuler(this._e1);
-          nb.node.quaternion.copy(nb.rest).multiply(rel);
+        const c = clampRelEuler(rel, lim, (s.deg && s.deg[bone]) || [0, 0, 0]);
+        this._e1.set(c[0], c[1], c[2]);
+        this._q2.setFromEuler(this._e1);
+        if (rel.angleTo(this._q2) > 1e-9) {
+          nb.node.quaternion.copy(nb.rest).multiply(this._q2);
         }
       }
     }
@@ -728,7 +729,9 @@ export class PoseLayer {
         const off = this._q1.copy(nb.rest).conjugate().multiply(nb.node.quaternion);
         out.kfBones[bone] = { deg: +(nb.rest.angleTo(nb.node.quaternion) * 180 / Math.PI).toFixed(3),
                               q: [+off.x.toFixed(6), +off.y.toFixed(6),
-                                  +off.z.toFixed(6), +off.w.toFixed(6)] };
+                                  +off.z.toFixed(6), +off.w.toFixed(6)],
+                              rest: [+nb.rest.x.toFixed(6), +nb.rest.y.toFixed(6),
+                                     +nb.rest.z.toFixed(6), +nb.rest.w.toFixed(6)] };
       }
       const hipsN = m._node('hips');
       out.kfHipsY = (k.hipsY && hipsN && m._restPos)

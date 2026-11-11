@@ -269,7 +269,7 @@ export function clampAnimation(anim) {
  */
 export function sample(anim, t) {
   const keys = (anim && anim.keyframes) || [];
-  const out = { bones: {}, expression: {}, hips_y: 0 };
+  const out = { bones: {}, deg: {}, expression: {}, hips_y: 0 };
   if (keys.length === 0) return out;
   const dur = Number(anim.duration_s) || keys[keys.length - 1].t || 0.001;
   let tt = Number.isFinite(t) ? t : 0;
@@ -298,6 +298,12 @@ export function sample(anim, t) {
     const q = quatSlerp(qa, qb, u);
     if (quatIsIdentity(q)) continue;   // passing exactly through rest
     out.bones[bone] = q;
+    // eased per-axis angle proxy (degrees): which EULER BRANCH this bone's
+    // rotation is meant to read as — a slerp between Y=±100° corners is a
+    // plain hinge spin, even though the canonical XYZ decomposition of it
+    // lives at Y=±80° with X/Z flipped by 180°. Consumers that must clamp
+    // in the euler domain (pose.js _keyframeLayer) use it to pick a branch.
+    (out.deg = out.deg || {})[bone] = va.map((v, j) => v + (vb[j] - v) * u);
   }
   const ea = a.expression || {}, eb = b.expression || {};
   for (const name of new Set([...Object.keys(ea), ...Object.keys(eb)])) {
@@ -318,5 +324,53 @@ function clampVec(v, lim) {
     clamp(v[0], lim.x[0], lim.x[1]),
     clamp(v[1], lim.y[0], lim.y[1]),
     clamp(v[2], lim.z[0], lim.z[1]),
+  ];
+}
+
+const wrapPi = (a) => ((a + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+
+/**
+ * Canonical XYZ-Euler decomposition (radians) of a unit quaternion — the
+ * same numbers THREE.Euler().setFromQuaternion(q, 'XYZ') returns.
+ */
+export function quatToXyzEuler(q) {
+  const { x, y, z, w } = q;
+  const m13 = 2 * (x * z + y * w);
+  if (Math.abs(m13) < 0.9999999) {
+    return [
+      Math.atan2(-2 * (y * z - x * w), 1 - 2 * (x * x + y * y)),
+      Math.asin(clamp(m13, -1, 1)),
+      Math.atan2(-2 * (x * y - z * w), 1 - 2 * (y * y + z * z)),
+    ];
+  }
+  return [
+    Math.atan2(2 * (y * z + x * w), 1 - 2 * (x * x + z * z)),
+    Math.asin(clamp(m13, -1, 1)),
+    0,
+  ];
+}
+
+/**
+ * Clamp a rest-relative bone quaternion into the per-axis KEYFRAME_LIMITS
+ * euler box (degrees), picking the Euler BRANCH that reads closest to
+ * `hintDeg` (sample.deg for the bone). XYZ-Euler has two representations
+ * per rotation — (x, y, z) and (x+π, π−y, z+π) — and the canonical one
+ * tops out at ±90° on Y, so a legitimate hinge spin past 90° (an elbow
+ * bending to 110°) canonically reads as X/Z=±180° and MUST NOT be clamped
+ * from that branch: it would wreck a valid pose (verified: both branches
+ * yield the identical rotation with three.js' XYZ order). Returns the
+ * clamped euler triple in RADIANS.
+ */
+export function clampRelEuler(q, limDeg, hintDeg) {
+  const e = quatToXyzEuler(q);
+  const alt = [wrapPi(e[0] + Math.PI), wrapPi(Math.PI - e[1]), wrapPi(e[2] + Math.PI)];
+  const h = (Array.isArray(hintDeg) ? hintDeg : [0, 0, 0]).map((d) => (Number(d) || 0) * DEG);
+  const d1 = (e[0] - h[0]) ** 2 + (e[1] - h[1]) ** 2 + (e[2] - h[2]) ** 2;
+  const d2 = (alt[0] - h[0]) ** 2 + (alt[1] - h[1]) ** 2 + (alt[2] - h[2]) ** 2;
+  const b = d2 < d1 ? alt : e;
+  return [
+    clamp(b[0], limDeg.x[0] * DEG, limDeg.x[1] * DEG),
+    clamp(b[1], limDeg.y[0] * DEG, limDeg.y[1] * DEG),
+    clamp(b[2], limDeg.z[0] * DEG, limDeg.z[1] * DEG),
   ];
 }

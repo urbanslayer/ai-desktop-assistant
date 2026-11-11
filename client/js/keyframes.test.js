@@ -16,6 +16,7 @@ import {
   KF_BLEND, KEYFRAME_BONES, KEYFRAME_LIMITS, KEYFRAME_EXPRESSIONS,
   HIPS_Y_MIN, HIPS_Y_MAX, validateAnimation, clampAnimation, sample,
   eulerToQuatXYZ, quatSlerp, quatAngleDeg, easeSmooth, IDENTITY_QUAT,
+  clampRelEuler, quatToXyzEuler,
 } from './keyframes.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -175,6 +176,30 @@ if (THREE) {
       assert.ok(quatNear(t, m, 1e-9), `(${x},${y},${z})`);
     }
   });
+
+  test('quatToXyzEuler matches THREE canonical + clampRelEuler keeps >90° hinges',
+    need, () => {
+      const P = Math.PI;
+      for (const [x, y, z] of [[20, -30, 40], [10, 95, 20], [0, 103.6, 0],
+                               [137, 137, 0], [-100, 10, 60], [0, -110, 0]]) {
+        const q = new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(x * P / 180, y * P / 180, z * P / 180, 'XYZ'));
+        const mine = quatToXyzEuler(q);
+        const three = new THREE.Euler().setFromQuaternion(q, 'XYZ');
+        assert.ok(near(mine[0], three.x, 1e-9) && near(mine[1], three.y, 1e-9)
+          && near(mine[2], three.z, 1e-9), `decompose (${x},${y},${z})`);
+      }
+      // an elbow hinge to 110° (canonical reads X/Z=±180!) survives its own
+      // clamp untouched — the bug that ate the fixture's 110° keyframes:
+      const hinge = eulerToQuatXYZ(0, 110, 0);
+      const c = clampRelEuler(hinge, KEYFRAME_LIMITS.leftLowerArm, [0, 110, 0]);
+      const back = eulerToQuatXYZ(c[0] / P * 180, c[1] / P * 180, c[2] / P * 180);
+      assert.ok(quatNear(hinge, back, 1e-9), '110° hinge clamped away');
+      // and an out-of-box spin hint-consistent branch DOES clamp: Y=135 > 126
+      const over = eulerToQuatXYZ(0, 135, 0);
+      const c2 = clampRelEuler(over, KEYFRAME_LIMITS.leftLowerArm, [0, 135, 0]);
+      assert.ok(near(c2[1] * 180 / P, 126, 1e-9), `no clamp: ${c2}`);
+    });
 
   // ── fake rig: pose.test.js's skeleton PLUS finger bones (they are NOT in
   //    the motion cache, so this also drives the _kfBone rest-snapshot path)
@@ -412,6 +437,10 @@ if (THREE) {
     const FRAMES = 10 * 60 * 60;              // 10 simulated minutes
     const euler = new THREE.Euler();
     const rel = new THREE.Quaternion();
+    const qClamp = new THREE.Quaternion();
+    const qOff = new THREE.Quaternion();
+    const qExp = new THREE.Quaternion();
+    const EASEK = (x) => x * x * (3 - 2 * x);   // pose.js blend easing
     const REST_DEG = 180 / Math.PI;
     let ai = 0, gap = 10, touched = new Set(), pending = null;
     let nextEvent = 200 + Math.floor(rnd() * 300), interrupts = 0, completed = 0;
@@ -463,19 +492,48 @@ if (THREE) {
         }
       }
       if (pose.kf) {
+        // what the contract sampler says right now (same t the pose layer uses)
+        const kfS = sample(pose.kf.anim, pose.kf.anim.loop ? pose.kf.t
+          : Math.min(pose.kf.t, pose.kf.anim.duration_s));
         for (const bone of pose.kf.bones) {
           touched.add(bone);
           const nb = pose._kfBone(bone);
           if (!nb) continue;
           rel.copy(nb.rest).conjugate().multiply(nb.node.quaternion);
-          euler.setFromQuaternion(rel);
           const lim = KEYFRAME_LIMITS[bone];
           if (lim) {
-            for (const ax of ['x', 'y', 'z']) {
-              const v = euler[ax] * REST_DEG;
-              assert.ok(v >= lim[ax][0] - 1e-3 && v <= lim[ax][1] + 1e-3,
-                `${bone}.${ax}=${v.toFixed(2)} past ${lim[ax]} f=${f}`);
+            // inside-the-limits, BRANCH-aware: the offset reads inside the
+            // euler box on the branch the sample intends (X/Z=±180 is a
+            // legitimate >90° hinge, not a violation — see clampRelEuler)
+            const c = clampRelEuler(rel, lim,
+              (kfS.deg && kfS.deg[bone]) || [0, 0, 0]);
+            qClamp.setFromEuler(euler.set(c[0], c[1], c[2], 'XYZ'));
+            assert.ok(rel.angleTo(qClamp) < 1e-6,
+              `${bone} offset past its limit box f=${f}`);
+          }
+          // and it is actually PLAYING the sampled motion, not just legal:
+          // (skipped while a grab/sit overrides bones below the kf layer —
+          // those frames belong to the interrupt layer, and the clean-rest
+          // assertions after the interrupt cover the handover)
+          const off = kfS.bones[bone];
+          if (off && !pose.kf.ghost && pose.grabs.size === 0
+              && pose.sitState === null) {
+            qOff.set(off.x, off.y, off.z, off.w);
+            qExp.set(0, 0, 0, 1).slerp(qOff, EASEK(pose.kf.w));
+            if (lim) {
+              // the player's exact pipeline: sample -> blend -> branch-aware
+              // clamp (a slerp between two box corners can bulge past an
+              // axis; the limits then win over the geodesic — by contract)
+              const c2 = clampRelEuler(qExp, lim,
+                (kfS.deg && kfS.deg[bone]) || [0, 0, 0]);
+              qExp.setFromEuler(euler.set(c2[0], c2[1], c2[2], 'XYZ'));
             }
+            const err = rel.angleTo(qExp) * 180 / Math.PI;
+            assert.ok(err <= (LIFE_BONES.has(bone) ? 3.0 : 0.5),
+              `${bone} drifts ${err.toFixed(2)}° from the sampled pose f=${f} `
+              + `grabs=[${[...pose.grabs.keys()]}] sit=${!!pose.sitState} `
+              + `anim=${pose.kf.anim.name} t=${pose.kf.t.toFixed(2)} `
+              + `w=${pose.kf.w.toFixed(3)} ghost=${!!pose.kf.ghost}`);
           }
         }
         assert.ok(Number.isFinite(motion._node('hips').position.y), 'hips_y NaN');
