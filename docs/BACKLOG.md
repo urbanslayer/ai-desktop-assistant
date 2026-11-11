@@ -162,7 +162,9 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 5. ~~**Optional: "only when I say her name"** filter for always-listen mode~~ — **DONE 2026-11-09**,
    see Done (2026-11-09) above.
 6. **She creates her own animations** (owner request), for whichever avatar is active at the time.
-   **IN PROGRESS 2026-11-11 — tier 1 (LLM keyframes) per docs/SELF_ANIMATION.md; tier 2 stays plan only.**
+   **Tier 1 DONE 2026-11-11 — LLM-authored keyframes per docs/SELF_ANIMATION.md** (create/keep/delete/list/adapt
+   tools, model-scoped storage, preview-then-keep, web Animations section; owner live test pending). Tier 2
+   (text-to-motion on eve) stays plan only.
    - **Shape:** she authors a named animation as data: keyframes of VRM humanoid bone rotations,
      expressions and timing, in the same format as the built-in gestures in `client/js/gestures.js`.
      She can then play it later through an action tag (`[act:my_bow]`) or a tool, like the built-ins.
