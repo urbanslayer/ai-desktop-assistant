@@ -76,11 +76,116 @@ SCENARIOS = {
     # Frame times are RELATIVE TO WAKE; the gesture starts at its startMs.
     "zoom": (None, []),
     # touch & posing QA (docs/TOUCH.md): drive the page with --touch specs
-    # (page runTouchSpec grammar) and capture mid-interaction.
-    "grab": (None, []),   # e.g. --touch "grab arm_l hand_l 0 0 -120 -140 900@2500"
-    "sit": (None, []),    # e.g. --touch "sit:476@1500;sit:578@9000"
-    "pat": (None, []),    # e.g. --touch "taps head head 3 300@2500"
+    # (page runTouchSpec grammar) and capture mid-interaction. The grab spec
+    # MUST drag the cursor far from rest (reviewer: a 0-px drag proves
+    # nothing); evaluate_touch_gates() asserts the hand followed the RAW
+    # cursor (or landed on the IK clamp point with the reason printed).
+    # grab  e.g. --touch "grab hand_l hand_l hand_l 91 -257 900 2200@1500"
+    #        (press the hand_l rect centre, drag 91 px out / 257 px UP over
+    #         900 ms, park 2200 ms — one PNG per grab fires EVENT-DRIVEN once
+    #         the cursor is steady 800 ms, so no clock-alignment guesswork)
+    # sit   e.g. --touch "sit:476@1500;sit:578@9000"
+    # pat   e.g. --touch "taps head head head head head 260@400" with capture
+    #        times INSIDE the pat hold window (e.g. 1.00,2.60 for taps at
+    #        400+260k ms): the gate checks the INSTANTANEOUS head-bone roll at
+    #        capture time in 8..12 deg, not the latched run peak.
+    "grab": (None, []),
+    "sit": (None, []),
+    "pat": (None, []),
 }
+
+
+def evaluate_touch_gates(outdir):
+    """Parse the per-frame /measure JSONs and print the reviewer's non-circular
+    touch gates. Returns the number of FAILed checks (0 = all green).
+
+    Per grab frame (metrics.grabQA, see index.html rikoMeasure):
+      spec sanity     rawDistPx >= 60      (the cursor must have LEFT rest)
+      reachable       dispPx >= 0.6*rawDistPx  AND  handToRawPx <= 12
+      clamped         dispPx >= 80 for far targets (rawDistPx >= 200, i.e. the
+                      above-shoulder case; else >= 40), hand lands ON the
+                      clamped IK point (handToClampedPx <= 14) and the clamp
+                      distance + reason (reach vs torso capsule) are printed
+      joint limits    live bone deviation vs rest <= GRAB_LIMITS (+0.5 deg)
+      capsule         capsuleClearM >= -0.01 (when within the capsule span)
+    Per pat frame: instantaneous patRollDeg (react active at capture time);
+    the run-level gate is best |instantaneous| in 8..12 across frames.
+    """
+    fails = 0
+    inst_frames = []
+    best = 0.0
+    scenario_is_pat = any(Path(outdir).glob("pat-*.json"))
+    for j in sorted(Path(outdir).glob("*.json")):
+        try:
+            met = json.loads(j.read_text()).get("metrics") or {}
+        except (json.JSONDecodeError, OSError):
+            continue
+        for gid, e in sorted((met.get("grabQA") or {}).items()):
+            if "dispPx" not in e:
+                continue
+            checks = [("cursor-left-rest>=60px", e["rawDistPx"] >= 60)]
+            reason = ""
+            if e.get("reachable", False):
+                checks.append(("disp>=60%raw", e["dispPx"] >= 0.6 * e["rawDistPx"]))
+                checks.append(("hand->raw<=12px", e["handToRawPx"] <= 12))
+            elif e.get("clampReason") == "limits":
+                checks.append(("disp>=50%raw", e["dispPx"] >= 0.5 * e["rawDistPx"]))
+                htc = e.get("handToClampedPx")
+                checks.append(("hand->clamp<=14px", htc is not None and htc <= 14))
+                reason = (f"joint-limit clamp: IK solved inside reach but GRAB_LIMITS "
+                          f"rotation stopped the arm {e['handToRawPx']}px short of "
+                          f"the cursor (boneAngles vs limits in json)")
+            elif e.get("clampReason"):
+                need = 80 if e["rawDistPx"] >= 200 else 40
+                checks.append((f"disp>={need}px", e["dispPx"] >= need))
+                htc = e.get("handToClampedPx")
+                checks.append(("hand->clamp<=14px", htc is not None and htc <= 14))
+                reason = (f"{e['clampReason']} clamp: raw {e.get('rawDistM')}m vs "
+                          f"reach {e.get('reachM')}m, raw capsule clear "
+                          f"{e.get('rawCapsuleClearM')}m -> hand short of cursor "
+                          f"by {e.get('handToRawM', e['handToRawPx'])} "
+                          f"(lands {htc}px from the clamped point)")
+            else:
+                checks.append(("has-reachability-verdict", False))
+            side = "left" if gid.endswith("_l") else "right"
+            bones = ([f"{side}UpperArm", f"{side}LowerArm"] if gid.startswith(("hand", "arm"))
+                     else [f"{side}UpperLeg", f"{side}LowerLeg"] if gid.startswith("foot") else [])
+            for bn in bones:
+                ang = (e.get("boneAngles") or {}).get(bn)
+                lim = (e.get("boneLimitsDeg") or {}).get(bn)
+                if ang is not None and lim is not None:
+                    checks.append((f"{bn}<=limit", ang <= lim + 0.5))
+            if e.get("capsuleClearM") is not None:
+                checks.append(("outside-capsule", e["capsuleClearM"] >= -0.01))
+            bad = [n for n, ok in checks if not ok]
+            fails += len(bad)
+            print(f"[grab-gate] {j.name} {gid} "
+                  f"{'reachable' if e.get('reachable') else 'clamped:' + str(e.get('clampReason'))} "
+                  f"disp={e['dispPx']}px "
+                  f"raw={e['rawDistPx']}px hand2raw={e['handToRawPx']}px "
+                  f"elbow={e.get('elbowDeg')}deg capClear={e.get('capsuleClearM')}m "
+                  f"{'PASS' if not bad else 'FAIL ' + ','.join(bad)}"
+                  + (f"  ({reason})" if reason else ""), flush=True)
+        pk = met.get("patPeakRollDeg")
+        ir = met.get("patRollDeg")
+        if ir is not None:
+            inst_frames.append((j.name, ir))
+            best = max(best, abs(ir))
+        if pk or ir is not None:
+            print(f"[pat-gate]  {j.name} instantaneous head roll="
+                  f"{ir if ir is not None else 'none-active'}deg "
+                  f"(latched peak {pk}deg)", flush=True)
+    if inst_frames:
+        ok = 8.0 <= best <= 12.0
+        fails += 0 if ok else 1
+        print(f"[pat-gate]  best INSTANTANEOUS roll in captured frames "
+              f"= {best:.1f}deg (gate 8..12, measured at capture time — not "
+              f"the latched run peak) {'PASS' if ok else 'FAIL'}", flush=True)
+    elif scenario_is_pat:
+        fails += 1
+        print("[pat-gate]  FAIL: no captured frame had an active headTilt "
+              "react — capture times must land inside the pat window", flush=True)
+    return fails
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -242,10 +347,11 @@ def main():
     time.sleep(1.0)  # let in-flight /capture POSTs land
     srv.shutdown()
     shots = sorted(p for p in os.listdir(args.outdir) if p.endswith(".png"))
-    print(f"[harness] scenario={args.scenario} shots={len(shots)}")
+    gate_fails = evaluate_touch_gates(args.outdir)
+    print(f"[harness] scenario={args.scenario} shots={len(shots)} touch-gate-fails={gate_fails}")
     for s in shots:
         print("  ", os.path.join(args.outdir, s))
-    return 0 if shots else 1
+    return 0 if shots and gate_fails == 0 else 1
 
 
 if __name__ == "__main__":

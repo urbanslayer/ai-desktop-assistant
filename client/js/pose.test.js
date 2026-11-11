@@ -149,6 +149,76 @@ if (THREE) {
     assert.deepEqual(bad.slice(0, 6), []);
   });
 
+  // ── reviewer regressions (T1 review: the first capture spec dragged 0 px,
+  // so a grab that did NOTHING passed; these pin the visible-follow itself) ──
+  test('grab regression: the hand visibly FOLLOWS a far raw target', need, () => {
+    const { motion, pose } = makePoseRig();
+    sim(motion, pose, 0.5);
+    const restW = live(motion, 'leftHand');
+    const target = [0.6, 1.6, 0.1];         // far up-out from the resting wrist
+    pose.setTarget('hand_l', target);
+    sim(motion, pose, 1.2);                 // deep inside the hold phase
+    const w = live(motion, 'leftHand');
+    const targetDist = new THREE.Vector3(...target).distanceTo(restW);
+    const disp = w.distanceTo(restW);
+    assert.ok(targetDist > 0.25, `spec sanity: target only ${targetDist.toFixed(3)} m from rest`);
+    // reviewer gate: displacement >= 60 % of the raw target's distance from rest
+    assert.ok(disp >= 0.6 * targetDist,
+      `hand moved ${disp.toFixed(3)} m but the target is ${targetDist.toFixed(3)} m away — grab is a no-op`);
+    assert.ok(w.distanceTo(new THREE.Vector3(...target)) < 0.05,
+      `wrist ${w.toArray().map((v) => +v.toFixed(3))} never reached the reachable target`);
+  });
+
+  test('release regression: arm returns to rest after a far grab (shake release)', need, () => {
+    const { motion, pose } = makePoseRig();
+    sim(motion, pose, 0.5);
+    const restW = live(motion, 'leftHand');
+    pose.setTarget('hand_l', [0.6, 1.6, 0.1]);
+    sim(motion, pose, 1.2);
+    pose.release('hand_l', { shake: true });
+    sim(motion, pose, 0.8);
+    const w = live(motion, 'leftHand');
+    // world-position gate (reviewer's "arm returns to rest"); the quaternion
+    // check below is the drift-proof companion, immune to life-layer breath
+    assert.ok(w.distanceTo(restW) < 0.03,
+      `hand ${w.toArray().map((v) => +v.toFixed(3))} not back near rest ${restW.toArray().map((v) => +v.toFixed(3))}`);
+    for (const bn of ['leftUpperArm', 'leftLowerArm']) {
+      const ang = motion._rest.get(bn).angleTo(motion._node(bn).quaternion);
+      assert.ok(ang < 1e-4, `${bn} drift ${ang}`);
+    }
+    assert.equal(pose.grabbedIds().length, 0);
+  });
+
+  test('pat headTilt: peak roll 8-12 deg HELD through the pat, eased out ~0.8 s, head only', need, () => {
+    const { motion, pose } = makePoseRig();
+    motion.setGazeOverride({ yaw: 0, pitch: 0 });
+    sim(motion, pose, 0.3);
+    pose.react('headTilt', { side: 1 });
+    const samples = [];
+    sim(motion, pose, 1.8, () => {
+      const d = pose.debug();
+      if (typeof d.patRollDeg === 'number') samples.push(d.patRollDeg);
+    });
+    const peak = Math.max(...samples.map((r) => Math.abs(r)));
+    assert.ok(peak >= 8 && peak <= 12, `pat peak roll ${peak.toFixed(2)} deg outside 8..12`);
+    // held (not a decaying blip): across the middle 0.30-0.75 s the tilt stays
+    // within 10 % of peak — the old exp-decay envelope failed this
+    const mid = samples.slice(Math.round(0.30 * 60), Math.round(0.75 * 60)).map((r) => Math.abs(r));
+    assert.ok(mid.length > 20, 'not enough hold samples');
+    assert.ok(Math.min(...mid) >= 0.9 * peak,
+      `tilt not held: dips to ${Math.min(...mid).toFixed(2)} deg vs peak ${peak.toFixed(2)}`);
+    // fully eased out at the end of the window (roll hits 0 exactly at dur;
+    // the last three frames before the reaction ends must be all but gone)
+    const tail = samples.slice(-3).map((r) => Math.abs(r));
+    assert.ok(Math.max(...tail) < 0.15, `ease-out incomplete: ${tail}`);
+    // head bone only (garment skinning rule)
+    for (const bn of ['neck', 'chest', 'spine', 'upperChest']) {
+      const ang = motion._rest.get(bn).angleTo(motion._node(bn).quaternion);
+      assert.ok(ang < 0.08, `${bn} rotated ${ang} rad by the pat`);
+    }
+    assert.ok((pose.debug().patPeakRollDeg || 0) >= 8, 'debug().patPeakRollDeg never recorded');
+  });
+
   test('head grab turns ONLY the head bone, inside the gaze envelope', need, () => {
     const { bones, motion, pose } = makePoseRig();
     // freeze gaze: the head delta must then be PURELY the pose overlay —

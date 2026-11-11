@@ -61,11 +61,20 @@ const GRAB_IN = 0.18;        // grab pull-in seconds
 const RELEASE_OUT = 0.4;     // spring-back seconds (docs/TOUCH.md)
 
 // reaction overlay shapes (instant local touch reactions)
+// headTilt (pat): ramp in ~0.15 s, HOLD while the patting continues (each
+// recognised pat re-triggers react() and restarts the hold), then ease out
+// over the last 0.8 s — NOT the exp decay, which faded a "lean into the pat"
+// to a third of its size before the second tap landed (reviewer: invisible).
+// Peak is a 10 deg head-bone ROLL toward the patting side (docs gate 8-12),
+// head bone only (never neck/chest — garment skinning, docs/BODY.md).
 const REACTIONS = {
-  headTilt: { dur: 1.2 },    // lean into the pat; opts: {side}
-  flinch:   { dur: 0.7 },    // bounce away;              opts: {dir} world-x
-  giggle:   { dur: 1.8 },    // wiggle;                   opts: {amp}
+  headTilt: { dur: 1.6, hold: true },  // opts: {side}
+  flinch:   { dur: 0.7 },              // bounce away; opts: {dir} world-x
+  giggle:   { dur: 1.8 },              // wiggle;      opts: {amp}
 };
+const PAT_RAMP_IN = 0.15;              // s to full tilt
+const PAT_EASE_OUT = 0.8;              // s ease-out (docs/TOUCH.md)
+const PAT_ROLL = 0.1745;               // 10 deg peak roll (mid of the 8-12 gate)
 
 /** Closest clamped push of point p outside segment capsule a-b radius r. */
 export function clampOutsideCapsule(p, a, b, r) {
@@ -108,6 +117,7 @@ export class PoseLayer {
     this.sitState = null;
     this.reacts.clear();
     this.flinchX = 0;
+    this._patPeakDeg = 0;
     const T = this.THREE;
     // rest hip->knee->ankle lengths per side (the walk probe only measures the
     // left; grabs need both) + each side's natural knee pole
@@ -292,10 +302,21 @@ export class PoseLayer {
       const dur = REACTIONS[name].dur;
       const decay = Math.exp(-3 * (r.t / dur));
       const inRamp = EASE(clamp(r.t / 0.08, 0, 1));
-      const w = decay * inRamp;
+      let w = decay * inRamp;
       if (name === 'headTilt') {
         const side = Math.sign(r.opts.side || 0);
-        if (headN) this._mulEuler(headN, 0.10 * w, -0.14 * side * w, -0.18 * side * w);
+        // hold-and-ease envelope: full tilt held while the pat lasts, eased
+        // out over PAT_EASE_OUT at the end of the window (ramps IN fast so
+        // the lean is instant, docs/TOUCH.md "react instantly on the page")
+        w = EASE(clamp(r.t / PAT_RAMP_IN, 0, 1))
+          * EASE(clamp((dur - r.t) / PAT_EASE_OUT, 0, 1));
+        const roll = -PAT_ROLL * side * w;   // head-bone roll INTO the pat side
+        if (headN) this._mulEuler(headN, 0.08 * w, -0.12 * side * w, roll);
+        r.w = w;
+        r.rollDeg = roll * 180 / Math.PI;
+        if (Math.abs(r.rollDeg) > (this._patPeakDeg || 0)) {
+          this._patPeakDeg = Math.abs(r.rollDeg);
+        }
       } else if (name === 'giggle') {
         const amp = (r.opts.amp ?? 0.07) * w;
         const s = Math.sin(r.t * Math.PI * 2 * 5.5) * amp;
@@ -397,6 +418,7 @@ export class PoseLayer {
     }
     target = clampOutsideCapsule(target, this.torso.a, this.torso.b,
                                  this.torso.r + 0.02);
+    g.clamped = target.slice();     // px-metric reference: what IK was told
     const sol = solveTwoBoneIK(S.toArray(), target, arm.l1, arm.l2, arm._grabPole);
     if (!sol) return;
     // world-space minimal arcs PRE-multiplied by the rest WORLD quaternion
@@ -525,10 +547,25 @@ export class PoseLayer {
     const T = this.THREE;
     const out = { grabs: {}, sitting: !!this.sitState, sitEdge: null, hipsOffset: null,
                   reacts: [...this.reacts.keys()], flinchX: this.flinchX,
-                  torso: { ...this.torso }, legAngles: {} };
+                  torso: { ...this.torso }, legAngles: {},
+                  // honest per-frame evidence for the grab QA (raw cursor-space
+                  // target vs the eased/clamped one, per-bone deviation vs rest)
+                  patPeakRollDeg: +(this._patPeakDeg || 0).toFixed(2), boneAngles: {} };
+    for (const bn of Object.keys(GRAB_LIMITS)) {
+      const n = m._node(bn), r = m._rest.get(bn);
+      if (n && r) out.boneAngles[bn] = +(r.angleTo(n.quaternion) * 180 / Math.PI).toFixed(2);
+    }
+    for (const [name, r] of this.reacts) {
+      if (name === 'headTilt' && typeof r.rollDeg === 'number') {
+        out.patRollDeg = +r.rollDeg.toFixed(2);
+        out.patW = +r.w.toFixed(3);
+      }
+    }
     for (const [id, g] of this.grabs) {
       out.grabs[id] = { state: g.state, w: +g.w.toFixed(3),
+                        raw: g.raw.map((v) => +v.toFixed(4)),
                         target: g.cur.map((v) => +v.toFixed(4)), shake: g.shake };
+      if (g.clamped) out.grabs[id].clamped = g.clamped.map((v) => +v.toFixed(4));
       if (g.solved) out.grabs[id].solved = g.solved.map((v) => +v.toFixed(4));
     }
     const wp = (n) => (n ? n.getWorldPosition(new T.Vector3()).toArray() : null);

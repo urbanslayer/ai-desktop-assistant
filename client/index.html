@@ -97,7 +97,7 @@
       hitTest, PressTracker, TouchRecogniser, TouchPostGate, GRABBABLE,
       SeamPostPolicy,
     } from './js/touch.js';
-    import { PoseLayer, GRAB_KIND } from './js/pose.js';
+    import { PoseLayer, GRAB_KIND, GRAB_LIMITS } from './js/pose.js';
     import { WalkDirector } from './js/walk.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
              GestureTracker, framingDistance, feetAnchorTarget,
@@ -531,6 +531,10 @@
     let _touchPress = new PressTracker();
     let _touchRec = new TouchRecogniser();
     const _touchGate = new TouchPostGate();
+    // Non-circular grab QA (reviewer): the RAW cursor point and the limb's
+    // REST pixel position, captured per grab, so the harness compares the
+    // hand against the CURSOR (not the already-clamped IK target).
+    const _grabQA = new Map();   // id -> {cursorPx, restPx, rawWorld, restWorld}
     const _lastPt = { x: 0, y: 0 };
     const _tp = new THREE.Vector3();
     const PART_BONE = {
@@ -542,6 +546,7 @@
       _touchPress = new PressTracker();
       _touchRec = new TouchRecogniser();
       grabId = null; grabDepth = null; sitReported = null; touchBlocked = false;
+      _grabQA.clear();
       _seamPolicy.reset();         // the new model's rects are a fresh first post
     }
 
@@ -567,9 +572,21 @@
       barH.name = 'barH'; barV.name = 'barV';
       _ringMesh.add(barH, barV);
     }
-    for (const m of [_edgeMesh, _ringMesh]) { m.renderOrder = 999; m.frustumCulled = false; }
-    _edgeMesh.visible = _ringMesh.visible = false;
-    scene.add(_edgeMesh, _ringMesh);
+    // smaller second marker (green) at the CLAMPED/SOLVED wrist when the
+    // reach/capsule clamp pulls it away from the raw cursor '+' (reviewer:
+    // the big '+' must sit on the RAW cursor point, never on the solved one)
+    const _ringSmMesh = new THREE.Group();
+    {
+      const mat = new THREE.MeshBasicMaterial({ color: 0x50ffa0, transparent: true, opacity: 0.95, depthTest: false });
+      const barH = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+      const barV = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+      barH.frustumCulled = barV.frustumCulled = false;
+      barH.name = 'barH'; barV.name = 'barV';
+      _ringSmMesh.add(barH, barV);
+    }
+    for (const m of [_edgeMesh, _ringMesh, _ringSmMesh]) { m.renderOrder = 999; m.frustumCulled = false; }
+    _edgeMesh.visible = _ringMesh.visible = _ringSmMesh.visible = false;
+    scene.add(_edgeMesh, _ringMesh, _ringSmMesh);
     const _hudV = new THREE.Vector3();
     /* World-space pose of a flat overlay drawn at viewport pixel (px, py),
        at a fixed camera distance: unproject maps that pixel's ray, so it is
@@ -688,6 +705,11 @@
       if (CAPTURE) console.log(`[touch] GRAB ${part} at ${Math.round(x)},${Math.round(y)}`);
       const w0 = b.getWorldPosition(new THREE.Vector3());
       pose.setTarget(part, w0.toArray());   // blend in from where it actually is
+      _grabQA.set(part, {
+        cursorPx: [x, y],
+        restPx: _pxOf(w0.toArray()),        // where the limb sits at grab start
+        rawWorld: w0.toArray(), restWorld: w0.toArray(),
+      });
       grabDepth = camera.position.distanceTo(w0);
       grabId = part; grabDownAt = performance.now();
       postTouch(part, 'grab', x, y);
@@ -761,7 +783,10 @@
       _lastPt.x = e.clientX; _lastPt.y = e.clientY;
       const ms = e.timeStamp || performance.now();
       if (grabId) {                       // drive the IK in the grab plane
-        pose.setTarget(grabId, _grabWorldPoint(e.clientX, e.clientY, grabDepth ?? 2));
+        const w = _grabWorldPoint(e.clientX, e.clientY, grabDepth ?? 2);
+        pose.setTarget(grabId, w);
+        const qa = _grabQA.get(grabId);   // RAW cursor px + world for the QA
+        if (qa) { qa.cursorPx = [e.clientX, e.clientY]; qa.rawWorld = w.toArray(); }
         return;
       }
       const ev = _touchPress.move(e.clientX, e.clientY, ms);
@@ -815,15 +840,33 @@
           _edgeMesh.material.opacity = 0.6 * Math.min(1, s.w);
         } else _edgeMesh.visible = false;
         let shown = false;
-        for (const [, g] of pose.grabs) {
+        for (const [id, g] of pose.grabs) {
           if (g.state !== 'out' && g.cur) {
-            const [px, py] = _pxOf(g.cur);
+            // '+' marks the RAW cursor px (recorded per pointermove); the
+            // eased g.cur is only a fallback when no pointer info exists.
+            const qa = _grabQA.get(id);
+            const [px, py] = qa ? qa.cursorPx : _pxOf(g.cur);
             if (Number.isFinite(px) && Number.isFinite(py)) {
               _ringMesh.visible = true;
               const u = _hudPlace(_ringMesh, px, py, D);
               const bar = _ringMesh.getObjectByName('barH'), bar2 = _ringMesh.getObjectByName('barV');
               bar.scale.set(15 * u, 1.6 * u, 1);          // 15 px x 1.6 px crosshair bars
               bar2.scale.set(1.6 * u, 15 * u, 1);
+              // small green cross at the solved wrist when the clamp pulls it
+              // visibly off the raw cursor point
+              let smShown = false;
+              if (g.solved) {
+                const [sx, sy] = _pxOf(g.solved);
+                if (Number.isFinite(sx) && Number.isFinite(sy)
+                    && Math.hypot(sx - px, sy - py) > 8) {
+                  _ringSmMesh.visible = true;
+                  const u2 = _hudPlace(_ringSmMesh, sx, sy, D);
+                  _ringSmMesh.getObjectByName('barH').scale.set(7 * u2, 0.9 * u2, 1);
+                  _ringSmMesh.getObjectByName('barV').scale.set(0.9 * u2, 7 * u2, 1);
+                  smShown = true;
+                }
+              }
+              if (!smShown) _ringSmMesh.visible = false;
               shown = true;
               break;
             }
@@ -832,6 +875,7 @@
         if (!shown && _qaMark) {
           // transient press marker for instant gestures (QA runs only)
           if (performance.now() / 1000 < _qaMark.until) {
+            _ringSmMesh.visible = false;
             _ringMesh.visible = true;
             const u = _hudPlace(_ringMesh, _qaMark.x, _qaMark.y, D);
             const bh = _ringMesh.getObjectByName('barH'), bv = _ringMesh.getObjectByName('barV');
@@ -1170,7 +1214,17 @@
     }
 
     // ── visual QA capture: PNGs (and pose metrics) at fixed seconds after wake ──
-    window.rikoCapture = () => renderer.domElement.toDataURL('image/png');
+    window.rikoCapture = () => {
+      // Headless Chromium can hand toDataURL a buffer up to a compositor
+      // frame behind the live scene (grab tiles captured a stale canvas while
+      // the pose stream proved the scene had moved). Re-render synchronously
+      // AND flush the GL pipe: in headless SwiftShader the draw commands sit
+      // in a queue and toDataURL read back the pre-drag buffer without an
+      // explicit finish().
+      renderer.render(scene, camera);
+      renderer.getContext().finish();
+      return renderer.domElement.toDataURL('image/png');
+    };
     // Pose metrics against the REAL rig, written for ANY VRM (0.x or 1.0;
     // bones a rig lacks report null instead of throwing — the owner's Furina
     // model has no chest bone, which used to kill every /measure POST).
@@ -1270,6 +1324,113 @@
             }
             return out;
           })(),
+          // Non-circular grab evidence (reviewer fix): hand px measured against
+          // the RAW CURSOR px and the hand's own REST px (recorded by the page
+          // at grab time), plus reach/clamp geometry, elbow flex and torso-
+          // capsule clearance. The harness gates live in
+          // client/tools/capture_frames.py:evaluate_grab_gates.
+          grabQA: (() => {
+            const out = {};
+            const dbg = pose.debug();
+            const capClear = (p) => {  // signed clearance vs torso capsule
+              const a = pose.torso.a, b = pose.torso.b, r = pose.torso.r;
+              const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+              const L2 = ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2;
+              const t = L2 > 1e-9
+                ? Math.max(0, Math.min(1, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]
+                                           + (p[2] - a[2]) * ab[2]) / L2))
+                : 0;
+              if (t <= 0 || t >= 1) return null;      // beyond the capsule span
+              const dx = p[0] - (a[0] + ab[0] * t), dy = p[1] - (a[1] + ab[1] * t),
+                    dz = p[2] - (a[2] + ab[2] * t);
+              return +(Math.hypot(dx, dy, dz) - r).toFixed(4);
+            };
+            for (const [id, g] of pose.grabs) {
+              if (g.state === 'out') continue;
+              const kind = GRAB_KIND[id];
+              const bone = vrm.humanoid.getNormalizedBoneNode(PART_BONE[id]);
+              if (!bone) continue;
+              const hw = bone.getWorldPosition(new THREE.Vector3());
+              const handPx = _pxOf(hw.toArray());
+              const qa = _grabQA.get(id);
+              const e = { state: g.state, w: +g.w.toFixed(3) };
+              if (qa) {
+                const d2 = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]);
+                e.cursorPx = qa.cursorPx.map((v) => +v.toFixed(1));
+                e.restPx = qa.restPx.map((v) => +v.toFixed(1));
+                e.handPx = handPx.map((v) => +v.toFixed(1));
+                e.dispPx = +d2(handPx, qa.restPx).toFixed(1);
+                e.rawDistPx = +d2(qa.cursorPx, qa.restPx).toFixed(1);
+                e.handToRawPx = +d2(handPx, qa.cursorPx).toFixed(1);
+                e.rawCapsuleClearM = capClear(qa.rawWorld);
+              }
+              if (kind.chain === 'arm' && qa) {
+                const arm = motion.rig.arms?.[kind.side];
+                const Sn = vrm.humanoid.getNormalizedBoneNode(`${kind.side}UpperArm`);
+                const En = vrm.humanoid.getNormalizedBoneNode(`${kind.side}LowerArm`);
+                if (arm && Sn && En) {
+                  const Sw = Sn.getWorldPosition(new THREE.Vector3());
+                  const Ew = En.getWorldPosition(new THREE.Vector3());
+                  const rawW = new THREE.Vector3().fromArray(qa.rawWorld);
+                  const dS = rawW.distanceTo(Sw);
+                  e.reachM = +(arm.l1 + arm.l2).toFixed(4);
+                  e.rawDistM = +dS.toFixed(4);
+                  e.reachable = dS <= (arm.l1 + arm.l2) * 0.995;
+                  e.handToRawM = +rawW.distanceTo(hw).toFixed(4);  // clamp dist
+                  const u = Sw.clone().sub(Ew), v = hw.clone().sub(Ew);
+                  const ul = u.length() * v.length();
+                  e.elbowDeg = ul > 1e-9
+                    ? +(Math.acos(Math.max(-1, Math.min(1, u.dot(v) / ul)))
+                        * 180 / Math.PI).toFixed(1)
+                    : null;
+                }
+              }
+              // clamp classification (non-circular evidence for the
+              // unreachable case): WHY can the hand not sit on the cursor?
+              if (qa && e.reachable === true && e.handToRawPx > 12
+                  && (e.rawCapsuleClearM === null || e.rawCapsuleClearM >= 0)) {
+                const cW0 = g.solved || g.clamped;
+                if (cW0) {
+                  const d0 = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]);
+                  if (d0(handPx, _pxOf(cW0)) <= 14) {
+                    // IK solved, but GRAB_LIMITS rotation stopped the bones
+                    // short of the solved point: joint-limit clamp
+                    e.reachable = false;
+                    e.clampReason = 'limits';
+                  }
+                }
+              }
+              if (qa && e.reachable === false && !e.clampReason) {
+                e.clampReason = (e.rawDistM !== undefined && e.reachM !== undefined
+                                 && e.rawDistM > e.reachM * 0.995) ? 'reach' : 'capsule';
+              } else if (qa && e.reachable === true && e.rawCapsuleClearM !== null && e.rawCapsuleClearM < 0) {
+                e.reachable = false;
+                e.clampReason = 'capsule';
+              }
+              if (qa && e.reachable === false) {
+                // the point IK could actually aim for: g.solved is the
+                // reach/capsule-clamped solution; hand-to-clamped proves the
+                // IK landed where geometry allowed (non-circular: raw gap +
+                // reason are reported alongside)
+                const cW = g.solved || g.clamped;
+                if (cW) {
+                  const d2c = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]);
+                  e.handToClampedPx = +d2c(handPx, _pxOf(cW)).toFixed(1);
+                  e.clampedPx = _pxOf(cW).map((v) => +v.toFixed(1));
+                }
+              }
+              if (kind.chain === 'arm' || kind.chain === 'leg') {
+                e.capsuleClearM = capClear(hw.toArray());
+              }
+              e.boneAngles = dbg.boneAngles;   // deg vs rest vs GRAB_LIMITS
+              e.boneLimitsDeg = Object.fromEntries(
+                Object.entries(GRAB_LIMITS).map(([k, v]) => [k, +(v * 180 / Math.PI).toFixed(1)]));
+              out[id] = e;
+            }
+            return out;
+          })(),
+          patPeakRollDeg: pose.debug().patPeakRollDeg,
+          patRollDeg: pose.debug().patRollDeg ?? null,
           headFootPx: headPx && footPx ? Math.round(footPx[1] - headPx[1]) : null,
           feetFromBottomPx: footPx ? Math.round(viewH() - footPx[1]) : null,
           // sit gates (docs/TOUCH.md): px the lowest foot hangs BELOW the
@@ -1379,21 +1540,63 @@
     }
     if (CAPTURE) {
       const wokeAt = performance.now();
-      for (const s of String(CAPTURE).split(',').map(Number).filter((n) => n > 0)) {
-        setTimeout(async () => {
+      // VRM load latency can slide the --touch spec behind these fixed
+      // capture times (furina 15 MB lags ~0.5 s, so the drag was only half
+      // done at capture time). Gate each capture on the interaction actually
+      // being in its hold phase instead of trusting wall-clock alignment.
+      const waitFor = async (fn, ms) => {
+        const t0 = performance.now();
+        while (!fn() && performance.now() - t0 < ms) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      };
+      const specTxt = String(typeof TOUCH_SPEC !== 'undefined' ? TOUCH_SPEC || '' : '');
+      const patPeak = () => {
+        try { return (pose.debug().patPeakRollDeg || 0) >= 8; } catch { return false; }
+      };
+      const postShot = async () => {
+        await new Promise((r) => requestAnimationFrame(r));  // a rendered frame in the buffer
+        const t = ((performance.now() - wokeAt) / 1000).toFixed(2);
+        await fetch(`/capture?t=${t}`, {
+          method: 'POST', headers: { 'Content-Type': 'text/plain' },
+          body: window.rikoCapture(),
+        });
+        await fetch(`/measure?t=${t}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(window.rikoMeasure()),
+        });
+      };
+      if (/(^|;)grab /.test(specTxt)) {
+        // Grab evidence is EVENT-DRIVEN: one shot per distinct grab, fired
+        // once the grab is in 'hold' with a stable cursor for 300 ms. Page
+        // clocks (wokeAt vs the post-VRM-load spec clock) drift by the model
+        // load time, so fixed capture seconds landed mid-drag / post-release
+        // on heavier avatars — a settled hold is the only frame worth a tile.
+        const shots = new Set();
+        let sig = '', stable = 0;
+        setInterval(async () => {
           try {
-            await new Promise((r) => requestAnimationFrame(r));  // a rendered frame in the buffer
-            const t = ((performance.now() - wokeAt) / 1000).toFixed(2);
-            await fetch(`/capture?t=${t}`, {
-              method: 'POST', headers: { 'Content-Type': 'text/plain' },
-              body: window.rikoCapture(),
-            });
-            await fetch(`/measure?t=${t}`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(window.rikoMeasure()),
-            });
-          } catch { /* harness gone; whatever it captured is captured */ }
-        }, s * 1000);
+            const qa = window.rikoMeasure().metrics.grabQA || {};
+            const key = Object.entries(qa)
+              .filter(([, e]) => e.state === 'hold' && e.cursorPx)
+              .map(([id, e]) => `${id}:${e.cursorPx}`).sort().join('|');
+            if (!key) { sig = ''; stable = 0; return; }
+            if (key !== sig) { sig = key; stable = 0; return; }
+            if (++stable < 8 || shots.has(key)) return;   // 800 ms steady cursor:
+            // drag done AND the IK ease has converged (release lands at +2.2 s)
+            shots.add(key);
+            await postShot();
+          } catch { /* harness gone */ }
+        }, 100);
+      } else {
+        for (const s of String(CAPTURE).split(',').map(Number).filter((n) => n > 0)) {
+          setTimeout(async () => {
+            try {
+              if (/(^|;)taps? /.test(specTxt)) await waitFor(patPeak, 8000);
+              await postShot();
+            } catch { /* harness gone; whatever it captured is captured */ }
+          }, s * 1000);
+        }
       }
     }
 
