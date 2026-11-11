@@ -15,7 +15,7 @@ const need = { skip: THREE ? false : 'run `npm install` in client/ (three is a d
 if (THREE) {
   const { AvatarMotion } = await import('./motion.js');
   const {
-    PoseLayer, GRAB_LIMITS, HEAD_GRAB_LIMITS, clampOutsideCapsule,
+    PoseLayer, GRAB_LIMITS, HEAD_GRAB_LIMITS, clampOutsideCapsule, clampGrabTarget,
   } = await import('./pose.js');
 
   // ── fake VRM on a real Object3D skeleton (same as motion.test.js) ──
@@ -431,5 +431,58 @@ if (THREE) {
       }
     }
     assert.ok(bad.length === 0, `${bad.length} violations: ${JSON.stringify(bad.slice(0, 8))}`);
+  });
+
+  // ── clampGrabTarget: cursor-ray reach clamp (docs/TOUCH.md live-issue notes) ──
+  const distToRay = (p, c, u) => {
+    const w = p.map((v, i) => v - c[i]);
+    const x = [w[1] * u[2] - w[2] * u[1], w[2] * u[0] - w[0] * u[2], w[0] * u[1] - w[1] * u[0]];
+    return Math.hypot(...x);
+  };
+
+  test('clampGrabTarget passes through points already within reach', () => {
+    const T = [0.35, 1.0, 0.2];
+    assert.deepEqual(clampGrabTarget([0, 1.5, 2], [0, 0, -1], [0.2, 1.25, 0], 0.5, T), T);
+  });
+
+  test('clampGrabTarget aims the cursor ray at the near side of the reach sphere', () => {
+    const C = [0, 1.6, 2], J = [0, 1.25, 0], r = 0.5;
+    const dir = J.map((v, i) => v - C[i]);
+    const T = J.map((v, i) => v + 4 * dir[i]);   // a raw point far past the joint
+    const p = clampGrabTarget(C, dir, J, r, T);
+    assert.ok(Math.abs(Math.hypot(...p.map((v, i) => v - J[i])) - r) < 1e-6, 'on the sphere');
+    const u = dir.map((v) => v / Math.hypot(...dir));
+    assert.ok(distToRay(p, C, u) < 1e-6, 'lands under the cursor ray, not off to the side');
+    assert.ok(p[2] > J[2], 'camera-side intersection (hand toward the viewer)');
+  });
+
+  test('clampGrabTarget far drag: the clamp point hugs the cursor, unlike the along-ray clamp', () => {
+    // regression for the live complaint "moving her hand is quite tricky":
+    // a measured headless grab dragged the cursor ~198 px but the hand moved
+    // only 43 px, because IK clamps ALONG the shoulder->target ray and that
+    // ray's screen projection drifts away from the cursor. Geometry here is
+    // the measured one (camera ~[0,1.5,1.9], left shoulder, reach 0.4345,
+    // raw cursor-plane point [0.72,0.42,0.07]).
+    const C = [0, 1.5, 1.9], J = [0.2, 1.25, 0], r = 0.4345, T = [0.72, 0.42, 0.07];
+    const dir = T.map((v, i) => v - C[i]);
+    const u = dir.map((v, i) => v / Math.hypot(...dir));
+    const p = clampGrabTarget(C, dir, J, r, T);
+    const naive = J.map((v, i) => v + (T[i] - v) * (r / Math.hypot(...T.map((v, i2) => v - J[i2]))));
+    assert.ok(p.every(Number.isFinite));
+    assert.ok(Math.abs(Math.hypot(...p.map((v, i) => v - J[i])) - r) < 1e-6,
+              'reachable: sits exactly on the IK sphere, so IK cannot drift further');
+    assert.ok(distToRay(p, C, u) < distToRay(naive, C, u),
+              `clamp must follow the cursor better than the old along-ray clamp ` +
+              `(${distToRay(p, C, u).toFixed(3)} vs ${distToRay(naive, C, u).toFixed(3)})`);
+  });
+
+  test('clampGrabTarget survives degenerate inputs', () => {
+    const a = clampGrabTarget([0, 1.5, 2], [0, 0, 0], [0, 1, 0], 0.5, [0, 3, 0]);
+    assert.ok(Math.abs(Math.hypot(...a.map((v, i) => v - [0, 1, 0][i])) - 0.5) < 1e-6,
+              'zero ray falls back to the along-ray clamp');
+    const b = clampGrabTarget([0, 1, 0], [0, -1, -2], [0, 1, 0], 0, [0, -5, -3]);
+    assert.ok(b.every(Number.isFinite), 'camera on the joint + zero reach stays finite');
+    assert.ok(Math.abs(Math.hypot(...b.map((v, i) => v - [0, 1, 0][i])) - 0.05) < 1e-6,
+              'zero reach floors to the 5 cm minimum and stays on the sphere');
   });
 }

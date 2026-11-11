@@ -22,7 +22,7 @@
 // (for the bone cache, rest snapshots and rig profile — rest quaternions are
 // taken from motion, never re-derived, so both layers share one truth).
 
-import { solveTwoBoneIK, sub, add, mul, dot, len, norm } from './ik.js';
+import { solveTwoBoneIK, sub, add, mul, dot, len, dist, norm } from './ik.js';
 import {
   sample as sampleKeyframes, clampAnimation, KF_BLEND, KEYFRAME_LIMITS,
   clampRelEuler,
@@ -93,6 +93,39 @@ export function clampOutsideCapsule(p, a, b, r) {
   if (dl > 1e-6) return add(near, mul(d, r / dl));
   // exactly on the axis: shove along any perpendicular
   return add(near, mul(norm([ab[1], -ab[0], ab[2] || 1e-3]), r));
+}
+
+/** IK target for a cursor-ray grab (docs/TOUCH.md live-issue notes).
+ *  A far drag puts the cursor-plane point far outside the limb's reach
+ *  sphere, and IK's along-ray clamp then parks the hand at a screen point
+ *  that does NOT follow the cursor (measured live-shape: 198 px drag → hand
+ *  moved 43 px). Instead: inside reach → the exact point; otherwise aim the
+ *  CURSOR RAY (camera → cursor) at the reach sphere around the live joint
+ *  and take the near intersection — the clamped hand keeps tracking the
+ *  cursor while the arm is fully extended. A ray that misses the sphere
+ *  yields its closest approach, pushed out onto the sphere. Pure math, no
+ *  THREE; the page owns the unprojection. */
+export function clampGrabTarget(camPos, rayDir, joint, reach, target) {
+  const r = Math.max(0.05, Number(reach) || 0.05);
+  const C = Array.from(camPos, Number);
+  const T = Array.from(target, Number);
+  const J = Array.from(joint, Number);
+  if (dist(T, J) <= r) return T;
+  const d = Array.from(rayDir, Number);
+  const dl = len(d);
+  if (!(dl > 1e-9)) return add(J, mul(sub(T, J), r / (dist(T, J) || 1)));
+  const u = mul(d, 1 / dl);
+  const oc = sub(C, J);
+  const b = dot(oc, u);
+  const disc = b * b - (dot(oc, oc) - r * r);
+  if (disc >= 0) {
+    const hit = -b - Math.sqrt(disc);
+    if (hit > 0) return add(C, mul(u, hit));   // under the cursor, on the sphere
+  }
+  const near = add(C, mul(u, Math.max(0, -b)));  // closest approach to the joint
+  const out = sub(near, J);
+  const ol = len(out);
+  return ol > 1e-9 ? add(J, mul(out, r / ol)) : add(J, [0, -r, 0]);
 }
 
 export class PoseLayer {
