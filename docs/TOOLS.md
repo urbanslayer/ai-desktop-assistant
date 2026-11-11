@@ -164,3 +164,39 @@ Prompt line while the tools are offered (registry `_music_line`):
 > playlists ("my X playlist") use spotify_play with kind=playlist — the
 > owner's library is searched first; spotify_playlists lists what they have.
 > Never claim you cannot play music while these tools are offered.
+
+## Custom animations (phase built, docs/SELF_ANIMATION.md)
+
+"Make up a little victory dance" — she invents the keyframes herself and the
+hub owns validation, storage and model scoping. The full keyframe format,
+per-bone limits and playback contract live in **docs/SELF_ANIMATION.md**;
+routes in docs/API.md (*Custom animations*).
+
+Five hub tools (`hub/tools/animation_tools.py`, offered whenever tools are
+on):
+
+| tool | permission | what it does |
+|---|---|---|
+| `create_animation(animation)` | always | validate + clamp + save (**draft**; kept under `settings.animations.auto_keep`); the turn's reply carries the preview play action `{type:"gesture", name, custom:true, preview:true}` |
+| `keep_animation(name)` | always | flip a draft to **kept** — only kept moves are taggable `[act:name]` |
+| `delete_animation(name)` | **ask** | remove it from the current model (owner said no) |
+| `list_animations()` | always | every model of the persona, `on_current_model` flagged |
+| `adapt_animation(name, from_model?)` | always | copy a named animation from another VRM model onto this one, re-clamped; `from_model` only when the name sits on several models |
+
+A rejected animation returns `{"error": "animation_error: …"}` — one
+precise, fixable message (up to 8 issues) so she can repair and retry in
+the same turn; out-of-range bone angles clamp instead and every clamp is
+listed in `clamped`. Reserved names (built-in gesture names from
+`client/js/gestures.js`, the `[act:]`-taggable action tags) are refused —
+a test re-parses that file so drift fails CI.
+
+Prompt line while the tools are offered (registry `_animation_line`):
+
+> When the owner asks you to invent/make up a move or dance, use
+> create_animation, perform it as a preview, and ask whether to keep it
+> (keep_animation) — never claim a move you did not actually create.
+
+Guard twin (docs/API.md *Claimed-action guard* family): an
+invent-a-move/dance request answered in words while `create_animation`
+sat offered triggers one `INVENT_NUDGE` retry this turn
+(`hub/animations.py` `detect_invent_request`, `hub/intents.py`).

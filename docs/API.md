@@ -230,12 +230,17 @@ history (your cursor may then jump *backwards*; if
 | `POST /api/personas/{id}/voice/lock` | freeze designed voice: its take becomes the clone |
 | `GET /api/settings` | LLM + TTS + tools settings + defaults + per-field source (key never returned) |
 | `PUT /api/settings` | change settings (blank field = unset → default; `clear_api_key`) |
-| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timers/touch/timezone/location/switch-phrase overrides → defaults |
+| `POST /api/settings/reset` | drop saved LLM/TTS/tools/memory/MCP/timers/touch/animations/timezone/location/switch-phrase overrides → defaults |
 | `GET /api/geocode?q=<place>` | Open-Meteo geocoder for the Settings Location picker (up to 5 matches) |
 | `POST /api/settings/test` | model probe + breeze health → `{ok, model, tts}` |
 | `GET /api/timers` | one-shot timers (docs/TIMERS.md; `?status=` filter) |
 | `DELETE /api/timers/{id}` | cancel a pending/firing timer |
 | `POST /api/chat/read` | "owner read this persona's chat" → cancels `chat.read` timers |
+| `GET /api/personas/{id}/animations` | custom animations (docs/SELF_ANIMATION.md; `?model=current\|all\|<sha>`, `?status=all\|kept\|draft`) |
+| `POST /api/personas/{id}/animations` | validate + save → `201` `{animation, clamped}` (draft; kept under `auto_keep`) |
+| `PUT /api/personas/{id}/animations/{name}` | edit `{name?, description?, status?}` (keep = `{"status":"kept"}`) |
+| `DELETE /api/personas/{id}/animations/{name}` | delete → `204` |
+| `POST /api/personas/{id}/animations/{name}/preview` | publish the play action to clients |
 | `GET /` | web config page (no auth; asks for the key) |
 
 ### GET /api/health
@@ -740,6 +745,7 @@ is what the page PUTs as `settings.location`.
              "auto_remember": true},
   "timers": {"allow_chaining": false},              // docs/TIMERS.md reviewer additions
   "touch": {"mode": "quiet", "cooldown_s": 45, "max_per_10min": 4},   // docs/TOUCH.md
+  "animations": {"auto_keep": false},                                 // docs/SELF_ANIMATION.md
   "switch_phrases": ["switch to", "change to", "become", "persona",
                      "talk to", "i want to talk to"],
   "timezone": "",                                  // saved override, "" = server zone
@@ -778,6 +784,7 @@ is what the page PUTs as `settings.location`.
   "memory_source": {"enabled": "default", "prompt_budget_tokens": "default",
                     "auto_remember": "saved"},
   "timers_source": {"allow_chaining": "saved"},
+  "animations_source": {"auto_keep": "default"},
   "touch_source": {"mode": "default", "cooldown_s": "default",
                    "max_per_10min": "default"}      // docs/TOUCH.md
 }
@@ -873,13 +880,17 @@ Semantics (made so a careless form save cannot break the hub):
   mode. Values are plain (no secrets). The desktop tray's *Touch reactions*
   writes `mode` through this same route, so the web card and the tray can
   never drift apart.
+- **The `animations` block** (docs/SELF_ANIMATION.md): `auto_keep` (bool,
+  default **false**). When true, `create_animation` / `adapt_animation`
+  results save straight as **kept**, skipping her "keep it?" question.
+  Non-boolean → `422`.
 - **The `timers` block** (docs/TIMERS.md reviewer additions):
   `allow_chaining` (bool) decides whether a timer-**fired** turn may set
   another timer at all; non-boolean → `422`. Blank = default = `false`.
   Default-overridable with `RIKO_TIMER_ALLOW_CHAINING=1`.
 
 `POST /api/settings/reset` with `{"llm": true, "tts": true, "tools": true,
-"memory": true, "mcp": true, "timers": true, "touch": true, "timezone": true, "location": true, "switch_phrases": true}` (each side optional,
+"memory": true, "mcp": true, "timers": true, "touch": true, "animations": true, "timezone": true, "location": true, "switch_phrases": true}` (each side optional,
 `422` if none)
 drops the saved overrides so the defaults apply again. Returns the same body
 as `GET`.
@@ -1204,6 +1215,61 @@ here off every UI thread; `/control/sit-state` `{sitting}` reports the page
 finished blending. Desktop → page bridge commands: `sit:<edge_y_css_px>`
 (re-sent when the edge moves ≥ 4 px), `stand`, `touch-mode:<off|quiet|chatty>`.
 
+## Custom animations (docs/SELF_ANIMATION.md)
+
+Persona-owned, hub-validated keyframe animations, **scoped to one VRM
+model**: `model_sha256` is the sha256 of the persona's stored avatar bytes
+— the very file `GET /api/personas/{id}/avatar` serves — and personas
+without an uploaded avatar use `'default'`. Swapping the avatar does not
+delete anything: the old rows simply belong to another model (list them
+with `?model=all`; the `adapt_animation` tool copies one over, re-clamped).
+
+```bash
+curl -s -H "$AUTH" "$HUB/api/personas/riko/animations"
+# {"model_sha256":"9f2c…","animations":[{"id":3,"persona_id":"riko",
+#   "name":"victory_dance","description":"both fists up, little hop",
+#   "duration_s":2.4,"loop":false,"ease":"smooth","status":"draft",
+#   "keyframes":[{"t":0.0,"bones":{},"expression":{}}, …],"created_at":"…",
+#   "model_sha256":"9f2c…","updated_at":"…"}]}
+#   ?model=all → every model; ?model=<sha|default> → that one;
+#   ?status=kept|draft filters (default: all). Default scope = current model.
+
+curl -s -H "$AUTH" -X POST "$HUB/api/personas/riko/animations" -d '{
+  "name":"victory_dance","description":"both fists up, little hop",
+  "duration_s":2.4,"loop":false,"ease":"smooth",
+  "keyframes":[{"t":0.0,"bones":{},"expression":{}},
+               {"t":0.6,"bones":{"leftUpperArm":[0,0,70]},"expression":{"happy":0.8},
+                "hips_y":0.04},
+               {"t":2.4,"bones":{},"expression":{}}]}'
+# 201 {"animation":{…,"status":"draft"},"clamped":["spine.x 90 clamped to 15"]}
+#   out-of-range bone angles CLAMP (the notes list every clamp); structural
+#   errors → 422 {"detail":"animation_error: <what to fix>"}; duplicate name
+#   on this model → 409; reserved/built-in gesture names rejected. Saved as
+#   draft unless settings.animations.auto_keep → kept.
+
+curl -s -H "$AUTH" -X PUT "$HUB/api/personas/riko/animations/victory_dance" \
+  -d '{"status":"kept"}'                          # Keep (or {"name":…}, {"description":…})
+#   only name/description/status are editable (unknown keys → 422); a new
+#   name must match ^[a-z][a-z0-9_]{1,31}$ and not be a reserved gesture/
+#   action name; collision on this model → 409. ?model=<sha> targets another
+#   model's row.
+curl -s -H "$AUTH" -X DELETE "$HUB/api/personas/riko/animations/victory_dance"   # 204 / 404
+curl -s -H "$AUTH" -X POST "$HUB/api/personas/riko/animations/victory_dance/preview"
+# {"ok":true,"persona_id":"riko","name":"victory_dance","model_sha256":"9f2c…"}
+#   publishes an `action` event through the SAME channel chat replies use:
+#   actions:[{"name":"victory_dance","at":0.0,"type":"gesture",
+#             "custom":true,"preview":true}]
+```
+
+In replies, `[act:victory_dance]` resolves only against the persona's
+**kept** animations on the **current model** (docs/BODY.md tags, hub/body
+.py): the action entry gains `type:"gesture", custom:true` and rides
+`turn_finished.actions`. `create_animation` makes the turn itself carry the
+preview play action above. The five craft tools are listed under *Tools*;
+the web page has an **Animations** tab (Preview / Keep / Rename / Delete).
+Every change publishes `animations_changed`; a persona delete drops all of
+its animation rows.
+
 ## Voice & audio (docs/VOICE.md)
 
 The **hub is the only component that talks to Breeze-TTS-2** (the GPU-side
@@ -1465,6 +1531,7 @@ Built-in hub tools:
 | `web_search` | SearXNG JSON search → `{results: [{title, url, content}]}`. Needs a `searxng_url` setting/env (`RIKO_SEARXNG_URL`); **not offered** when unset |
 | `fetch_page` | GET a URL, extract readable text (title + paragraphs/heads/lists, ≤ 20 000 chars, ≤ 10 MB, ≤ 20 s). Refuses loopback/private IPs unless `allow_private_fetch` |
 | `get_time` | hub clock as ISO-8601 with UTC offset |
+| `create_animation` / `keep_animation` / `delete_animation` / `list_animations` / `adapt_animation` | custom animation craft (see *Custom animations* below); `delete_animation` defaults to `ask` |
 | `spotify_play` / `spotify_control` / `spotify_now_playing` / `spotify_devices` / `spotify_transfer` / `spotify_like_current` / `spotify_playlists` | music over the Spotify Web API (see *Spotify* above); **not offered** until Spotify is configured, always listed for permissions |
 
 Permissions per tool name, effective policy (`GET /api/tools` shows all of
@@ -1647,8 +1714,9 @@ curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 #   {"seq":20,"time":"…","type":"timer_fired","id":3,"label":"tea","persona_id":"riko","message_id":42},
 #   {"seq":21,"time":"…","type":"turn_finished","persona":"riko","origin":"timer","persona_id":"riko","timer":{"id":3,"label":"tea"},"message_id":42,"reply":"Your tea is ready!","speech":"Your tea is ready!","emotion":"happy","actions":[],"audio_url":"/api/messages/42/audio"},
 #   {"seq":22,"time":"…","type":"state_changed","version":22},
-#   {"seq":23,"time":"…","type":"now_playing","playing":true,"uri":"spotify:track:…","track":"Bohemian Rhapsody","artists":"Queen","album":"A Night at the Opera","duration_ms":354000,"position_ms":12345,"device":"Riko","context_uri":"spotify:album:…"}
-# ],"last":23}
+#   {"seq":23,"time":"…","type":"animations_changed","persona_id":"riko","model_sha256":"9f2c…"},
+#   {"seq":24,"time":"…","type":"now_playing","playing":true,"uri":"spotify:track:…","track":"Bohemian Rhapsody","artists":"Queen","album":"A Night at the Opera","duration_ms":354000,"position_ms":12345,"device":"Riko","context_uri":"spotify:album:…"}
+# ],"last":24}
 ```
 
 Loop: keep `last`, pass it back as `after`, `wait` ≤ 30 s (default 25). The
@@ -1676,7 +1744,9 @@ the proactive reply without another round-trip: `origin: "timer"`,
 `persona_id`, `timer: {id, label}`, `reply`, `speech`, `emotion`, `actions`,
 `audio_url` (and the usual `persona`, `message_id`, `emotion`). Desktop
 clients: play origin-timer turns like normal replies; queue them if busy.
-`now_playing` (music phase 1, docs/SPOTIFY_NOTES.md) fires ONLY on a real
+`animations_changed` (`{persona_id, model_sha256}`) fires whenever a custom
+animation is created, kept, renamed or deleted (docs/SELF_ANIMATION.md) —
+refresh your animations view on it. `now_playing` (music phase 1, docs/SPOTIFY_NOTES.md) fires ONLY on a real
 playback state change — `{playing, uri, track, artists, album, duration_ms,
 position_ms, device, context_uri}` (fields as in
 `GET /api/spotify/now-playing`); the hub stops polling while paused/idle, so
