@@ -288,6 +288,7 @@
         (<code>[act:name]</code>); <b>Preview</b> tells the connected clients to perform it right
         now and needs a client build with custom-animation playback.</p>
       <div class="err" id="aerr"></div>
+      <p class="hint" id="apreviewnote" hidden></p>
     </div>
   </section>
 
@@ -1823,8 +1824,21 @@ async function loadAnimations() {
       try { await fn(); await poll(); loadAnimations(); }
       catch (e) { $("aerr").textContent = e.message; }
     };
-    $("alist").querySelectorAll(".apreview").forEach((b) => b.onclick = () =>
-      act(() => api(`/api/personas/${pid}/animations/${encodeURIComponent(b.dataset.name)}/preview?model=${b.dataset.model}`, { method: "POST" })));
+    // Preview: the hub publishes an 'action' event; the desktop forwards it
+    // to her avatar. delivered:false means no desktop app is online to play
+    // it — say so instead of pretending the dance happened. (The note lives
+    // OUTSIDE #alist so the re-render after the click keeps it visible.)
+    $("alist").querySelectorAll(".apreview").forEach((b) => b.onclick = () => {
+      $("apreviewnote").hidden = true;
+      act(async () => {
+        const r = await api(`/api/personas/${pid}/animations/${encodeURIComponent(b.dataset.name)}/preview?model=${b.dataset.model}`, { method: "POST" });
+        const note = $("apreviewnote");
+        if (r && r.delivered === false) {
+          note.textContent = "Riko's desktop app isn't connected — she can't dance right now.";
+          note.hidden = false;
+        } else { note.hidden = true; }
+      });
+    });
     $("alist").querySelectorAll(".akeep").forEach((b) => b.onclick = () =>
       act(() => api(`/api/personas/${pid}/animations/${encodeURIComponent(b.dataset.name)}?model=${b.dataset.model}`, { method: "PUT", json: { status: "kept" } })));
     $("alist").querySelectorAll(".arename").forEach((b) => b.onclick = () => {

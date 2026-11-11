@@ -111,6 +111,15 @@ SCENARIOS = {
     # empty list, so the custom gate can only pass if the page registers the
     # inline copy before director.say() validates the name.
     "custom_say_inline": (None, []),
+    # web Animations tab Preview end-to-end (desktop forwards the hub's
+    # 'action' event as an actions-ONLY page event): NO say, NO voice, NO
+    # bubble — just {type:'actions', actions:[{...custom, preview,
+    # animation inline...}]}. /custom-animations.json serves an empty list,
+    # so the dance only plays if handle('actions') registers the inline copy
+    # before director.say() validates the name. Shots fire event-driven off
+    # keyframe progress (&kfwatch), and the run gates on ZERO
+    # "unknown action" console warnings (chromium.log).
+    "actions_preview_inline": (None, []),
     # song ticker (docs/SPOTIFY_NOTES.md): a music:state command arrives at
     # 6 s; the gate checks metrics.tickerQA in the measure dumps — shown,
     # exact text, marquee iff long title, bar above the feet rects.
@@ -601,6 +610,17 @@ def main():
             (6.5, {"type": "say", "text": _text, "emotion": "happy",
                    "seconds": 3, "actions": [_action]}),
         ]
+    if args.scenario == "actions_preview_inline":
+        # the actions-only page event the desktop emits for a web Preview
+        # click (riko/session.py _on_action_preview): no status, no say, no
+        # bubble — the inline animation is the ONLY source of the dance.
+        _first = Handler.anim_doc["animations"][0]
+        Handler.serve_custom = False
+        Handler.queue = [
+            (6.0, {"type": "actions", "actions": [
+                {"name": _first["name"], "at": 0.0, "type": "gesture",
+                 "custom": True, "preview": True, "animation": _first}]}),
+        ]
     if args.scenario in ("ticker", "ticker_short"):
         # desktop forwards the hub's now_playing as a command event; feed the
         # page the real envelope (session._emit_music_state's shape)
@@ -641,7 +661,7 @@ def main():
         url += f"&wheelzoom={args.gestures}"
     if args.touch:
         url += "&touch=" + urllib.parse.quote(args.touch, safe="")
-    if args.scenario in ("custom_say", "custom_say_inline"):
+    if args.scenario in ("custom_say", "custom_say_inline", "actions_preview_inline"):
         url += "&kfwatch=0.35,0.8"
     maxsec = max(float(s) for s in args.secs.split(","))
     dur = args.runtime if args.runtime else maxsec + 8
@@ -669,8 +689,20 @@ def main():
     srv.shutdown()
     shots = sorted(p for p in os.listdir(args.outdir) if p.endswith(".png"))
     gate_fails = evaluate_touch_gates(args.outdir)
-    if args.scenario in ("custom", "custom_say", "custom_say_inline"):
+    if args.scenario in ("custom", "custom_say", "custom_say_inline",
+                         "actions_preview_inline"):
         gate_fails += evaluate_custom_gates(args.outdir, Handler.anim_doc["animations"])
+    if args.scenario in ("custom_say", "custom_say_inline", "actions_preview_inline"):
+        # the director must never drop the named action: a miss logs
+        # "unknown action '<name>' — ignored" on the console and she just
+        # stands there, frames or no frames
+        with open(os.path.join(args.outdir, "chromium.log"),
+                  errors="replace") as f:
+            log = f.read()
+        n = log.count("unknown action")
+        if n:
+            print(f"[gate] FAIL: {n} 'unknown action' console warnings")
+            gate_fails += n
     if args.scenario in ("ticker", "ticker_short"):
         gate_fails += evaluate_ticker_gates(args.outdir, args.scenario == "ticker",
                                             _text)

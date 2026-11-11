@@ -2190,6 +2190,26 @@
       } else if (ev.type === 'heard') {
         flash(heard, ev.text, 6);
         feed(director.heard(T(), ev.text || ''));
+      } else if (ev.type === 'actions') {
+        // actions-only event (the web Animations tab's Preview, forwarded by
+        // the desktop from the hub's 'action' event): no bubble, no voice —
+        // register the inline custom animations exactly like a 'say' does
+        // (BEFORE the director validates the names, SELF_ANIMATION.md), then
+        // schedule them through director.say with an empty line so the
+        // actions play NOW (at * 0 s speech = immediately).
+        const acts = Array.isArray(ev.actions) ? ev.actions : [];
+        if (acts.length) {
+          registerInlineAnimations(acts, {
+            customAnims, validateAnimation,
+            library: (extra) => director.library(extra),
+          });
+        }
+        if (TIMING && acts.length) {
+          (window.__actionTimeline = window.__actionTimeline || []).push(
+            { t: T(), type: 'actions', actions: acts, seconds: 0 });
+        }
+        feed(director.say(T(), { emotion: 'neutral', seconds: 0, text: '',
+                                 actions: acts }));
       } else if (ev.type === 'error') {
         flash(bubble, ev.text, 6, 'error');
         feed(director.error(T()));

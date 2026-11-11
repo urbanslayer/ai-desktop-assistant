@@ -236,6 +236,26 @@ and the `custom_say_inline` capture scenario (`capture_frames.py custom_say_inli
 `/custom-animations.json` serves an EMPTY list — the animation exists only inline on the reply
 action — and the `custom-gate` lines must still PASS mid-pose).
 
+## The web Animations tab's Preview button (2026-11)
+
+`POST /api/personas/{id}/animations/{name}/preview` publishes an `action` event
+(`{persona_id, emotion:null, actions:[<preview action + inline animation>]}`) on the same event
+channel chat replies ride. The desktop's events follower (`riko/session.py` `_on_hub_event`)
+handles kind `action` for the ACTIVE persona only (dedupe on the event's `seq`+`time` against a
+ring replay, same style as the timer handlers) and forwards `actions` to the avatar page as an
+**actions-only page event** `{type:'actions', actions}` — the page handler registers the inline
+copies BEFORE `director.say()` validates the names (identical ordering to a `say` carrying
+actions) and schedules them with an empty line, so the dance plays immediately with NO bubble
+and NO voice. The preview route answers `{ok, delivered}` honestly: `delivered:false,
+reason:"no desktop online"` when no registered desktop client is online (still 200 — the event
+is published for any other live-events follower), and the web page says
+"Riko's desktop app isn't connected" instead of pretending it played.
+Regression: the desktop tests (`test_action_preview_*` in `tests/test_custom_animations.py`),
+the preview-delivery assertions in `test_animations_routes_crud_event_and_preview`, and the
+`actions_preview_inline` capture scenario (`capture_frames.py actions_preview_inline <out> <secs>`:
+actions-only event, EMPTY custom list, keyframe-gated shots must PASS with zero
+"unknown action" console warnings).
+
 ## Rules for both children
 
 - Never start a compositor/WM/X server; never query the owner's live session (`hyprctl`, `swaymsg`, `qdbus`,

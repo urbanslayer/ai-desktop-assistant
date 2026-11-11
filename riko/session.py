@@ -74,6 +74,8 @@ class Session:
         self._timer_lock = threading.Lock()
         self._timer_played = collections.deque(maxlen=512)   # message_ids already queued to speak
         self._timer_noticed = collections.deque(maxlen=512)  # message_ids already sent to the tray
+        self._action_lock = threading.Lock()
+        self._action_played = collections.deque(maxlen=512)  # 'action' event seqs already forwarded
         if self.listen_mode == "always" and self.source == "desktop":
             if not self._vad_start():
                 self.listen_mode = "push_to_talk"
@@ -367,6 +369,27 @@ class Session:
         viewer.emit("command", cmd="music:state "
                     + json.dumps(payload, ensure_ascii=False))
 
+    def _on_action_preview(self, ev):
+        """'action' event = the web Animations tab's Preview button
+        (hub/server.py preview route): forward its actions to the avatar
+        page as an 'actions' page event. The page registers the actions'
+        inline `animation` copies BEFORE the director validates the names
+        (docs/SELF_ANIMATION.md, the live curtsey_twirl bug), then schedules
+        them through director.say exactly like a reply's actions — only
+        without the bubble or the voice. viewer.emit is a queue put, so this
+        stays cheap on the follower thread (never Qt)."""
+        if str(ev.get("persona_id") or ev.get("persona") or "") != self._active_id():
+            return  # another persona's preview: her avatar is not the one on screen
+        actions = ev.get("actions")
+        if not isinstance(actions, list) or not actions:
+            return
+        key = (ev.get("seq"), ev.get("time"))
+        with self._action_lock:
+            if key in self._action_played:  # ring replay / double delivery
+                return
+            self._action_played.append(key)
+        viewer.emit("actions", actions=actions)
+
     def _on_hub_event(self, kind, ev):
         """One hub event (follower thread). Only timer traffic matters here:
         every other turn was already played by the call that started it."""
@@ -378,6 +401,9 @@ class Session:
             return
         if kind == "now_playing":
             self._on_now_playing(ev)  # song ticker (docs/SPOTIFY_NOTES.md)
+            return
+        if kind == "action":
+            self._on_action_preview(ev)  # web Animations tab Preview (SELF_ANIMATION.md)
             return
         if kind != "turn_finished" or ev.get("origin") != "timer":
             return  # a normal turn (no origin) was spoken by its own /api/chat

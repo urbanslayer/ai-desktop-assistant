@@ -495,6 +495,9 @@ def test_animations_routes_crud_event_and_preview(hub):
     hub.get("/api/events", params={"after": hub._ring, "wait": 0})  # drain
     r = hub.post("/api/personas/riko/animations/big_win/preview")
     assert r.status_code == 200 and r.json()["ok"] is True
+    # honest delivery: no desktop app is registered/online -> say so (200 still)
+    assert r.json()["delivered"] is False
+    assert r.json()["reason"] == "no desktop online"
     acts = [e for e in new_events(hub, types=("action",))][-1]
     assert acts["persona_id"] == "riko"
     assert len(acts["actions"]) == 1
@@ -503,6 +506,14 @@ def test_animations_routes_crud_event_and_preview(hub):
         "name": "big_win", "at": 0.0, "type": "gesture", "custom": True,
         "preview": True}
     assert act0["animation"]["name"] == "big_win"      # self-contained replay
+    # a registered online desktop client flips delivered to true
+    assert hub.post("/api/clients/rd1/register",
+                    json={"name": "Riko desktop", "kind": "desktop",
+                          "tools": []}).status_code == 200
+    r = hub.post("/api/personas/riko/animations/big_win/preview")
+    assert r.status_code == 200 and r.json()["delivered"] is True
+    assert "reason" not in r.json()
+    new_events(hub)  # drain the second preview's 'action' event
     assert hub.post("/api/personas/riko/animations/ghost/preview"
                     ).status_code == 404
 

@@ -2359,8 +2359,16 @@ def create_app(data_dir, api_key: str | None = None,
             action["animation"] = inline
         events.publish("action", persona_id=persona_id, emotion=None,
                        actions=[action])
-        return {"ok": True, "persona_id": persona_id, "name": name,
-                "model_sha256": sha}
+        # honest delivery (the owner asked): the play only lands if a desktop
+        # app is online to forward it. Still 200 — the event is published, and
+        # any other live-events follower (Android) rides it too.
+        online = any(c.get("kind") == "desktop"
+                     for c in clients_hub.online_clients())
+        out = {"ok": True, "delivered": online, "persona_id": persona_id,
+               "name": name, "model_sha256": sha}
+        if not online:
+            out["reason"] = "no desktop online"
+        return out
 
 
 
