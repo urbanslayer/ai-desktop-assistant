@@ -162,7 +162,7 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 5. ~~**Optional: "only when I say her name"** filter for always-listen mode~~ — **DONE 2026-11-09**,
    see Done (2026-11-09) above.
 6. **She creates her own animations** (owner request), for whichever avatar is active at the time.
-   **Plan only for now.**
+   **IN PROGRESS 2026-11-11 — tier 1 (LLM keyframes) per docs/SELF_ANIMATION.md; tier 2 stays plan only.**
    - **Shape:** she authors a named animation as data: keyframes of VRM humanoid bone rotations,
      expressions and timing, in the same format as the built-in gestures in `client/js/gestures.js`.
      She can then play it later through an action tag (`[act:my_bow]`) or a tool, like the built-ins.
@@ -184,8 +184,9 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
      page section.
    - **Hooks that already exist:** the gesture/pose sampler (`samplePose`/`sampleGesture`,
      `mirrorPose`), `director.js`, action tags (`hub/body.py`), and the persona `appearance` field.
-7. **Touch and posing: interacting with her body, not just moving her** (owner request). **IN PROGRESS 2026-11-10 — contract docs/TOUCH.md;
-   feasibility looks good.**
+7. **Touch and posing: interacting with her body, not just moving her** (owner request). **DONE 2026-11-11 —
+   docs/TOUCH.md** (limb grab with IK, pat/poke/tickle + hub `/api/touch` reactions, sit on the screen edge;
+   owner live test pending). Original plan kept below.
    - **Sit on the screen edge:** drag her down so her legs go past the bottom of the screen, and she
      sits on the edge with her legs dangling off-screen. Lift her back up and she stands again.
      Detection: during a window drag, if the hips come within a small margin of the bottom of the
