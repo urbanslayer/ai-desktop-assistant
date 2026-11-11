@@ -76,7 +76,10 @@ models on eve: MoMask / T2M-GPT / MotionGPT / HY-Motion → VRMA) stays **plan o
   reserved name, keyframe count/timing, unknown bone, `neck`) with a message the model can act on.
   The page clamps again on playback (defence in depth).
 
-## Measured pose cookbook (2026-11, headless on both rigs)
+## Measured pose cookbook
+
+> Renders of the owner's Furina model (third-party VRM, licence unknown) are kept out of the public repo; the sample-avatar renders in `docs/evidence/` are published.
+ (2026-11, headless on both rigs)
 
 Method: `client/tools/capture_frames.py custom … --gaze 0,0` on 3 s probe animations holding one bone at a
 time, then **objective world-space deltas** from each frame's `bones`/`metrics` (hand/head/foot positions vs
@@ -87,20 +90,20 @@ the exact keyed values). Rest pose = **arms at sides** (`{}`), not T-pose, on bo
 
 | Motion | Furina (LIVE) | sample avatar | Evidence |
 | --- | --- | --- | --- |
-| `upperArm` Z | **L −Z / R +Z raises the arm out to the side** (70 ≈ horizontal T, 100–110 overhead V); opposite sign crosses the arm over the body | **mirrored** (L +Z / R −Z raise) | `pose_measured_furina_arms.png`, `pose_measured_sample_arms.png` |
+| `upperArm` Z | **L −Z / R +Z raises the arm out to the side** (70 ≈ horizontal T, 100–110 overhead V); opposite sign crosses the arm over the body | **mirrored** (L +Z / R −Z raise) | Furina render (not published), `pose_measured_sample_arms.png` |
 | `upperArm` Y | **− swings the arm FORWARD**, + swings back (both signs lift the hand slightly as the arm swings on its cone) | behaves differently (mixed swing+abduction); prefer Z moves on sample | world deltas (hands z ∓0.35 m at ±60°) |
 | `upperArm` X | twist along the arm — near no-op on the hand (<0.01 m at 60°) | same (negligible) | both probe runs |
-| `lowerArm` (elbow) | **hinge = Y: −75…−90 flexes the forearm FORWARD/up** (hand rises ~0.15–0.2 m, forward ~0.16 m); + swings it back; Z = small sideways swing (avoid); X = twist | **same sign** (Y− forward confirmed: hand z +0.22 at Y−60) | `pose_measured_furina_arms.png` |
+| `lowerArm` (elbow) | **hinge = Y: −75…−90 flexes the forearm FORWARD/up** (hand rises ~0.15–0.2 m, forward ~0.16 m); + swings it back; Z = small sideways swing (avoid); X = twist | **same sign** (Y− forward confirmed: hand z +0.22 at Y−60) | Furina render (not published) |
 | `shoulder` | decorative: ±10–15 shifts the shoulder line slightly (L Z+ pulls the arm slightly inward) | same | probe run |
-| `spine` / `upperChest` Z | **lean sideways: +Z leans to HER LEFT** (eyes shift +x); **sway = spine Z ±8…12 plus upperChest Z ±5…8 SAME sign**, alternate sign per key | Z lean works; direction mirrored (lean-right for +Z) | `pose_measured_furina_head.png` (spine rows) |
+| `spine` / `upperChest` Z | **lean sideways: +Z leans to HER LEFT** (eyes shift +x); **sway = spine Z ±8…12 plus upperChest Z ±5…8 SAME sign**, alternate sign per key | Z lean works; direction mirrored (lean-right for +Z) | Furina render (not published) (spine rows) |
 | `chest` | **no-op on the live rig — the VRM has no Chest bone; use spine + upperChest** | works | world probe (zero delta) |
 | `spine` X | + leans BACK (eyes −z); − leans forward | **mirrored** (+ leans forward) | `pose_measured_sample_head.png` |
-| `head` X | **+ = look UP (chin up), − = nod down** | **mirrored** (+ = nod) | `pose_measured_furina_head.png` vs `pose_measured_sample_head.png` |
+| `head` X | **+ = look UP (chin up), − = nod down** | **mirrored** (+ = nod) | Furina render (not published) vs `pose_measured_sample_head.png` |
 | `head` Y | turn left/right (either sign turns) | either sign turns | same sheets |
-| `head` Z | **tilt: Z+ tilts to HER RIGHT, Z− to her left** (ear toward shoulder — the "tilt to the music" axis) | mirrored (+ tilts her left) | `pose_measured_furina_roll.png`, `pose_measured_sample_roll.png` |
-| `upperLeg` X | + swings knee/leg FORWARD (foot +z 0.35 m at +60°); − swings back | same (foot forward at +60°) | `pose_measured_furina_legs_hops.png` |
+| `head` Z | **tilt: Z+ tilts to HER RIGHT, Z− to her left** (ear toward shoulder — the "tilt to the music" axis) | mirrored (+ tilts her left) | Furina render (not published), `pose_measured_sample_roll.png` |
+| `upperLeg` X | + swings knee/leg FORWARD (foot +z 0.35 m at +60°); − swings back | same (foot forward at +60°) | Furina render (not published) |
 | `lowerLeg` X | **− is the natural knee bend (heel toward glutes)**; + raises the shin forward (kick) | **mirrored** (+ bends naturally) | same sheet |
-| `hips_y` | translates the WHOLE body: +0.05…0.15 lifts the feet off the ground (≈36 px / 0.1 m airborne); − dips/sinks; keyed legs add bends but never re-pin the feet | same | `pose_measured_furina_legs_hops.png` |
+| `hips_y` | translates the WHOLE body: +0.05…0.15 lifts the feet off the ground (≈36 px / 0.1 m airborne); − dips/sinks; keyed legs add bends but never re-pin the feet | same | Furina render (not published) |
 
 Reference poses (live rig — exact numbers, each verified by capture; mirror L/R pairs as shown):
 
@@ -132,17 +135,17 @@ lowerArm/shoulder/spine back to rest on every intermediate key; the sway was key
 Furina, so her "V" crossed the arms inward. Renders (headless Furina, ~8–12 timestamps each, ground line
 drawn in red):
 
-- `docs/evidence/spotlight_as_stored.png` — the stored doc rendered under old rest-fill semantics:
+- `spotlight_as_stored` render (not published) — the stored doc rendered under old rest-fill semantics:
   arms inward/crossed mid-move, no sway, no tilt.
-- `docs/evidence/spotlight_renormalised.png` — same key values after the hub's hold-fill expansion
+- `spotlight_renormalised` render (not published) — same key values after the hub's hold-fill expansion
   (`holdFillKeyframes`/`fill_keyframe_holds`): limbs hold between keys and the wind-up swing reads,
   but the axis/sign errors remain (still no V, sway is a twist).
-- `docs/evidence/spotlight_corrected.png` — re-authored from the owner's description with the cookbook
+- `spotlight_corrected` render (not published) — re-authored from the owner's description with the cookbook
   (V = L −100/R +100, sway = spine+upperChest Z ±10/7 alternating, tilt = head Z ±12, hop = hips_y
   −0.03→+0.14→−0.03 with a knee-steer): V overhead at t≈0.8–1.6, visible lean both ways, ear-to-shoulder
   tilt following the sway, and a hop whose airborne frame lifts the boot soles ~40 px off the ground line
   (raw lowest-ink row 620 vs planted 657–670), with crouch before and compression on landing.
-- `docs/evidence/spotlight_arm_lift_compare.png` — as-stored vs renormalised at equal doc times (arm
+- `spotlight_arm_lift_compare` render (not published) — as-stored vs renormalised at equal doc times (arm
   elevation difference from hold semantics alone).
 
 All four stored live drafts (`cheeky_swayer`, `curtsey_twirl`, `hat_tip_hop`, `spotlight_twirl`) are
