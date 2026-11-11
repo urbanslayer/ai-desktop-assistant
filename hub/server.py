@@ -505,6 +505,21 @@ def create_app(data_dir, api_key: str | None = None,
     # an uploaded avatar. Lazily hashed, cached by (mtime, size).
     anim_sha = _animations.ModelShaResolver(avatars_dir)
 
+    # hold-semantics migration (docs/SELF_ANIMATION.md): stored animations
+    # predating the 2026-11 revision leave bones/expression/hips_y out of
+    # keyframes they hold through. Expand every stored row to explicit
+    # per-key values ONCE at start so the page player never needs a special
+    # case and every draft on the live hub (e.g. spotlight_twirl) becomes
+    # unambiguous without a manual step. Idempotent — re-running changes 0.
+    try:
+        _kf_fixed = _animations.migrate_hold_semantics(store)
+        if _kf_fixed:
+            print(f"[hub] hold-semantics keyframe migration rewrote "
+                  f"{_kf_fixed} animation row(s)", flush=True)
+    except Exception as e:  # never block hub start on the migration
+        print(f"[hub] hold-semantics keyframe migration skipped: "
+              f"{type(e).__name__}: {e}", flush=True)
+
     # ── location settings (weather round, docs/API.md "Weather") ────────
     # Saved place wins; blank/reset falls back to the RIKO_LOCATION env
     # default (a plain place name geocoded lazily at first use, cached in
@@ -2261,7 +2276,8 @@ def create_app(data_dir, api_key: str | None = None,
                             "exists on this model")
         events.publish("animations_changed", persona_id=persona_id,
                        model_sha256=sha)
-        return {"animation": row, "clamped": notes}
+        return {"animation": row, "clamped": notes,
+                "lint": _animations.lint_animation(body, clean)}
 
     @app.put("/api/personas/{persona_id}/animations/{name}")
     async def put_animation(persona_id: str, name: str, request: Request,

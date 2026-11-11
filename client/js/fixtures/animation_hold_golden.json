@@ -1,0 +1,1268 @@
+{
+ "note": "hub.animations.fill_keyframe_holds golden output; keep in lockstep with client/js/keyframes.test.js",
+ "cases": [
+  {
+   "name": "spotlight_twirl-live",
+   "in": [
+    {
+     "t": 0.0,
+     "bones": {},
+     "expression": {}
+    },
+    {
+     "t": 0.6,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       15.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -15.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       80.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -80.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       20.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -20.0
+      ]
+     },
+     "expression": {
+      "happy": 0.6
+     },
+     "hips_y": 0.03
+    },
+    {
+     "t": 1.2,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       100.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -60.0
+      ],
+      "spine": [
+       0.0,
+       8.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       15.0,
+       0.0
+      ],
+      "chest": [
+       5.0,
+       5.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 1.8,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       60.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -100.0
+      ],
+      "spine": [
+       0.0,
+       -8.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       -15.0,
+       0.0
+      ],
+      "chest": [
+       5.0,
+       -5.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 2.2,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       85.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -85.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       25.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -25.0
+      ],
+      "head": [
+       -10.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.08
+    },
+    {
+     "t": 2.6,
+     "bones": {},
+     "expression": {}
+    }
+   ],
+   "out": [
+    {
+     "t": 0.0,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "spine": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "chest": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.0
+     },
+     "hips_y": 0.0
+    },
+    {
+     "t": 0.6,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       15.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -15.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       80.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -80.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       20.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -20.0
+      ],
+      "spine": [
+       0.0,
+       4.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       7.5,
+       0.0
+      ],
+      "chest": [
+       2.5,
+       2.5,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.6
+     },
+     "hips_y": 0.03
+    },
+    {
+     "t": 1.2,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       100.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -60.0
+      ],
+      "spine": [
+       0.0,
+       8.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       15.0,
+       0.0
+      ],
+      "chest": [
+       5.0,
+       5.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       10.5
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -10.5
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       21.875
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -21.875
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 1.8,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       60.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -100.0
+      ],
+      "spine": [
+       0.0,
+       -8.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       -15.0,
+       0.0
+      ],
+      "chest": [
+       5.0,
+       -5.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       6.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -6.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       23.75
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -23.75
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 2.2,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       85.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -85.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       25.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -25.0
+      ],
+      "head": [
+       -10.0,
+       0.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       3.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -3.0
+      ],
+      "spine": [
+       0.0,
+       -4.0,
+       0.0
+      ],
+      "chest": [
+       2.5,
+       -2.5,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.08
+    },
+    {
+     "t": 2.6,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "spine": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "chest": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.0
+     },
+     "hips_y": 0.0
+    }
+   ]
+  },
+  {
+   "name": "synthetic-hold",
+   "in": [
+    {
+     "t": 0.0,
+     "bones": {
+      "leftUpperArm": [
+       0,
+       0,
+       10
+      ]
+     },
+     "expression": {
+      "happy": 0.5
+     },
+     "hips_y": 0.01
+    },
+    {
+     "t": 0.5,
+     "bones": {},
+     "expression": {}
+    },
+    {
+     "t": 1.0,
+     "bones": {
+      "leftUpperArm": [
+       0,
+       0,
+       50
+      ],
+      "head": [
+       0,
+       0,
+       20
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 1.5,
+     "bones": {},
+     "expression": {}
+    }
+   ],
+   "out": [
+    {
+     "t": 0.0,
+     "bones": {
+      "leftUpperArm": [
+       0,
+       0,
+       10
+      ],
+      "head": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.5
+     },
+     "hips_y": 0.01
+    },
+    {
+     "t": 0.5,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       30.0
+      ],
+      "head": [
+       0.0,
+       0.0,
+       10.0
+      ]
+     },
+     "expression": {
+      "happy": 0.75
+     },
+     "hips_y": 0.03
+    },
+    {
+     "t": 1.0,
+     "bones": {
+      "leftUpperArm": [
+       0,
+       0,
+       50
+      ],
+      "head": [
+       0,
+       0,
+       20
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 1.5,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.0
+     },
+     "hips_y": 0.0
+    }
+   ]
+  },
+  {
+   "name": "already-explicit",
+   "in": [
+    {
+     "t": 0.0,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "spine": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "chest": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.0
+     },
+     "hips_y": 0.0
+    },
+    {
+     "t": 0.6,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       15.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -15.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       80.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -80.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       20.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -20.0
+      ],
+      "spine": [
+       0.0,
+       4.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       7.5,
+       0.0
+      ],
+      "chest": [
+       2.5,
+       2.5,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.6
+     },
+     "hips_y": 0.03
+    },
+    {
+     "t": 1.2,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       100.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -60.0
+      ],
+      "spine": [
+       0.0,
+       8.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       15.0,
+       0.0
+      ],
+      "chest": [
+       5.0,
+       5.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       10.5
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -10.5
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       21.875
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -21.875
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 1.8,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       60.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -100.0
+      ],
+      "spine": [
+       0.0,
+       -8.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       -15.0,
+       0.0
+      ],
+      "chest": [
+       5.0,
+       -5.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       6.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -6.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       23.75
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -23.75
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 2.2,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       85.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -85.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       25.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -25.0
+      ],
+      "head": [
+       -10.0,
+       0.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       3.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -3.0
+      ],
+      "spine": [
+       0.0,
+       -4.0,
+       0.0
+      ],
+      "chest": [
+       2.5,
+       -2.5,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.08
+    },
+    {
+     "t": 2.6,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "spine": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "chest": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.0
+     },
+     "hips_y": 0.0
+    }
+   ],
+   "out": [
+    {
+     "t": 0.0,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "spine": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "chest": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.0
+     },
+     "hips_y": 0.0
+    },
+    {
+     "t": 0.6,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       15.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -15.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       80.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -80.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       20.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -20.0
+      ],
+      "spine": [
+       0.0,
+       4.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       7.5,
+       0.0
+      ],
+      "chest": [
+       2.5,
+       2.5,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.6
+     },
+     "hips_y": 0.03
+    },
+    {
+     "t": 1.2,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       100.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -60.0
+      ],
+      "spine": [
+       0.0,
+       8.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       15.0,
+       0.0
+      ],
+      "chest": [
+       5.0,
+       5.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       10.5
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -10.5
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       21.875
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -21.875
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 1.8,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       60.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -100.0
+      ],
+      "spine": [
+       0.0,
+       -8.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       -15.0,
+       0.0
+      ],
+      "chest": [
+       5.0,
+       -5.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       6.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -6.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       23.75
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -23.75
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.05
+    },
+    {
+     "t": 2.2,
+     "bones": {
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       85.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       -85.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       25.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       -25.0
+      ],
+      "head": [
+       -10.0,
+       0.0,
+       0.0
+      ],
+      "leftShoulder": [
+       0.0,
+       0.0,
+       3.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       -3.0
+      ],
+      "spine": [
+       0.0,
+       -4.0,
+       0.0
+      ],
+      "chest": [
+       2.5,
+       -2.5,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 1.0
+     },
+     "hips_y": 0.08
+    },
+    {
+     "t": 2.6,
+     "bones": {
+      "leftShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightShoulder": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightUpperArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "leftLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "rightLowerArm": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "spine": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "head": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "chest": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "expression": {
+      "happy": 0.0
+     },
+     "hips_y": 0.0
+    }
+   ]
+  }
+ ]
+}

@@ -37,31 +37,48 @@ MAX_INLINE_ANIMATION_CHARS = 32000
 
 
 def _animation_doc_description() -> str:
-    example = ('{"name":"victory_dance","description":"fists up, hop",'
-               '"duration_s":2.4,"loop":false,"ease":"smooth","keyframes":['
+    example = ('{"name":"spotlight_twirl","description":"V arms, sway, tilt, hop",'
+               '"duration_s":3.4,"loop":false,"ease":"smooth","keyframes":['
                '{"t":0,"bones":{},"expression":{}},'
-               '{"t":0.6,"bones":{"leftUpperArm":[0,0,70],'
-               '"rightUpperArm":[0,0,-70],"leftLowerArm":[0,-90,0]},'
-               '"expression":{"happy":0.8},"hips_y":0.04},'
-               '{"t":1.2,"bones":{"leftUpperArm":[0,0,55],'
-               '"rightUpperArm":[0,0,-85],"leftLowerArm":[0,-70,0],'
-               '"spine":[4,0,0]},"expression":{"happy":1}},'
-               '{"t":2.4,"bones":{},"expression":{}}]}')
+               '{"t":0.7,"bones":{"leftUpperArm":[0,0,-100],"rightUpperArm":[0,0,100]},'
+               '"expression":{"happy":0.8},"hips_y":0.02},'
+               '{"t":1.4,"bones":{"leftUpperArm":[0,0,-100],"rightUpperArm":[0,0,100],'
+               '"spine":[0,0,10],"upperChest":[0,0,7],"head":[0,0,12]}},'
+               '{"t":1.9,"bones":{"leftUpperArm":[0,0,-100],"rightUpperArm":[0,0,100],'
+               '"spine":[0,0,-10],"upperChest":[0,0,-7],"head":[0,0,-12]}},'
+               '{"t":2.4,"bones":{"leftUpperArm":[0,0,-60],"rightUpperArm":[0,0,60]},'
+               '"hips_y":-0.03},'
+               '{"t":2.7,"bones":{"leftUpperArm":[0,0,-40],"rightUpperArm":[0,0,40]},'
+               '"hips_y":0.12},'
+               '{"t":3.0,"bones":{},"expression":{},"hips_y":-0.02},'
+               '{"t":3.4,"bones":{},"expression":{}}]}')
     return (
         "Doc: {name: lowercase snake_case 2-32, unused on this model, never "
         "a built-in gesture name; description: short; duration_s: 0.4..8; "
         "loop: bool; ease: smooth|linear; keyframes: 2..24x {t: seconds, "
         "first 0, last = duration_s; bones: {bone: [x,y,z]}; expression: "
         "{face: 0..1}; hips_y: -0.25..0.15}}. Bone rotations are LOCAL Euler "
-        "DEGREES vs the rest pose, mirrored sign left/right; start and end "
-        "at rest (empty bones). Bones: hips, spine, chest, upperChest, head, "
-        "then Shoulder, UpperArm, LowerArm, Hand, UpperLeg, LowerLeg, Foot "
-        "with left/right prefixes; neck is FORBIDDEN; finger bones like "
-        "leftIndexProximal (Thumb has no Intermediate). Limits: spine/chest/"
-        "upperChest ±15, head ±40, shoulders ±30, hips ±45 (±60 y), arms/"
-        "legs to ±137 — larger values clamp, reported in `clamped`. "
-        "Expressions: happy angry sad relaxed surprised + visemes aa ih ou "
-        "ee oh blink. Example: " + example)
+        "DEGREES vs the rest pose (arms hang at sides); a track absent from a "
+        "key HOLDS/interpolates between the keys that specify it. Bones: hips, "
+        "spine, upperChest (chest may be missing — skip it), head, "
+        "Shoulder/UpperArm/LowerArm/Hand/UpperLeg/LowerLeg/Foot with left/ "
+        "right prefixes; neck FORBIDDEN; fingers like leftIndexProximal. "
+        "Limits clamp (reported in `clamped`): spine/upperChest ±15, head ±40, "
+        "shoulder ±30, arms/legs ±137. COOKBOOK (measured on your current "
+        "body; axes are per-rig): RAISE arms out = leftUpperArm Z NEGATIVE / "
+        "rightUpperArm Z POSITIVE (±70 = straight out sideways, ±100..110 = V "
+        "overhead); opposite sign crosses the arms over the body — a 'V/raise' "
+        "needs |z|>=70. upperArm Y swings front(-)/back(+); X is a twist "
+        "(invisible). Elbow hinge = lowerArm Y: -80 flexes the forearm "
+        "forward/up (hands on hips = upperArm z ∓20 + lowerArm [0,-80,±20]). "
+        "SWAY side-to-side = spine Z ±10 + upperChest Z ±7 SAME sign, "
+        "alternating per key (Y twists, not sway). HEAD: Z tilts ear-to-"
+        "shoulder, X nods, Y turns. WAVE = one upperArm Z ±95 + lowerArm "
+        "[0,-60,0], oscillate lowerArm Y -40..-90. HOP = hips_y -0.03 dip, "
+        "+0.12 air (the whole body including feet rides the offset up — the "
+        "hop is visible without keying legs), -0.02 land. Start/end at "
+        "rest. Expressions: happy angry "
+        "sad relaxed surprised + visemes aa ih ou ee oh blink. Example: " + example)
 
 
 TOOL_DESCRIPTIONS = {
@@ -150,6 +167,9 @@ def build_animation_specs(store: Any, persona_id: str,
                "duration_s": row["duration_s"]}
         if notes:
             out["clamped"] = notes
+        lint = _animations.lint_animation(args.get("animation"), clean)
+        if lint:
+            out["lint"] = lint
         out["note"] = (
             "You are performing it now as a preview. " +
             ("It is saved: tell the owner, no need to ask." if status == "kept"

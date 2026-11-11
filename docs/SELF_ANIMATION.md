@@ -39,19 +39,115 @@ models on eve: MoMask / T2M-GPT / MotionGPT / HY-Motion → VRMA) stays **plan o
 ```
 
 - `bones`: humanoid bone name → **Euler degrees `[x, y, z]`, XYZ order, local, relative to the rest pose of the
-  normalized humanoid bone** (three-vrm 3 normalized rig, so the same numbers work on VRM0 and VRM1). A bone missing
-  from a keyframe = rest (0,0,0) at that key.
+  normalized humanoid bone** (three-vrm 3 normalized rig). Bone local **axis signs are rig-specific** — they are NOT
+  identical between avatars (see the measured convention table below; the live model and the QA sample avatar are
+  axis-mirrored on several bones).
+- **Hold semantics (2026-11 revision — replaces "missing = rest"):** a bone / expression / `hips_y` value **missing
+  from a keyframe interpolates** between the nearest keyframes where that track IS specified (linear in time), and
+  the FIRST/LAST keyframes act as implicit rest/0 anchors when the track is absent there — animations still start and
+  end at rest via the existing 0.25 s blend. You no longer need to re-key a bone on every key where it should hold a
+  pose. `validate_animation` **expands every mentioned track into explicit per-key values at save time**
+  (`fill_keyframe_holds`), so stored docs are unambiguous and even an old "missing = rest" player renders the same
+  move (hub-normalise-at-save chosen over sampler parity because stored docs then need no semantics version flag at
+  all); `client/js/keyframes.js` `holdFillKeyframes()` implements the identical fill defensively for cached /
+  hand-written / fixture docs, and `client/js/fixtures/animation_hold_golden.json` is the parity fixture both sides
+  test against (`hub/animations.py` fill output == fixture == page fill).
+  Stored pre-revision rows are migrated **automatically on hub startup** (`migrate_hold_semantics`; idempotent;
+  logs `hold-semantics keyframe migration rewrote N animation row(s)`).
 - Allowed bones: `hips, spine, chest, upperChest, head, leftShoulder, rightShoulder, leftUpperArm, rightUpperArm,
   leftLowerArm, rightLowerArm, leftHand, rightHand, leftUpperLeg, rightUpperLeg, leftLowerLeg, rightLowerLeg,
   leftFoot, rightFoot` plus finger bones (`leftThumbProximal` … `rightLittleDistal`). **`neck` is not allowed**
   (Furina garment skinning, docs/BODY.md); `spine`/`chest`/`upperChest` are limited to ±15° per axis; `head` ±40°.
+- **Bone conventions (⚠ measured 2026-11 — see "Measured pose cookbook" below):** VRM bone local axes are
+  **rig-specific**, not standardised. The **live-model convention (Furina)**: `leftUpperArm`/`rightUpperArm`
+  **Z raises the arm out to the side** (left −Z, right +Z; |z|≈70 ≈ out to the side, 100+ = overhead V),
+  **Y swings it front/back** (−=forward), X ≈ twist (near no-op). The old doc said "left +Z raises the left
+  arm" — that was measured on the **sample avatar**, whose arm/head/spine axes are **mirrored** vs Furina.
+  Keyframe numbers are per-model assets (`animations.model_sha256`), so the cookbook is authored against the
+  live rig and the table below records both rigs' signs.
 - `expression`: VRM expression name (`happy, angry, sad, relaxed, surprised, aa, ih, ou, ee, oh, blink`) → 0..1.
-- `hips_y`: optional vertical hip offset in metres, −0.25 .. 0.15 (a hop or a curtsy dip). Legs: unless any
-  leg bone is keyed, feet stay planted.
+- `hips_y`: optional vertical hip offset in metres, −0.25 .. 0.15 (a hop or a curtsy dip). Measured (2026-11):
+  the player **translates the whole body** by the offset — with no leg bone keyed the feet ride with it and
+  **leave the ground** (≈36 px of lift per 0.1 m at the QA capture zoom, airborne confirmed on both probe
+  rigs), so a hop is visible without touching legs (this is the chosen hop behavior). There is no
+  feet-pinned mode: keying legs only adds knee bends on top (keep `hips_y` near 0 for a planted crouch).
 - Limits: the hub owns `hub/animation_limits.json` (per-bone min/max degrees per axis, matching the page's
   `pose.js` grab/joint limits) and **clamps** out-of-range values and **rejects** structural errors (bad name,
   reserved name, keyframe count/timing, unknown bone, `neck`) with a message the model can act on.
   The page clamps again on playback (defence in depth).
+
+## Measured pose cookbook (2026-11, headless on both rigs)
+
+Method: `client/tools/capture_frames.py custom … --gaze 0,0` on 3 s probe animations holding one bone at a
+time, then **objective world-space deltas** from each frame's `bones`/`metrics` (hand/head/foot positions vs
+the rest baseline; `eyesWorld` for head roll) plus vision confirmation on the contact sheets. Evidence PNGs:
+`docs/evidence/pose_measured_*.png` (generated from `client/tools/probe_evidence/` probe runs; labels give
+the exact keyed values). Rest pose = **arms at sides** (`{}`), not T-pose, on both rigs. Signs are for
+`[X, Y, Z]` Euler degrees, local, from rest; "Furina" = the live model, "sample" = the QA sample avatar.
+
+| Motion | Furina (LIVE) | sample avatar | Evidence |
+| --- | --- | --- | --- |
+| `upperArm` Z | **L −Z / R +Z raises the arm out to the side** (70 ≈ horizontal T, 100–110 overhead V); opposite sign crosses the arm over the body | **mirrored** (L +Z / R −Z raise) | `pose_measured_furina_arms.png`, `pose_measured_sample_arms.png` |
+| `upperArm` Y | **− swings the arm FORWARD**, + swings back (both signs lift the hand slightly as the arm swings on its cone) | behaves differently (mixed swing+abduction); prefer Z moves on sample | world deltas (hands z ∓0.35 m at ±60°) |
+| `upperArm` X | twist along the arm — near no-op on the hand (<0.01 m at 60°) | same (negligible) | both probe runs |
+| `lowerArm` (elbow) | **hinge = Y: −75…−90 flexes the forearm FORWARD/up** (hand rises ~0.15–0.2 m, forward ~0.16 m); + swings it back; Z = small sideways swing (avoid); X = twist | **same sign** (Y− forward confirmed: hand z +0.22 at Y−60) | `pose_measured_furina_arms.png` |
+| `shoulder` | decorative: ±10–15 shifts the shoulder line slightly (L Z+ pulls the arm slightly inward) | same | probe run |
+| `spine` / `upperChest` Z | **lean sideways: +Z leans to HER LEFT** (eyes shift +x); **sway = spine Z ±8…12 plus upperChest Z ±5…8 SAME sign**, alternate sign per key | Z lean works; direction mirrored (lean-right for +Z) | `pose_measured_furina_head.png` (spine rows) |
+| `chest` | **no-op on the live rig — the VRM has no Chest bone; use spine + upperChest** | works | world probe (zero delta) |
+| `spine` X | + leans BACK (eyes −z); − leans forward | **mirrored** (+ leans forward) | `pose_measured_sample_head.png` |
+| `head` X | **+ = look UP (chin up), − = nod down** | **mirrored** (+ = nod) | `pose_measured_furina_head.png` vs `pose_measured_sample_head.png` |
+| `head` Y | turn left/right (either sign turns) | either sign turns | same sheets |
+| `head` Z | **tilt: Z+ tilts to HER RIGHT, Z− to her left** (ear toward shoulder — the "tilt to the music" axis) | mirrored (+ tilts her left) | `pose_measured_furina_roll.png`, `pose_measured_sample_roll.png` |
+| `upperLeg` X | + swings knee/leg FORWARD (foot +z 0.35 m at +60°); − swings back | same (foot forward at +60°) | `pose_measured_furina_legs_hops.png` |
+| `lowerLeg` X | **− is the natural knee bend (heel toward glutes)**; + raises the shin forward (kick) | **mirrored** (+ bends naturally) | same sheet |
+| `hips_y` | translates the WHOLE body: +0.05…0.15 lifts the feet off the ground (≈36 px / 0.1 m airborne); − dips/sinks; keyed legs add bends but never re-pin the feet | same | `pose_measured_furina_legs_hops.png` |
+
+Reference poses (live rig — exact numbers, each verified by capture; mirror L/R pairs as shown):
+
+- **Arms at sides (rest):** `{}`. Not a T-pose.
+- **Arms straight out (T):** `leftUpperArm [0,0,-70]`, `rightUpperArm [0,0,70]`.
+- **V overhead:** `leftUpperArm [0,0,-100]`, `rightUpperArm [0,0,100]` (add `leftLowerArm/rightLowerArm
+  [0,0,∓10]` to keep the arms straight-looking; clear the shoulder around t=0.6 with ±30 first for a smooth
+  wind-up).
+- **Hands on hips (waist-height guard):** `leftUpperArm [0,0,-20]` + `leftLowerArm [0,-80,20]`,
+  `rightUpperArm [0,0,20]` + `rightLowerArm [0,-80,-20]` — hands land at waist height in front of the hips;
+  on a straight-elbow rest rig they don't clasp the hip exactly (verified: hands Δy +0.15 m, Δz +0.16 m).
+- **One arm waving overhead:** `rightUpperArm [0,0,95]` to raise (right = +Z on the live rig),
+  `rightLowerArm [0,-60,0]` brings the forearm forward-up next to the head, then oscillate
+  `rightLowerArm` Y between −40 and −90 across keys (or ±12° on upperArm Z for a wider wave).
+- **Side-to-side sway:** spine `Z ±10` + upperChest `Z ±7` **same sign**, one sign per key, alternating;
+  NOT the Y axis (Y is a waist twist).
+- **Head tilt to the music:** `head Z ±12` matching (or countering) the sway sign — Z is the tilt axis,
+  X is the nod, Y is the turn.
+- **Small hop:** no leg keys needed: `hips_y` −0.03 (dip) → +0.12 (air — the whole body, feet included,
+  rides the offset) → −0.02 (landing bend) → 0; add `head X -6` on the dip and arms swinging Y− on the
+  rise for weight. For a planted crouch instead of a hop keep `hips_y` ≤ 0 and bend the legs.
+
+### Proof: spotlight_twirl on the live model (Furina)
+
+The owner's saved `spotlight_twirl` ("arms in a V, sway, head tilt, hop") rendered as "arms pointing out
+from the elbows and nothing else" for three compounding reasons: the old missing=rest semantics snapped
+lowerArm/shoulder/spine back to rest on every intermediate key; the sway was keyed on spine/head **Y**
+(twist/turn) instead of **Z**; and the raise pair used the sample-avatar signs, which are **mirrored** on
+Furina, so her "V" crossed the arms inward. Renders (headless Furina, ~8–12 timestamps each, ground line
+drawn in red):
+
+- `docs/evidence/spotlight_as_stored.png` — the stored doc rendered under old rest-fill semantics:
+  arms inward/crossed mid-move, no sway, no tilt.
+- `docs/evidence/spotlight_renormalised.png` — same key values after the hub's hold-fill expansion
+  (`holdFillKeyframes`/`fill_keyframe_holds`): limbs hold between keys and the wind-up swing reads,
+  but the axis/sign errors remain (still no V, sway is a twist).
+- `docs/evidence/spotlight_corrected.png` — re-authored from the owner's description with the cookbook
+  (V = L −100/R +100, sway = spine+upperChest Z ±10/7 alternating, tilt = head Z ±12, hop = hips_y
+  −0.03→+0.14→−0.03 with a knee-steer): V overhead at t≈0.8–1.6, visible lean both ways, ear-to-shoulder
+  tilt following the sway, and a hop whose airborne frame lifts the boot soles ~40 px off the ground line
+  (raw lowest-ink row 620 vs planted 657–670), with crouch before and compression on landing.
+- `docs/evidence/spotlight_arm_lift_compare.png` — as-stored vs renormalised at equal doc times (arm
+  elevation difference from hold semantics alone).
+
+All four stored live drafts (`cheeky_swayer`, `curtsey_twirl`, `hat_tip_hop`, `spotlight_twirl`) are
+sparse and get rewritten to explicit per-key values by `migrate_hold_semantics` **automatically at hub
+startup** (idempotent; logs the row count).
 
 ## Seams
 

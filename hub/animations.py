@@ -132,6 +132,165 @@ def _as_f(v) -> float:
     return float(v)  # type: ignore[arg-type]
 
 
+# ── hold semantics (docs/SELF_ANIMATION.md, 2026-11 revision) ──────────────
+#
+# A bone / expression / hips_y value MISSING from a keyframe no longer means
+# "rest at that key". It interpolates between the nearest keys where the
+# track IS specified, and the FIRST/LAST keyframes act as implicit rest/0
+# anchors when the track is absent there — so animations still start and end
+# at rest. validate_animation expands every mentioned track into explicit
+# per-key values at save time, so STORED docs are unambiguous (even an
+# old page player reading "missing = rest" renders exactly the same move).
+# client/js/keyframes.js implements the same fill defensively (desktop
+# caches and fixtures can hold pre-expansion docs); client/js/fixtures/
+# animation_hold_golden.json is the parity fixture both sides test against.
+
+def _track_fill(spec: dict, ts: list[float], zero) -> list:
+    """spec: keyIndex -> authored value (absent = missing). Returns one value
+    per key, linear in TIME between the nearest specified anchors; the first
+    and last keys are implicit `zero` anchors when the track is missing
+    there. spec/zero are lists (bones) or scalars (expression, hips_y)."""
+    n = len(ts)
+    out: list = [None] * n
+    for i in range(n):
+        if i in spec:
+            out[i] = spec[i]
+            continue
+        prev = max((k for k in spec if k < i), default=None)
+        nxt = min((k for k in spec if k > i), default=None)
+        if prev is None and nxt is None:      # no anchor at all: rest
+            out[i] = zero
+        elif prev is None:                    # implicit rest anchor at key 0
+            assert nxt is not None
+            va, vb = zero, spec[nxt]
+            u = (ts[i] - ts[0]) / (ts[nxt] - ts[0]) if ts[nxt] > ts[0] else 0.0
+            out[i] = _lerp(va, vb, u)
+        elif nxt is None:                     # implicit rest anchor at last key
+            va, vb = spec[prev], zero
+            u = (ts[i] - ts[prev]) / (ts[n - 1] - ts[prev]) \
+                if ts[n - 1] > ts[prev] else 0.0
+            out[i] = _lerp(va, vb, u)
+        else:
+            va, vb = spec[prev], spec[nxt]
+            u = (ts[i] - ts[prev]) / (ts[nxt] - ts[prev]) \
+                if ts[nxt] > ts[prev] else 0.0
+            out[i] = _lerp(va, vb, u)
+    return out
+
+
+def _lerp(a, b, u):
+    if isinstance(a, list):
+        return [round(a[j] + (b[j] - a[j]) * u, 3) for j in range(len(a))]
+    return round(a + (b - a) * u, 3)
+
+
+def fill_keyframe_holds(keyframes: list[dict]) -> list[dict]:
+    """Expand sparse keyframes to explicit per-key values (hold semantics).
+    Idempotent: an already-explicit list comes back value-identical."""
+    n = len(keyframes)
+    if n < 2:
+        return [dict(k) for k in keyframes]
+    ts = [float(k["t"]) for k in keyframes]
+    out = [{**k, "bones": dict(k.get("bones") or {}),
+            "expression": dict(k.get("expression") or {})} for k in keyframes]
+    bone_track: dict[str, dict] = {}
+    expr_track: dict[str, dict] = {}
+    hips_track: dict[int, float] = {}
+    for i, k in enumerate(keyframes):
+        for bone, v in (k.get("bones") or {}).items():
+            bone_track.setdefault(bone, {})[i] = v
+        for ex, w in (k.get("expression") or {}).items():
+            expr_track.setdefault(ex, {})[i] = w
+        if k.get("hips_y") is not None:
+            hips_track[i] = float(k["hips_y"])
+    for bone, spec in bone_track.items():
+        vals = _track_fill(spec, ts, [0.0, 0.0, 0.0])
+        for i, v in enumerate(vals):
+            out[i]["bones"][bone] = v
+    for ex, spec in expr_track.items():
+        vals = _track_fill(spec, ts, 0.0)
+        for i, v in enumerate(vals):
+            out[i]["expression"][ex] = v
+    if hips_track:
+        vals = _track_fill(hips_track, ts, 0.0)
+        for i, v in enumerate(vals):
+            out[i]["hips_y"] = v
+    return out
+
+
+# ── descriptive lint (non-fatal hints, docs/SELF_ANIMATION.md) ──────────────
+# Cheap words-vs-numbers checks on the CREATED doc: when the description
+# promises a move the numbers cannot show, the model gets a hint it can act
+# on in the same turn. Hints never reject and never block the save.
+
+_LINT_SWAY_RE = re.compile(
+    r"sway|swaying|lean|tilt|side[- ]to[- ]side|rock(?:ing)?", re.IGNORECASE)
+_LINT_HOP_RE = re.compile(
+    r"hop|jump|bounce|leap|spring", re.IGNORECASE)
+_LINT_RAISE_RE = re.compile(
+    r"\bv\b|raise|arms? up|arms? high|overhead|reach up|arms? rise",
+    re.IGNORECASE)
+
+# measured on the sample avatar + Furina (docs/SELF_ANIMATION.md convention
+# table): UpperArm ±Z swings the arm sideways — ~30° clears the shoulder
+# line, ~80°+ reads as a raised/V pose; a hop needs hips_y >= ~0.08 m to
+# read against the ground line.
+LINT_ARM_RAISE_MIN_DEG = 30.0
+LINT_HOP_MIN_M = 0.08   # measured: 0.03-0.05 reads as nothing; 0.12+ is a clear hop
+_TORSO_BONES = ("spine", "chest", "upperChest", "head")
+
+
+def lint_animation(doc: dict, clean: dict) -> list[str]:
+    """Words-vs-numbers hints for one created animation (see above)."""
+    notes: list[str] = []
+    text = f"{clean.get('name', '')} {clean.get('description', '')}"
+    kfs = clean.get("keyframes") or []
+
+    def _zmax(bones):
+        vals = [abs((k.get("bones") or {}).get(b, [0, 0, 0])[2])
+                for k in kfs for b in bones]
+        return max(vals, default=0.0)
+
+    if _LINT_SWAY_RE.search(text) and _zmax(_TORSO_BONES) < 3.0:
+        notes.append("hint: description says sway/lean/tilt but no Z-axis "
+                     "keys on spine/chest/head — sideways motion is Z "
+                     "(Y twists the torso, it barely registers sideways)")
+    hips_vals = [k.get("hips_y") or 0.0 for k in kfs]
+    if _LINT_HOP_RE.search(text) and max(hips_vals, default=0.0) < LINT_HOP_MIN_M:
+        notes.append(f"hint: description says hop/jump but hips_y never "
+                     f"reaches {LINT_HOP_MIN_M} m — a visible hop needs a "
+                     "dip (~-0.03) then a rise (>=0.05); feet leave the "
+                     "ground with the hips automatically")
+    if _LINT_RAISE_RE.search(text) and _zmax(
+            ("leftUpperArm", "rightUpperArm")) < LINT_ARM_RAISE_MIN_DEG:
+        notes.append("hint: description raises the arms but |UpperArm.z| "
+                     "stays under 30° — Z swings the arm sideways/up "
+                     "(see the cookbook raise pair for the CURRENT rig: "
+                     "leftUpperArm -Z / rightUpperArm +Z raise on the live "
+                     "model); clear the shoulder at ~30°, a raised/V pose "
+                     "needs |z| >= 75-105")
+    return notes
+
+
+def migrate_hold_semantics(store) -> int:
+    """Hub-start migration (idempotent): rewrite every stored animation's
+    keyframes with explicit hold-filled values so stored docs are
+    unambiguous for any player. Returns the number of rows rewritten."""
+    fixed = 0
+    for row in store.iter_animations():
+        kfs = row.get("keyframes") or []
+        if len(kfs) < 2:
+            continue
+        try:
+            filled = fill_keyframe_holds(kfs)
+        except (KeyError, TypeError, ValueError):
+            continue            # a row the current validator never produced
+        if filled != kfs:
+            if store.set_animation_keyframes(row["id"], filled):
+                fixed += 1
+    return fixed
+
+
 def validate_animation(doc, reserved=None) -> tuple[dict, list[str]]:
     """Check + clamp one keyframe document (docs/SELF_ANIMATION.md format).
 
@@ -311,6 +470,9 @@ def validate_animation(doc, reserved=None) -> tuple[dict, list[str]]:
         raise ValueError("animation_error: " + "; ".join(errors[:MAX_ERRORS])
                          + (f"; (+{len(errors) - MAX_ERRORS} more)"
                             if len(errors) > MAX_ERRORS else ""))
+    # hold semantics: store every mentioned track EXPLICITLY per key
+    # (docs/SELF_ANIMATION.md) so stored docs are unambiguous for any player
+    clean_kfs = fill_keyframe_holds(clean_kfs)
     return ({"name": name, "description": desc,
              "duration_s": round(_as_f(dur), 3), "loop": loop, "ease": ease,
              "keyframes": clean_kfs}, notes)

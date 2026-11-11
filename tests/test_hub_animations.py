@@ -46,6 +46,87 @@ def test_shared_fixture_validates_clean():
     assert clean["keyframes"][-1]["t"] == clean["duration_s"]
 
 
+# ── hold semantics (2026-11 revision, docs/SELF_ANIMATION.md) ───────────────
+
+_SPOT_SPARSE = [  # shape of the owner-authored spotlight_twirl: tracks appear
+    {"t": 0.0, "bones": {}, "expression": {}},                        # only on
+    {"t": 0.6, "bones": {"leftShoulder": [0, 0, 15], "leftLowerArm": [0, 0, 20],
+                         "leftUpperArm": [0, 0, -80]}, "expression": {"happy": 0.6},
+     "hips_y": 0.03},                                                 # one or
+    {"t": 1.2, "bones": {"leftUpperArm": [0, 0, -100]}, "expression": {},
+     "hips_y": 0.05},                                                 # two keys
+    {"t": 2.6, "bones": {}, "expression": {}},
+]
+
+
+def test_fill_keyframe_holds_interpolates_between_keys():
+    filled = A.fill_keyframe_holds(_SPOT_SPARSE)
+    # lowerArm/shoulder HOLD between the keys that mention them (no snap to rest)
+    assert filled[2]["bones"]["leftLowerArm"] == [0.0, 0.0, 14.0]  # lerped toward rest
+    assert filled[2]["bones"]["leftShoulder"] == [0.0, 0.0, 10.5]
+    assert filled[1]["bones"]["leftLowerArm"] == [0, 0, 20]        # authored value kept
+    # expression + hips_y follow the same rule
+    assert filled[2]["expression"]["happy"] == pytest.approx(0.42)
+    # first/last keyframes are implicit rest anchors
+    assert filled[0]["bones"]["leftUpperArm"] == [0.0, 0.0, 0.0]
+    assert filled[-1]["bones"]["leftShoulder"] == [0.0, 0.0, 0.0]
+    assert filled[-1]["hips_y"] == 0.0
+    # idempotent
+    assert A.fill_keyframe_holds(filled) == filled
+
+
+def test_validate_animation_stores_explicit_holds():
+    doc = simple_doc(name="spot_probe",
+                     keyframes=copy.deepcopy(_SPOT_SPARSE), duration_s=2.6)
+    clean, _ = A.validate_animation(doc)
+    for key in clean["keyframes"]:  # every mentioned track is explicit on every key
+        assert "leftLowerArm" in key["bones"] and "leftShoulder" in key["bones"]
+        assert "happy" in key["expression"]
+        assert "hips_y" in key
+
+
+def test_hold_golden_parity_fixture():
+    """hub/animations.py fill output == client/js/fixtures/animation_hold_golden.json
+    (the page's holdFillKeyframes is tested against the same fixture)."""
+    fx = json.loads((ROOT / "client" / "js" / "fixtures" / "animation_hold_golden.json")
+                    .read_text(encoding="utf-8"))
+    for case in fx["cases"]:
+        assert A.fill_keyframe_holds(copy.deepcopy(case["in"])) == case["out"], case["name"]
+
+
+def test_migrate_hold_semantics_idempotent(store):
+    doc = simple_doc(name="old_spot", keyframes=copy.deepcopy(_SPOT_SPARSE),
+                     duration_s=2.6)
+    clean, _ = A.validate_animation(doc)  # store rows arrive pre-validated
+    row = store.add_animation("riko", "shaAAA", {**clean, "keyframes":
+                                                 copy.deepcopy(_SPOT_SPARSE)})
+    assert row is not None
+    assert A.migrate_hold_semantics(store) == 1
+    again = store.get_animation("riko", "old_spot", model_sha256="shaAAA")
+    assert again["keyframes"][1]["bones"]["leftLowerArm"] == [0, 0, 20]
+    assert "leftLowerArm" in again["keyframes"][2]["bones"]
+    assert A.migrate_hold_semantics(store) == 0   # second pass rewrites nothing
+
+
+def test_lint_notes_flag_docs_that_miss_their_description():
+    sparse_kfs = copy.deepcopy(_SPOT_SPARSE)
+    doc = {"name": "spot_x", "description": "arms up in a V, sway, hop",
+           "duration_s": 2.6, "keyframes": sparse_kfs}
+    notes = A.lint_animation(doc, {"name": "spot_x",
+                                   "description": doc["description"],
+                                   "keyframes": sparse_kfs})
+    assert any("sway" in n for n in notes)          # only Y-axis torso keys here
+    assert any("hop" in n for n in notes)           # hips_y max 0.05 is invisible
+    assert not any("V" in n or "raise" in n for n in notes)  # -100 is a real raise
+    good = {"name": "spot_ok", "description": "V arms, sway, hop",
+            "keyframes": [{"t": 0.0, "bones": {}, "expression": {}},
+                          {"t": 1.0, "bones": {"leftUpperArm": [0, 0, -100],
+                                               "spine": [0, 0, 10]},
+                           "expression": {}, "hips_y": 0.12},
+                          {"t": 2.0, "bones": {}, "expression": {}}]}
+    assert A.lint_animation(good, good) == []      # notes never fire on honest docs
+
+
 def test_gesture_names_match_gestures_js():
     """The reserved built-in gesture list is parsed from client/js/gestures.js
     at test time: if the page ever renames/adds a gesture, this fails and the
@@ -679,8 +760,13 @@ def test_animation_tool_permissions_and_descriptions(store):
                            {"delete_animation": "always"}) == "always")
     assert permission_for("create_animation", "hub", "act", {}) == "always"
     for name, spec in specs.items():
-        assert len(spec.description) <= 1500, (name, len(spec.description))
-    assert "victory_dance" in specs["create_animation"].description
+        # create_animation carries the measured pose cookbook (axis signs + named
+        # reference poses) inline so the model authors moves that render correctly;
+        # that legitimately needs more than the generic 1500-char tool-description cap.
+        cap = 2600 if name == "create_animation" else 1500
+        assert len(spec.description) <= cap, (name, len(spec.description))
+    assert "spotlight_twirl" in specs["create_animation"].description
+    assert "COOKBOOK" in specs["create_animation"].description
 
 
 class _EventRecorder:

@@ -822,6 +822,28 @@ class Store:
                 "GROUP BY model_sha256 ORDER BY MIN(id)", (persona_id,)).fetchall()
         return [r["model_sha256"] for r in rows]
 
+    def iter_animations(self) -> list[dict]:
+        """Every stored animation across ALL personas/models (creation
+        order) — the hub-start hold-semantics migration iterates this
+        (docs/SELF_ANIMATION.md); callers must not mutate the rows."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM animations ORDER BY id").fetchall()
+        return [self._animation_dict(r) for r in rows]
+
+    def set_animation_keyframes(self, animation_id: int,
+                                keyframes: list[dict]) -> bool:
+        """Overwrite one animation's keyframes (id-targeted, for the
+        migration; normal path is add/update via validate). True if a row
+        was written."""
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE animations SET keyframes_json=?, updated_at=? "
+                "WHERE id=?",
+                (json.dumps(keyframes), now_iso(), animation_id))
+            self.db.commit()
+        return cur.rowcount > 0
+
     def update_animation(self, persona_id: str, name: str, model_sha256: str,
                          *, new_name: str | None = None,
                          description: str | None = None,

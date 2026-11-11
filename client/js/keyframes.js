@@ -9,7 +9,9 @@
  *    keyframes: [ { t, bones?: {<bone>: [x,y,z] degrees XYZ, rest-relative},
  *                   hips_y?: metres, expression?: {<preset>: 0..1} }, ... ] }
  *   - 2..24 keys, t strictly ascending, first t === 0, last t === duration_s
- *   - a bone absent from a key rests at that key; `neck` is never allowed
+ *   - HOLD semantics (2026-11): a track absent from a keyframe is
+ *     interpolated between the nearest keys that specify it, with implicit
+ *     rest/0 anchors at the first/last keyframes; `neck` is never allowed
  *   - 'smooth' = cubic ease in/out per segment (x²(3-2x), the same curve the
  *     sit/grab blends use), then slerp between the two key quaternions
  *   - rotations are relative to the NORMALIZED bone rest (three-vrm
@@ -254,6 +256,88 @@ export function clampAnimation(anim) {
 
 // ── sampling ─────────────────────────────────────────────────
 
+// ── hold semantics (docs/SELF_ANIMATION.md, 2026-11 revision) ──
+// A bone / expression / hips_y value MISSING from a keyframe INTERPOLATES
+// between the nearest keys where the track IS specified (linear in time),
+// with implicit rest/0 anchors at the FIRST/LAST keyframes when the track
+// is absent there — animations still start and end at rest. The hub's
+// validator expands every SAVED doc to this explicit per-key form
+// (hub/animations.py fill_keyframe_holds; parity fixture
+// client/js/fixtures/animation_hold_golden.json, tested against the exact
+// hub output). We fill here too, defensively: desktop caches, fixtures and
+// hand-written docs can still carry pre-expansion sparse keyframes, and
+// they must not render the old "missing = rest" snap.
+export function holdFillKeyframes(anim) {
+  const keys = (anim && anim.keyframes) || [];
+  const n = keys.length;
+  if (n < 2) return keys.map((k) => ({ ...k }));
+  const ts = keys.map((k) => (Number.isFinite(+k.t) ? +k.t : 0));
+  const out = keys.map((k) => ({
+    ...k,
+    bones: { ...(k.bones || {}) },
+    expression: { ...(k.expression || {}) },
+  }));
+  const boneTrack = {};
+  const exprTrack = {};
+  let hipsTrack = null;
+  keys.forEach((k, i) => {
+    for (const [bone, v] of Object.entries(k.bones || {})) {
+      (boneTrack[bone] || (boneTrack[bone] = {}))[i] = v;
+    }
+    for (const [ex, w] of Object.entries(k.expression || {})) {
+      (exprTrack[ex] || (exprTrack[ex] = {}))[i] = w;
+    }
+    if (Number.isFinite(k.hips_y)) (hipsTrack || (hipsTrack = {}))[i] = k.hips_y;
+  });
+  const idxsOf = (spec) => Object.keys(spec).map(Number).sort((a, b) => a - b);
+  const lerp = (va, vb, u) => (Array.isArray(va)
+    ? va.map((v, j) => Math.round((v + (vb[j] - v) * u) * 1000) / 1000)
+    : Math.round((va + (vb - va) * u) * 1000) / 1000);
+  const fillTrack = (spec, zero) => {
+    const idxs = idxsOf(spec);
+    return ts.map((_, i) => {
+      if (i in spec) return spec[i];
+      let prev = null;
+      let next = null;
+      for (const j of idxs) {
+        if (j < i) prev = j;
+        else if (j > i) { next = j; break; }
+      }
+      if (prev === null && next === null) return zero;
+      if (prev === null) {
+        const span = ts[next] - ts[0];
+        return lerp(zero, spec[next], span > 0 ? (ts[i] - ts[0]) / span : 0);
+      }
+      if (next === null) {
+        const span = ts[n - 1] - ts[prev];
+        return lerp(spec[prev], zero, span > 0 ? (ts[i] - ts[prev]) / span : 0);
+      }
+      const span = ts[next] - ts[prev];
+      return lerp(spec[prev], spec[next], span > 0 ? (ts[i] - ts[prev]) / span : 0);
+    });
+  };
+  for (const [bone, spec] of Object.entries(boneTrack)) {
+    const vals = fillTrack(spec, [0, 0, 0]);
+    for (let i = 0; i < n; i++) out[i].bones[bone] = vals[i];
+  }
+  for (const [ex, spec] of Object.entries(exprTrack)) {
+    const vals = fillTrack(spec, 0);
+    for (let i = 0; i < n; i++) out[i].expression[ex] = vals[i];
+  }
+  if (hipsTrack) {
+    const vals = fillTrack(hipsTrack, 0);
+    for (let i = 0; i < n; i++) out[i].hips_y = vals[i];
+  }
+  return out;
+}
+
+const _holdFillCache = new WeakMap();
+function _holdFilledKeys(anim) {
+  if (!anim || typeof anim !== 'object') return [];
+  if (!_holdFillCache.has(anim)) _holdFillCache.set(anim, holdFillKeyframes(anim));
+  return _holdFillCache.get(anim);
+}
+
 /**
  * Pure frame sample. `t` is seconds from the animation's start (the pose
  * layer advances it at frame rate). Looped animations wrap t inside
@@ -265,10 +349,11 @@ export function clampAnimation(anim) {
  *      hips_y: number }              // metres, interpolated
  * Bones that are identity at BOTH neighbouring keys are omitted (the pose
  * layer leaves unkeyed bones exactly alone: feet stay planted unless a leg
- * bone is keyed).
+ * bone is keyed). Tracks mentioned ANYWHERE are hold-filled first (see
+ * holdFillKeyframes), so "missing at this key" means "held", never "rest".
  */
 export function sample(anim, t) {
-  const keys = (anim && anim.keyframes) || [];
+  const keys = _holdFilledKeys(anim);
   const out = { bones: {}, deg: {}, expression: {}, hips_y: 0 };
   if (keys.length === 0) return out;
   const dur = Number(anim.duration_s) || keys[keys.length - 1].t || 0.001;

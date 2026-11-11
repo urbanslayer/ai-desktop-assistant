@@ -16,7 +16,7 @@ import {
   KF_BLEND, KEYFRAME_BONES, KEYFRAME_LIMITS, KEYFRAME_EXPRESSIONS,
   HIPS_Y_MIN, HIPS_Y_MAX, validateAnimation, clampAnimation, sample,
   eulerToQuatXYZ, quatSlerp, quatAngleDeg, easeSmooth, IDENTITY_QUAT,
-  clampRelEuler, quatToXyzEuler,
+  clampRelEuler, quatToXyzEuler, holdFillKeyframes,
 } from './keyframes.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -575,3 +575,55 @@ if (THREE) {
     assert.ok(completed > 20, `only ${completed} clean ends checked`);
   });
 }
+
+// ── hold semantics + parity fixture (docs/SELF_ANIMATION.md, 2026-11) ──────
+
+const HOLD_FIXTURE = JSON.parse(
+  readFileSync(join(HERE, 'fixtures', 'animation_hold_golden.json'), 'utf8'));
+
+test('holdFillKeyframes matches the hub golden output exactly', () => {
+  for (const c of HOLD_FIXTURE.cases) {
+    assert.deepEqual(holdFillKeyframes({ keyframes: c.in }), c.out, c.name);
+  }
+});
+
+// The stored spotlight_twirl (owner-authored, tracks mentioned on 1-2 keys):
+// after the hub's save-time expansion the doc is explicit per key, but the
+// page must also HOLD these values between keys when handed the raw sparse
+// doc (desktop caches / hand-written docs).
+const SPOT_SPARSE = {
+  duration_s: 2.6, ease: 'smooth', loop: false,
+  keyframes: [
+    { t: 0.0, bones: {}, expression: {} },
+    { t: 0.6, bones: { leftShoulder: [0, 0, 15], leftLowerArm: [0, 0, 20],
+                       rightLowerArm: [0, 0, -20], leftUpperArm: [0, 0, -80],
+                       rightUpperArm: [0, 0, 80] },
+      expression: { happy: 0.6 }, hips_y: 0.03 },
+    { t: 1.2, bones: { leftUpperArm: [0, 0, -100], rightUpperArm: [0, 0, -60] } },
+    { t: 1.8, bones: { leftUpperArm: [0, 0, 60], rightUpperArm: [0, 0, -100] } },
+    { t: 2.2, bones: { leftUpperArm: [0, 0, 85], rightUpperArm: [0, 0, -85],
+                       leftLowerArm: [0, 0, 25], rightLowerArm: [0, 0, -25] } },
+    { t: 2.6, bones: {}, expression: {} },
+  ],
+};
+
+test('stored spotlight_twirl holds lowerArm/shoulder between keys (not rest)', () => {
+  const filled = holdFillKeyframes(SPOT_SPARSE);
+  // every key now carries an explicit value for every mentioned track
+  for (const k of filled) {
+    assert.ok('leftShoulder' in k.bones && 'leftLowerArm' in k.bones,
+      `key t=${k.t} missing held tracks`);
+  }
+  // t=1.2: lowerArm is 3/8 from the 0.6 key (20) toward the 2.2 key (25)
+  // (linear in time: u=(1.2-0.6)/(2.2-0.6)=0.375), shoulder lerps toward
+  // rest — nothing snaps to 0.
+  const k12 = filled[2];
+  assert.ok(Math.abs(k12.bones.leftLowerArm[2] - 21.875) < 1e-6,
+    `leftLowerArm z at t=1.2 = ${k12.bones.leftLowerArm[2]}`);
+  assert.ok(k12.bones.leftShoulder[2] > 10, 'shoulder snapped to rest mid-move');
+  // sampling the sparse doc mid-move rotates the forearm (old semantics = rest)
+  const mid = sample(SPOT_SPARSE, 1.2);
+  const q = mid.bones.leftLowerArm;
+  assert.ok(q && quatAngleDeg(q, IDENTITY_QUAT) > 15,
+    'leftLowerArm sampled at rest mid-animation (hold semantics broken)');
+});
