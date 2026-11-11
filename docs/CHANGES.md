@@ -216,7 +216,7 @@ that specifies and verifies it.
 
 ## Testing
 
-- **~1200 pytest tests** (`uv run pytest`): hub API/store/migrations,
+- **2,300+ pytest tests** (plus 170 node tests for the avatar page) (`uv run pytest`): hub API/store/migrations,
   tools, timers, memory, voice, packaging/env drift, desktop loopback,
   listen modes, name gate, touch arbitration, typing/dictation, vendor
   integrity, backups.

@@ -89,7 +89,7 @@ Summary — details and per-feature docs: **[docs/CHANGES.md](docs/CHANGES.md)**
   now-playing ticker. ([docs/SPOTIFY_NOTES.md](docs/SPOTIFY_NOTES.md), [docs/SOLOIST.md](docs/SOLOIST.md))
 - **Web config page** — one page on the hub for personas, brain, memory, voices, tools,
   MCP, timers, animations and chat. ([docs/API.md](docs/API.md))
-- **Testing** — ~1200 pytest tests, node suites for the avatar page and the extension,
+- **Testing** — 2,300+ pytest tests, 170 node tests for the avatar page and the extension,
   and a headless visual QA harness that renders the real avatar and measures poses.
 - **Docs** — every feature ships with a contract doc (see [docs/](docs/) and
   [docs/BACKLOG.md](docs/BACKLOG.md) as the feature map).
