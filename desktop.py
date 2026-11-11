@@ -51,6 +51,7 @@ from riko import tts, viewer
 from riko import roam as roam_state
 from riko.config import load_config
 from riko.music import oauth_local as music_oauth
+from riko.music import mpris as music_mpris
 from riko.music import soloist as music_soloist
 from riko.music import spotifyd as music_spotifyd
 from riko.session import Session
@@ -997,7 +998,7 @@ def build_stop_typing_action(menu, typing_svc, command_pack=None):
 
 
 def build_music_menu(menu, player, listener=None, notify=None,
-                     ticker=None, push_cmd=None):
+                     ticker=None, push_cmd=None, mpris=None):
     """Music submenu (music phase 1 + docs/SOLOIST.md): Start/Stop the
     desktop player (Soloist by default, spotifyd on legacy configs), its
     status, Connect Spotify (the local loopback OAuth listener catches the
@@ -1007,8 +1008,10 @@ def build_music_menu(menu, player, listener=None, notify=None,
     desktop.music.player: off the whole submenu is omitted. Soloist gets
     two extra items: the status line 'Soloist <ver>, expires <date>' (warn
     when < 7 days) and 'Update Soloist now'; a missing key file shows its
-    fix-it text instead of pretending the player can start. Messages land
-    as tray notifications (no modal boxes from the tray)."""
+    fix-it text instead of pretending the player can start. `mpris`
+    (riko/music/mpris.py publisher) adds the persisted 'Media players
+    (MPRIS)' checkbox. Messages land as tray notifications (no modal boxes
+    from the tray)."""
     if player is None or player.mode == "off":
         return None
     music_menu = QMenu("Music", menu)
@@ -1107,6 +1110,26 @@ def build_music_menu(menu, player, listener=None, notify=None,
                     pass
         ticker_action.toggled.connect(_ticker)
         music_menu.addAction(ticker_action)
+
+    # MPRIS export (riko/music/mpris.py): same persisted-toggle shape as the
+    # ticker; flips the live bus name without touching the config.
+    if mpris is not None:
+        mpris_action = QAction("Media players (MPRIS)", music_menu)
+        mpris_action.setCheckable(True)
+        mpris_action.setChecked(bool(mpris.running))
+        mpris_action.setToolTip(
+            "Publish org.mpris.MediaPlayer2.riko on the session bus so the\n"
+            "desktop bar's media widget follows her player\n"
+            "(desktop.music.mpris: riko|any|off)")
+
+        def _mpris(on):
+            appstate.save_music_mpris(bool(on))
+            try:
+                mpris.set_enabled(bool(on))
+            except Exception:  # noqa: BLE001
+                pass
+        mpris_action.toggled.connect(_mpris)
+        music_menu.addAction(mpris_action)
 
     def _refresh():
         st = player.status()
@@ -1892,6 +1915,31 @@ def main():
         music_listener.start()   # port busy = another instance owns it, fine
     else:
         music_listener = None
+    # MPRIS2 export (riko/music/mpris.py): dux-shell-style bars (Quickshell
+    # media widgets, playerctl) discover players on the session bus, and
+    # Soloist has no MPRIS — so Riko publishes org.mpris.MediaPlayer2.riko
+    # from the SAME reconciled now-playing state that paints the ticker
+    # (session.on_music_state; docs/SOLOIST.md 'Desktop media controls').
+    # desktop.music.mpris riko|any|off + the tray checkbox (persisted);
+    # legacy spotifyd never publishes (it ships its own MPRIS name).
+    mpris_mode = music_mpris.resolve_mode(music_cfg)
+    if music_mpris.should_publish(mpris_mode, music_kind):
+        mpris_export = music_mpris.RikoMprisPublisher(
+            mode=mpris_mode, device_name=music_device,
+            ws=(music_player.ws
+                if isinstance(music_player, music_soloist.SoloistPlayer)
+                else None),
+            log=lambda line: print(line, flush=True))
+        try:                        # seed from the hub before the bar can ask
+            mpris_export.update(session.hub.spotify_now_playing())
+        except Exception:           # hub down: dark until the first event
+            pass
+        if appstate.load_music_mpris() is not False:
+            mpris_export.start()
+        session.on_music_state = mpris_export.update
+        app.aboutToQuit.connect(mpris_export.stop)
+    else:
+        mpris_export = None
     # song ticker (docs/SPOTIFY_NOTES.md): tray choice wins over the config
     # default; the effective value is pushed to the page at every start
     ticker_on = appstate.load_music_ticker()
@@ -1900,6 +1948,7 @@ def main():
     build_music_menu(menu, music_player, music_listener,
                      notify=lambda title, body: tray.showMessage(title, body),
                      ticker=ticker_on,
+                     mpris=mpris_export,
                      push_cmd=lambda cmd: bridge.command.emit(cmd))
     bridge.command.emit(f"music:ticker:{1 if ticker_on else 0}")
     app.aboutToQuit.connect(music_player.stop)

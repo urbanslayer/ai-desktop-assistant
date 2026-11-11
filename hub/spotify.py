@@ -580,14 +580,38 @@ class SpotifyClient:
 
 # ── the hub-side orchestrator ───────────────────────────────────────────────
 
+def best_art_url(item: dict) -> str:
+    """Largest https album-art URL of a currently-playing item ('' when the
+    API gave nothing usable). The https filter is a downstream contract: the
+    page ticker and the MPRIS artUrl hand the URL straight to a browser
+    engine. Spotify sorts its images array largest-first but sizes aren't
+    guaranteed — pick by width*height when present so a weird order can't
+    downgrade the art."""
+    best_url, best_area = "", -1
+    for img in ((item.get("album") or {}).get("images") or []):
+        if not isinstance(img, dict):
+            continue
+        url = str(img.get("url") or "")
+        if not url.startswith("https://"):
+            continue
+        try:
+            area = int(img.get("width") or 0) * int(img.get("height") or 0)
+        except (TypeError, ValueError):
+            area = 0
+        if area > best_area:
+            best_url, best_area = url, area
+    return best_url
+
+
 def track_snapshot(cp: dict | None) -> dict:
     """currently-playing payload → the compact now_playing shape clients get:
     {playing, uri, track, artists, album, duration_ms, position_ms, device,
-    context_uri}. Nothing playing → {playing: False, uri: ''}."""
+    context_uri, art_url}. Nothing playing → {playing: False, uri: ''}.
+    art_url = largest https album art (MPRIS mpris:artUrl, docs/API.md)."""
     if not cp:
         return {"playing": False, "uri": "", "track": "", "artists": "",
                 "album": "", "duration_ms": 0, "position_ms": 0,
-                "device": "", "context_uri": ""}
+                "device": "", "context_uri": "", "art_url": ""}
     item = cp.get("item") or {}
     device = cp.get("device") or {}
     return {
@@ -601,6 +625,7 @@ def track_snapshot(cp: dict | None) -> dict:
         "position_ms": int(cp.get("progress_ms") or 0),
         "device": str(device.get("name") or ""),
         "context_uri": str((cp.get("context") or {}).get("uri") or ""),
+        "art_url": best_art_url(item),
     }
 
 

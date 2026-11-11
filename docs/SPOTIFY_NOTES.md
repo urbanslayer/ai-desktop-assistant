@@ -256,3 +256,12 @@ state:
   overflow, button-in-bar, and feet-rect clearance; the PNGs composite the
   ticker's real rects/text onto the canvas shot (the harness shoots the
   WebGL canvas, which cannot see DOM).
+
+## Desktop media controls (MPRIS) (2026-11-11, owner request)
+
+The same reconciled snapshot that paints the ticker is also exported as an
+MPRIS2 player (`org.mpris.MediaPlayer2.riko`) so MPRIS consumers —
+dux-shell-style Quickshell bars, GNOME, playerctl — show and control the
+song beside her window. Full section: docs/SOLOIST.md, "Desktop media
+controls (MPRIS)"; hub-side fields (`art_url`, the `seek` control action)
+in docs/API.md.

@@ -31,6 +31,10 @@ class Session:
         self.source = source  # stamped on every message the hub stores
         self.hub = hub_client.get()
         hub_client.note_active(self.hub.state())  # who is active right now?
+        # riko/music/mpris.py subscribes here to receive every reconciled
+        # now_playing snapshot (same dict as the music:state command);
+        # desktop.py wires it. None = no MPRIS export (docs/SOLOIST.md).
+        self.on_music_state: Optional[Callable[[dict], None]] = None
         self.recorder = asr.Recorder()
         self._turns = queue.Queue()
         self._hub_audio_down = False  # hub voice trouble: print once, not per turn
@@ -397,8 +401,17 @@ class Session:
 
     def _emit_music_state(self, snap):
         payload = {k: snap.get(k) for k in self._MUSIC_KEYS if k in snap}
-        viewer.emit("command", cmd="music:state "
-                    + json.dumps(payload, ensure_ascii=False))
+        viewer.emit("command", cmd="music:state " + json.dumps(
+            payload, ensure_ascii=False))
+        # MPRIS export (riko/music/mpris.py): the SAME reconciled state goes
+        # to the session-bus player. Best-effort like viewer.emit — a broken
+        # hook must never break the ticker path.
+        cb = getattr(self, "on_music_state", None)
+        if cb is not None:
+            try:
+                cb(dict(snap))
+            except Exception as e:
+                print(f"[music] state hook failed: {e}", flush=True)
 
     def _on_action_preview(self, ev):
         """'action' event = the web Animations tab's Preview button

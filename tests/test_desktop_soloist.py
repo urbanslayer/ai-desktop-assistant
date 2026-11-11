@@ -915,7 +915,11 @@ def test_feed_snapshot_maps_the_official_entity_shapes(tmp_path):
                     "track": "Bohemian Rhapsody", "artists": "Queen",
                     "album": "A Night at the Opera", "duration_ms": 354000,
                     "position_ms": 4200, "device": "Riko",
-                    "context_uri": "spotify:album:X"}
+                    "context_uri": "spotify:album:X",
+                    # the WS item carries no stable https URL; art_url stays
+                    # empty here and fills in from the hub now_playing merge
+                    # (the MPRIS export reads it)
+                    "art_url": ""}
     # quiet events never repaint the ticker
     assert feed.feed({"type": "position_sync",
                       "position": {"position_ms": 9000}}) is False

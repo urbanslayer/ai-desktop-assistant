@@ -18,7 +18,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 TRACK = {"uri": "spotify:track:AAA", "name": "Bohemian Rhapsody",
          "duration_ms": 354000,
          "artists": [{"name": "Queen"}],
-         "album": {"name": "A Night at the Opera"}}
+         "album": {"name": "A Night at the Opera", "images": [
+             {"url": "https://i.scdn.co/image/big", "width": 640,
+              "height": 640},
+             {"url": "https://i.scdn.co/image/small", "width": 64,
+              "height": 64}]}}
 DEVICE_RIKO = {"id": "dev-riko", "name": "Riko", "type": "Speaker",
                "is_active": True, "volume_percent": 40}
 DEVICE_ECHO = {"id": "dev-echo", "name": "Echo Kitchen", "type": "Smartphone",

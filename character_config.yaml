@@ -158,6 +158,17 @@ desktop:
                          # "Show song ticker" checkbox overrides this once
                          # clicked (persisted in the appstate like the
                          # other tray toggles)
+    mpris: riko          # advertise the song to Linux media widgets over
+                         # MPRIS2 (org.mpris.MediaPlayer2.riko) so MPRIS
+                         # consumers — dux-shell-style bars, GNOME's media
+                         # section, playerctl — show and control it while
+                         # Soloist plays (docs/SOLOIST.md).
+                         # riko = only while Riko's own device holds
+                         # playback; any = mirror any device as a remote;
+                         # off = never. Tray Music ▸ "Media players
+                         # (MPRIS)" overrides this once clicked. Never
+                         # published for player: spotifyd (it ships its
+                         # own MPRIS name).
     # device_name: ""    # Spotify Connect name; default "Riko" — the SAME
                          # name the hub's Settings > Spotify and her prompt
                          # use (persona names confuse which device is hers)

@@ -3271,10 +3271,12 @@ def create_app(data_dir, api_key: str | None = None,
 
     @app.post("/api/spotify/control")
     async def post_spotify_control(request: Request):
-        """{action: play|pause|toggle|next|previous}: transport control for
-        the avatar's song ticker (docs/SPOTIFY_NOTES.md). Answers with the
-        fresh now-playing snapshot so the optimistic page UI can reconcile;
-        409 while not connected, 429 inside a quota back-off."""
+        """{action: play|pause|toggle|next|previous|seek, value?}: transport
+        control for the avatar's song ticker (docs/SPOTIFY_NOTES.md) and the
+        MPRIS export (riko/music/mpris.py). `seek` takes value = seconds from
+        the track start. Answers with the fresh now-playing snapshot so the
+        optimistic page UI can reconcile; 409 while not connected, 429 inside
+        a quota back-off."""
         try:
             body = await request.json()
         except Exception:
@@ -3282,10 +3284,13 @@ def create_app(data_dir, api_key: str | None = None,
         if not isinstance(body, dict):
             return err(400, "body must be a JSON object")
         action = str(body.get("action") or "").strip().lower()
-        if action not in ("play", "pause", "toggle", "next", "previous"):
-            return err(422, "action must be play|pause|toggle|next|previous")
+        if action not in ("play", "pause", "toggle", "next", "previous",
+                          "seek"):
+            return err(422, "action must be play|pause|toggle|next|"
+                            "previous|seek")
         try:
-            done = await run_in_threadpool(spotify_hub.control, action)
+            value = body.get("value") if action == "seek" else None
+            done = await run_in_threadpool(spotify_hub.control, action, value)
             snap = await run_in_threadpool(spotify_hub.now_playing, True)
             return {"ok": True, "action": done.get("action"),
                     "now_playing": snap}

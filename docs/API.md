@@ -1126,7 +1126,12 @@ curl -s -H "$AUTH" -X POST "$HUB/api/spotify/disconnect"   # drop tokens, keep s
 curl -s -H "$AUTH" "$HUB/api/spotify/now-playing"
 # {"playing":true,"uri":"spotify:track:…","track":"…","artists":"…",
 #  "album":"…","duration_ms":354000,"position_ms":12345,"device":"Riko",
-#  "context_uri":"…"}    // 409 not connected, 429 inside quota back-off
+#  "context_uri":"…","art_url":"https://i.scdn.co/image/…"}
+#                                  // 409 not connected, 429 inside quota back-off
+# art_url = the item's largest https album-cover URL ("" when the item
+# carries none): the page ticker may ignore it; the desktop republishes it
+# as mpris:artUrl on its MPRIS2 export (docs/SOLOIST.md, "Desktop media
+# controls (MPRIS)").
 # the call is ALSO the page-interest signal for the idle watch: a client
 # that asks within the last 2 min keeps the slow watch alive
 curl -s -H "$AUTH" -X POST "$HUB/api/spotify/wake"
@@ -1137,8 +1142,10 @@ curl -s -H "$AUTH" -X POST "$HUB/api/spotify/wake"
 curl -s -H "$AUTH" -X POST "$HUB/api/spotify/control" \
      -H 'content-type: application/json' -d '{"action":"toggle"}'
 # {"ok":true,"action":"pause","now_playing":{…fresh snapshot…}}
-# action: play|pause|toggle|next|previous (toggle flips against the fresh
-# snapshot: playing->pause, paused->resume). Same 409/429 rules; this is the
+# action: play|pause|toggle|next|previous|seek (toggle flips against the fresh
+# snapshot: playing->pause, paused->resume). "seek" carries "value": seconds
+# from track start (PUT /me/player/seek, value*1000 ms) — the desktop's MPRIS
+# export forwards bar scrubbing through it. Same 409/429 rules; this is the
 # song ticker's transport button behind the desktop (docs/SPOTIFY_NOTES.md).
 curl -s -H "$AUTH" "$HUB/api/spotify/devices"
 # {"devices":[{"id":"…","name":"Riko","type":"Speaker","active":true,"volume":40}]}  # cached 60 s
@@ -1745,7 +1752,7 @@ curl -s -H "$AUTH" "$HUB/api/events?after=0&wait=25"
 #   {"seq":21,"time":"…","type":"turn_finished","persona":"riko","origin":"timer","persona_id":"riko","timer":{"id":3,"label":"tea"},"message_id":42,"reply":"Your tea is ready!","speech":"Your tea is ready!","emotion":"happy","actions":[],"audio_url":"/api/messages/42/audio"},
 #   {"seq":22,"time":"…","type":"state_changed","version":22},
 #   {"seq":23,"time":"…","type":"animations_changed","persona_id":"riko","model_sha256":"9f2c…"},
-#   {"seq":24,"time":"…","type":"now_playing","playing":true,"uri":"spotify:track:…","track":"Bohemian Rhapsody","artists":"Queen","album":"A Night at the Opera","duration_ms":354000,"position_ms":12345,"device":"Riko","context_uri":"spotify:album:…"}
+#   {"seq":24,"time":"…","type":"now_playing","playing":true,"uri":"spotify:track:…","track":"Bohemian Rhapsody","artists":"Queen","album":"A Night at the Opera","duration_ms":354000,"position_ms":12345,"device":"Riko","context_uri":"spotify:album:…","art_url":"https://i.scdn.co/image/…"}
 # ],"last":24}
 ```
 
@@ -1778,7 +1785,7 @@ clients: play origin-timer turns like normal replies; queue them if busy.
 animation is created, kept, renamed or deleted (docs/SELF_ANIMATION.md) —
 refresh your animations view on it. `now_playing` (music phase 1, docs/SPOTIFY_NOTES.md) fires ONLY on a real
 playback state change — `{playing, uri, track, artists, album, duration_ms,
-position_ms, device, context_uri}` (fields as in
+position_ms, device, context_uri, art_url}` (fields as in
 `GET /api/spotify/now-playing`); while paused/idle the hub's slow idle watch
 (default 30 s, interest-gated) still notices external play, so a
 paused→playing change arrives within one idle period at worst.

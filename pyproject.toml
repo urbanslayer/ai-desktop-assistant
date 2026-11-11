@@ -23,6 +23,13 @@ dependencies = [
     # hub/pyproject.toml; the hub imports it lazily, so local mode without it
     # still boots — MCP just reports "unavailable".
     "mcp",
+    # MPRIS2 export for desktop media widgets (riko/music/mpris.py): pure
+    # Python, zero-dep D-Bus client with EXPLICIT variant typing. PySide6
+    # QtDBus can't express the spec's a{sv} members (int64 mpris:length,
+    # object-path mpris:trackid): QDBusAbstractAdaptor needs Q_CLASSINFO
+    # which PySide6 doesn't expose, and a{sv} values marshal as the
+    # narrowest Python int (small lengths leave as int32, spec says `x`).
+    "jeepney>=0.9.0",
 ]
 
 [dependency-groups]

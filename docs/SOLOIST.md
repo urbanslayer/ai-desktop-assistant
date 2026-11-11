@@ -116,6 +116,50 @@ Docs: docs/SPOTIFY_NOTES.md gets a pointer here; docs/API.md/TOOLS.md only if
 anything user-visible changes; README/setup steps for the owner: create the
 key, write the key file, Start player, pick "Riko" once on the phone.
 
+## Desktop media controls (MPRIS)
+
+Soloist has no MPRIS of its own (official docs, 2026-11-11), so the desktop
+publishes one: `org.mpris.MediaPlayer2.riko` at `/org/mpris/MediaPlayer2` on
+the session bus, Identity "Riko". Any MPRIS consumer — dux-shell-style
+Quickshell bars, GNOME's media section, playerctl — then shows the song in
+its media widget and its transport buttons control playback.
+`riko/music/mpris.py`, jeepney on a daemon thread (QtDBus stayed a dev
+dependency and PySide6 can't build the spec's `a{sv}` variant members —
+jeepney was already a transitive dep via keyring).
+
+- **State = exactly what the ticker shows**: the reconciled now-playing
+  snapshot (hub `now_playing` events + the Soloist WS fast path) arrives via
+  `session.on_music_state`. Position extrapolates between beats
+  (`position_ms` + elapsed); a track change or >1 s jump also emits the
+  spec's `Seeked` signal, every visible change emits
+  `org.freedesktop.DBus.Properties.PropertiesChanged` — players refresh on
+  signals, never by polling.
+- **Transport buttons** call the hub (`hub_client.spotify_control` →
+  `POST /api/spotify/control`, run off the bus thread so the D-Bus loop
+  never blocks on HTTP): play/pause/toggle/next/previous, plus `seek`
+  (seconds from track start — so `CanSeek` is true). `Stop` pauses (Spotify
+  has no stop). `Volume` mirrors the Soloist WS volume (0..1) and writes
+  back through it — the live duck while she speaks still comes from
+  SoloistDuck below.
+- **The name stays registered while idle** (PlaybackStatus `Stopped`, empty
+  Metadata): dms/Quickshell-style bars track the *player list*, so a name
+  that comes and goes looks like a crash; a greyed "Stopped" entry is what
+  they handle best. `player: spotifyd` / `player: off` never publish —
+  spotifyd exports its own `org.mpris.MediaPlayer2.spotifyd` and a bar
+  listing two players for one song picks arbitrarily.
+- **Cover art**: the hub's now_playing snapshot carries `art_url` (largest
+  https album image of the item, docs/API.md) → `mpris:artUrl`.
+- **Config**: `desktop.music.mpris: riko|any|off` (default `riko`:
+  advertise only while Riko's own Connect device holds playback; `any`:
+  mirror Spotify on any device as a remote). Tray: Music ▸ "Media players
+  (MPRIS)" persists the override, same shape as the ticker checkbox.
+- **`MprisDuck` never ducks our own service** (the WS duck above already
+  handles her player; ducking `org.mpris.MediaPlayer2.riko` would fight it).
+- Verify from a terminal: `playerctl -p riko metadata`, or
+  `gdbus call --session --dest org.mpris.MediaPlayer2.riko --object-path
+  /org/mpris/MediaPlayer2 --method org.freedesktop.DBus.Properties.GetAll
+  org.mpris.MediaPlayer2.Player`.
+
 ## Owner steps (once)
 1. https://developer.spotify.com/dashboard/soloist -> generate API key.
 2. In a terminal (key never goes in chat):

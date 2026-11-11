@@ -285,12 +285,16 @@ class HubClient:
                 return None
             raise
 
-    def spotify_control(self, action, timeout=20):
+    def spotify_control(self, action, timeout=20, value=None):
         """POST /api/spotify/control {action}: play|pause|toggle|next|
-        previous. Returns {ok, action, now_playing}; the HTTP thread that
-        calls this waits on one Spotify round trip (never the Qt thread)."""
+        previous|seek. `seek` needs `value` = target position in seconds.
+        Returns {ok, action, now_playing}; the HTTP thread that calls this
+        waits on one Spotify round trip (never the Qt thread)."""
+        body = {"action": action}
+        if value is not None:
+            body["value"] = value
         return self._json("POST", "/api/spotify/control",
-                          json={"action": action}, timeout=timeout)
+                          json=body, timeout=timeout)
 
     def tts_audio(self, text, persona=None):
         """POST /api/tts: WAV bytes of `text` in a persona's voice (no cache)."""

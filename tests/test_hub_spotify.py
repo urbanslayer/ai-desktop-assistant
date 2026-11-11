@@ -513,6 +513,40 @@ def test_spotify_control_route_not_connected_409(hub_app):
     assert "detail" in r.json()
 
 
+def test_spotify_control_route_seek(hub_app, fake):
+    """seek (the MPRIS export's slider, riko/music/mpris.py): value =
+    seconds -> PUT /me/player/seek with position_ms; no value -> 400."""
+    app, client = hub_app
+    seed_tokens(app)
+    fake.now = playing_snapshot()
+    r = client.post("/api/spotify/control",
+                    json={"action": "seek", "value": 42.5})
+    assert r.status_code == 200
+    assert r.json()["ok"] and r.json()["action"] == "seek"
+    assert r.json()["now_playing"]["uri"] == TRACK["uri"]
+    assert fake.last("PUT", "/v1/me/player/seek")["query"]["position_ms"] \
+        == "42500"
+    assert client.post("/api/spotify/control",
+                       json={"action": "seek"}).status_code == 400
+    assert client.post("/api/spotify/control",
+                       json={"action": "seek", "value": -5}).status_code == 400
+
+
+def test_now_playing_snapshot_carries_art_url(hub_app, fake):
+    """art_url = largest https album image of the item (docs/API.md): it
+    rides every now_playing payload so the MPRIS export gets mpris:artUrl."""
+    app, client = hub_app
+    seed_tokens(app)
+    fake.now = playing_snapshot()
+    snap = client.get("/api/spotify/now-playing").json()
+    assert snap["art_url"] == "https://i.scdn.co/image/big"
+    fake.now["item"]["album"]["images"] = [
+        {"url": "http://e/no-tls.jpg", "width": 640, "height": 640}]
+    app.state.spotify._now_cache = None
+    snap = client.get("/api/spotify/now-playing").json()
+    assert snap["art_url"] == ""                  # https-only contract
+
+
 # ── tools wiring: listed always, offered only when configured, human text ───
 
 def test_tools_listed_and_gated(hub_app):

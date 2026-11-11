@@ -426,6 +426,9 @@ def soloist_snapshot(state: dict) -> dict:
         "position_ms": int((position or {}).get("position_ms") or 0),
         "device": str(state.get("device_name") or ""),
         "context_uri": str((context or {}).get("uri") or ""),
+        # the WS item's artwork isn't a stable https URL in the docs; art
+        # arrives with the hub's now_playing event (art_url) instead
+        "art_url": "",
     }
 
 

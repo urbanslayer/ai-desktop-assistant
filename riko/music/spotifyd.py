@@ -62,6 +62,10 @@ BACKEND_ALIASES = {"pipewire": "pulseaudio", "pipewire-pulse": "pulseaudio"}
 DEFAULT_DUCK_FRACTION = 0.15            # player volume while she speaks
 OUTPUT_RING = 20                        # spotifyd output lines kept for errors
 MPRIS_PLAYERS = ("spotifyd", "spotify")   # duck-worthy names, in order
+MPRIS_SELF = "riko"                       # org.mpris.MediaPlayer2.riko = OUR
+#     own export (riko/music/mpris.py): never a duck target — Soloist's WS
+#     volume ducking already handles her player, and ducking the advertised
+#     one would fight the bar's own volume slider.
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 
@@ -424,12 +428,15 @@ class MprisDuck:
 
     def _players(self) -> dict:
         if self._bus is not None:
-            return self._bus or {}
-        factory = SESSION_BUS or _dbus_props_bus
-        try:
-            return factory() or {}
-        except Exception:
-            return {}
+            players = self._bus or {}
+        else:
+            factory = SESSION_BUS or _dbus_props_bus
+            try:
+                players = factory() or {}
+            except Exception:
+                return {}
+        # Riko's own MPRIS export is never a duck target (see MPRIS_SELF)
+        return {n: p for n, p in players.items() if n != MPRIS_SELF}
 
     def duck(self) -> None:
         if self._saved:                 # already ducked
