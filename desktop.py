@@ -1281,8 +1281,25 @@ def main():
                 act.setChecked(True)
             viewer.emit("command", cmd=cmd)
             win.js(f"window.riko && riko.onCommand && riko.onCommand({json.dumps(cmd)})")
+        elif cmd == "custom-animations:reload":  # hub list refreshed → page re-reads
+            # /custom-animations.json (docs/SELF_ANIMATION.md). Emitted from
+            # this Qt thread; the FETCH happened on a hub thread — Qt never
+            # blocks on the hub here.
+            viewer.emit("command", cmd=cmd)
+            win.js(f"window.riko && riko.onCommand && riko.onCommand({json.dumps(cmd)})")
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
+
+    # ── Custom keyframe animations (docs/SELF_ANIMATION.md) ────────────
+    # The desktop caches the ACTIVE persona's hub list; the page serves it
+    # through the viewer. Refresh runs on helper/hub threads (startup kick,
+    # state poller via announce_persona, events follower via
+    # session._on_animations_changed); the page is only pinged through the
+    # Qt bridge signal, so the Qt thread never touches the hub.
+    hub_client.set_on_custom_animations(
+        lambda count: bridge.command.emit("custom-animations:reload"))
+    threading.Thread(target=hub_client.refresh_custom_animations,
+                     daemon=True, name="riko-anims").start()
 
     # ── Scroll = zoom her ────────────────────────────────────────────────
     # The PAGE renders the zoom every frame (client/js/scale.js): the wheel

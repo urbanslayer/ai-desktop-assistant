@@ -40,6 +40,7 @@ spacing). Acceptance is RELATIVE to the attached rig (works on any VRM):
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import signal
@@ -92,6 +93,12 @@ SCENARIOS = {
     "grab": (None, []),
     "sit": (None, []),
     "pat": (None, []),
+    # custom keyframe animation QA (docs/SELF_ANIMATION.md): serve
+    # --animations (default: the victory fixture) as /custom-animations.json,
+    # play it with --touch "custom:<name>@<ms>" and photograph at the keys.
+    # evaluate_custom_gates() re-samples the fixture IN PYTHON and compares
+    # every captured frame's bone offsets AND world rotations (<= 3 deg).
+    "custom": (None, []),
 }
 
 
@@ -188,6 +195,179 @@ def evaluate_touch_gates(outdir):
     return fails
 
 
+def evaluate_custom_gates(outdir, anims):
+    """Independent PYTHON re-implementation of the keyframe sampler
+    (docs/SELF_ANIMATION.md): for every captured frame that shows an active
+    custom animation, recompute the expected rest-relative offset per keyed
+    bone (and the composed WORLD rotation from the reported local-rest chain)
+    at the frame's own reported (t, w), and gate it to <= 3 deg. The numbers
+    under test come from the browser's three.js pipeline, the expectation
+    from stdlib math — shared code only through the JSON contract.
+    Returns the number of failed checks.
+    """
+    by_name = {a.get("name"): a for a in anims}
+    def q_xyz(d):                      # XYZ Euler degrees -> unit quaternion
+        hx, hy, hz = (math.radians(v) / 2 for v in d)
+        sx, cx, sy, cy, sz, cz = (math.sin(hx), math.cos(hx), math.sin(hy),
+                                  math.cos(hy), math.sin(hz), math.cos(hz))
+        return (sx * cy * cz + cx * sy * sz, cx * sy * cz - sx * cy * sz,
+                cx * cy * sz + sx * sy * cz, cx * cy * cz - sx * sy * sz)
+
+    def qmul(a, b):
+        ax, ay, az, aw = a
+        bx, by, bz, bw = b
+        return (aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz)
+
+    def qnorm(q):
+        n = math.sqrt(sum(v * v for v in q))
+        return tuple(v / n for v in q) if n > 0 else (0.0, 0.0, 0.0, 1.0)
+
+    def qslerp(a, b, u):
+        if u <= 0:
+            return a
+        if u >= 1:
+            return b
+        x1, y1, z1, w1 = a
+        x2, y2, z2, w2 = b
+        c = w1 * w2 + x1 * x2 + y1 * y2 + z1 * z2
+        if c < 0:
+            x2, y2, z2, w2, c = -x2, -y2, -z2, -w2, -c
+        if c > 0.9995:
+            return qnorm(tuple(v1 + (v2 - v1) * u for v1, v2 in
+                               zip(a, (x2, y2, z2, w2))))
+        s = math.sqrt(1 - c * c)
+        ang = math.atan2(s, c)
+        k1, k2 = math.sin((1 - u) * ang) / s, math.sin(u * ang) / s
+        return tuple(v1 * k1 + v2 * k2 for v1, v2 in
+                     zip(a, (x2, y2, z2, w2)))
+
+    def qang(a, b):
+        d = abs(sum(v1 * v2 for v1, v2 in zip(a, b)))
+        return 2 * math.degrees(math.acos(min(1.0, d)))
+
+    ID = (0.0, 0.0, 0.0, 1.0)
+
+    def prep(anim):
+        keys = anim["keyframes"]
+        dur = float(anim["duration_s"])
+        smooth = anim.get("ease", "smooth") == "smooth"
+
+        def ease(u):
+            return u * u * (3.0 - 2.0 * u) if smooth else u
+
+        def sample(t):
+            """bone -> expected rest-relative offset quaternion at anim-time t."""
+            if anim.get("loop"):
+                t %= dur
+            t = max(0.0, min(dur, t))
+            i = 0
+            while i + 2 < len(keys) and t >= keys[i + 1]["t"]:
+                i += 1
+            ka, kb = keys[i], keys[i + 1]
+            u = 0.0 if kb["t"] <= ka["t"] else (t - ka["t"]) / (kb["t"] - ka["t"])
+            e = ease(u)
+            out = {}
+            bones = set(ka.get("bones") or {}) | set(kb.get("bones") or {})
+            for b in bones:
+                va = (ka.get("bones") or {}).get(b, [0.0, 0.0, 0.0])
+                vb = (kb.get("bones") or {}).get(b, [0.0, 0.0, 0.0])
+                q = qslerp(q_xyz(va), q_xyz(vb), e)
+                if qang(q, ID) > 1e-4:
+                    out[b] = qnorm(q)
+            hy = ((ka.get("hips_y") or 0.0) * (1 - e)
+                  + (kb.get("hips_y") or 0.0) * e)
+            return out, hy
+        return sample, ease
+
+    prepped = {}
+    fails = 0
+    frames = 0
+    for j in sorted(Path(outdir).glob("*.json")):
+        try:
+            met = json.loads(j.read_text()).get("metrics") or {}
+        except (json.JSONDecodeError, OSError):
+            continue
+        qa = met.get("keyframeQA")
+        if not qa:
+            continue
+        anim = by_name.get(qa.get("name"))
+        if anim is None:
+            fails += 1
+            frames += 1
+            print(f"[custom-gate] {j.name} FAIL: animation name "
+                  f"{qa.get('name')!r} is not in the served list", flush=True)
+            continue
+        if id(anim) not in prepped:
+            prepped[id(anim)] = prep(anim)
+        sample, ease = prepped[id(anim)]
+        frames += 1
+        t, w = float(qa["t"]), float(qa["w"])
+        blend = ease(min(1.0, max(0.0, w)))
+        off_q, hips = sample(t)
+        checks = [(f"name={anim['name']}", qa.get("name") == anim["name"]),
+                  ("neck-never-keyed", "neck" not in (qa.get("bones") or {}))]
+        worst = 0.0
+        for bone, e in sorted((qa.get("bones") or {}).items()):
+            if bone not in off_q:      # page wrote rest there; assert it holds
+                got = tuple(e.get("q") or ID)
+                checks.append((f"{bone}-at-rest", qang(got, ID) <= 3.0))
+                continue
+            want = qslerp(ID, off_q[bone], blend)   # pose blends by power e
+            err = qang(want, tuple(e["q"]))
+            worst = max(worst, err)
+            checks.append((f"{bone}-offset<=3deg", err <= 3.0))
+            # WORLD check without any matrix decompose: the page reports the
+            # live LOCAL quaternion of every ancestor up to vrm.scene
+            # (chainQ, hips-side first). Actual = product of those; expected
+            # = same product with keyed nodes replaced by rest * offset — a
+            # limb's rest-relative angle must survive the whole parent chain
+            # (a wrong spine would throw the arm off). Live local rotations
+            # are immune to the negative bone scales Unity rigs carry, which
+            # scramble getWorldQuaternion decompose (measured on Furina).
+            chain = (qa.get("chain") or {}).get(bone)
+            chainq = (qa.get("chainQ") or {}).get(bone)
+            if chain and chainq and len(chain) == len(chainq):
+                node_as_bone = {}
+                for b2, e2 in (qa.get("bones") or {}).items():
+                    c2 = (qa.get("chain") or {}).get(b2)
+                    if c2:
+                        node_as_bone[c2[-1]] = b2
+                act = exp = ID
+                for idx, node in enumerate(chain):
+                    live = qnorm(tuple(chainq[idx]))
+                    act = qmul(act, live)
+                    b2 = node_as_bone.get(node)
+                    if b2 is None:
+                        exp = qmul(exp, live)   # unkeyed: live is its own rest
+                        continue
+                    r = (qa["bones"][b2] or {}).get("rest")
+                    base = qnorm(tuple(r)) if r else ID
+                    o = off_q.get(b2)
+                    exp = qmul(exp, base if o is None
+                               else qmul(base, qslerp(ID, o, blend)))
+                werr = qang(exp, act)
+                worst = max(worst, werr)
+                checks.append((f"{bone}-world<=3deg", werr <= 3.0))
+        got_hips = float(qa.get("hipsY") or 0.0)
+        checks.append((f"hipsY={hips * blend:.3f}",
+                       abs(got_hips - hips * blend) <= 0.011))
+        bad = [n for n, ok in checks if not ok]
+        fails += len(bad)
+        print(f"[custom-gate] {j.name} name={qa.get('name')} t={t:.3f} w={w:.2f} "
+              f"bones={len(qa.get('bones') or {})} worstErr={worst:.2f}deg "
+              f"hipsY={got_hips:.4f} {'PASS' if not bad else 'FAIL ' + ','.join(bad)}",
+              flush=True)
+    if not frames:
+        fails += 1
+        print("[custom-gate] FAIL: no captured frame had an active custom "
+              "animation — check the --touch custom:<name>@ms step and the "
+              "capture times", flush=True)
+    return fails
+
+
 class Handler(SimpleHTTPRequestHandler):
     t0 = time.monotonic()
     queue = []
@@ -195,6 +375,8 @@ class Handler(SimpleHTTPRequestHandler):
     scenario = "idle"
     shots = 0
     vrm_path = DEFAULT_VRM
+    anim_path = str(REPO / "client" / "js" / "fixtures" / "animation_victory.json")
+    anim_doc = {"animations": []}
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -202,6 +384,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({})
         if path == "/animations.json":
             return self._json({"animations": []})
+        if path == "/custom-animations.json":
+            with open(self.anim_path) as f:
+                anim = json.load(f)
+            return self._json(anim if "animations" in anim else {"animations": [anim]})
         if path == "/avatar.vrm":
             with open(self.vrm_path, "rb") as f:
                 return self._send(f.read(), "model/gltf-binary")
@@ -274,6 +460,9 @@ def main():
                     help="browser lifetime (default: last capture + 8 s)")
     ap.add_argument("--vrm", default=DEFAULT_VRM,
                     help="VRM file to serve as /avatar.vrm (default: character_files/sample_avatar.vrm)")
+    ap.add_argument("--animations", default=None,
+                    help="json file (one animation or {animations:[...]}) served "
+                         "as /custom-animations.json (default: the victory fixture)")
     ap.add_argument("--size", default="420x680",
                     help="viewport WxH (default 420x680 = the desktop window)")
     ap.add_argument("--desktop", action="store_true",
@@ -300,6 +489,11 @@ def main():
     Handler.outdir = args.outdir
     Handler.queue = list(events)
     Handler.vrm_path = args.vrm
+    if args.animations:
+        Handler.anim_path = args.animations
+    with open(Handler.anim_path) as f:
+        _anim_raw = json.load(f)
+    Handler.anim_doc = _anim_raw if "animations" in _anim_raw else {"animations": [_anim_raw]}
     Handler.t0 = time.monotonic()  # server clock vs page clock differ a bit; fine
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -348,6 +542,8 @@ def main():
     srv.shutdown()
     shots = sorted(p for p in os.listdir(args.outdir) if p.endswith(".png"))
     gate_fails = evaluate_touch_gates(args.outdir)
+    if args.scenario == "custom":
+        gate_fails += evaluate_custom_gates(args.outdir, Handler.anim_doc["animations"])
     print(f"[harness] scenario={args.scenario} shots={len(shots)} touch-gate-fails={gate_fails}")
     for s in shots:
         print("  ", os.path.join(args.outdir, s))

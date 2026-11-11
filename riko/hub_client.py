@@ -111,6 +111,16 @@ class HubClient:
         """Switch persona by id, name or keyword (case-insensitive, hub-side)."""
         return self._json("POST", "/api/active", json={"persona": name_or_id})
 
+    def persona_animations(self, persona_id):
+        """Custom keyframe animations (docs/SELF_ANIMATION.md) the owner made
+        for this persona: current model, every upload status the hub serves.
+        Returns the list (possibly empty); the hub owns validation."""
+        data = self._json("GET",
+                          f"/api/personas/{persona_id}/animations"
+                          f"?model=current&status=all")
+        anims = data.get("animations") if isinstance(data, dict) else data
+        return [a for a in (anims or []) if isinstance(a, dict)]
+
     def chat(self, text, source="desktop", persona=None, voice=False):
         """One turn. Returns the ChatResult: {reply, speech, persona, switched,
         message_ids, state_version}. `speech` is the cleaned spoken text
@@ -286,10 +296,12 @@ PERSONA_NAMES_TTL = 300.0  # names change rarely; the ASR prompt asks at most ev
 
 
 def _reset():
-    global _client, _active, _names_cache
+    global _client, _active, _names_cache, _custom_animations, _on_custom_animations
     _client = None
     _active = None
     _names_cache = None
+    _custom_animations = []  # custom keyframe list cache (SELF_ANIMATION.md)
+    _on_custom_animations = None
     _last_chat_read.clear()  # tests must not inherit another test's chat.read throttle
 
 
@@ -363,6 +375,53 @@ def announce_persona(state):
     from riko import viewer  # lazy: viewer imports this module at startup
     viewer.emit("persona", id=active["id"], name=active["name"],
                 avatar_version=active["avatar_version"])
+    # new persona, new custom animation list (docs/SELF_ANIMATION.md) —
+    # this runs on the hub poller / switch caller's thread, never Qt
+    refresh_custom_animations()
+    return True
+
+
+# ── custom keyframe animations (docs/SELF_ANIMATION.md) ───────────
+# The desktop is the cache: it fetches the active persona's list from the
+# hub at startup, on every persona switch and on the hub's
+# `animations_changed` event. The avatar page pulls the cache through the
+# viewer (GET /custom-animations.json) and reloads on `custom-animations:reload`.
+_custom_animations: list = []
+_on_custom_animations = None  # desktop.py sets fn(count); fires after a refresh
+
+
+def set_on_custom_animations(fn):
+    global _on_custom_animations
+    _on_custom_animations = fn
+
+
+def custom_animations():
+    return list(_custom_animations)
+
+
+def refresh_custom_animations():
+    """Fetch the active persona's custom animations into the cache and tell
+    the page to re-read it. Runs on whatever thread the HUB calls come from
+    (startup helper thread, state poller, events follower) — never the Qt
+    thread. A hub failure keeps the previous cache. Returns True on success."""
+    global _custom_animations
+    active = _active or {}
+    pid = active.get("id")
+    if not pid:
+        return False
+    try:
+        anims = get().persona_animations(pid)
+    except Exception as e:  # HubError etc: hub down or hub without the endpoint
+        print(f"[animations] fetch failed: {type(e).__name__}: {e} "
+              f"(keeping {len(_custom_animations)} cached)")
+        return False
+    _custom_animations = anims
+    print(f"[animations] {len(anims)} custom animation(s) for persona {pid}")
+    if _on_custom_animations:
+        try:
+            _on_custom_animations(len(anims))
+        except Exception as e:
+            print(f"[animations] notify failed: {type(e).__name__}: {e}")
     return True
 
 

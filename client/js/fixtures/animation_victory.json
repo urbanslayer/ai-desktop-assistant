@@ -1,0 +1,24 @@
+{
+  "name": "victory_dance",
+  "description": "both fists pump up, little hop, big smile (A6-page fixture)",
+  "duration_s": 2.4,
+  "loop": false,
+  "ease": "smooth",
+  "keyframes": [
+    { "t": 0.0, "bones": {}, "expression": {} },
+    { "t": 0.6,
+      "bones": { "leftUpperArm": [0, 0, 70], "rightUpperArm": [0, 0, -70],
+                 "leftLowerArm": [0, -90, 0], "rightLowerArm": [0, 90, 0] },
+      "expression": { "happy": 0.8 }, "hips_y": 0.0 },
+    { "t": 1.2,
+      "bones": { "leftUpperArm": [0, 0, 100], "rightUpperArm": [0, 0, -100],
+                 "leftLowerArm": [0, -70, 0], "rightLowerArm": [0, 70, 0],
+                 "spine": [4, 0, 0] },
+      "expression": { "happy": 0.9 }, "hips_y": 0.06 },
+    { "t": 1.8,
+      "bones": { "leftUpperArm": [0, 0, 60], "rightUpperArm": [0, 0, -60],
+                 "leftLowerArm": [0, -110, 0], "rightLowerArm": [0, 110, 0] },
+      "expression": { "happy": 0.6 }, "hips_y": 0.0 },
+    { "t": 2.4, "bones": {}, "expression": {} }
+  ]
+}
