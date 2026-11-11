@@ -99,6 +99,13 @@ SCENARIOS = {
     # evaluate_custom_gates() re-samples the fixture IN PYTHON and compares
     # every captured frame's bone offsets AND world rotations (<= 3 deg).
     "custom": (None, []),
+    # director path QA (live bug: reply action naming a custom animation was
+    # dropped with "unknown action — ignored"): NO --touch here. A queued
+    # 'say' event whose actions array NAMES the served animation must play
+    # it through director.say -> applyAction's custom catch. Shots fire
+    # EVENT-DRIVEN off keyframe progress (&kfwatch=0.35,0.8), so the frame
+    # always shows her mid-pose regardless of model load latency.
+    "custom_say": (None, []),
 }
 
 
@@ -432,7 +439,11 @@ class Handler(SimpleHTTPRequestHandler):
     def _due(self):
         now = time.monotonic() - self.t0
         due = [ev for (at, ev) in self.queue if at <= now]
-        self.queue = [(at, ev) for (at, ev) in self.queue if at > now]
+        # Handler.queue is a CLASS attr and ThreadingHTTPServer makes a fresh
+        # instance per request: pruning through `self.queue` only shadowed it,
+        # so every /next poll re-delivered past events (82 duplicate 'say's
+        # kept the bubble up forever). Prune the class attr itself.
+        Handler.queue = [(at, ev) for (at, ev) in Handler.queue if at > now]
         return due
 
     def _json(self, obj):
@@ -494,6 +505,20 @@ def main():
     with open(Handler.anim_path) as f:
         _anim_raw = json.load(f)
     Handler.anim_doc = _anim_raw if "animations" in _anim_raw else {"animations": [_anim_raw]}
+    if args.scenario == "custom_say":
+        # prove the DIRECTOR path: the hub's reply action names the custom
+        _first = Handler.anim_doc["animations"][0]["name"]
+        # long text on purpose: the bubble then really covers her head band,
+        # so the same run doubles as bubble context for touch QA (TOUCH.md)
+        _text = ("Look what I made! This reply line is deliberately long so "
+                 "the speech bubble stretches well past her head, the way a "
+                 "wordy answer does in the real desktop window: press a part "
+                 "under it and the bubble should not eat your click anymore.")
+        Handler.queue = [
+            (6.0, {"type": "status", "state": "speaking"}),
+            (6.5, {"type": "say", "text": _text, "emotion": "happy",
+                   "seconds": 3, "actions": [{"name": _first, "at": 0.2}]}),
+        ]
     Handler.t0 = time.monotonic()  # server clock vs page clock differ a bit; fine
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -516,6 +541,8 @@ def main():
         url += f"&wheelzoom={args.gestures}"
     if args.touch:
         url += "&touch=" + urllib.parse.quote(args.touch, safe="")
+    if args.scenario == "custom_say":
+        url += "&kfwatch=0.35,0.8"
     maxsec = max(float(s) for s in args.secs.split(","))
     dur = args.runtime if args.runtime else maxsec + 8
     cmd = [
@@ -542,7 +569,7 @@ def main():
     srv.shutdown()
     shots = sorted(p for p in os.listdir(args.outdir) if p.endswith(".png"))
     gate_fails = evaluate_touch_gates(args.outdir)
-    if args.scenario == "custom":
+    if args.scenario in ("custom", "custom_say"):
         gate_fails += evaluate_custom_gates(args.outdir, Handler.anim_doc["animations"])
     print(f"[harness] scenario={args.scenario} shots={len(shots)} touch-gate-fails={gate_fails}")
     for s in shots:

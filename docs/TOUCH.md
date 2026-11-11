@@ -93,3 +93,35 @@ animations) follows after T1 is merged and tested, and reuses the posing code bu
 - No new runtime network fetches (the page is vendored/offline: `tests/test_client_vendor.py` must stay green).
 - Settings with secrets/write-only rules unchanged; new settings are plain values.
 - Commit after each green milestone.
+
+## Live-issue notes (Nov 2026 grab investigation)
+
+Owner report (Furina persona, normal desktop window, press held ~250 ms then dragged): "moving her hand
+is quite tricky, and only the right hand seemed to move, I couldn't grab her left". Headless findings:
+
+- **Proven + fixed — the speech bubble swallowed presses.** `#bubble` sits over the upper body during
+  speech; while visible, any pointerdown landing on it never reached the canvas (HEAD code: 0/2 head
+  grabs during a bubble, 1/1 after it hides; fixed code: 2/2 — bubble bottom measured at y=111 over a
+  110 px press point, `client/tools/capture_frames.py custom_say` + `say:` touch-spec op). Presses on
+  the bubble now pass through to touch (`#bubble` has no drag handler of its own, so nothing is lost).
+- **Proven + fixed — far drags dead on the reach clamp.** The cursor-plane target was clamped to a
+  sphere fixed to the rest anchor, so a 198 px drag moved the hand ~45 px and further pull bought
+  nothing. The target is now the cursor ray ∩ reach sphere around the live shoulder
+  (`clampGrabTarget` in `client/js/pose.js`, gated by `client/js/pose.test.js`): exactly under the
+  cursor while reachable, always exactly reachable beyond it. Measured (sample rig, 420x680,
+  `--desktop`): upward drags track the cursor within ~54 px (disp 153–160 px); downward/outward drags
+  stay ~45 px because the arm is already fully extended toward the cursor — that residual is physical
+  reach, not gating. Gates must state a minimum visible displacement, not only clamp correctness.
+- **Proven + fixed — the capture harness re-delivered queued events.** `_due` pruned through an
+  instance attr while `Handler.queue` is a class attr with a fresh handler per request, so every
+  `/next` poll re-fired past events (82 duplicate `say`s kept the bubble up forever and skewed bubble
+  A/Bs). `Handler.queue` is now pruned directly.
+- **Unproven headlessly — a left-vs-right asymmetry.** With `character_files/sample_avatar.vrm` the
+  posted part rects are symmetric (hand_l/hand_r 46x44 px, mirrored), page `hitTest` tries small parts
+  first so the hand wins over `arm_l`, the desktop arbiter and hub reactions treat both sides
+  identically, and synthetic grabs reach-and-hold on both hands. If the owner still cannot grab the
+  left hand after the bubble fix, the remaining suspects are persona-rig-specific (Furina's rest pose
+  or garment may shrink/overlap the left-hand rect in `computeParts`) or the 250 ms hold + 6 px slop
+  window reading as a window drag. Next live step: `capture_frames.py grab` specs on the owner's
+  Furina VRM (`--vrm`) comparing hand_l/hand_r rect sizes, or a `?debug` screenshot; if the rects
+  differ, widen/precedence-fix `computeParts` for that rig rather than touching the arbiter.
