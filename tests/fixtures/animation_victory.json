@@ -1,0 +1,32 @@
+{
+  "name": "victory_dance",
+  "description": "both fists up, little hop, happy face",
+  "duration_s": 2.4,
+  "loop": false,
+  "ease": "smooth",
+  "keyframes": [
+    { "t": 0.0, "bones": {}, "expression": {} },
+    {
+      "t": 0.6,
+      "bones": {
+        "leftUpperArm": [0, 0, 70],
+        "rightUpperArm": [0, 0, -70],
+        "leftLowerArm": [0, -90, 0]
+      },
+      "expression": { "happy": 0.8 },
+      "hips_y": 0.04
+    },
+    {
+      "t": 1.2,
+      "bones": {
+        "leftUpperArm": [0, 0, 55],
+        "rightUpperArm": [0, 0, -85],
+        "leftLowerArm": [0, -70, 0],
+        "spine": [4, 0, 0]
+      },
+      "expression": { "happy": 1.0 },
+      "hips_y": -0.02
+    },
+    { "t": 2.4, "bones": {}, "expression": {} }
+  ]
+}

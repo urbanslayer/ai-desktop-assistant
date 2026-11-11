@@ -1,0 +1,25 @@
+{
+  "_meta": "Per-bone min/max Euler degrees per axis (local, vs rest pose) for custom animations (docs/SELF_ANIMATION.md). Mirrors client/js/pose.js grab/joint limits where they exist (GRAB_LIMITS 2.4/2.2/1.8 rad -> 137/126/103 deg); docs fix spine/chest/upperChest at +/-15, head at +/-40 (wider than HEAD_GRAB_LIMITS: the keyframe layer clamps here AND the page clamps again on playback). neck is absent = not an allowed bone at all.",
+  "bones": {
+    "hips":          {"x": [-45, 45], "y": [-60, 60], "z": [-45, 45]},
+    "spine":         {"x": [-15, 15], "y": [-15, 15], "z": [-15, 15]},
+    "chest":         {"x": [-15, 15], "y": [-15, 15], "z": [-15, 15]},
+    "upperChest":    {"x": [-15, 15], "y": [-15, 15], "z": [-15, 15]},
+    "head":          {"x": [-40, 40], "y": [-40, 40], "z": [-40, 40]},
+    "leftShoulder":  {"x": [-30, 30], "y": [-30, 30], "z": [-30, 30]},
+    "rightShoulder": {"x": [-30, 30], "y": [-30, 30], "z": [-30, 30]},
+    "leftUpperArm":  {"x": [-137, 137], "y": [-137, 137], "z": [-137, 137]},
+    "rightUpperArm": {"x": [-137, 137], "y": [-137, 137], "z": [-137, 137]},
+    "leftLowerArm":  {"x": [-126, 126], "y": [-126, 126], "z": [-126, 126]},
+    "rightLowerArm": {"x": [-126, 126], "y": [-126, 126], "z": [-126, 126]},
+    "leftHand":      {"x": [-90, 90], "y": [-90, 90], "z": [-90, 90]},
+    "rightHand":     {"x": [-90, 90], "y": [-90, 90], "z": [-90, 90]},
+    "leftUpperLeg":  {"x": [-103, 103], "y": [-103, 103], "z": [-103, 103]},
+    "rightUpperLeg": {"x": [-103, 103], "y": [-103, 103], "z": [-103, 103]},
+    "leftLowerLeg":  {"x": [-126, 126], "y": [-126, 126], "z": [-126, 126]},
+    "rightLowerLeg": {"x": [-126, 126], "y": [-126, 126], "z": [-126, 126]},
+    "leftFoot":      {"x": [-60, 60], "y": [-60, 60], "z": [-60, 60]},
+    "rightFoot":     {"x": [-60, 60], "y": [-60, 60], "z": [-60, 60]}
+  },
+  "finger_default": {"x": [-110, 110], "y": [-110, 110], "z": [-110, 110]}
+}
