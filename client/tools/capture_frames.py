@@ -111,6 +111,11 @@ SCENARIOS = {
     # empty list, so the custom gate can only pass if the page registers the
     # inline copy before director.say() validates the name.
     "custom_say_inline": (None, []),
+    # song ticker (docs/SPOTIFY_NOTES.md): a music:state command arrives at
+    # 6 s; the gate checks metrics.tickerQA in the measure dumps — shown,
+    # exact text, marquee iff long title, bar above the feet rects.
+    "ticker": (None, []),
+    "ticker_short": (None, []),
 }
 
 
@@ -380,6 +385,68 @@ def evaluate_custom_gates(outdir, anims):
     return fails
 
 
+def evaluate_ticker_gates(outdir, expect_marquee, expect_text):
+    """Song-ticker gates off metrics.tickerQA in the /measure dumps (the
+    page-side painter state, docs/SPOTIFY_NOTES.md):
+      shown           at least one frame shows the bar
+      text            the rendered text is exactly 'track — artists'
+      marquee         scrolls iff the title overflows (expect_marquee)
+      button          btn rect sits inside the bar rect, icon state 'pause'
+      feet clearance  no feet part rect intersects the bar rect (the ticker
+                      never covers her feet hit rects)
+    Returns the number of FAILed checks.
+    """
+    fails = 0
+    hit = None
+    for j in sorted(Path(outdir).glob("*.json")):
+        try:
+            met = json.loads(j.read_text()).get("metrics") or {}
+        except (json.JSONDecodeError, OSError):
+            continue
+        qa = met.get("tickerQA") or {}
+        if qa.get("shown"):
+            hit = (j.name, qa, met)
+            break
+    if not hit:
+        print("[ticker-gate] FAIL: no captured frame showed the ticker")
+        return 1
+    name, qa, met = hit
+    checks = [("text", qa.get("text") == expect_text),
+              ("marquee", qa.get("marquee") is expect_marquee),
+              ("btn-state-pause", qa.get("btnState") == "pause")]
+    bx, by, bw, bh = qa.get("bar") or [0, 0, 0, 0]
+    checks.append(("bar-slim-bottom", bh <= 34 and by >= 400))
+    kx, ky, kw, kh = qa.get("btn") or [0, 0, 0, 0]
+    checks.append(("btn-inside-bar", bx <= kx and ky >= by and kx + kw <= bx + bw
+                   and ky + kh <= by + bh))
+    for part in ("foot_l", "foot_r"):
+        r = (met.get("parts") or {}).get(part)
+        if not r:
+            continue
+        if isinstance(r, dict):
+            rx, ry, rw, rh = (r["x"], r["y"],
+                              r.get("w", r.get("width", 0)),
+                              r.get("h", r.get("height", 0)))
+        else:
+            rx, ry, rw, rh = r[:4]
+        overlap = not (rx + rw <= bx or bx + bw <= rx
+                       or ry + rh <= by or by + bh <= ry)
+        # parts rects carry a 6 px visual pad; a <= 6 px nick of the pad by
+        # a pointer-events:none bar is not "covering the feet hit rect"
+        nick = max(0.0, min(ry + rh, by + bh) - max(ry, by)) if overlap else 0.0
+        checks.append((f"{part}-clears-bar", not overlap or nick <= 6))
+        if overlap and nick <= 6:
+            print(f"[ticker-gate] note: {part} pad nicked by {nick:.0f}px "
+                  "(bar top touches the rect's 6px pad; pointer-events: "
+                  "none, no touch is stolen)")
+    bad = [n for n, ok in checks if not ok]
+    print(f"[ticker-gate] {name} text={qa.get('text')!r} marquee="
+          f"{qa.get('marquee')} bar={qa.get('bar')} btn={qa.get('btn')} "
+          + ("OK" if not bad else f"FAIL: {bad}"))
+    fails += len(bad)
+    return fails
+
+
 class Handler(SimpleHTTPRequestHandler):
     t0 = time.monotonic()
     queue = []
@@ -534,6 +601,24 @@ def main():
             (6.5, {"type": "say", "text": _text, "emotion": "happy",
                    "seconds": 3, "actions": [_action]}),
         ]
+    if args.scenario in ("ticker", "ticker_short"):
+        # desktop forwards the hub's now_playing as a command event; feed the
+        # page the real envelope (session._emit_music_state's shape)
+        long_title = args.scenario == "ticker"
+        _text = ""
+        _snap = {
+            "playing": True, "uri": "spotify:track:capTICKER001",
+            "track": ("Bohemian Rhapsody (2011 Remaster) · Guitar Immortal "
+                      "Version with the full operatic middle section"
+                      if long_title else "Call Me"),
+            "artists": "Queen & Friends" if long_title else "Riko",
+            "album": "A Night at the Opera", "duration_ms": 355000,
+            "position_ms": 60000, "device": "Riko", "context_uri": "",
+        }
+        _text = f"{_snap['track']} — {_snap['artists']}"
+        Handler.queue = [(6.0, {"type": "command",
+                                "cmd": "music:state "
+                                       + json.dumps(_snap, ensure_ascii=False)})]
     Handler.t0 = time.monotonic()  # server clock vs page clock differ a bit; fine
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -586,6 +671,9 @@ def main():
     gate_fails = evaluate_touch_gates(args.outdir)
     if args.scenario in ("custom", "custom_say", "custom_say_inline"):
         gate_fails += evaluate_custom_gates(args.outdir, Handler.anim_doc["animations"])
+    if args.scenario in ("ticker", "ticker_short"):
+        gate_fails += evaluate_ticker_gates(args.outdir, args.scenario == "ticker",
+                                            _text)
     print(f"[harness] scenario={args.scenario} shots={len(shots)} touch-gate-fails={gate_fails}")
     for s in shots:
         print("  ", os.path.join(args.outdir, s))

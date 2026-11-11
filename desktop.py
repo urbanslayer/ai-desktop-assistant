@@ -482,7 +482,9 @@ class RoamController(QObject):
         self.backend = None            # None | "xcb" ("layer" reserved)
         self.in_strip = False
         self.x = None                  # (x, y, w, h) window coords of her body
+        self.x_extra = None            # second interactive rect (ticker button)
         self._sent = None
+        self._sent_extra = None
         self.xcb = None
         self.xid = 0
         self.warned = ""
@@ -637,9 +639,11 @@ class RoamController(QObject):
         if not (self.in_strip and self.backend == "xcb" and self.xcb and self.xcb.display):
             return
         rect = self._clipped_bbox()
-        changed = rect != self._sent
+        extra = self._clipped_extra()
+        changed = rect != self._sent or extra != self._sent_extra
         self._sent = rect
-        new = self.xcb.create_region([rect] if rect else [])
+        self._sent_extra = extra
+        new = self.xcb.create_region([r for r in (rect, extra) if r])
         self.xcb.set_input_region(self.xid, new)
         self.xcb.destroy_region(new)
         # Rate-limited trace of every shaping change (≤ 1 line / 2 s): the first
@@ -652,16 +656,21 @@ class RoamController(QObject):
 
     def _clear_region(self):
         self._sent = None
+        self._sent_extra = None
         if self.in_strip or (self.xcb and self.xcb.display and self.xid):
             try:
                 self.xcb.set_input_region(self.xid, 0)   # RegionNone: whole window
             except Exception:  # noqa: BLE001
                 pass
 
-    def _clipped_bbox(self):
-        if not self.x or not self.in_strip:
+    def _clip(self, rect):
+        """Clip a page rect to the strip; too-small = not interactive."""
+        if not rect or not self.in_strip:
             return None
-        x, y, w, h = self.x
+        try:
+            x, y, w, h = (int(v) for v in rect)
+        except (TypeError, ValueError):
+            return None
         _, _, sw, sh = self.strip_geom
         x0, y0 = max(0, x), max(0, y)
         x1, y1 = min(sw, x + w), min(sh, y + h)
@@ -669,9 +678,20 @@ class RoamController(QObject):
             return None
         return (x0, y0, x1 - x0, y1 - y0)
 
+    def _clipped_bbox(self):
+        return self._clip(self.x)
+
+    def _clipped_extra(self):
+        """The ticker button's rect (bbox `hit_extra`): a second interactive
+        island in the roam click-through mask, so the song button stays
+        clickable while everything around her body stays click-through."""
+        return self._clip(self.x_extra)
+
     # ── from the page / viewer ─────────────────────────────────────────
-    def update_bbox(self, x, y, w, h):
+    def update_bbox(self, x, y, w, h, extra=None):
         self.x = (int(x), int(y), int(w), int(h))
+        self.x_extra = tuple(extra) if (isinstance(extra, (list, tuple))
+                                        and len(extra) == 4) else None
         self.apply_bbox()
 
     # ── click forwarding (xcb path) ────────────────────────────────────
@@ -695,7 +715,9 @@ class RoamController(QObject):
         except Exception:  # noqa: BLE001
             return False
         rect = self._clipped_bbox()
-        inside = bool(rect) and rect[0] <= ex < rect[0] + rect[2] and rect[1] <= ey < rect[1] + rect[3]
+        rects = [r for r in (rect, self._clipped_extra()) if r]
+        inside = any(r[0] <= ex < r[0] + r[2] and r[1] <= ey < r[1] + r[3]
+                     for r in rects)
         kind = "pointerdown" if code == 4 else "pointerup"
         print(f"[roam] forward {kind} ({ex},{ey})", flush=True)
         if inside:
@@ -717,7 +739,8 @@ def handle_bbox_post(win, roamc, args: dict) -> dict:
     """
     win.last_bbox = args
     try:
-        roamc.update_bbox(args["x"], args["y"], args["w"], args["h"])
+        roamc.update_bbox(args["x"], args["y"], args["w"], args["h"],
+                          args.get("hit_extra"))
     except (KeyError, TypeError, ValueError):
         return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
     return {"ok": True}
@@ -973,11 +996,14 @@ def build_stop_typing_action(menu, typing_svc, command_pack=None):
     return action
 
 
-def build_music_menu(menu, player, listener=None, notify=None):
+def build_music_menu(menu, player, listener=None, notify=None,
+                     ticker=None, push_cmd=None):
     """Music submenu (music phase 1 + docs/SOLOIST.md): Start/Stop the
     desktop player (Soloist by default, spotifyd on legacy configs), its
-    status, and Connect Spotify (the local loopback OAuth listener catches
-    the redirect and hands the code to the hub). With
+    status, Connect Spotify (the local loopback OAuth listener catches the
+    redirect and hands the code to the hub), and the 'Show song ticker'
+    checkbox (docs/SPOTIFY_NOTES.md — persisted like the other tray
+    toggles; live changes ride the command bridge through push_cmd). With
     desktop.music.player: off the whole submenu is omitted. Soloist gets
     two extra items: the status line 'Soloist <ver>, expires <date>' (warn
     when < 7 days) and 'Update Soloist now'; a missing key file shows its
@@ -1064,6 +1090,23 @@ def build_music_menu(menu, player, listener=None, notify=None):
             _notify("Music", f"Spotify connect failed: {e}")
     connect_action.triggered.connect(_connect)
     music_menu.addAction(connect_action)
+
+    # song ticker (docs/SPOTIFY_NOTES.md): checkbox persisted like the other
+    # tray toggles; live flips go straight to the page over the bridge
+    if ticker is not None:
+        ticker_action = QAction("Show song ticker", music_menu)
+        ticker_action.setCheckable(True)
+        ticker_action.setChecked(bool(ticker))
+
+        def _ticker(on):
+            appstate.save_music_ticker(bool(on))
+            if push_cmd is not None:
+                try:
+                    push_cmd(f"music:ticker:{1 if on else 0}")
+                except Exception:  # noqa: BLE001
+                    pass
+        ticker_action.toggled.connect(_ticker)
+        music_menu.addAction(ticker_action)
 
     def _refresh():
         st = player.status()
@@ -1619,6 +1662,34 @@ def main():
             print(f"[touch] sit-state: {'sitting' if win.sit_state['sitting'] else 'standing'}",
                   flush=True)
             return {"ok": True}
+        elif cmd in ("music-control", "music-state"):
+            # song ticker (docs/SPOTIFY_NOTES.md): the page's transport
+            # button (music-control) or a late-open seed (music-state). One
+            # Spotify round trip waits on THIS viewer HTTP thread — never
+            # Qt — and the page flipped its icon optimistically, so a slow
+            # hub only delays the reconcile, never the click.
+            if cmd == "music-state":
+                action = ""
+            else:
+                action = str(args.get("action") or "").strip().lower()
+                if action not in ("play", "pause", "toggle", "next",
+                                  "previous"):
+                    return {"ok": False, "error": "action must be play|"
+                            "pause|toggle|next|previous"}
+            try:
+                hc = hub_client.get()
+                out = (hc.spotify_now_playing() if cmd == "music-state"
+                       else hc.spotify_control(action))
+            except hub_client.HubError as e:
+                # 409 not connected / 429 quota back-off: the page reverts
+                # its optimistic flip and hides the ticker
+                return {"ok": False, "error": str(e), "status": e.status}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            if cmd == "music-state":
+                return {"ok": True, "now_playing": out}
+            return {"ok": True, "action": out.get("action"),
+                    "now_playing": out.get("now_playing")}
         elif cmd == "avatar-scale":
             # scroll over her = her zoom: the PAGE renders the visual zoom
             # every frame and asks the desktop only for WINDOW moves at
@@ -1821,8 +1892,16 @@ def main():
         music_listener.start()   # port busy = another instance owns it, fine
     else:
         music_listener = None
+    # song ticker (docs/SPOTIFY_NOTES.md): tray choice wins over the config
+    # default; the effective value is pushed to the page at every start
+    ticker_on = appstate.load_music_ticker()
+    if ticker_on is None:
+        ticker_on = bool(music_cfg.get("ticker", True))
     build_music_menu(menu, music_player, music_listener,
-                     notify=lambda title, body: tray.showMessage(title, body))
+                     notify=lambda title, body: tray.showMessage(title, body),
+                     ticker=ticker_on,
+                     push_cmd=lambda cmd: bridge.command.emit(cmd))
+    bridge.command.emit(f"music:ticker:{1 if ticker_on else 0}")
     app.aboutToQuit.connect(music_player.stop)
 
     # Soloist builds expire 90 days after their build date: check at start

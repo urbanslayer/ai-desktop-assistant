@@ -167,3 +167,48 @@ Owner steps (once, see docs/SOLOIST.md for the details):
    herself from the official CDN on the first start).
 4. On the phone's Spotify app pick "Riko" in the device list once — the
    session is stored and restored on every later start.
+
+## Song ticker (2026-11-11, owner request)
+
+"Small ticker at the bottom of her window showing the currently playing
+song, with a play/pause button." Data is the hub's existing now-playing
+state — nothing new is polled:
+
+- **Data path:** the hub's `now_playing` event (events long-poll, deduped
+  state changes) → `riko/session.py` follower thread → viewer command
+  `music:state {json}` → page. A page opened mid-song gets one seed: the
+  session asks `GET /api/spotify/now-playing` once right after the follower
+  starts (`_seed_now_playing`, best effort — 409 stays dark). The idle
+  snapshot (`playing:false, uri:""`) is forwarded too: it is exactly what
+  tells the page to hide the bar.
+- **Button path:** page button → viewer `POST /control/music-control`
+  `{action:"toggle"}` → desktop → `POST /api/spotify/control` → hub's
+  `SpotifyHub.control` (new `toggle` branch: reads the young cache or one
+  fresh call, then pause/resume — the 403 retry inside `call()` covers a
+  Spotify-side "Restriction violated"). The round trip waits on the viewer
+  HTTP thread, never Qt; the page flipped its icon optimistically before
+  the request, so a slow hub delays only the reconcile. The response (and
+  any later `now_playing`) reconciles the truth; a failed control reverts
+  the flip and hides the bar until the next event proves things.
+- **Page policy** (`client/js/ticker.js`, pure + node-tested): shows when
+  playing or paused-with-a-track (paused shows the paused icon), hides on
+  idle/nothing/disabled/error and ~10 min after a pause; text is
+  `track — artists`; the marquee only engages when the painter measures
+  overflow; the tray switch `music:ticker:{0,1}` overrides everything.
+- **Touch safety:** the bar is `pointer-events: none` — only the button
+  takes clicks. It is NOT a body-part rect (`computeParts` untouched), and
+  the roam click-through mask gains the button rect as a SECOND rect via
+  the bbox payload's `hit_extra`, so the strip keeps click-through
+  everywhere else while the button stays clickable. Feet hit rects sit
+  above the 30 px bar (capture gate: at most the rects' 6 px pad is
+  nicked).
+- **Config/UX:** `desktop.music.ticker: true` default; tray Music ▸
+  "Show song ticker" checkbox persisted in the appstate
+  (`appstate.load/save_music_ticker`) like the other tray toggles; the
+  effective value is pushed to the page at every start. Bubble-family
+  styling, inline SVG icons — no external fonts, offline-vendored client.
+- **QA:** `capture_frames.py` scenarios `ticker` / `ticker_short` assert
+  (from `metrics.tickerQA` in the measure dumps) exact text, marquee iff
+  overflow, button-in-bar, and feet-rect clearance; the PNGs composite the
+  ticker's real rects/text onto the canvas shot (the harness shoots the
+  WebGL canvas, which cannot see DOM).

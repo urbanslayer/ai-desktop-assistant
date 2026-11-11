@@ -3213,6 +3213,29 @@ def create_app(data_dir, api_key: str | None = None,
         except _spotify.SpotifyError as e:
             return spotify_error_response(e)
 
+    @app.post("/api/spotify/control")
+    async def post_spotify_control(request: Request):
+        """{action: play|pause|toggle|next|previous}: transport control for
+        the avatar's song ticker (docs/SPOTIFY_NOTES.md). Answers with the
+        fresh now-playing snapshot so the optimistic page UI can reconcile;
+        409 while not connected, 429 inside a quota back-off."""
+        try:
+            body = await request.json()
+        except Exception:
+            return err(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return err(400, "body must be a JSON object")
+        action = str(body.get("action") or "").strip().lower()
+        if action not in ("play", "pause", "toggle", "next", "previous"):
+            return err(422, "action must be play|pause|toggle|next|previous")
+        try:
+            done = await run_in_threadpool(spotify_hub.control, action)
+            snap = await run_in_threadpool(spotify_hub.now_playing, True)
+            return {"ok": True, "action": done.get("action"),
+                    "now_playing": snap}
+        except _spotify.SpotifyError as e:
+            return spotify_error_response(e)
+
     # ── long-term memory (docs/WALK_MEMORY.md M) ────────────────────────
     def valid_fact_scope(scope: str) -> bool:
         return scope == "user" or (

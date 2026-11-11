@@ -11,6 +11,7 @@ window can show "listening...", "thinking...", her speech bubble, and swap
 the VRM when the persona changes — by keyword, riko-ctl or another client.
 """
 import collections
+import json
 import queue
 import threading
 import time
@@ -337,6 +338,34 @@ class Session:
         if self._events_stop is None:
             self._events_stop = hub_client.start_events_follower(
                 self._on_hub_event, client=self.hub, wait=wait)
+            threading.Thread(target=self._seed_now_playing,
+                             daemon=True).start()
+
+    def _seed_now_playing(self):
+        """Late-client seed for the song ticker (docs/SPOTIFY_NOTES.md): the
+        page opens mid-song, so ask the hub once what is playing. Best
+        effort: 409 (not connected) or any hub hiccup means no ticker."""
+        try:
+            snap = hub_client.get().spotify_now_playing()
+        except Exception:
+            return
+        if isinstance(snap, dict) and (snap.get("uri") or snap.get("track")):
+            self._emit_music_state(snap)
+
+    def _on_now_playing(self, ev):
+        """now_playing event (follower thread) -> page ticker command.
+        Forwarded even when empty: the idle snapshot (uri '') is exactly
+        what tells the page to hide the ticker now."""
+        self._emit_music_state(ev)
+
+    # keys the ticker understands; the event envelope keys stay behind
+    _MUSIC_KEYS = ("playing", "uri", "track", "artists", "album",
+                   "duration_ms", "position_ms", "device", "context_uri")
+
+    def _emit_music_state(self, snap):
+        payload = {k: snap.get(k) for k in self._MUSIC_KEYS if k in snap}
+        viewer.emit("command", cmd="music:state "
+                    + json.dumps(payload, ensure_ascii=False))
 
     def _on_hub_event(self, kind, ev):
         """One hub event (follower thread). Only timer traffic matters here:
@@ -346,6 +375,9 @@ class Session:
             return
         if kind == "animations_changed":
             self._on_animations_changed(ev)  # custom animations list refreshed
+            return
+        if kind == "now_playing":
+            self._on_now_playing(ev)  # song ticker (docs/SPOTIFY_NOTES.md)
             return
         if kind != "turn_finished" or ev.get("origin") != "timer":
             return  # a normal turn (no origin) was spoken by its own /api/chat

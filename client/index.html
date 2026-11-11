@@ -62,6 +62,43 @@
       font: inherit; color: #221a30; background: rgba(255, 255, 255, 0.96); box-shadow: 0 4px 18px rgba(0, 0, 0, 0.3);
     }
     #input.show { display: block; }
+
+    /* Song ticker (docs/SPOTIFY_NOTES.md): slim now-playing bar along the
+       bottom edge, both window and roam strip. The bar is pointer-events:
+       none — only the button takes clicks — and it is NOT a body-part rect,
+       so it never steals touches from her (feet hit rects live above it). */
+    #ticker {
+      position: fixed; left: 0; right: 0; bottom: 0; height: 30px; z-index: 6;
+      display: flex; align-items: center; gap: 8px; padding: 0 10px;
+      background: linear-gradient(to top, rgba(30, 25, 45, 0.66), rgba(30, 25, 45, 0.44));
+      backdrop-filter: blur(3px); pointer-events: none;
+      opacity: 0; transform: translateY(6px); transition: opacity .25s, transform .25s;
+    }
+    #ticker.show { opacity: 1; transform: none; }
+    #ticker-btn {
+      pointer-events: auto; flex: 0 0 auto; width: 26px; height: 26px; padding: 0;
+      border: 0; border-radius: 8px; cursor: pointer;
+      background: rgba(255, 255, 255, 0.14); color: #f3eefc;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #ticker-btn:hover { background: rgba(255, 255, 255, 0.26); }
+    #ticker-btn:active { transform: scale(0.92); }
+    #ticker-track {
+      flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap;
+      font-size: 12.5px; color: #f3eefc; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+      -webkit-mask-image: linear-gradient(to right, transparent, #000 10px, #000 calc(100% - 10px), transparent);
+              mask-image: linear-gradient(to right, transparent, #000 10px, #000 calc(100% - 10px), transparent);
+    }
+    #ticker-text { display: inline-block; will-change: transform; }
+    /* marquee only when the text overflows (the painter measures and sets
+       .scroll); it ping-pongs so both ends of the title get read */
+    #ticker-track.scroll #ticker-text {
+      animation: ticker-scroll 12s linear infinite alternate;
+    }
+    @keyframes ticker-scroll {
+      from { transform: translateX(0); }
+      to   { transform: translateX(calc(var(--tick-fit, 0px) - 100%)); }
+    }
   </style>
   <!-- Vendored libraries (offline: no CDN). See client/vendor/README.md;
        tests/test_client_vendor.py guards versions, hashes and local paths. -->
@@ -81,6 +118,7 @@
   <div id="bubble"></div>
   <div id="hud"><div id="heard"></div><div id="approval"></div><div id="status"></div></div>
   <input id="input" type="text" placeholder="Say something to her… (Enter to send, Esc to close)" autocomplete="off">
+  <div id="ticker" aria-hidden="true"><button id="ticker-btn" type="button" title="play/pause"></button><div id="ticker-track"><span id="ticker-text"></span></div></div>
   <audio id="voice"></audio>
 
   <script type="module">
@@ -100,6 +138,9 @@
     import { PoseLayer, GRAB_KIND, GRAB_LIMITS, clampGrabTarget } from './js/pose.js';
     import { registerInlineAnimations } from './js/inline_anim.js';
     import { validateAnimation } from './js/keyframes.js';
+    import {
+      tickerState, setEnabled, applySnapshot, press, resolveControl, tickerView,
+    } from './js/ticker.js';
     import { WalkDirector } from './js/walk.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
              GestureTracker, framingDistance, feetAnchorTarget,
@@ -778,6 +819,88 @@
         body: JSON.stringify({ sitting }),
       }).catch(() => {});
     }
+
+    // ── song ticker (docs/SPOTIFY_NOTES.md) ────────────────────────────
+    // The hub's now_playing (forwarded by the desktop as `music:state {...}`
+    // commands) drives a pure module (js/ticker.js); this block is only a
+    // painter + a button that posts /control/music-control. Optimistic flip,
+    // reconciled by the control response or the next now_playing event.
+    let tState = tickerState(true);
+    const tBar = document.getElementById('ticker');
+    const tBtn = document.getElementById('ticker-btn');
+    const tTrack = document.getElementById('ticker-track');
+    const tText = document.getElementById('ticker-text');
+    // inline SVG icons: the offline client ships no icon font
+    const TICON_PLAY = '<svg viewBox="0 0 10 12" width="11" height="13" aria-hidden="true">'
+      + '<path d="M0 0 L10 6 L0 12 Z" fill="currentColor"/></svg>';
+    const TICON_PAUSE = '<svg viewBox="0 0 10 12" width="11" height="13" aria-hidden="true">'
+      + '<rect x="0.5" y="0" width="3.2" height="12" fill="currentColor"/>'
+      + '<rect x="6.3" y="0" width="3.2" height="12" fill="currentColor"/></svg>';
+    let tTimer = 0;
+    function tickerPaint() {
+      // marquee applies only when the text actually overflows the track
+      const overflow = tText.scrollWidth > tTrack.clientWidth + 1;
+      const view = tickerView(tState, { overflow, now: Date.now() });
+      tBar.classList.toggle('show', !!view);
+      if (view) {
+        if (tText.textContent !== view.text) tText.textContent = view.text;
+        tBtn.innerHTML = view.playing ? TICON_PAUSE : TICON_PLAY;
+        tBtn.dataset.state = view.playing ? 'pause' : 'play';
+        tBtn.title = view.playing ? 'pause' : 'play';
+        tTrack.style.setProperty('--tick-fit', tTrack.clientWidth + 'px');
+        tTrack.classList.toggle('scroll', view.marquee);
+      }
+      clearTimeout(tTimer);
+      tTimer = setTimeout(tickerPaint, view ? 2000 : 5000);
+    }
+    function musicSnapshot(snap) {
+      if (snap && typeof snap === 'object' && snap.uri) {
+        snap = { ...snap, _seenAt: Date.now() };  // paused-hide countdown base
+      }
+      tState = applySnapshot(tState, snap);
+      tickerPaint();
+    }
+    tBtn.addEventListener('click', () => {
+      const r = press(tState, 'toggle', Date.now());
+      if (!r.send) return;
+      tState = r.state;
+      tickerPaint();                     // optimistic flip BEFORE the network
+      fetch('/control/music-control', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: r.send }),
+      }).then((resp) => resp.json()).then((out) => {
+        tState = resolveControl(tState, out);
+        tickerPaint();                   // reconcile with the hub's truth
+      }).catch(() => {
+        tState = resolveControl(tState, { ok: false });
+        tickerPaint();                   // revert the flip, hide until proven
+      });
+    });
+    tickerPaint();
+    if (DESKTOP) {
+      // late client: ask once what is playing (the events stream only shows
+      // changes); best effort — no hub / not connected stays dark
+      fetch('/control/music-state', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      }).then((resp) => resp.json()).then((out) => {
+        if (out && out.ok) musicSnapshot(out.now_playing);
+      }).catch(() => {});
+    }
+    function tickerCaptureQA() {   // capture-harness evidence (CAPTURE mode)
+      if (!CAPTURE) return undefined;
+      const rect = (el) => {
+        const b = el.getBoundingClientRect();
+        return [Math.round(b.x), Math.round(b.y), Math.round(b.width), Math.round(b.height)];
+      };
+      return {
+        shown: tBar.classList.contains('show'),
+        text: tText.textContent,
+        marquee: tTrack.classList.contains('scroll'),
+        btnState: tBtn.dataset.state || '',
+        bar: rect(tBar),
+        btn: rect(tBtn),
+      };
+    }
     function flashEmotion(name, value) {   // instant local reaction, no network
       motion.applyEmotion(name, value);
       setTimeout(() => {
@@ -959,6 +1082,14 @@
         // QA harness injection: full payload straight from the command
         try { setCustomAnimations(JSON.parse(cmd.slice('custom-animations:set '.length)).animations); }
         catch { /* junk payload: keep what we had */ }
+      } else if (cmd.startsWith('music:ticker:')) {
+        // tray Music ▸ Show song ticker (docs/SPOTIFY_NOTES.md)
+        tState = setEnabled(tState, cmd.slice('music:ticker:'.length) === '1');
+        tickerPaint();
+      } else if (cmd.startsWith('music:state ')) {
+        // now_playing forwarded by the desktop session: the ticker's truth
+        try { musicSnapshot(JSON.parse(cmd.slice('music:state '.length))); }
+        catch { /* junk payload: keep what we had */ }
       }
       // press-hint:<limb|none> is optional in the contract; nothing to do yet
     }
@@ -991,11 +1122,22 @@
       const bh = Math.min(innerHeight - y, Math.round(y1 - y0 + pad * 2));
       const parts = computeParts();
       const hy = hipsPxY(), fy = feetPxY();
+      // the ticker button is the one interactive island OUTSIDE her body
+      // rect: roam click-through masks add it as a second rect (hit_extra)
+      let hitExtra;
+      if (tBar.classList.contains('show')) {
+        const b = tBtn.getBoundingClientRect();
+        if (b.width > 0 && b.height > 0) {
+          hitExtra = [Math.round(b.x), Math.round(b.y),
+                      Math.round(b.width), Math.round(b.height)];
+        }
+      }
       return {
         x, y, w: bw, h: bh,
         ...(parts ? { parts } : {}),
         ...(hy != null ? { hips_y: Math.round(hy) } : {}),
         ...(fy != null ? { feet_y: Math.round(fy) } : {}),
+        ...(hitExtra ? { hit_extra: hitExtra } : {}),
       };
     }
     function postBbox() {
@@ -1361,7 +1503,50 @@
       // explicit finish().
       renderer.render(scene, camera);
       renderer.getContext().finish();
-      return renderer.domElement.toDataURL('image/png');
+      const tqa = tickerCaptureQA();
+      if (!tqa || !tqa.shown) return renderer.domElement.toDataURL('image/png');
+      // Song-ticker evidence (docs/SPOTIFY_NOTES.md): this harness shoots the
+      // WebGL canvas, which by nature misses DOM. Composite the ticker's REAL
+      // state — its live rects, text and button mode (tickerCaptureQA) — onto
+      // the shot so the PNG shows exactly what the page paints at that frame.
+      const c = document.createElement('canvas');
+      c.width = renderer.domElement.width; c.height = renderer.domElement.height;
+      const g = c.getContext('2d');
+      g.drawImage(renderer.domElement, 0, 0);
+      const sx = c.width / innerWidth, sy = c.height / innerHeight;
+      g.save();
+      g.scale(sx, sy);
+      const [bx, by, bw, bh] = tqa.bar;
+      g.fillStyle = 'rgba(30, 25, 45, 0.55)';
+      g.fillRect(bx, by, bw, bh);
+      const [kx, ky, kw, kh] = tqa.btn;
+      g.fillStyle = 'rgba(255, 255, 255, 0.16)';
+      g.beginPath();
+      g.roundRect(kx, ky, kw, kh, 8);
+      g.fill();
+      g.fillStyle = '#f3eefc';
+      if (tqa.btnState === 'pause') {
+        g.fillRect(kx + kw * 0.28, ky + kh * 0.2, kw * 0.15, kh * 0.6);
+        g.fillRect(kx + kw * 0.57, ky + kh * 0.2, kw * 0.15, kh * 0.6);
+      } else {
+        g.beginPath();
+        g.moveTo(kx + kw * 0.32, ky + kh * 0.2);
+        g.lineTo(kx + kw * 0.78, ky + kh * 0.5);
+        g.lineTo(kx + kw * 0.32, ky + kh * 0.8);
+        g.closePath();
+        g.fill();
+      }
+      const tx = kx + kw + 8, tw = bx + bw - tx - 8;
+      g.beginPath();
+      g.rect(tx, by, tw, bh);
+      g.clip();
+      g.font = '12.5px system-ui, sans-serif';
+      g.textBaseline = 'middle';
+      // marquee frames look mid-scroll on purpose (the CSS animation's phase
+      // isn't readable cross-process; the .scroll class IS the proof)
+      g.fillText(tqa.text, tx + (tqa.marquee ? -tw * 0.35 : 0), by + bh / 2);
+      g.restore();
+      return c.toDataURL('image/png');
     };
     // Pose metrics against the REAL rig, written for ANY VRM (0.x or 1.0;
     // bones a rig lacks report null instead of throwing — the owner's Furina
@@ -1443,6 +1628,7 @@
           gazeDbg: motion.__debug(),
           // touch/pose seams for the capture harness (docs/TOUCH.md)
           parts: computeParts(), hipsYpx: hipsPxY(), feetYpx: feetPxY(),
+          tickerQA: tickerCaptureQA(),
           pose: pose.debug(), touchMode,
           leftHandPx: worldPx(bones.leftHand),
           rightHandPx: worldPx(bones.rightHand),

@@ -144,3 +144,50 @@ def test_bbox_post_non_roam_stores_seam_and_never_touches_input_region(qapp):
     r3 = desktop.handle_bbox_post(win, roamc, {"parts": {}, "hips_y": 300})
     assert r3["ok"] is False
     assert win.last_bbox["hips_y"] == 300
+
+
+# ── roam click-through mask + the song-ticker button (SPOTIFY_NOTES.md) ────
+
+class XcbRegionSpy(XcbSpy):
+    """Also records the rect lists handed to create_region."""
+
+    def __init__(self):
+        super().__init__()
+        self.regions = []
+
+    def create_region(self, rects):
+        self.regions.append(list(rects))
+        return f"region-{len(self.regions)}"
+
+    def destroy_region(self, region):
+        pass
+
+
+def test_bbox_post_roam_mask_gains_ticker_button_rect(qapp):
+    """hit_extra (the ticker button) becomes a SECOND interactive rect in
+    the strip's click-through mask; junk or absent extras leave the mask at
+    exactly her body rect."""
+    payload = json.loads((FX / "touch_bbox_parts.json").read_text())
+    payload["hit_extra"] = [380, 650, 26, 26]
+    win = FakeWin()
+    roamc = desktop.RoamController(win, {"desktop": {"roam": "strip"}}, tray=None)
+    spy = XcbRegionSpy()
+    roamc.xcb, roamc.xid, roamc.backend, roamc.in_strip = spy, 0xBEEF, "xcb", True
+    roamc.strip_geom = (0, 0, 1920, 700)
+    body = (payload["x"], payload["y"], payload["w"], payload["h"])
+
+    assert desktop.handle_bbox_post(win, roamc, payload) == {"ok": True}
+    assert roamc.x_extra == (380, 650, 26, 26)
+    assert spy.regions[-1] == [body, (380, 650, 26, 26)]
+
+    # an extra fully outside the strip clips away: mask is just her body
+    payload2 = dict(payload, hit_extra=[1900, 710, 26, 26])
+    desktop.handle_bbox_post(win, roamc, payload2)
+    assert spy.regions[-1] == [body]
+
+    # junk extras are ignored, never crash the seam
+    for junk in ("380,650", [1, 2, 3], None, {"x": 1}):
+        desktop.handle_bbox_post(win, roamc, dict(payload, hit_extra=junk))
+        assert roamc.x_extra is None
+    # and the arbiter's source (last_bbox) still carries everything
+    assert "parts" in win.last_bbox and "hips_y" in win.last_bbox

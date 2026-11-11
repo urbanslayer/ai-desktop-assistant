@@ -153,6 +153,11 @@ desktop:
                          # player yourself; Riko only uses it)
                          # Legacy `spotifyd: managed|external|off` below
                          # still works when `player` is absent.
+    ticker: true         # song ticker at the bottom of her window
+                         # (docs/SPOTIFY_NOTES.md); the tray's Music ▸
+                         # "Show song ticker" checkbox overrides this once
+                         # clicked (persisted in the appstate like the
+                         # other tray toggles)
     # device_name: ""    # Spotify Connect name; default "Riko" — the SAME
                          # name the hub's Settings > Spotify and her prompt
                          # use (persona names confuse which device is hers)

@@ -267,6 +267,19 @@ class HubClient:
         /api/messages/42/audio or /api/personas/<id>/greeting/audio?v=3)."""
         return self._call("GET", audio_url, timeout=AUDIO_TIMEOUT).content
 
+    # ── Spotify transport (song ticker, docs/SPOTIFY_NOTES.md) ──────────
+    def spotify_now_playing(self):
+        """GET /api/spotify/now-playing: the fresh-enough snapshot.
+        HubError(status=409) while Spotify is not connected."""
+        return self._json("GET", "/api/spotify/now-playing")
+
+    def spotify_control(self, action, timeout=20):
+        """POST /api/spotify/control {action}: play|pause|toggle|next|
+        previous. Returns {ok, action, now_playing}; the HTTP thread that
+        calls this waits on one Spotify round trip (never the Qt thread)."""
+        return self._json("POST", "/api/spotify/control",
+                          json={"action": action}, timeout=timeout)
+
     def tts_audio(self, text, persona=None):
         """POST /api/tts: WAV bytes of `text` in a persona's voice (no cache)."""
         body = {"text": text}

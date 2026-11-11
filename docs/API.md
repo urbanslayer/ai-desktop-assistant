@@ -1125,6 +1125,12 @@ curl -s -H "$AUTH" "$HUB/api/spotify/now-playing"
 # {"playing":true,"uri":"spotify:track:…","track":"…","artists":"…",
 #  "album":"…","duration_ms":354000,"position_ms":12345,"device":"Riko",
 #  "context_uri":"…"}    // 409 not connected, 429 inside quota back-off
+curl -s -H "$AUTH" -X POST "$HUB/api/spotify/control" \
+     -H 'content-type: application/json' -d '{"action":"toggle"}'
+# {"ok":true,"action":"pause","now_playing":{…fresh snapshot…}}
+# action: play|pause|toggle|next|previous (toggle flips against the fresh
+# snapshot: playing->pause, paused->resume). Same 409/429 rules; this is the
+# song ticker's transport button behind the desktop (docs/SPOTIFY_NOTES.md).
 curl -s -H "$AUTH" "$HUB/api/spotify/devices"
 # {"devices":[{"id":"…","name":"Riko","type":"Speaker","active":true,"volume":40}]}  # cached 60 s
 curl -s -H "$AUTH" -X POST "$HUB/api/spotify/transfer" -d '{"device":"Riko"}'
@@ -1215,10 +1221,18 @@ curl -s -H "$AUTH" -X POST "$HUB/api/touch" -d '{"kind":"pat","part":"head"}' -H
 ```
 
 Desktop seams (viewer `POST /control/<cmd>`, docs/TOUCH.md): `bbox` carries
-`parts` + `hips_y`; `/control/touch` `{part, kind, x, y, hold_ms}` forwards
-here off every UI thread; `/control/sit-state` `{sitting}` reports the page
-finished blending. Desktop → page bridge commands: `sit:<edge_y_css_px>`
-(re-sent when the edge moves ≥ 4 px), `stand`, `touch-mode:<off|quiet|chatty>`.
+`parts` + `hips_y` (+ `hit_extra` — the song-ticker button's rect, a second
+interactive rect in the roam click-through mask); `/control/touch`
+`{part, kind, x, y, hold_ms}` forwards here off every UI thread;
+`/control/sit-state` `{sitting}` reports the page finished blending.
+`/control/music-control` `{action}` and `/control/music-state` `{}` drive the
+song ticker through the hub (the Spotify round trip waits on the viewer HTTP
+thread, never Qt); both answer with `{ok, now_playing}` so the page can
+reconcile its optimistic play/pause flip. Desktop → page bridge commands:
+`sit:<edge_y_css_px>` (re-sent when the edge moves ≥ 4 px), `stand`,
+`touch-mode:<off|quiet|chatty>`, `music:state {json}` (the hub's now_playing,
+forwarded from the events long-poll + seeded once at start,
+docs/SPOTIFY_NOTES.md), `music:ticker:{0,1}` (tray Music ▸ Show song ticker).
 
 ## Custom animations (docs/SELF_ANIMATION.md)
 

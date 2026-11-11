@@ -120,3 +120,28 @@ def save_name_gate(on: bool) -> bool:
         return True
     except OSError:
         return False
+
+
+def load_music_ticker() -> bool | None:
+    """The persisted 'Show song ticker' tray choice (docs/SPOTIFY_NOTES.md),
+    or None when never chosen — then desktop.music.ticker from the config
+    decides (never raises)."""
+    try:
+        data = json.loads(state_path("music_ticker").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    on = data.get("on") if isinstance(data, dict) else None
+    return on if isinstance(on, bool) else None
+
+
+def save_music_ticker(on: bool) -> bool:
+    """Persist the song-ticker choice. Non-bools are ignored, not written."""
+    if not isinstance(on, bool):
+        return False
+    try:
+        path = state_path("music_ticker")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"on": on}), encoding="utf-8")
+        return True
+    except OSError:
+        return False

@@ -1011,11 +1011,20 @@ class SpotifyHub:
                 "shuffle": bool(shuffle), "alternatives": []}
 
     def control(self, action: str, value=None) -> dict:
-        """pause|resume|next|prev|seek|volume|shuffle. seek/volume take a
-        value (seconds / percent); shuffle a bool-ish."""
+        """pause|resume|next|prev|seek|volume|shuffle|toggle. seek/volume take
+        a value (seconds / percent); shuffle a bool-ish. 'toggle' (the ticker
+        button, docs/SPOTIFY_NOTES.md) reads the current snapshot and flips."""
         self.require()
         action = str(action or "").strip().lower()
         c = self.client()
+        if action == "toggle":
+            # fresh-enough truth for the flip: the young cache, else one call
+            snap = self._now_cache
+            if snap is None or time.monotonic() - float(
+                    snap.get("_fetched") or 0) > 5.0:
+                snap = self._fetch_snapshot()
+            return self.control("pause" if snap.get("playing") else "resume",
+                                value)
         if action == "pause":
             self.call(c.pause)
             self._wake.clear()

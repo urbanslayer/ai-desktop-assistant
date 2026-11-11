@@ -460,6 +460,59 @@ def test_not_connected_gates(hub_app):
     assert hub_status["connected"] is False and hub_status["configured"] is True
 
 
+# ── POST /api/spotify/control: the song ticker's transport button ───────────
+
+def test_spotify_control_route(hub_app, fake):
+    """pause/resume/next/previous answers 200 with the fresh now_playing so
+    the ticker's optimistic UI reconciles (docs/SPOTIFY_NOTES.md)."""
+    app, client = hub_app
+    seed_tokens(app)
+    fake.now = playing_snapshot()
+    r = client.post("/api/spotify/control", json={"action": "pause"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and body["action"] == "pause"
+    # the fake echoes whatever fake.now says; prove the snapshot rides along
+    assert body["now_playing"]["uri"] == TRACK["uri"]
+    assert "_fetched" not in body["now_playing"]
+    fake.now = playing_snapshot(is_playing=False)
+    app.state.spotify._now_cache = None
+    r = client.post("/api/spotify/control", json={"action": "play"})
+    assert r.status_code == 200 and r.json()["action"] == "resume"
+    assert r.json()["now_playing"]["playing"] is False   # echo of the fake
+    for action in ("next", "previous"):
+        assert client.post("/api/spotify/control",
+                           json={"action": action}).status_code == 200
+    # bad payloads
+    assert client.post("/api/spotify/control",
+                       json={"action": "rewind"}).status_code == 422
+    assert client.post("/api/spotify/control",
+                       json={"action": "resume"}).status_code == 422
+    assert client.post("/api/spotify/control", json={}).status_code == 422
+
+
+def test_spotify_control_route_toggle(hub_app, fake):
+    """toggle flips against the fresh truth: playing -> pause, paused ->
+    resume (what the ticker button posts)."""
+    app, client = hub_app
+    seed_tokens(app)
+    fake.now = playing_snapshot(is_playing=True)
+    r = client.post("/api/spotify/control", json={"action": "toggle"})
+    assert r.status_code == 200 and r.json()["action"] == "pause"
+    app.state.spotify._now_cache = {
+        **app.state.spotify._now_cache,
+        "playing": False, "_fetched": time.monotonic()}
+    r = client.post("/api/spotify/control", json={"action": "toggle"})
+    assert r.json()["action"] == "resume"
+
+
+def test_spotify_control_route_not_connected_409(hub_app):
+    _, client = hub_app
+    r = client.post("/api/spotify/control", json={"action": "pause"})
+    assert r.status_code == 409
+    assert "detail" in r.json()
+
+
 # ── tools wiring: listed always, offered only when configured, human text ───
 
 def test_tools_listed_and_gated(hub_app):
