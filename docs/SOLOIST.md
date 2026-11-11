@@ -158,3 +158,6 @@ key, write the key file, Start player, pick "Riko" once on the phone.
 - **`external` mode** expects you to run soloist yourself; Riko reaches its
   API via the same `<data-dir>/ws.addr`+`ws.port` discovery files the daemon
   writes (or `soloist.ws_port` if you point `-D` somewhere else).
+
+## Live verification (2026-11-11)
+Owner confirmed: Soloist (pid owns the "Spotify" PipeWire stream) plays the Dance playlist on device "Riko", and the volume dips while she speaks and restores after. spotifyd no longer runs.
