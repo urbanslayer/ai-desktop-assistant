@@ -17,7 +17,7 @@ try:  # package import (repo root) vs standalone (`python server.py` in hub/)
 except (ImportError, SystemError):  # standalone: hub/ is on sys.path
     import memory as _memory  # type: ignore[no-redef]
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Voice migration for personas written before the voice round (docs/VOICE.md):
 # a bland design-mode voice with a random seed, so they keep talking after the
@@ -137,6 +137,29 @@ CREATE TABLE IF NOT EXISTS timers(
 );
 CREATE INDEX IF NOT EXISTS idx_timers_due ON timers(status, due_at);
 CREATE INDEX IF NOT EXISTS idx_timers_persona ON timers(persona_id, status);
+"""
+
+# Custom animations (docs/SELF_ANIMATION.md): persona-owned keyframe sets,
+# scoped to the avatar model they were authored on (sha256 of the persona's
+# VRM bytes, 'default' when it has no uploaded avatar).
+_SCHEMA_V10 = """
+CREATE TABLE IF NOT EXISTS animations(
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  persona_id      TEXT NOT NULL,
+  model_sha256    TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  description     TEXT NOT NULL DEFAULT '',
+  duration_s      REAL NOT NULL,
+  loop            INTEGER NOT NULL DEFAULT 0,
+  ease            TEXT NOT NULL DEFAULT 'smooth',
+  keyframes_json  TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'draft',
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  UNIQUE(persona_id, model_sha256, name)
+);
+CREATE INDEX IF NOT EXISTS idx_animations_persona
+  ON animations(persona_id, model_sha256);
 """
 
 
@@ -259,6 +282,8 @@ class Store:
             cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
             if "meta" not in cols:
                 self.db.execute("ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
+        if version < 10:  # custom animations round (docs/SELF_ANIMATION.md)
+            self.db.executescript(_SCHEMA_V10)
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.commit()
 
@@ -397,6 +422,7 @@ class Store:
             self.db.execute("DELETE FROM personas WHERE id=?", (pid,))
             self.db.execute("DELETE FROM messages WHERE persona=?", (pid,))
             self.db.execute("DELETE FROM timers WHERE persona_id=?", (pid,))
+            self.db.execute("DELETE FROM animations WHERE persona_id=?", (pid,))
             self.db.commit()
             return ids
 
@@ -720,6 +746,130 @@ class Store:
                         out.append(self._timer_dict(row))
             self.db.commit()
         return out
+
+    # ── custom animations (docs/SELF_ANIMATION.md) ───────────────────────
+    @staticmethod
+    def _animation_dict(row) -> dict:
+        try:
+            kfs = json.loads(row["keyframes_json"])
+        except ValueError:
+            kfs = []
+        return {"id": row["id"], "persona_id": row["persona_id"],
+                "model_sha256": row["model_sha256"], "name": row["name"],
+                "description": row["description"],
+                "duration_s": row["duration_s"], "loop": bool(row["loop"]),
+                "ease": row["ease"], "keyframes": kfs, "status": row["status"],
+                "created_at": row["created_at"], "updated_at": row["updated_at"]}
+
+    def add_animation(self, persona_id: str, model_sha256: str, doc: dict,
+                      status: str = "draft") -> dict | None:
+        """Store one validated keyframe doc (animations.validate_animation
+        output). None when (persona, model, name) already exists."""
+        ts = now_iso()
+        try:
+            with self._lock:
+                cur = self.db.execute(
+                    "INSERT INTO animations(persona_id,model_sha256,name,"
+                    "description,duration_s,loop,ease,keyframes_json,status,"
+                    "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (persona_id, model_sha256, doc["name"],
+                     str(doc.get("description") or ""),
+                     float(doc["duration_s"]), 1 if doc.get("loop") else 0,
+                     doc.get("ease", "smooth"),
+                     json.dumps(doc.get("keyframes") or []), status, ts, ts))
+                self.db.commit()
+                aid = cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+        if aid is None:
+            return None
+        with self._lock:
+            row = self.db.execute("SELECT * FROM animations WHERE id=?",
+                                  (aid,)).fetchone()
+        return self._animation_dict(row) if row else None
+
+    def get_animation(self, persona_id: str, name: str,
+                      model_sha256: str) -> dict | None:
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM animations WHERE persona_id=? AND "
+                "model_sha256=? AND name=?",
+                (persona_id, model_sha256, name)).fetchone()
+        return self._animation_dict(row) if row else None
+
+    def list_animations(self, persona_id: str, model_sha256: str | None = None,
+                        status: str | None = None) -> list[dict]:
+        """Kept first, then drafts, newest first inside each group.
+        model_sha256=None lists across every model of the persona."""
+        where, args = ["persona_id=?"], [persona_id]
+        if model_sha256 is not None:
+            where.append("model_sha256=?")
+            args.append(model_sha256)
+        if status:
+            where.append("status=?")
+            args.append(status)
+        with self._lock:
+            rows = self.db.execute(
+                f"SELECT * FROM animations WHERE {' AND '.join(where)} "
+                "ORDER BY status DESC, id DESC", args).fetchall()
+        return [self._animation_dict(r) for r in rows]
+
+    def animation_models(self, persona_id: str) -> list[str]:
+        """Every model sha this persona has animations on (creation order)."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT model_sha256 FROM animations WHERE persona_id=? "
+                "GROUP BY model_sha256 ORDER BY MIN(id)", (persona_id,)).fetchall()
+        return [r["model_sha256"] for r in rows]
+
+    def update_animation(self, persona_id: str, name: str, model_sha256: str,
+                         *, new_name: str | None = None,
+                         description: str | None = None,
+                         status: str | None = None) -> tuple[dict | None, str]:
+        """Patch name/description/status. Returns (row, '') on success,
+        (None, 'missing') when the row is gone, (None, 'conflict') when the
+        new name already exists on the same persona+model."""
+        sets, vals = ["updated_at=?"], [now_iso()]
+        if new_name is not None:
+            sets.append("name=?")
+            vals.append(new_name)
+        if description is not None:
+            sets.append("description=?")
+            vals.append(description)
+        if status is not None:
+            sets.append("status=?")
+            vals.append(status)
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM animations WHERE persona_id=? AND "
+                "model_sha256=? AND name=?",
+                (persona_id, model_sha256, name)).fetchone()
+            if row is None:
+                return None, "missing"
+            try:
+                self.db.execute(
+                    f"UPDATE animations SET {','.join(sets)} WHERE id=?",
+                    (*vals, row["id"]))
+            except sqlite3.IntegrityError:
+                return None, "conflict"
+            self.db.commit()
+            row = self.db.execute("SELECT * FROM animations WHERE id=?",
+                                  (row["id"],)).fetchone()
+        return self._animation_dict(row), ""
+
+    def delete_animation(self, persona_id: str, name: str,
+                         model_sha256: str) -> dict | None:
+        """Delete by persona+model+name; returns the removed row or None."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM animations WHERE persona_id=? AND "
+                "model_sha256=? AND name=?",
+                (persona_id, model_sha256, name)).fetchone()
+            if row is None:
+                return None
+            self.db.execute("DELETE FROM animations WHERE id=?", (row["id"],))
+            self.db.commit()
+        return self._animation_dict(row)
 
     # ── long-term memory facts (docs/WALK_MEMORY.md M) ─────────────────
     # scope: "user" (shared across personas) or "persona:<id>" (private note)

@@ -230,11 +230,113 @@ def test_invent_detector():
         assert not A.detect_invent_request(t), t
 
 
+# ── store: round-trip + model scoping (schema v10) ──────────────────────────
+
+@pytest.fixture
+def store(tmp_path):
+    s = Store(tmp_path / "hub.db")
+    s.add_persona("riko", "Riko", [], "sys", "hi", "")
+    s.add_persona("asuka", "Asuka", [], "sys", "hi", "")
+    yield s
+    s.close()
+
+
+def _clean_doc(name="victory_dance"):
+    clean, notes = A.validate_animation(fixture_doc())
+    assert notes == []
+    clean["name"] = name
+    return clean
+
+
+def test_schema_version_is_10():
+    from hub.store import SCHEMA_VERSION
+    assert SCHEMA_VERSION == 10
+
+
+def test_store_round_trip_and_model_scoping(store):
+    doc = _clean_doc()
+    row = store.add_animation("riko", "shaAAA", doc)
+    assert row and row["status"] == "draft" and row["model_sha256"] == "shaAAA"
+    assert row["keyframes"] == doc["keyframes"]          # exact round-trip
+    assert row["loop"] is False and row["duration_s"] == 2.4
+    got = store.get_animation("riko", "victory_dance", "shaAAA")
+    assert got == row
+
+    # duplicate (persona, model, name) refused; same name on another model fine
+    assert store.add_animation("riko", "shaAAA", doc) is None
+    other = store.add_animation("riko", "shaBBB", doc)
+    assert other and other["id"] != row["id"]
+    # another persona too
+    assert store.add_animation("asuka", "shaAAA", doc) is not None
+
+    assert [a["model_sha256"] for a in
+            store.list_animations("riko", model_sha256="shaAAA")] == ["shaAAA"]
+    assert len(store.list_animations("riko")) == 2       # across models
+    assert store.animation_models("riko") == ["shaAAA", "shaBBB"]
+
+    # status filter + kept-first ordering
+    upd, err = store.update_animation("riko", "victory_dance", "shaAAA",
+                                      status="kept")
+    assert err == "" and upd["status"] == "kept"
+    store.add_animation("riko", "shaAAA", _clean_doc("newer_draft"))
+    names = [(a["name"], a["status"]) for a in
+             store.list_animations("riko", "shaAAA")]
+    assert names[0] == ("victory_dance", "kept")
+    assert ("newer_draft", "draft") in names
+    assert store.list_animations("riko", "shaAAA", status="draft")[0][
+        "name"] == "newer_draft"
+
+    # rename inside the same model; conflict on an existing name
+    upd, err = store.update_animation("riko", "newer_draft", "shaAAA",
+                                      new_name="curtsy")
+    assert err == "" and upd["name"] == "curtsy"
+    upd, err = store.update_animation("riko", "curtsy", "shaAAA",
+                                      new_name="victory_dance")
+    assert upd is None and err == "conflict"
+    upd, err = store.update_animation("riko", "ghost", "shaAAA",
+                                      status="kept")
+    assert upd is None and err == "missing"
+
+    # description patch
+    upd, err = store.update_animation("riko", "curtsy", "shaAAA",
+                                      description="small bow")
+    assert err == "" and upd["description"] == "small bow"
+
+    # delete is model-scoped
+    gone = store.delete_animation("riko", "victory_dance", "shaAAA")
+    assert gone and gone["name"] == "victory_dance"
+    assert store.get_animation("riko", "victory_dance", "shaAAA") is None
+    assert store.get_animation("riko", "victory_dance", "shaBBB") is not None
+    assert store.delete_animation("riko", "victory_dance", "shaAAA") is None
+
+    # persona deletion cascades
+    store.delete_persona("riko")
+    assert store.list_animations("riko") == []
+    assert store.list_animations("asuka") != []
+
+
+def test_store_migrates_old_db(tmp_path):
+    """A v9 hub DB (fresh Store then downgraded pragma) gains the animations
+    table on reopen — mirrors the user_version migration path."""
+    db = tmp_path / "hub.db"
+    s = Store(db)
+    s.close()
+    import sqlite3
+    con = sqlite3.connect(db)
+    con.execute("DROP TABLE animations")
+    con.execute("PRAGMA user_version=9")
+    con.commit()
+    con.close()
+    s2 = Store(db)
+    assert s2.get_animation("riko", "x", "sha") is None   # table exists
+    s2.close()
+
+
 def test_model_sha_resolver(tmp_path):
+    import hashlib
     r = A.ModelShaResolver(tmp_path)
     assert r("nobody") == A.MODEL_DEFAULT
     (tmp_path / "riko.vrm").write_bytes(b"glTF-fake-vrm")
-    import hashlib
     assert r("riko") == hashlib.sha256(b"glTF-fake-vrm").hexdigest()
     # cached across calls, refreshed when the bytes change
     assert r("riko") == hashlib.sha256(b"glTF-fake-vrm").hexdigest()

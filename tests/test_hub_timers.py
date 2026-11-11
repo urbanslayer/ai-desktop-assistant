@@ -165,7 +165,7 @@ def test_migration_v7_to_v8_adds_timers(tmp_path):
     s.db.commit()
     s.close()
     s2 = Store(path)
-    assert s2.db.execute("PRAGMA user_version").fetchone()[0] == 9  # keeps migrating to the current schema
+    assert s2.db.execute("PRAGMA user_version").fetchone()[0] == 10  # keeps migrating to the current schema
     assert s2.recent_messages("riko", 5)[0]["timer_id"] is None  # old rows survive
     t = s2.add_timer(persona_id="riko", label="tea", prompt="p",
                      due_at=iso(NOW), cancel_on=["chat.read"], captured={})
