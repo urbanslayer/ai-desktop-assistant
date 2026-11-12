@@ -1030,7 +1030,8 @@ def create_app(data_dir, api_key: str | None = None,
 
     @app.put("/api/personas/{persona_id}")
     async def put_persona(persona_id: str, request: Request):
-        if not store.persona_exists(persona_id):
+        before = store.get_persona(persona_id)
+        if not before:
             return err(404, f"no persona '{persona_id}'")
         try:
             body = await request.json()
@@ -1061,6 +1062,14 @@ def create_app(data_dir, api_key: str | None = None,
                 return err(422, "keywords must be a list")
             fields["keywords"] = [str(k).strip().lower() for k in body["keywords"] if str(k).strip()]
         persona = store.update_persona(persona_id, fields) if fields else store.get_persona(persona_id)
+        # The greeting is NOT part of the greeting-audio cache key (voice_version +
+        # rules version): a cached clip was made from the OLD greeting (or the
+        # preview line, when the greeting was still empty at first fetch) and would
+        # be replayed forever on app start / persona switch. Drop it when the text
+        # changes so the next GET synthesizes the current greeting (owner report:
+        # Jahoda spoke the voice-preview line instead of her greeting).
+        if "greeting" in fields and fields["greeting"] != (before.get("greeting") or ""):
+            delete_persona_audio(persona_id)
         bump_state()
         return public_persona(persona)
 
