@@ -256,3 +256,9 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 15. **Speech bubble above the head, not over the face** (owner request 2026-11-12, do after 13): place the
     bubble above the head bone (fallback: on the body) using the live head position, kept on screen and
     clear of the face; mind the touch rule that the bubble swallows presses (TOUCH.md) and the roam strip.
+16. **Reduce memory use** (owner report 2026-11-12): loading the desktop assistant uses over 1 GB of RAM,
+    which is too high. First measure: per-process RSS/PSS of desktop.py and its web-view (renderer, GPU,
+    utility) with the owner's avatar vs the sample avatar, idle and after a few minutes of chat. Then cut
+    the biggest costs, e.g. avatar textures (downscale/compress, free CPU copies after GPU upload), Chromium
+    flags/process model, Python-side imports and caches. Set a target from the measurements and keep a
+    repeatable measurement script.
