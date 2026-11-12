@@ -259,6 +259,47 @@ the preview-delivery assertions in `test_animations_routes_crud_event_and_previe
 actions-only event, EMPTY custom list, keyframe-gated shots must PASS with zero
 "unknown action" console warnings).
 
+## Hops bend the legs (2026-11, owner request) — contract
+
+Owner report: her hop/jump (e.g. the saved `victory_leap`, which keys `hips_y` only) rises and lands with
+**straight legs**. Owner wants a real jump: crouch, push off, legs tucked in the air, knees absorbing the landing.
+
+**Reference (measured from the owner's recording of a jump in his VRM viewer, 60 fps, 4 jumps, all
+consistent; H = standing height):** crouch: head drops 14 % H over 0.20 s, held ~0.4 s, push-off 0.10 s →
+airborne 0.55 s, apex at +0.32 s; at the apex the feet have risen 46 % H but the head only 28 % H, i.e. the
+legs are **tucked by ~17 % H (knee flex ≈ 100°)** → feet touch down while the body is still descending, head
+sinks to 9 % H below standing within 0.2 s (landing crouch), held 0.25 s, recovers in 0.25 s.
+
+**Design (owner decision: legs bend automatically; she should never have to key legs for a hop):**
+- **Page / player (`client/js/pose.js` keyframe layer, solver in a new pure `client/js/legs.js`):** whenever a
+  keyframe animation drives `hips_y` and the doc does **not** key a given leg bone, the player derives that
+  bone from `hips_y` every frame (explicitly keyed leg bones always win):
+  - `hips_y < 0` (crouch / landing): **feet planted** — two-leg IK keeps each foot at its rest world position
+    (≤ 1 cm vertical, ≤ 2 cm horizontal drift) while the hips sink; knees bend forward (pole = character
+    forward), thighs flex forward, feet stay flat. Leg lengths and the rest hip-to-ankle distance come from the
+    attached rig (works on VRM 0.x and 1.0, sample avatar and the owner's model; null-guard missing bones).
+    Clamp to `KEYFRAME_LIMITS`; if the dip is deeper than the legs can bend, bend to the limit and let the
+    feet sink rather than over-rotate.
+  - `hips_y > 0` (airborne): feet ride with the body as today **plus a tuck**: knee flex rises smoothly with
+    height to ≈ 95° at `hips_y ≥ 0.10`, thigh forward ≈ 0.3 × knee, foot points ≈ 15°; left/right may differ by
+    ~10 % so it doesn't look mechanical. The tuck must ease in/out with no pop at `hips_y = 0` (both branches
+    agree at 0 = rest).
+  - Blend with the same in/out envelope as other keyed bones; legs written by this go into `k.bones` so the
+    final frame restores them exactly; no change to animations without `hips_y`.
+- **Hub (`hub/tools/animation_tools.py` cookbook text, `hub/animations.py` lint, this doc's cookbook row):**
+  the hop recipe teaches the timing above in `hips_y` terms and says **don't key legs**: anticipation
+  `hips_y −0.08` over ~0.2 s (hold ~0.1 s) → apex `+0.12…0.15` ~0.3 s after leaving the ground → touchdown
+  `0` → landing dip `−0.05` for ~0.2 s → `0` (≈ 1.4–1.6 s total). Lint hint when a hop/jump/leap/bounce
+  description has a rise ≥ 0.05 but no dip ≤ −0.05 before it (anticipation) or none after it (landing).
+- **Acceptance (measured, both rigs: `character_files/sample_avatar.vrm` and the owner's ACTIVE avatar fetched
+  to `$TMPDIR`):** a hop doc following the recipe, captured headless with `capture_frames.py custom`, printing
+  per-frame knee flex (deg), thigh flex, foot world y vs ground and foot xz drift:
+  crouch key: knee flex 50–110°, feet within 1 cm of the ground, xz drift ≤ 2 cm; apex: knee 70–110°,
+  feet clearly airborne; landing key: knee 30–80°, feet planted as above; rest keys: legs at rest (≤ 1°).
+  The saved-style legacy doc (`victory_leap` numbers: `hips_y` −0.03/0.12/−0.02/0.02/0.06/0.1/−0.02, no legs)
+  must also bend (no straight-legged airborne frame). Contact sheet of the **sample avatar only** in
+  `docs/evidence/`; owner-model numbers in the report only (third-party model renders stay out of the repo).
+
 ## Rules for both children
 
 - Never start a compositor/WM/X server; never query the owner's live session (`hyprctl`, `swaymsg`, `qdbus`,

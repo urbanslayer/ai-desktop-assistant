@@ -247,3 +247,12 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 10. The status pill text during tool use is a stopgap: give the page a first-class `status(text=…)`.
 11. The thinking-pose fingers only curl on rigs that have weighted finger bones (the sample avatar doesn't).
 12. Test-run warnings (MCP SDK ping deprecation, FastAPI `on_event`); silence or migrate.
+13. **Hops bend the legs** (owner request 2026-11-12, in progress): docs/SELF_ANIMATION.md "Hops bend the legs".
+14. **Greeting uses the persona's own line** (owner report 2026-11-12, do after 13): on app start and on a
+    persona switch, Jahoda (greeting "Jahoda, reporting for duty!") instead speaks "Senpai, this is what my voice
+    sounds like" — the voice-sample/preview text, not her greeting. Find which path (startup greet vs the
+    persona-switch/voice-preview path) feeds the TTS, make both speak the active persona's greeting, test the
+    switch case too.
+15. **Speech bubble above the head, not over the face** (owner request 2026-11-12, do after 13): place the
+    bubble above the head bone (fallback: on the body) using the live head position, kept on screen and
+    clear of the face; mind the touch rule that the bubble swallows presses (TOUCH.md) and the roam strip.
