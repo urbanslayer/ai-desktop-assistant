@@ -171,6 +171,12 @@ if (THREE) {
 
   test('release regression: arm returns to rest after a far grab (shake release)', need, () => {
     const { motion, pose } = makePoseRig();
+    // Freeze the gaze: a random big glance (motion.js _nextGlance = t +
+    // rand(2, 5), pulled by the first saccade at t~0) yaws the HIPS up to
+    // 0.6 rad, which moves the hand's WORLD position by centimetres right
+    // inside this test's 2.5 s window — the world-rest gate below then
+    // flakes on Math.random. Same freeze the pat/head tests use.
+    motion.setGazeOverride({ yaw: 0, pitch: 0 });
     sim(motion, pose, 0.5);
     const restW = live(motion, 'leftHand');
     pose.setTarget('hand_l', [0.6, 1.6, 0.1]);

@@ -221,6 +221,38 @@ def evaluate_touch_gates(outdir):
     return fails
 
 
+CUSHION_M = 0.09        # legs.js HOP_LEGS.cushion: max sink under the doc
+CUSHION_FLOOR = -0.14   # legs.js HOP_LEGS.cushionFloor: hipsEff floor
+
+
+def landing_touchdowns(anim, hips_at):
+    """Python mirror of legs.js landingTouchdowns (detection only — enough
+    to classify a doc as 'has an airborne rise' for the hips gate): maximal
+    runs of the 120 Hz-sampled hips_y curve above crossY=0.01 whose peak is
+    >= riseMin=0.05 and which END inside the doc (a landing). Empty list =
+    the landing cushion is identically 0 for this doc, so hipsEff must equal
+    the raw doc curve everywhere."""
+    keys = anim.get("keyframes") or []
+    dur = float(anim.get("duration_s") or 0)
+    if dur <= 0 or len(keys) < 2:
+        return []
+    n = max(8, math.ceil(dur * 120))
+    dt = dur / n
+    ys = [hips_at(i * dt)[1] for i in range(n + 1)]
+    out, i = [], 0
+    while i <= n:
+        if ys[i] <= 0.01:
+            i += 1
+            continue
+        j = i
+        while j <= n and ys[j] > 0.01:
+            j += 1
+        if j <= n and max(ys[i:j]) >= 0.05:
+            out.append(j * dt)       # crossed back down inside the doc
+        i = j + 1
+    return out
+
+
 def evaluate_custom_gates(outdir, anims):
     """Independent PYTHON re-implementation of the keyframe sampler
     (docs/SELF_ANIMATION.md): for every captured frame that shows an active
@@ -232,6 +264,7 @@ def evaluate_custom_gates(outdir, anims):
     Returns the number of failed checks.
     """
     by_name = {a.get("name"): a for a in anims}
+
     def q_xyz(d):                      # XYZ Euler degrees -> unit quaternion
         hx, hy, hz = (math.radians(v) / 2 for v in d)
         sx, cx, sy, cy, sz, cz = (math.sin(hx), math.cos(hx), math.sin(hy),
@@ -309,6 +342,7 @@ def evaluate_custom_gates(outdir, anims):
         return sample, ease
 
     prepped = {}
+    tds = {}          # id(anim) -> python-detected touchdown times (see below)
     fails = 0
     frames = 0
     for j in sorted(Path(outdir).glob("*.json")):
@@ -385,13 +419,37 @@ def evaluate_custom_gates(outdir, anims):
                 worst = max(worst, werr)
                 checks.append((f"{bone}-world<=3deg", werr <= 3.0))
         got_hips = float(qa.get("hipsY") or 0.0)
-        checks.append((f"hipsY={hips * blend:.3f}",
-                       abs(got_hips - hips * blend) <= 0.011))
+        # hips gate: the player writes hipsEff * ease(w), where hipsEff is
+        # the doc's hips_y MINUS the stateless landing cushion (legs.js
+        # landingEff — the hips sink under the doc curve around touchdowns).
+        # The page exports the exact hipsEff it used (keyframeQA.hipsEff):
+        # gate the measured offset against it. Docs with no airborne rise
+        # have cushion == 0 everywhere -> hipsEff must equal the raw doc
+        # sample (byte-identical pass-through); docs WITH a touchdown get
+        # independent bounds instead (sink <= C, never above doc, floor).
+        eff_qa = qa.get("hipsEff")
+        if id(anim) not in tds:
+            tds[id(anim)] = landing_touchdowns(anim, sample)
+        if eff_qa is None:      # page without the export: raw-doc gate
+            checks.append((f"hipsY={hips * blend:.3f}",
+                           abs(got_hips - hips * blend) <= 0.011))
+        else:
+            eff = float(eff_qa)
+            checks.append((f"hipsY=hipsEff*blend={eff * blend:.3f}",
+                           abs(got_hips - eff * blend) <= 0.011))
+            if not tds[id(anim)]:
+                checks.append(("hipsEff==doc", abs(eff - hips) <= 0.002))
+            else:
+                checks.append(
+                    ("hipsEff-in-cushion-bounds",
+                     eff <= hips + 0.006
+                     and eff >= max(hips - CUSHION_M, CUSHION_FLOOR) - 0.006))
         bad = [n for n, ok in checks if not ok]
         fails += len(bad)
         print(f"[custom-gate] {j.name} name={qa.get('name')} t={t:.3f} w={w:.2f} "
               f"bones={len(qa.get('bones') or {})} worstErr={worst:.2f}deg "
-              f"hipsY={got_hips:.4f} {'PASS' if not bad else 'FAIL ' + ','.join(bad)}",
+              f"hipsY={got_hips:.4f} hipsEff={qa.get('hipsEff')} "
+              f"{'PASS' if not bad else 'FAIL ' + ','.join(bad)}",
               flush=True)
     if not frames:
         fails += 1

@@ -309,6 +309,22 @@ sinks to 9 % H below standing within 0.2 s (landing crouch), held 0.25 s, recove
   `legQA`/`autoLegs` in `rikoMeasure.keyframeQA`, doc-time shots via `capture_frames.py --kftime`
   (page `?kftime=`), fixture `client/js/fixtures/animation_hop_legs_qa.json`, sheet
   `docs/evidence/hop_legs_sample.png`.
+- **Landing cushion (2026-11 follow-up):** a doc whose `hips_y` dips only shallowly (or not at all) after a
+  rise used to land on nearly-straight legs because the planted IK only bends UNDER the ground line. The
+  player now writes `hipsEff = max(hips_y − c(t), −0.14)` (`landingCushion`/`landingTouchdowns`/`landingEff`
+  in `client/js/legs.js`), where touchdown is where the 120 Hz-sampled doc curve DESCENDS through
+  `crossY = 0.01` after peaking ≥ `riseMin = 0.05`, and `c(t)` ramps 0 → `cushion = 0.09` over
+  [td − `cushionPre = 0.25`, td + `cushionRise = 0.12`] and decays back to 0 by td + `cushionHold = 0.45`
+  (max over overlapping windows). All pure functions of DOCUMENT time — no playback state, seek/QA-safe.
+  The sink is rate-limited to `cushionSinkPerFrame = 0.004` m per 60 fps frame (the knee near full
+  extension sits on an acos cliff); the rise is uncapped on purpose. Docs with no airborne rise have
+  `c ≡ 0`, so their hips offset is byte-identical to the doc curve. Planted-knee pole rule: knees track
+  character-forward with a `poleSplayDeg = 12.5°` OUTWARD splay; the rest-knee perpendicular is only used
+  when it clearly points forward (`dot(perp, forward) > poleFwdDot = 0.7`) so a knock-kneed rest rig cannot
+  bend its shins into an X. QA: `rikoMeasure.keyframeQA` exports `hipsEff` (the exact effective target the
+  player wrote) plus `hipsDoc`; the `capture_frames.py custom` hips gate compares the measured offset
+  against `hipsEff × blend` (±0.011) and independently asserts `hipsEff == hipsDoc` for docs without a
+  touchdown. Verify with `--kftime` shots (see Acceptance above).
 
 ## Rules for both children
 

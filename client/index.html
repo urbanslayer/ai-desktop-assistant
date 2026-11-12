@@ -1801,6 +1801,12 @@
             if (!dbg.keyframes) return null;
             const qa = { ...dbg.keyframes, bones: dbg.kfBones || {},
                          hipsY: dbg.kfHipsY ?? 0, chain: {}, chainQ: {},
+                         // effective hips target the player used (doc curve
+                         // + landing cushion) and the raw doc sample: the
+                         // harness gates the written hips against hipsEff, and
+                         // asserts hipsEff == hipsDoc for docs with no rise
+                         hipsEff: dbg.kfHipsEff ?? 0,
+                         hipsDoc: dbg.kfHipsDoc ?? 0,
                          boneOfNode: {}, localRest: {},
                          // leg bones AUTO-derived from hips_y (not keyed in
                          // the doc): the harness gates must not demand rest

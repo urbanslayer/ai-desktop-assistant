@@ -522,6 +522,12 @@ export class PoseLayer {
       if (k.autoLegs.tuck) tuckDeg = k.autoLegs.tuck(docT) * e;
       if (k.autoLegs.blend) blendW = k.autoLegs.blend(docT) * e;
     }
+    // QA export: the EXACT effective hips target this frame used (doc curve
+    // + landing cushion), so the capture gate can compare the written hips
+    // against hipsEff instead of the raw doc curve (capture_frames.py
+    // evaluate_custom_gates; docs without an airborne rise: hipsEff == doc).
+    k.hipsEff = hipsEff;
+    k.hipsDoc = Number.isFinite(s.hips_y) ? s.hips_y : 0;
     if (hipsEff || s.hips_y || k.hipsY) {
       const hips = m._node('hips');
       if (hips && m._restPos) {
@@ -942,6 +948,10 @@ export class PoseLayer {
       const hipsN = m._node('hips');
       out.kfHipsY = (k.hipsY && hipsN && m._restPos)
         ? +(hipsN.position.y - m._restPos.y).toFixed(4) : 0;
+      // effective hips target the layer USED this frame (doc + cushion) and
+      // the raw doc sample — the capture gate gates against these
+      out.kfHipsEff = Number.isFinite(k.hipsEff) ? +k.hipsEff.toFixed(4) : 0;
+      out.kfHipsDoc = Number.isFinite(k.hipsDoc) ? +k.hipsDoc.toFixed(4) : 0;
     }
     for (const bn of Object.keys(GRAB_LIMITS)) {
       const n = m._node(bn), r = m._rest.get(bn);
