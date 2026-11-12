@@ -301,6 +301,14 @@ sinks to 9 % H below standing within 0.2 s (landing crouch), held 0.25 s, recove
   The saved-style legacy doc (`victory_leap` numbers: `hips_y` −0.03/0.12/−0.02/0.02/0.06/0.1/−0.02, no legs)
   must also bend (no straight-legged airborne frame). Contact sheet of the **sample avatar only** in
   `docs/evidence/`; owner-model numbers in the report only (third-party model renders stay out of the repo).
+- **Implementation notes (2026-11):** solver `client/js/legs.js` (pure, world-space, no three import); the
+  keyframe layer roots the planted chain on the LIVE hip joint so life-layer hip sway cannot drift the
+  "planted" foot, blends the foot target passive→pinned over the first cm of dip, and leans the ankle 8 mm
+  back as the crouch sets in (heels forward) so long-legged rigs clear the 50° crouch gate inside the 2 cm
+  drift budget. Bone writes PRE-MULTIPLY the rest world quaternion (the rig rule). Measurement:
+  `legQA`/`autoLegs` in `rikoMeasure.keyframeQA`, doc-time shots via `capture_frames.py --kftime`
+  (page `?kftime=`), fixture `client/js/fixtures/animation_hop_legs_qa.json`, sheet
+  `docs/evidence/hop_legs_sample.png`.
 
 ## Rules for both children
 
