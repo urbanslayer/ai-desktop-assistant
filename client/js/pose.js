@@ -23,6 +23,7 @@
 // taken from motion, never re-derived, so both layers share one truth).
 
 import { solveTwoBoneIK, sub, add, mul, dot, len, dist, norm } from './ik.js';
+import { solveHopLegs } from './legs.js';
 import {
   sample as sampleKeyframes, clampAnimation, KF_BLEND, KEYFRAME_LIMITS,
   clampRelEuler,
@@ -184,7 +185,9 @@ export class PoseLayer {
       const dir = norm(sub(f, h));
       let perp = norm(sub(sub(k, h), mul(dir, dot(sub(k, h), dir))));
       if (len(perp) < 1e-3) perp = [0, 0, 0];
-      this._legRest[side] = { l1, l2, hip: h, kneePole: perp };
+      // knee/ankle rest world positions too: the hips_y hop-leg solver
+      // (legs.js) plants the feet exactly on these while the hips sink
+      this._legRest[side] = { l1, l2, hip: h, knee: k, ankle: f, kneePole: perp };
     }
   }
 
@@ -287,8 +290,36 @@ export class PoseLayer {
     }
     this.kf = { anim: c.anim, t: 0, w: 0, out: false, preview: !!preview,
                 bones: new Set(), hipsY: !!(this.kf && this.kf.hipsY),
-                expr: new Set(), ghost };
+                expr: new Set(), ghost,
+                // hips_y hop legs (docs/SELF_ANIMATION.md "Hops bend the
+                // legs"): derive the leg bones from hips_y when the DOC
+                // drives hips_y and does not key that leg's bones at all.
+                autoLegs: this._autoLegsState(c.anim) };
     return true;
+  }
+
+  /** Per-animation auto-leg policy: enabled when any keyframe carries a
+   *  hips_y track (and the rig can actually receive the hips offset), and
+   *  per BONE suppressed when the doc keys that exact bone — "whenever a
+   *  keyframe animation drives hips_y and the doc does not key a given leg
+   *  bone, the player derives that bone" (contract): explicitly keyed leg
+   *  bones always win; a derived shin chains off the KEYED thigh because
+   *  this layer reads live transforms after the keyed writes. */
+  _autoLegsState(anim) {
+    const m = this.motion;
+    const keys = Array.isArray(anim.keyframes) ? anim.keyframes : [];
+    const keyed = new Set();
+    let hasHipsY = false;
+    for (const kf of keys) {
+      if (kf && Number.isFinite(kf.hips_y)) hasHipsY = true;
+      for (const b of Object.keys((kf && kf.bones) || {})) keyed.add(b);
+    }
+    return {
+      enabled: hasHipsY && !!m._node('hips') && !!m._restPos,
+      keyed,                   // bone names the doc itself keys (wins)
+      bones: new Set(),        // leg bones THIS mechanism wrote (for QA + gates)
+      solve: {},               // last frame's solver metrics (QA)
+    };
   }
 
   /** Blend back to rest over the remaining blend window. A limb grab or a
@@ -473,6 +504,11 @@ export class PoseLayer {
         k.hipsY = true;
       }
     }
+    // hips_y hop legs: crouch plants the feet (IK), airborne rides + tucks.
+    // Solved with the BLEND-SCALED offset and written absolutely, so the
+    // feet stay pinned through the blend-in and both branches hit exact
+    // rest as e -> 0 (the same 0.25 s envelope as every keyed bone).
+    if (k.autoLegs && k.autoLegs.enabled) this._autoLegs(k, s.hips_y * e);
     const em = this.vrm.expressionManager;
     if (em) {
       for (const [name, v] of Object.entries(s.expression)) {
@@ -498,6 +534,97 @@ export class PoseLayer {
     let r = this._kfRest.get(bone);
     if (!r) { r = n2.quaternion.clone(); this._kfRest.set(bone, r); }
     return { node: n2, rest: r };
+  }
+
+  // legs written by the hips_y hop solver (docs/SELF_ANIMATION.md). World
+  // targets from legs.js -> bone quaternions with the SAME rule proven for
+  // IK arm/leg grabs: the minimal world arc PRE-MULTIPLIES the bone's rest
+  // WORLD quaternion, then local = parentWorld^-1 * worldTarget. Synthetic
+  // identity-frame tests pass without this and lie; real VRMs do nothing.
+  _autoLegs(k, hipsYeff) {
+    const m = this.motion;
+    k.autoLegs.solve = {};
+    if (!(Math.abs(hipsYeff) > 1e-5)) return;   // both branches == rest at 0
+    const T = this.THREE;
+    const scene = m.vrm.scene;
+    scene.updateMatrixWorld(true);              // hips_y applied: hips is live
+    // facing = world +z rotated by her root (same sense as the gaze math)
+    const face = new T.Vector3(0, 0, 1)
+      .applyQuaternion(scene.getWorldQuaternion(new T.Quaternion()));
+    const fl = Math.hypot(face.x, face.z);
+    const forward = fl > 1e-6 ? [face.x / fl, 0, face.z / fl] : [0, 0, 1];
+    const legs = {};
+    for (const side of ['left', 'right']) {
+      const leg = this._legRest && this._legRest[side];
+      if (leg) legs[side] = { hip: leg.hip, knee: leg.knee, ankle: leg.ankle };
+    }
+    const solved = solveHopLegs({ legs, forward, hipsY: hipsYeff });
+    for (const side of ['left', 'right']) {
+      const sol = solved[side];
+      if (!sol) continue;
+      const hipN = m._node(`${side}UpperLeg`);
+      const kneeN = m._node(`${side}LowerLeg`);
+      const footN = m._node(`${side}Foot`);
+      if (!hipN || !kneeN || !footN) continue;        // rig without this bone
+      // rest WORLD directions/quaternions read live BEFORE any write this
+      // frame (the keyframe layer owns the legs here, so live == rest)
+      const p0 = hipN.getWorldPosition(new T.Vector3());
+      const p1 = kneeN.getWorldPosition(new T.Vector3());
+      const p2 = footN.getWorldPosition(new T.Vector3());
+      const u0 = p1.clone().sub(p0).normalize();
+      const w0 = p2.clone().sub(p1).normalize();
+      const hipW = hipN.getWorldQuaternion(new T.Quaternion());
+      const kneeW = kneeN.getWorldQuaternion(new T.Quaternion());
+      const qH = new T.Quaternion()
+        .setFromUnitVectors(u0, new T.Vector3().fromArray(sol.thighDir))
+        .multiply(hipW);
+      const qK = new T.Quaternion()
+        .setFromUnitVectors(w0, new T.Vector3().fromArray(sol.shinDir))
+        .multiply(kneeW);
+      const parentQ = (hipN.parent || scene)
+        .getWorldQuaternion(new T.Quaternion());
+      const wroteHip = this._writeAutoLeg(k, `${side}UpperLeg`,
+        parentQ.invert().multiply(qH));
+      // parent reference for children = the world quaternion the thigh ACTUALLY
+      // holds after this frame's writes (ours, or the doc's key when it won)
+      const hipNow = wroteHip ? qH : hipW;
+      const wroteKnee = this._writeAutoLeg(k, `${side}LowerLeg`,
+        hipNow.clone().invert().multiply(qK));
+      // foot: FLAT while planted (angle 0 -> bone untouched, stays flat);
+      // airborne it rides the shin and points ~15 deg beyond it
+      if (footN && sol.footArc && Math.abs(sol.footArc.angle) > 1e-4) {
+        const footW = footN.getWorldQuaternion(new T.Quaternion());
+        const qF = new T.Quaternion()
+          .setFromAxisAngle(new T.Vector3().fromArray(sol.footArc.axis), sol.footArc.angle)
+          .multiply(footW);
+        this._writeAutoLeg(k, `${side}Foot`,
+          (wroteKnee ? qK : kneeW).clone().invert().multiply(qF));
+      }
+      k.autoLegs.solve[side] = { mode: sol.mode, kneeFlexDeg: +sol.kneeFlexDeg.toFixed(2),
+                                 thighFlexDeg: +sol.thighFlexDeg.toFixed(2) };
+    }
+  }
+
+  // Write one auto-leg bone ABSOLUTELY (the solver already folded in the
+  // blend weight through hips_y*e), clamped into its KEYFRAME_LIMITS euler
+  // box on the canonical branch, and register it in k.bones so the final
+  // frame restores exact rest like every other keyframe write.
+  _writeAutoLeg(k, bone, localTarget) {
+    if (k.autoLegs.keyed.has(bone)) return;    // a doc key always wins
+    const nb = this._kfBone(bone);
+    if (!nb) return;
+    const rel = nb.rest.clone().invert().multiply(localTarget);
+    const lim = KEYFRAME_LIMITS[bone];
+    if (lim) {
+      const e = new this.THREE.Euler().setFromQuaternion(rel, 'XYZ');
+      const c = clampRelEuler(rel, lim,
+        [(e.x * 180) / Math.PI, (e.y * 180) / Math.PI, (e.z * 180) / Math.PI]);
+      rel.setFromEuler(new this.THREE.Euler(c[0], c[1], c[2], 'XYZ'));
+    }
+    nb.node.quaternion.copy(nb.rest).multiply(rel);
+    k.bones.add(bone);
+    k.autoLegs.bones.add(bone);
+    return true;
   }
 
   // ONE exact ew=0 frame, then let go (the grab-release rule): every bone
@@ -753,6 +880,8 @@ export class PoseLayer {
       const k = this.kf;
       out.keyframes = { name: k.anim.name || '', t: +k.t.toFixed(3),
                         w: +k.w.toFixed(3), out: k.out, preview: !!k.preview };
+      out.autoLegs = k.autoLegs ? [...k.autoLegs.bones] : [];
+      out.autoLegSolve = (k.autoLegs && k.autoLegs.enabled) ? k.autoLegs.solve : {};
       out.kfBones = {};
       for (const bone of k.bones) {
         const nb = this._kfBone(bone);
@@ -799,11 +928,21 @@ export class PoseLayer {
       const ankle = wp(m._node(`${side}Foot`));
       if (!hip || !knee || !ankle) continue;
       const th = sub(knee, hip), sh = sub(ankle, knee);
+      const legR = this._legRest && this._legRest[side];
       out.legAngles[side] = {
         thighBelowHoriz: +(90 - angDeg(th, [0, -1, 0])).toFixed(2),
         thighZ: +th[2].toFixed(4),
         kneeFlex: +angDeg(th, sh).toFixed(2),
         shinFromVertical: +angDeg(sh, [0, -1, 0]).toFixed(2),
+        // hop-legs evidence (docs/SELF_ANIMATION.md acceptance): thigh flex
+        // vs the rig's OWN rest thigh direction, and how far the foot moved
+        // from its rest world spot (dy + xz drift; planted gates: <=1 cm /
+        // <=2 cm). Ground is world y = 0 in the page.
+        thighFlexDeg: legR ? +angDeg(th, sub(legR.knee, legR.hip)).toFixed(2) : null,
+        footWorld: ankle.map((v) => +v.toFixed(4)),
+        footDyRestM: legR ? +(ankle[1] - legR.ankle[1]).toFixed(4) : null,
+        footXzDriftM: legR
+          ? +Math.hypot(ankle[0] - legR.ankle[0], ankle[2] - legR.ankle[2]).toFixed(4) : null,
       };
     }
     if (this.sitState) {

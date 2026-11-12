@@ -1,11 +1,13 @@
 // node --test client/js/keyframes.js — the keyframe player contract
 // (docs/SELF_ANIMATION.md): validation, clamps, slerp sampling, the pose
 // layer's playKeyframes/stopKeyframes API, and a 10-minute per-frame
-// simulation (fixture + 50 random valid animations at 60 fps, interleaved
+// simulation (fixture + 50 random animations at 60 fps, interleaved
 // with grab/sit interrupts) asserting: no NaN, every bone inside the limits,
 // neck never rotated, exact rest within 0.3 s after every end/interrupt, and
-// feet planted whenever no leg bone is keyed. Pure-math tests always run;
-// the rig tests need three (`npm install` in client/).
+// legs untouched when no leg bone AND no hips_y track is keyed (hips_y-driven
+// docs bend the legs automatically — docs/SELF_ANIMATION.md "Hops bend the
+// legs" — and pose_hoplegs.test.js owns that behavior). Pure-math tests always
+// run; the rig tests need three (`npm install` in client/).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -371,6 +373,9 @@ if (THREE) {
   const LIFE_BONES = new Set(['spine', 'head', 'hips']);  // life layer writes these too
   const legsKeyed = (a) => a.keyframes.some((k) => Object.keys(k.bones || {})
     .some((b) => LEG_BONES.includes(b)));
+  // "Hops bend the legs": hips_y-driven docs DERIVE the leg bones even when
+  // unkeyed, so the untouched-legs invariant only holds without hips_y too
+  const hipsDriven = (a) => a.keyframes.some((k) => Number.isFinite(k.hips_y));
 
   function randomAnim(rnd, i) {
     const bones = [];
@@ -405,7 +410,7 @@ if (THREE) {
 
   test('10 simulated minutes at 60 fps: fixture + 50 random animations with '
     + 'grab/sit interrupts (no NaN, limits hold, neck never moves, rest '
-    + 'restored within 0.3 s, feet planted without leg keys)', need, () => {
+    + 'restored within 0.3 s, legs untouched without leg keys AND hips_y)', need, () => {
     const { motion, pose } = makeRig();
     const rnd = mulberry32(0xA6C6);
     const anims = [FIXTURE];
@@ -451,7 +456,7 @@ if (THREE) {
       if (ai < anims.length && f >= gap && !pose.kf && pose.grabs.size === 0
           && !pose.sitState) {
         touched = new Set();
-        legs = legsKeyed(anims[ai]);
+        legs = legsKeyed(anims[ai]) || hipsDriven(anims[ai]);
         assert.equal(pose.playKeyframes(anims[ai]), true);
         ai += 1;
       }

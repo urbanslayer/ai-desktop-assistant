@@ -57,12 +57,23 @@ def main():
         # label the tile
         tile = im.convert("RGB")
         d = ImageDraw.Draw(tile)
+        leg = met.get("legQA") or {}
+        leg_lines = []
+        for side in ("left", "right"):
+            s = leg.get(side) or {}
+            if s:
+                leg_lines.append(
+                    f"{side[0].upper()} knee={s.get('kneeFlexDeg')}deg"
+                    f" thigh={s.get('thighFlexDeg')}deg"
+                    f" footDy={s.get('footDyFromRestM')}m"
+                    f" xz={s.get('footXzDriftM')}m {s.get('mode') or ''}")
         lines = [f"t={png.name.split('-t')[1][:6] if '-t' in png.name else png.name}",
                  f"v={met.get('visualScale')} win={met.get('windowScale')}",
                  f"canvas={im.width}x{im.height}" + (
                      f"  body={box['bodyPx']}px  foot@{box['footFromBottom']}"
-                     if box else "")]
-        d.rectangle([0, 0, tile.width, 54], fill=(12, 12, 18))
+                     if box else "")] + leg_lines
+        band = 20 + 17 * len(lines)
+        d.rectangle([0, 0, tile.width, band], fill=(12, 12, 18))
         for i, ln in enumerate(lines):
             d.text((6, 4 + i * 17), ln, fill=(120, 230, 160))
         tiles.append(tile)

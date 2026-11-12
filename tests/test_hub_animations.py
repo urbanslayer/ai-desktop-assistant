@@ -120,11 +120,65 @@ def test_lint_notes_flag_docs_that_miss_their_description():
     assert not any("V" in n or "raise" in n for n in notes)  # -100 is a real raise
     good = {"name": "spot_ok", "description": "V arms, sway, hop",
             "keyframes": [{"t": 0.0, "bones": {}, "expression": {}},
+                          {"t": 0.5, "bones": {}, "expression": {},
+                           "hips_y": -0.08},
                           {"t": 1.0, "bones": {"leftUpperArm": [0, 0, -100],
                                                "spine": [0, 0, 10]},
                            "expression": {}, "hips_y": 0.12},
+                          {"t": 1.5, "bones": {}, "expression": {},
+                           "hips_y": -0.05},
                           {"t": 2.0, "bones": {}, "expression": {}}]}
     assert A.lint_animation(good, good) == []      # notes never fire on honest docs
+
+
+def _hop_doc(desc, hips_seq):
+    """Minimal hop-shaped doc: one hips_y key per value (t = 0.3 i)."""
+    kfs = [{"t": round(0.3 * i, 2), "bones": {}, "expression": {},
+            **({"hips_y": h} if h is not None else {})}
+           for i, h in enumerate(hips_seq)]
+    return {"name": "hop_probe", "description": desc, "keyframes": kfs}
+
+
+def test_lint_hop_shape_hints_flag_missing_crouch_and_landing():
+    # rise >= 0.05 with no dip <= -0.05 before it -> anticipation hint
+    doc = _hop_doc("a happy little hop", [0.0, 0.12, 0.0, -0.05, 0.0])
+    notes = A.lint_animation(doc, doc)
+    assert any("crouches first" in n for n in notes)
+    assert not any("landing dip" in n for n in notes)
+    # dip before but none after the last rise key -> landing-dip hint
+    doc = _hop_doc("big jump", [0.0, -0.08, 0.14, 0.0])
+    notes = A.lint_animation(doc, doc)
+    assert any("landing dip" in n for n in notes)
+    assert not any("crouches first" in n for n in notes)
+    # full crouch -> apex -> landing recipe: no hop-shape hints at all
+    doc = _hop_doc("bounce bounce", [0.0, -0.08, 0.14, 0.0, -0.05, 0.0])
+    notes = A.lint_animation(doc, doc)
+    assert not any("crouches first" in n or "landing dip" in n
+                   for n in notes)
+    # negatives: no rise >= 0.05 (pure crouch), or no hop word
+    doc = _hop_doc("a deep crouch hold", [0.0, -0.1, -0.1, 0.0])
+    doc["name"] = "crouch_hold"               # 'hop_probe' would match the hop regex
+    assert A.lint_animation(doc, doc) == []
+    doc = _hop_doc("slowly sinks down", [0.0, 0.12, 0.0])
+    doc["name"] = "slow_sink"
+    notes = A.lint_animation(doc, doc)
+    assert not any("crouches first" in n or "landing dip" in n
+                   for n in notes)
+
+
+def test_animation_doc_example_validates_and_lints_clean():
+    """The example embedded in the create_animation tool description must
+    pass the hub's own validator with zero clamp notes and zero lint hints
+    (the cookbook teaches by example; a stale example teaches bad numbers)."""
+    from hub.tools import animation_tools as AT
+    raw = AT._animation_doc_description().split("Example: ", 1)[1]
+    doc = json.loads(raw)
+    clean, notes = A.validate_animation(doc)
+    assert notes == []
+    assert clean["keyframes"][0]["t"] == 0.0
+    assert clean["keyframes"][-1]["t"] == clean["duration_s"]
+    assert 2 <= len(clean["keyframes"]) <= 24
+    assert A.lint_animation(clean, clean) == []
 
 
 def test_gesture_names_match_gestures_js():

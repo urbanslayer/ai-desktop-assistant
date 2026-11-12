@@ -333,10 +333,17 @@ def evaluate_custom_gates(outdir, anims):
         t, w = float(qa["t"]), float(qa["w"])
         blend = ease(min(1.0, max(0.0, w)))
         off_q, hips = sample(t)
+        # leg bones the player AUTO-derives from hips_y (docs/SELF_ANIMATION.md
+        # "Hops bend the legs"): they are legitimately off-rest even though the
+        # doc does not key them — skip the offset/rest gates, and treat their
+        # nodes as transparent when composing other bones' expected world chain.
+        auto = set(qa.get("autoLegs") or [])
         checks = [(f"name={anim['name']}", qa.get("name") == anim["name"]),
                   ("neck-never-keyed", "neck" not in (qa.get("bones") or {}))]
         worst = 0.0
         for bone, e in sorted((qa.get("bones") or {}).items()):
+            if bone in auto:
+                continue
             if bone not in off_q:      # page wrote rest there; assert it holds
                 got = tuple(e.get("q") or ID)
                 checks.append((f"{bone}-at-rest", qang(got, ID) <= 3.0))
@@ -366,8 +373,8 @@ def evaluate_custom_gates(outdir, anims):
                     live = qnorm(tuple(chainq[idx]))
                     act = qmul(act, live)
                     b2 = node_as_bone.get(node)
-                    if b2 is None:
-                        exp = qmul(exp, live)   # unkeyed: live is its own rest
+                    if b2 is None or b2 in auto:
+                        exp = qmul(exp, live)   # unkeyed/auto-leg: live is its own rest
                         continue
                     r = (qa["bones"][b2] or {}).get("rest")
                     base = qnorm(tuple(r)) if r else ID

@@ -103,7 +103,7 @@ the exact keyed values). Rest pose = **arms at sides** (`{}`), not T-pose, on bo
 | `head` Z | **tilt: Z+ tilts to HER RIGHT, Z− to her left** (ear toward shoulder — the "tilt to the music" axis) | mirrored (+ tilts her left) | Furina render (not published), `pose_measured_sample_roll.png` |
 | `upperLeg` X | + swings knee/leg FORWARD (foot +z 0.35 m at +60°); − swings back | same (foot forward at +60°) | Furina render (not published) |
 | `lowerLeg` X | **− is the natural knee bend (heel toward glutes)**; + raises the shin forward (kick) | **mirrored** (+ bends naturally) | same sheet |
-| `hips_y` | translates the WHOLE body: +0.05…0.15 lifts the feet off the ground (≈36 px / 0.1 m airborne); − dips/sinks; keyed legs add bends but never re-pin the feet | same | Furina render (not published) |
+| `hips_y` | translates the WHOLE body: +0.05…0.15 lifts the feet off the ground (≈36 px / 0.1 m airborne); − dips/sinks. The player now bends the legs **automatically**: `hips_y` < 0 → planted knees (feet stay put), `hips_y` > 0 → airborne tuck; explicitly keyed leg bones always win, but a hop needs **no leg keys** | same | Furina render (not published) |
 
 Reference poses (live rig — exact numbers, each verified by capture; mirror L/R pairs as shown):
 
@@ -122,9 +122,11 @@ Reference poses (live rig — exact numbers, each verified by capture; mirror L/
   NOT the Y axis (Y is a waist twist).
 - **Head tilt to the music:** `head Z ±12` matching (or countering) the sway sign — Z is the tilt axis,
   X is the nod, Y is the turn.
-- **Small hop:** no leg keys needed: `hips_y` −0.03 (dip) → +0.12 (air — the whole body, feet included,
-  rides the offset) → −0.02 (landing bend) → 0; add `head X -6` on the dip and arms swinging Y− on the
-  rise for weight. For a planted crouch instead of a hop keep `hips_y` ≤ 0 and bend the legs.
+- **Hop / jump:** the player bends the legs for you (planted knees when `hips_y` < 0, tuck when airborne) —
+  **never key leg bones for a hop**. Author only `hips_y`: crouch −0.08 over ~0.2 s (hold ~0.1 s) → apex
+  +0.12…0.15 ~0.3 s after leaving the ground → touchdown 0 → landing dip −0.05 for ~0.2 s → 0
+  (~1.4–1.6 s total). Add `head X -6` on the crouch and arms swinging Y− on the rise for weight. For a
+  held crouch without a jump keep `hips_y` ≤ 0 the whole time.
 
 ### Proof: spotlight_twirl on the live model (Furina)
 

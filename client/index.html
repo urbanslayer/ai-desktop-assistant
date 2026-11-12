@@ -1755,6 +1755,31 @@
           })(),
           patPeakRollDeg: pose.debug().patPeakRollDeg,
           patRollDeg: pose.debug().patRollDeg ?? null,
+          // hop-legs evidence (docs/SELF_ANIMATION.md "Hops bend the legs"):
+          // per captured frame knee flex deg (angle between thigh and shin),
+          // thigh flex (vs this rig's own rest thigh), each foot world y
+          // minus ground (world y = 0 here) and its offset from the rest
+          // spot, and each foot's xz drift from rest. Gates: planted keys
+          // footDyFromRestM <= 0.01 & footXzDriftM <= 0.02; apex feet
+          // airborne (footDyFromRestM >> 0); mode = the solver branch.
+          legQA: (() => {
+            const la = pose.debug().legAngles || {};
+            const out = {};
+            for (const side of ['left', 'right']) {
+              const a = la[side];
+              if (!a) continue;
+              out[side] = {
+                kneeFlexDeg: a.kneeFlex,
+                thighFlexDeg: a.thighFlexDeg,
+                footY: a.footWorld ? a.footWorld[1] : null,
+                footYFromGround: a.footWorld ? a.footWorld[1] : null,
+                footDyFromRestM: a.footDyRestM,
+                footXzDriftM: a.footXzDriftM,
+                mode: ((pose.debug().autoLegSolve || {})[side] || {}).mode || null,
+              };
+            }
+            return out;
+          })(),
           headFootPx: headPx && footPx ? Math.round(footPx[1] - headPx[1]) : null,
           feetFromBottomPx: footPx ? Math.round(viewH() - footPx[1]) : null,
           // sit gates (docs/TOUCH.md): px the lowest foot hangs BELOW the
@@ -1776,7 +1801,11 @@
             if (!dbg.keyframes) return null;
             const qa = { ...dbg.keyframes, bones: dbg.kfBones || {},
                          hipsY: dbg.kfHipsY ?? 0, chain: {}, chainQ: {},
-                         boneOfNode: {}, localRest: {} };
+                         boneOfNode: {}, localRest: {},
+                         // leg bones AUTO-derived from hips_y (not keyed in
+                         // the doc): the harness gates must not demand rest
+                         // for these (capture_frames.py evaluate_custom_gates)
+                         autoLegs: dbg.autoLegs || [] };
             const qv = (q) => [+q.x.toFixed(6), +q.y.toFixed(6),
                                +q.z.toFixed(6), +q.w.toFixed(6)];
             for (const bone of Object.keys(qa.bones)) {
