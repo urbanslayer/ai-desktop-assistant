@@ -39,19 +39,21 @@ MAX_INLINE_ANIMATION_CHARS = 32000
 def _animation_doc_description() -> str:
     example = ('{"name":"spotlight_twirl","description":"V arms, sway, tilt, hop",'
                '"duration_s":3.4,"loop":false,"ease":"smooth","keyframes":['
-               '{"t":0,"bones":{},"expression":{}},'
+               '{"t":0},'
                '{"t":0.7,"bones":{"leftUpperArm":[0,0,-100],"rightUpperArm":[0,0,100]},'
                '"expression":{"happy":0.8},"hips_y":0.02},'
-               '{"t":1.4,"bones":{"leftUpperArm":[0,0,-100],"rightUpperArm":[0,0,100],'
-               '"spine":[0,0,10],"upperChest":[0,0,7],"head":[0,0,12]}},'
-               '{"t":1.9,"bones":{"leftUpperArm":[0,0,-100],"rightUpperArm":[0,0,100],'
-               '"spine":[0,0,-10],"upperChest":[0,0,-7],"head":[0,0,-12]}},'
-               '{"t":2.4,"bones":{"leftUpperArm":[0,0,-60],"rightUpperArm":[0,0,60]},'
-               '"hips_y":-0.03},'
-               '{"t":2.7,"bones":{"leftUpperArm":[0,0,-40],"rightUpperArm":[0,0,40]},'
-               '"hips_y":0.12},'
-               '{"t":3.0,"bones":{},"expression":{},"hips_y":-0.02},'
-               '{"t":3.4,"bones":{},"expression":{}}]}')
+               '{"t":1.4,"bones":{"spine":[0,0,10],"upperChest":[0,0,7],'
+               '"head":[0,0,12]}},'
+               '{"t":1.9,"bones":{"spine":[0,0,-10],"upperChest":[0,0,-7],'
+               '"head":[0,0,-12]}},'
+               '{"t":2.0,"bones":{"leftUpperArm":[0,0,-60],"rightUpperArm":[0,0,60]},'
+               '"hips_y":-0.08},'
+               '{"t":2.2,"hips_y":-0.08},'
+               '{"t":2.55,"bones":{"leftUpperArm":[0,-25,-50],'
+               '"rightUpperArm":[0,-25,50]},"hips_y":0.14},'
+               '{"t":2.9,"hips_y":0},'
+               '{"t":3.1,"hips_y":-0.05},'
+               '{"t":3.4}]}')
     return (
         "Doc: {name: lowercase snake_case 2-32, unused on this model, never "
         "a built-in gesture name; description: short; duration_s: 0.4..8; "
@@ -74,9 +76,11 @@ def _animation_doc_description() -> str:
         "SWAY side-to-side = spine Z ±10 + upperChest Z ±7 SAME sign, "
         "alternating per key (Y twists, not sway). HEAD: Z tilts ear-to-"
         "shoulder, X nods, Y turns. WAVE = one upperArm Z ±95 + lowerArm "
-        "[0,-60,0], oscillate lowerArm Y -40..-90. HOP = hips_y -0.03 dip, "
-        "+0.12 air (the whole body including feet rides the offset up — the "
-        "hop is visible without keying legs), -0.02 land. Start/end at "
+        "[0,-60,0], oscillate lowerArm Y -40..-90. HOP = legs bend "
+        "AUTOMATICALLY, never key them: crouch hips_y -0.08 over ~0.2 s "
+        "(hold ~0.1 s) → apex +0.12..0.15 ~0.3 s after takeoff → touchdown "
+        "0 → landing dip -0.05 ~0.2 s → 0 (~1.5 s); arms may swing Y- "
+        "forward on the rise. Start/end at "
         "rest. Expressions: happy angry "
         "sad relaxed surprised + visemes aa ih ou ee oh blink. Example: " + example)
 

@@ -237,6 +237,8 @@ _LINT_RAISE_RE = re.compile(
 # read against the ground line.
 LINT_ARM_RAISE_MIN_DEG = 30.0
 LINT_HOP_MIN_M = 0.08   # measured: 0.03-0.05 reads as nothing; 0.12+ is a clear hop
+LINT_HOP_RISE_M = 0.05  # a hop-shaped rise for the crouch/landing structure check
+LINT_HOP_DIP_M = -0.05  # deep enough to read as a crouch / landing-absorb bend
 _TORSO_BONES = ("spine", "chest", "upperChest", "head")
 
 
@@ -256,11 +258,28 @@ def lint_animation(doc: dict, clean: dict) -> list[str]:
                      "keys on spine/chest/head — sideways motion is Z "
                      "(Y twists the torso, it barely registers sideways)")
     hips_vals = [k.get("hips_y") or 0.0 for k in kfs]
-    if _LINT_HOP_RE.search(text) and max(hips_vals, default=0.0) < LINT_HOP_MIN_M:
-        notes.append(f"hint: description says hop/jump but hips_y never "
-                     f"reaches {LINT_HOP_MIN_M} m — a visible hop needs a "
-                     "dip (~-0.03) then a rise (>=0.05); feet leave the "
-                     "ground with the hips automatically")
+    if _LINT_HOP_RE.search(text):
+        if max(hips_vals, default=0.0) < LINT_HOP_MIN_M:
+            notes.append(f"hint: description says hop/jump but hips_y never "
+                         f"reaches {LINT_HOP_MIN_M} m — a visible hop needs a "
+                         "crouch (~-0.08) then a rise (>=0.12); feet leave the "
+                         "ground with the hips automatically")
+        # hop SHAPE: a real jump crouches before it rises and absorbs the
+        # landing after it (docs/SELF_ANIMATION.md: legs bend themselves, the
+        # author only shapes hips_y). Checked on the first/last rise key.
+        rises = [i for i, v in enumerate(hips_vals) if v >= LINT_HOP_RISE_M]
+        if rises:
+            if not any(v <= LINT_HOP_DIP_M for v in hips_vals[:rises[0]]):
+                notes.append("hint: description says hop/jump and hips_y "
+                             "rises, but nothing crouches first — dip to "
+                             "~-0.08 over ~0.2 s (hold ~0.1 s) before the "
+                             "rise; the player bends the legs for you, never "
+                             "key legs for a hop")
+            if not any(v <= LINT_HOP_DIP_M for v in hips_vals[rises[-1] + 1:]):
+                notes.append("hint: description says hop/jump and hips_y "
+                             "rises, but there is no landing dip after it — "
+                             "bring hips_y back to 0 at touchdown then dip "
+                             "~-0.05 for ~0.2 s, then 0")
     if _LINT_RAISE_RE.search(text) and _zmax(
             ("leftUpperArm", "rightUpperArm")) < LINT_ARM_RAISE_MIN_DEG:
         notes.append("hint: description raises the arms but |UpperArm.z| "

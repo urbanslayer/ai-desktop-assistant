@@ -103,7 +103,7 @@ the exact keyed values). Rest pose = **arms at sides** (`{}`), not T-pose, on bo
 | `head` Z | **tilt: Z+ tilts to HER RIGHT, Z− to her left** (ear toward shoulder — the "tilt to the music" axis) | mirrored (+ tilts her left) | Furina render (not published), `pose_measured_sample_roll.png` |
 | `upperLeg` X | + swings knee/leg FORWARD (foot +z 0.35 m at +60°); − swings back | same (foot forward at +60°) | Furina render (not published) |
 | `lowerLeg` X | **− is the natural knee bend (heel toward glutes)**; + raises the shin forward (kick) | **mirrored** (+ bends naturally) | same sheet |
-| `hips_y` | translates the WHOLE body: +0.05…0.15 lifts the feet off the ground (≈36 px / 0.1 m airborne); − dips/sinks; keyed legs add bends but never re-pin the feet | same | Furina render (not published) |
+| `hips_y` | translates the WHOLE body: +0.05…0.15 lifts the feet off the ground (≈36 px / 0.1 m airborne); − dips/sinks. The player now bends the legs **automatically**: `hips_y` < 0 → planted knees (feet stay put), `hips_y` > 0 → airborne tuck; explicitly keyed leg bones always win, but a hop needs **no leg keys** | same | Furina render (not published) |
 
 Reference poses (live rig — exact numbers, each verified by capture; mirror L/R pairs as shown):
 
@@ -122,9 +122,11 @@ Reference poses (live rig — exact numbers, each verified by capture; mirror L/
   NOT the Y axis (Y is a waist twist).
 - **Head tilt to the music:** `head Z ±12` matching (or countering) the sway sign — Z is the tilt axis,
   X is the nod, Y is the turn.
-- **Small hop:** no leg keys needed: `hips_y` −0.03 (dip) → +0.12 (air — the whole body, feet included,
-  rides the offset) → −0.02 (landing bend) → 0; add `head X -6` on the dip and arms swinging Y− on the
-  rise for weight. For a planted crouch instead of a hop keep `hips_y` ≤ 0 and bend the legs.
+- **Hop / jump:** the player bends the legs for you (planted knees when `hips_y` < 0, tuck when airborne) —
+  **never key leg bones for a hop**. Author only `hips_y`: crouch −0.08 over ~0.2 s (hold ~0.1 s) → apex
+  +0.12…0.15 ~0.3 s after leaving the ground → touchdown 0 → landing dip −0.05 for ~0.2 s → 0
+  (~1.4–1.6 s total). Add `head X -6` on the crouch and arms swinging Y− on the rise for weight. For a
+  held crouch without a jump keep `hips_y` ≤ 0 the whole time.
 
 ### Proof: spotlight_twirl on the live model (Furina)
 
@@ -299,6 +301,30 @@ sinks to 9 % H below standing within 0.2 s (landing crouch), held 0.25 s, recove
   The saved-style legacy doc (`victory_leap` numbers: `hips_y` −0.03/0.12/−0.02/0.02/0.06/0.1/−0.02, no legs)
   must also bend (no straight-legged airborne frame). Contact sheet of the **sample avatar only** in
   `docs/evidence/`; owner-model numbers in the report only (third-party model renders stay out of the repo).
+- **Implementation notes (2026-11):** solver `client/js/legs.js` (pure, world-space, no three import); the
+  keyframe layer roots the planted chain on the LIVE hip joint so life-layer hip sway cannot drift the
+  "planted" foot, blends the foot target passive→pinned over the first cm of dip, and leans the ankle 8 mm
+  back as the crouch sets in (heels forward) so long-legged rigs clear the 50° crouch gate inside the 2 cm
+  drift budget. Bone writes PRE-MULTIPLY the rest world quaternion (the rig rule). Measurement:
+  `legQA`/`autoLegs` in `rikoMeasure.keyframeQA`, doc-time shots via `capture_frames.py --kftime`
+  (page `?kftime=`), fixture `client/js/fixtures/animation_hop_legs_qa.json`, sheet
+  `docs/evidence/hop_legs_sample.png`.
+- **Landing cushion (2026-11 follow-up):** a doc whose `hips_y` dips only shallowly (or not at all) after a
+  rise used to land on nearly-straight legs because the planted IK only bends UNDER the ground line. The
+  player now writes `hipsEff = max(hips_y − c(t), −0.14)` (`landingCushion`/`landingTouchdowns`/`landingEff`
+  in `client/js/legs.js`), where touchdown is where the 120 Hz-sampled doc curve DESCENDS through
+  `crossY = 0.01` after peaking ≥ `riseMin = 0.05`, and `c(t)` ramps 0 → `cushion = 0.09` over
+  [td − `cushionPre = 0.25`, td + `cushionRise = 0.12`] and decays back to 0 by td + `cushionHold = 0.45`
+  (max over overlapping windows). All pure functions of DOCUMENT time — no playback state, seek/QA-safe.
+  The sink is rate-limited to `cushionSinkPerFrame = 0.004` m per 60 fps frame (the knee near full
+  extension sits on an acos cliff); the rise is uncapped on purpose. Docs with no airborne rise have
+  `c ≡ 0`, so their hips offset is byte-identical to the doc curve. Planted-knee pole rule: knees track
+  character-forward with a `poleSplayDeg = 12.5°` OUTWARD splay; the rest-knee perpendicular is only used
+  when it clearly points forward (`dot(perp, forward) > poleFwdDot = 0.7`) so a knock-kneed rest rig cannot
+  bend its shins into an X. QA: `rikoMeasure.keyframeQA` exports `hipsEff` (the exact effective target the
+  player wrote) plus `hipsDoc`; the `capture_frames.py custom` hips gate compares the measured offset
+  against `hipsEff × blend` (±0.011) and independently asserts `hipsEff == hipsDoc` for docs without a
+  touchdown. Verify with `--kftime` shots (see Acceptance above).
 
 ## Rules for both children
 
