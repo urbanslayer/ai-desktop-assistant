@@ -126,11 +126,16 @@ INTROSPECT_XML = """<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Intr
 # ── pure helpers (drive straight from tests) ─────────────────────────────────
 
 def resolve_mode(music_cfg: dict | None) -> str:
-    """desktop.music.mpris -> 'riko'|'any'|'off'; default 'riko'; a bad
-    value is 'off' (same fail-closed habit as select_player())."""
+    """desktop.music.mpris -> 'riko'|'any'|'off'; default 'any' (live
+    2026-11-12: with `riko` the bar's media widget ignored phone playback —
+    the export stays Stopped while Spotify plays on another device, so
+    dux-shell-style bars picked some random Firefox player instead. `any`
+    mirrors whatever Spotify plays on ANY device, as a remote control);
+    `riko` (own-device only) and `off` remain selectable; a bad value is
+    'off' (same fail-closed habit as select_player())."""
     v = str((music_cfg or {}).get("mpris") or "").strip().lower()
     if not v:
-        return "riko"
+        return "any"
     return v if v in ("riko", "any", "off") else "off"
 
 
@@ -258,7 +263,7 @@ class RikoMprisPublisher:
     round trips always leave that thread immediately. Every failure is a
     logged no-op — an absent bus (CI, ssh session) never breaks the tray."""
 
-    def __init__(self, mode: str = "riko", device_name: str = "Riko", *,
+    def __init__(self, mode: str = "any", device_name: str = "Riko", *,
                  control=None, ws=None, log=print, clock=time.monotonic,
                  connector=None):
         self.mode = mode if mode in ("riko", "any") else "off"

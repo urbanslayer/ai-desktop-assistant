@@ -573,7 +573,18 @@ class SoloistDuck:
     """Lower Soloist's volume while she speaks, restore after — the
     WebSocket replacement for MprisDuck (same duck/restore/on_speak
     interface). If the WS isn't discoverable every call is a silent no-op,
-    exactly like the dbus-less MprisDuck."""
+    exactly like the dbus-less MprisDuck.
+
+    Live bug 2026-11-12 (volume dipped on the owner's PHONE and stayed
+    there): Soloist's set_volume rides the Spotify Connect SESSION, not the
+    Soloist device — while playback lived on his phone, duck and restore
+    both landed there, late and out of order, and the restore lost the
+    race. So: duck ONLY while Soloist itself is the active, playing device
+    (from its WS state); otherwise touch nothing. A ducked level captured
+    mid-session is also poison, so the pre-duck level is captured once per
+    speech run (nested/overlapping speak events never overwrite it), and
+    restore CONFIRMS through the WS state, resending once when the reported
+    volume is still the ducked level."""
 
     def __init__(self, fraction: float = DEFAULT_DUCK_FRACTION, *, ws=None):
         try:
@@ -582,29 +593,77 @@ class SoloistDuck:
             self.fraction = DEFAULT_DUCK_FRACTION
         self.ws = ws
         self._saved = None                     # volume% restored on restore()
+        self._ducked = None                    # the level restore() verifies against
+        self._runs = 0                         # nested speak(True) depth
 
     def available(self) -> bool:
         return bool(self.ws) and self.ws.available()
 
-    def duck(self) -> None:
-        if self._saved is not None or self.ws is None:   # already ducked
-            return
-        st = self.ws.playback_state()
+    def _active_playing(self) -> dict | None:
+        """Soloist's playback_state, but only when Soloist IS the active
+        Connect device and playback is running — else None (someone else
+        owns the session: its volume knob is not ours to turn)."""
+        if self.ws is None:
+            return None
+        st = self.ws.playback_state() or {}
         if not st:
+            return None
+        active = st.get("is_active")
+        if active is None:                     # some state frames omit it
+            authf = getattr(self.ws, "auth_state", None)
+            active = (authf() or {}).get("is_active") if authf else None
+        if not bool(active):
+            return None
+        if str(st.get("status") or "").lower() != "playing":
+            return None
+        return st
+
+    def duck(self) -> None:
+        ws = self.ws
+        st = self._active_playing()
+        if st is None or ws is None:           # not our device / not playing
+            return
+        self._runs += 1
+        if self._saved is not None:            # nested speech: keep the level
             return
         try:
-            vol = float(st.get("volume"))
+            vol = float(st.get("volume") or 0)
         except (TypeError, ValueError):
             return
-        if self.ws.set_volume(max(0, min(100, round(vol * self.fraction)))):
+        ducked = max(0, min(100, round(vol * self.fraction)))
+        if ws.set_volume(ducked):
             self._saved = vol
+            self._ducked = ducked
 
     def restore(self) -> None:
+        if self._runs > 0:                     # speech runs still open
+            self._runs -= 1
+            if self._runs > 0:
+                return
         if self._saved is None:
             return
-        vol, self._saved = self._saved, None
-        if self.ws is not None:
-            self.ws.set_volume(max(0, min(100, round(vol))))
+        vol, ducked, self._saved, self._ducked = \
+            self._saved, self._ducked, None, None
+        if self.ws is None:
+            return
+        target = max(0, min(100, round(vol)))
+        self.ws.set_volume(target)
+        # confirm through the WS state: Connect/WS echo can drop a write.
+        # Only resend when the reported volume is still the DUCKED level —
+        # anything else (even the user's own change) stays untouched.
+        try:
+            time.sleep(0.05)
+            reported = float((self.ws.playback_state() or {}).get("volume") or 0)
+        except (TypeError, ValueError):
+            return
+        if ducked is not None and abs(reported - ducked) <= abs(reported - target):
+            self.ws.set_volume(target)
+
+    def restore_now(self) -> None:
+        """Shutdown hook: drop any nesting bookkeeping and restore whatever
+        duck is still active — the process is leaving, speech runs are over."""
+        self._runs = 0
+        self.restore()
 
     def on_speak(self, speaking: bool) -> None:
         """Session.on_speak hook: True = she started, False = she stopped."""
@@ -623,6 +682,15 @@ class CompositeDuck:
     def on_speak(self, speaking: bool) -> None:
         duck = self.primary if self.primary.available() else self.fallback
         duck.on_speak(speaking)
+
+    def restore_now(self) -> None:
+        """Shutdown: restore BOTH — whichever ducked (availability can flip
+        mid-run), and an empty duck state is a no-op either way."""
+        for duck in (self.primary, self.fallback):
+            try:
+                duck.restore_now()
+            except Exception:  # noqa: BLE001 — shutdown path, never raise
+                pass
 
 
 # -- auto-update ---------------------------------------------------------------

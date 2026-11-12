@@ -194,8 +194,11 @@ class AvatarWindow(QWebEngineView):
             else:
                 act = self._arb.press(
                     pos.x(), pos.y(), touch_desk.now_ms(),
-                    inside_limb=touch_desk.limb_at(self.last_bbox,
-                                                   pos.x(), pos.y()) is not None)
+                    # limbs AND the ticker button island (bug E: an off-limb
+                    # press was consumed as a window drag, so the page never
+                    # saw the ticker click and control never reached the hub)
+                    inside_limb=touch_desk.interactive_at(self.last_bbox,
+                                                          pos.x(), pos.y()))
                 if act == touch_desk.MOVE:
                     if self.sit_watch:
                         self.sit_watch()      # watch the edge for 3 s
@@ -745,6 +748,37 @@ def handle_bbox_post(win, roamc, args: dict) -> dict:
     except (KeyError, TypeError, ValueError):
         return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
     return {"ok": True}
+
+
+def music_control_cmd(cmd: str, args: dict) -> dict:
+    """The /control/music-control + /control/music-state branch (song
+    ticker, docs/SPOTIFY_NOTES.md). The page's transport button (toggle/
+    play/pause/next/previous) or a late-open seed (music-state). One Spotify
+    round trip waits on THIS viewer HTTP thread — never Qt — and the page
+    flipped its icon optimistically, so a slow hub only delays the
+    reconcile, never the click. 409 not connected / 429 quota back-off come
+    back as {ok: false, status}: the page reverts its flip and hides the
+    ticker until the next now_playing proves otherwise.
+    """
+    if cmd == "music-state":
+        action = ""
+    else:
+        action = str((args or {}).get("action") or "").strip().lower()
+        if action not in ("play", "pause", "toggle", "next", "previous"):
+            return {"ok": False,
+                    "error": "action must be play|pause|toggle|next|previous"}
+    try:
+        hc = hub_client.get()
+        out = (hc.spotify_now_playing() if cmd == "music-state"
+               else hc.spotify_control(action))
+    except hub_client.HubError as e:
+        return {"ok": False, "error": str(e), "status": e.status}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if cmd == "music-state":
+        return {"ok": True, "now_playing": out}
+    return {"ok": True, "action": out.get("action"),
+            "now_playing": out.get("now_playing")}
 
 
 def _hyprland_rule(width, height):
@@ -1415,6 +1449,12 @@ def main():
             # blocks on the hub here.
             viewer.emit("command", cmd=cmd)
             win.js(f"window.riko && riko.onCommand && riko.onCommand({json.dumps(cmd)})")
+        elif cmd.startswith("music:"):  # tray ▸ Show song ticker (and any
+            # music:* page command). Live bug 2026-11-12: these were emitted
+            # onto this bridge but no branch forwarded them — the command
+            # fell off the end of on_command and the page never hid the bar.
+            viewer.emit("command", cmd=cmd)
+            win.js(f"window.riko && riko.onCommand && riko.onCommand({json.dumps(cmd)})")
 
     bridge.command.connect(on_command, Qt.ConnectionType.QueuedConnection)
 
@@ -1686,33 +1726,9 @@ def main():
                   flush=True)
             return {"ok": True}
         elif cmd in ("music-control", "music-state"):
-            # song ticker (docs/SPOTIFY_NOTES.md): the page's transport
-            # button (music-control) or a late-open seed (music-state). One
-            # Spotify round trip waits on THIS viewer HTTP thread — never
-            # Qt — and the page flipped its icon optimistically, so a slow
-            # hub only delays the reconcile, never the click.
-            if cmd == "music-state":
-                action = ""
-            else:
-                action = str(args.get("action") or "").strip().lower()
-                if action not in ("play", "pause", "toggle", "next",
-                                  "previous"):
-                    return {"ok": False, "error": "action must be play|"
-                            "pause|toggle|next|previous"}
-            try:
-                hc = hub_client.get()
-                out = (hc.spotify_now_playing() if cmd == "music-state"
-                       else hc.spotify_control(action))
-            except hub_client.HubError as e:
-                # 409 not connected / 429 quota back-off: the page reverts
-                # its optimistic flip and hides the ticker
-                return {"ok": False, "error": str(e), "status": e.status}
-            except Exception as e:  # noqa: BLE001
-                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-            if cmd == "music-state":
-                return {"ok": True, "now_playing": out}
-            return {"ok": True, "action": out.get("action"),
-                    "now_playing": out.get("now_playing")}
+            # song ticker: page's transport button / late-open seed. Module-
+            # level music_control_cmd (unit-tested; bug E regression).
+            return music_control_cmd(cmd, args)
         elif cmd == "avatar-scale":
             # scroll over her = her zoom: the PAGE renders the visual zoom
             # every frame and asks the desktop only for WINDOW moves at
@@ -1909,6 +1925,10 @@ def main():
             music_spotifyd.MprisDuck(_duck_fraction))
     if music_player.mode != "off":
         session.on_speak = music_duck.on_speak
+        # shutdown with a live duck (she was mid-line when the app closed):
+        # restore before the player dies, else the dip is baked into the
+        # Connect session and the next playback starts quiet.
+        app.aboutToQuit.connect(music_duck.restore_now)
         music_listener = music_oauth.OAuthListener(
             hub_client.get(), port=music_cfg.get("oauth_port",
                                                  music_oauth.DEFAULT_PORT))

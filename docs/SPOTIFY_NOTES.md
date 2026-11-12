@@ -246,6 +246,15 @@ state:
   everywhere else while the button stays clickable. Feet hit rects sit
   above the 30 px bar (capture gate: at most the rects' 6 px pad is
   nicked).
+- **Bug E (live 2026-11-12):** the play/pause press never reached the hub
+  (zero `POST /api/spotify/control` in the log): the desktop's floating-
+  window press arbiter decided "window move" for every press outside the
+  limb rects, so the button — the one interactive island OUTSIDE her body
+  — swallowed it as a drag. `touch_desk.interactive_at()` now answers the
+  arbiter with limb rects OR the `hit_extra` island; the optimistic flip
+  + revert-on-failure page policy is untouched. Regression:
+  `test_press_arbitration_passes_ticker_hits_to_the_page`,
+  `test_music_control_cmd_reaches_the_hub`.
 - **Config/UX:** `desktop.music.ticker: true` default; tray Music ▸
   "Show song ticker" checkbox persisted in the appstate
   (`appstate.load/save_music_ticker`) like the other tray toggles; the

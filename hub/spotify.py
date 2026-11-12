@@ -71,6 +71,10 @@ SCOPES = ("user-read-playback-state user-modify-playback-state "
 PLAYLIST_SCOPES = ("playlist-read-private", "playlist-read-collaborative")
 LIKED_SCOPES = ("user-library-read",)
 SEARCH_LIMIT_MAX = 10          # dev-mode hard cap (docs/SPOTIFY_NOTES.md)
+# /v1/search wraps results under the PLURAL type key ('tracks', 'albums',
+# 'artists', 'playlists') — the client maps kind -> key before reading.
+SEARCH_PLURAL = {"track": "tracks", "album": "albums",
+                 "artist": "artists", "playlist": "playlists"}
 POLL_S = 5.0                   # now_playing poll ceiling while playing
 MIN_POLL_S = 1.0               # test floor
 IDLE_POLL_S = 30.0             # slow watch while NOT playing (0 disables)
@@ -192,6 +196,55 @@ def is_liked_songs(query: str) -> bool:
     if bool(_LIKED_ADJ.search(n) and _SONG_NOUN.search(n)):
         return True
     return bool(re.search(r"\bfavou?rites\b", n))
+
+
+REF_TYPES = ("track", "album", "playlist", "artist")
+_URI_RE = re.compile(r"spotify:(track|album|playlist|artist):([A-Za-z0-9]+)")
+_ID_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def parse_spotify_ref(query: str):
+    """A Spotify URI ('spotify:track:ID') or open link
+    ('https://open.spotify.com/track/ID?si=…', '/intl-<lang>/' detours) →
+    (kind, canonical 'spotify:<kind>:<id>'); None for anything else. Such a
+    query needs NO search: the id IS the answer (live bug 2026-11-12 — URIs
+    went through the broken search and 'found no track')."""
+    raw = str(query or "").strip()
+    m = _URI_RE.fullmatch(raw)
+    if m:
+        return m.group(1), m.group(0)
+    try:
+        u = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https") or \
+            u.netloc.lower().removeprefix("www.") != "open.spotify.com":
+        return None
+    parts = [p for p in u.path.split("/") if p]
+    if parts and parts[0].lower().startswith("intl-"):
+        parts = parts[1:]                   # app locale detour
+    if len(parts) != 2:
+        return None
+    kind, ident = parts[0].lower(), parts[1]
+    if kind not in REF_TYPES or not _ID_RE.fullmatch(ident):
+        return None
+    return kind, f"spotify:{kind}:{ident}"
+
+
+_BY_RE = re.compile(r"\s+by\s+", re.IGNORECASE)
+
+
+def split_title_artist(query: str):
+    """'HIDE && SEEK by (G)I-DLE' → ('HIDE && SEEK', '(G)I-DLE'); None when
+    there is no ' by ' split with content on both sides. rsplit: titles
+    themselves contain 'by' ('Fly by Night by Rush')."""
+    raw = str(query or "").strip()
+    hits = list(_BY_RE.finditer(raw))
+    if not hits:
+        return None
+    m = hits[-1]
+    title, artist = raw[:m.start()].strip(), raw[m.end():].strip()
+    return (title, artist) if title and artist else None
 
 
 # ── PKCE + authorize URL (pure, testable) ───────────────────────────────────
@@ -480,11 +533,15 @@ class SpotifyClient:
     def search(self, query: str, kind: str, limit: int = 3) -> list[dict]:
         """One search type, limit clamped to the dev-mode cap of 10.
         Returns the raw items (already the right type for `kind`).
-        Spotify interleaves NULL entries in items lists — always filtered."""
+        /v1/search answers under the PLURAL type key ('tracks', not
+        'track' — reading the singular key returned [] for EVERY live
+        search, 2026-11-12). Spotify interleaves NULL entries in items
+        lists — always filtered."""
         limit = max(1, min(SEARCH_LIMIT_MAX, int(limit)))
         data = self.api("GET", "/search",
                         params={"q": query, "type": kind, "limit": limit})
-        items = ((data or {}).get(kind) or {}).get("items") or []
+        key = SEARCH_PLURAL.get(kind, str(kind) + "s")
+        items = ((data or {}).get(key) or {}).get("items") or []
         return [i for i in items if i]
 
     def my_playlists(self, limit: int = OWN_PAGE_LIMIT) -> list[dict]:
@@ -533,6 +590,15 @@ class SpotifyClient:
 
     def player_devices(self) -> list[dict]:
         return (self.api("GET", "/me/player/devices") or {}).get("devices") or []
+
+    def item(self, kind: str, item_id: str) -> dict:
+        """One GET /{kind}/{id} (name resolution for direct URI play).
+        Best-effort: any failure answers {} — what you play by URI is
+        playable even when its name cannot be fetched."""
+        try:
+            return self.api("GET", f"/{kind}/{item_id}") or {}
+        except SpotifyError:
+            return {}
 
     def transfer(self, device_id: str, play: bool = True) -> None:
         self.api("PUT", "/me/player", body={"device_ids": [device_id],
@@ -969,6 +1035,30 @@ class SpotifyHub:
         if not query:
             raise SpotifyError("say what to play (a song, artist, album or "
                                "playlist)")
+        # exact references first: a URI / open link IS the answer — no
+        # search, no guessing (live bug 2026-11-12: they went through
+        # search and died in its broken key)
+        ref = parse_spotify_ref(query)
+        if ref:
+            kind, uri = ref
+            info = self.call(self.client().item, kind + "s",
+                             uri.split(":")[-1]) or {}
+            name = str(info.get("name") or "") or uri
+            artists = ", ".join(str(a.get("name") or "")
+                                for a in (info.get("artists") or [])
+                                if isinstance(a, dict) and a.get("name"))
+            wanted = self.resolve_device(device)
+            dev_id = self._playback_device(wanted)
+            if kind == "track":
+                self.call(self.client().start_playback, uris=[uri],
+                          device_id=dev_id)
+            else:
+                self.call(self.client().start_playback, context_uri=uri,
+                          device_id=dev_id)
+            self.wake()
+            return {"uri": uri, "name": name, "artists": artists,
+                    "device": wanted["name"], "kind": kind,
+                    "source": "uri", "alternatives": []}
         kind = str(kind or "track").strip().lower()
         if kind not in ("track", "album", "playlist", "artist"):
             raise SpotifyError("kind must be track, album, playlist or artist")
@@ -989,7 +1079,18 @@ class SpotifyHub:
                         "kind": "playlist", "source": "library",
                         "alternatives": alternatives}
         artists = ""
-        items = self.call(self.client().search, query, kind, 3)
+        # 'title by artist' (the owner's spoken shape): ask Spotify with its
+        # own field filters — 'track:"hide && seek" artist:"i-dle"' beats
+        # the bare sentence, whose punctuation ('&&') kills the match. The
+        # plain query stays as the fallback when the filtered one is empty.
+        ta = split_title_artist(query) if kind in ("track", "album") else None
+        items = []
+        if ta:
+            field = "track" if kind == "track" else "album"
+            items = self.call(self.client().search,
+                              f'{field}:"{ta[0]}" artist:"{ta[1]}"', kind, 3)
+        if not items:
+            items = self.call(self.client().search, query, kind, 3)
         if kind == "artist":
             # artists are not directly playable: top hit becomes their
             # top artist playlist (a playable context)

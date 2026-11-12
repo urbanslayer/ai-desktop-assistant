@@ -307,3 +307,109 @@ def test_beat_paints_local_snapshot_when_hub_unreachable(ticker_env,
     finally:
         feed.stop()
         s.close()
+
+
+# ── bugs C + E: the page's commands must actually be wired (2026-11-12) ──────
+
+import pathlib                                      # noqa: E402
+
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _desktop_mod():
+    import os
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    for var in ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
+                "SWAYSOCK"):
+        os.environ.pop(var, None)
+    import desktop
+    return desktop
+
+
+def test_bridge_forwards_music_commands_to_page():
+    # bug C (live): tray Music > "Show song ticker" pushed music:ticker:0,
+    # but desktop's bridge command pump had no music: branch — the toggle
+    # fell off and the visible bar never hid.
+    src = (REPO / "desktop.py").read_text()
+    assert 'elif cmd.startswith("music:"):' in src
+    block = src.split('elif cmd.startswith("music:"):')[1].split("elif")[0]
+    assert 'viewer.emit("command", cmd=cmd)' in block
+    assert "riko.onCommand" in block
+
+
+def test_press_arbitration_passes_ticker_hits_to_the_page():
+    # bug E (live): the floating-window press arbiter treated every press
+    # outside the limb rects as a window MOVE, so the ticker's play/pause
+    # click never reached the page (hub log: zero control POSTs). The
+    # arbiter input must come from interactive_at(), which honours the
+    # page-published hit_extra island.
+    src = (REPO / "desktop.py").read_text()
+    assert "touch_desk.interactive_at(" in src
+    from riko import touch_desk
+    bbox = {"x": 0, "y": 0, "w": 100, "h": 100, "limbs": [],
+            "hit_extra": [10, 80, 24, 16]}
+    assert touch_desk.interactive_at(bbox, 20, 88)      # on the button
+    assert not touch_desk.interactive_at(bbox, 60, 40)  # plain body: move
+    assert not touch_desk.interactive_at({"x": 0, "y": 0, "w": 9, "h": 9,
+                                          "limbs": []}, 5, 5)
+
+
+class _CtlHub:
+    def __init__(self, boom=False):
+        self.controls, self.boom = [], boom
+
+    def spotify_control(self, action):
+        # real shape from POST /api/spotify/control: {ok, action, now_playing}
+        self.controls.append(action)
+        if self.boom:
+            raise hub_client.HubError("hub is down", status=503)
+        return {"ok": True, "action": action,
+                "now_playing": {"playing": action == "play",
+                                "uri": "spotify:track:1", "track": "x"}}
+
+    def spotify_now_playing(self):
+        # real shape from GET /api/spotify/now-playing: the bare snapshot
+        return {"playing": True, "uri": "spotify:track:1",
+                "track": "HIDE AND SEEK", "artists": "(G)I-DLE"}
+
+
+def _ctl(monkeypatch, hub):
+    desktop = _desktop_mod()
+    monkeypatch.setattr(desktop.hub_client, "get", lambda: hub)
+    return desktop
+
+
+def test_music_control_cmd_reaches_the_hub(monkeypatch):
+    # bug E desktop leg: the viewer command must land on the hub
+    hub = _CtlHub()
+    desktop = _ctl(monkeypatch, hub)
+    for action in ("play", "pause", "toggle", "next", "previous"):
+        out = desktop.music_control_cmd("music-control", {"action": action})
+        assert out["ok"] is True
+        assert out["now_playing"]["uri"] == "spotify:track:1"
+    assert hub.controls == ["play", "pause", "toggle", "next", "previous"]
+
+
+def test_music_control_cmd_rejects_junk_actions(monkeypatch):
+    hub = _CtlHub()
+    desktop = _ctl(monkeypatch, hub)
+    out = desktop.music_control_cmd("music-control", {"action": "self-destruct"})
+    assert out["ok"] is False and hub.controls == []
+
+
+def test_music_control_cmd_hub_error_is_not_ok(monkeypatch):
+    # the page reverts its optimistic flip only when the POST answers not-ok
+    hub = _CtlHub(boom=True)
+    desktop = _ctl(monkeypatch, hub)
+    out = desktop.music_control_cmd("music-control", {"action": "toggle"})
+    assert out["ok"] is False and out["status"] == 503
+
+
+def test_music_state_cmd_seeds_the_late_opened_ticker(monkeypatch):
+    hub = _CtlHub()
+    desktop = _ctl(monkeypatch, hub)
+    out = desktop.music_control_cmd("music-state", {})
+    # index.html: musicSnapshot(out.now_playing) — bare snapshot, same
+    # shape as the music:state event payload
+    assert out["ok"] is True
+    assert out["now_playing"]["track"] == "HIDE AND SEEK"

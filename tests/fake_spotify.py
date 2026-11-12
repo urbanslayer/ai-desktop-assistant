@@ -23,10 +23,70 @@ TRACK = {"uri": "spotify:track:AAA", "name": "Bohemian Rhapsody",
               "height": 640},
              {"url": "https://i.scdn.co/image/small", "width": 64,
               "height": 64}]}}
+# The owner's live query 'hide && seek by i-dle': punctuation in the title,
+# '(G)I-DLE' spelled with parens on Spotify's side. Real-shape fixture so
+# the real matching rules are what get exercised (bug 2026-11-12: singular
+# response keys made EVERY catalogue search return []).
+HIDE = {"uri": "spotify:track:HIDE1", "name": "HIDE AND SEEK",
+        "duration_ms": 180000,
+        "artists": [{"name": "(G)I-DLE"}],
+        "album": {"name": "I feel", "images": [
+            {"url": "https://i.scdn.co/image/hide", "width": 640,
+             "height": 640}]}}
 DEVICE_RIKO = {"id": "dev-riko", "name": "Riko", "type": "Speaker",
                "is_active": True, "volume_percent": 40}
 DEVICE_ECHO = {"id": "dev-echo", "name": "Echo Kitchen", "type": "Smartphone",
                "is_active": False, "volume_percent": 60}
+
+# GET /v1/search answers under PLURAL type keys — the real API shape
+# ({'tracks': {'items': [...]}}); the fake used the singular kind and hid
+# a production bug that returned [] for EVERY search (2026-11-12).
+SEARCH_PLURAL = {"track": "tracks", "album": "albums",
+                 "artist": "artists", "playlist": "playlists"}
+
+
+def _compact(word) -> str:
+    """Search-match key: casefold + drop everything non-alphanumeric
+    ('(G)I-DLE' -> 'gidle', 'i-dle' -> 'idle', 'hide && seek' words ->
+    'hide','seek')."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(word or "")).casefold()
+    return "".join(c for c in s if c.isalnum())
+
+
+def _words(text) -> list:
+    return [w for w in (_compact(t) for t in str(text or "").split()) if w]
+
+
+def _word_hit(word: str, words: list) -> bool:
+    # 'i-dle' must hit '(G)I-DLE': after compaction, containment either way
+    return any(w == word or word in w or w in word for w in words)
+
+
+def search_matches(q: str, item: dict) -> bool:
+    """Crude Spotify-like matcher: q may carry field filters
+    (track:"…" artist:"…" album:"…"); leftover plain words must hit the
+    name or any artist name."""
+    import re
+    fields = dict(re.findall(r'(track|artist|album):"([^"]*)"', q or ""))
+    rest = re.sub(r'(track|artist|album):"[^"]*"', " ", q or "")
+    name_words = _words(item.get("name"))
+    artist_words = [w for a in (item.get("artists") or [])
+                    if isinstance(a, dict) for w in _words(a.get("name"))]
+    if fields.get("track") and not all(
+            _word_hit(w, name_words) for w in _words(fields["track"])):
+        return False
+    if fields.get("album") and not all(
+            _word_hit(w, _words((item.get("album") or {}).get("name")))
+            for w in _words(fields["album"])):
+        return False
+    if fields.get("artist") and not all(
+            _word_hit(w, artist_words) for w in _words(fields["artist"])):
+        return False
+    for w in _words(rest):
+        if not _word_hit(w, name_words) and not _word_hit(w, artist_words):
+            return False
+    return True
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -108,9 +168,11 @@ class FakeSpotify:
                        "expires_in": 3600, "token_type": "Bearer",
                        "scope": "user-read-playback-state"}
         self.token_error = None            # (status, body) for /api/token
-        self.search = {"track": [TRACK], "playlist": [], "album": [],
+        self.search = {"track": [TRACK, HIDE], "playlist": [], "album": [],
                        "artist": [{"uri": "spotify:artist:ART1",
-                                   "name": "Queen"}]}
+                                   "name": "Queen"},
+                                  {"uri": "spotify:artist:GIDLE",
+                                   "name": "(G)I-DLE"}]}
         # owner library (2026-11-10 round): /me/playlists + /me/tracks.
         # Tests fill these; None entries mimic Spotify's interleaved nulls.
         self.playlists = []                # [{uri, name, tracks:{total}}]
@@ -179,7 +241,28 @@ class FakeSpotify:
             return respond(200, self.me)
         if method == "GET" and path == "/v1/search":
             kind = query.get("type", "track")
-            return respond(200, {kind: {"items": self.search.get(kind, [])}})
+            q = query.get("q") or ""
+            pool = [i for i in self.search.get(kind, []) if i]
+            hits = [i for i in pool if search_matches(q, i)]
+            import re as _re
+            filtered = bool(_re.search(r'(track|artist|album):"', q))
+            # Field-filtered queries are honoured strictly (a real Spotify
+            # answers exactly nothing when track:/artist: don't match).
+            # Plain queries are forgiving like Spotify's: a query matching
+            # nothing in this tiny pool hands back the pool. Null entries
+            # interleave like the real API's.
+            items = (hits if filtered else (hits or pool)) + [None]
+            return respond(200, {SEARCH_PLURAL.get(kind, kind + "s"):
+                                 {"items": items}})
+        if method == "GET" and path.startswith("/v1/") and path.count("/") == 3:
+            kind, _, ident = path[len("/v1/"):].partition("/")
+            if kind in ("tracks", "albums", "artists", "playlists"):
+                # single-item GETs (name resolution for direct URI play)
+                for i in self.search.get(kind.rstrip("s"), []):
+                    if i and str(i.get("uri") or "").endswith(":" + ident):
+                        return respond(200, i)
+                return respond(200, {"uri": f"spotify:{kind[:-1]}:{ident}",
+                                     "name": f"Fake {kind[:-1]} {ident}"})
         if method == "GET" and path == "/v1/me/playlists":
             limit = int(query.get("limit") or 50)
             offset = int(query.get("offset") or 0)

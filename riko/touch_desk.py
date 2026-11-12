@@ -90,6 +90,25 @@ def limb_at(bbox, x, y):
     return None
 
 
+def interactive_at(bbox, x, y) -> bool:
+    """A press at (x, y) (page CSS px) belongs to the PAGE, not to a window
+    drag: it is on a limb rect or on the bbox post's `hit_extra` (the song
+    ticker's play/pause button — the one interactive island outside her body).
+    Live bug 2026-11-12: the floating window's press arbitration consumed
+    every off-limb press as a window move, so the ticker button never saw a
+    click and /control/music-control was never POSTed."""
+    if limb_at(bbox, x, y) is not None:
+        return True
+    extra = (bbox or {}).get("hit_extra")
+    if (isinstance(extra, (list, tuple)) and len(extra) == 4
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in extra)):
+        ex, ey, ew, eh = (float(v) for v in extra)
+        if ew > 0 and eh > 0 and ex <= x <= ex + ew and ey <= y <= ey + eh:
+            return True
+    return False
+
+
 class PressArbiter:
     """Click/hold/drag arbitration for one window (docs/TOUCH.md).
 

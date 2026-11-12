@@ -21,14 +21,16 @@ DESCRIPTIONS = {
     "spotify_play": (
         "Play music on Spotify: query is a song, artist, album or playlist "
         "name (or 'some <mood>'-style search words). kind: track (default) | "
-        "album | playlist | artist. For the owner's own playlists (\"my X "
-        "playlist\") use kind=playlist — the owner's library is searched "
+        "album | playlist | artist. For the owner's own playlists (\\\"my X "
+        "playlist\\\") use kind=playlist — the owner's library is searched "
         "first (catalogue search misses private playlists). 'my liked "
         "songs'/'saved tracks' plays the saved songs. shuffle: true shuffles "
         "(used for liked songs). device: a Spotify Connect device name — "
         "omit it to use the desktop player named in Settings (default "
         "'Riko'). Resolves the best hit and starts it; the result names "
-        "what is now playing and where. Requires Spotify Premium."),
+        "what is now playing and where. Requires Spotify Premium. A "
+        "spotify:<type>:<id> URI or open.spotify.com link plays DIRECTLY "
+        "(no search)."),
     "spotify_control": (
         "Control Spotify playback: action = pause | resume | next | prev | "
         "seek | volume | shuffle. value: seconds from track start for seek, "

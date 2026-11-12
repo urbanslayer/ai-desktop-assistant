@@ -355,6 +355,33 @@ def test_unduckable_player_skipped():
     duck.restore()
 
 
+def test_duck_skips_players_fronting_a_remote_session():
+    # bug B's twin on the MPRIS leg (live 2026-11-12): a local Spotify
+    # front player mirrors a Connect session held by the PHONE. Its
+    # PlaybackStatus is NOT Playing (the active device owns playback), and
+    # Set Volume would ride the session to the phone — exactly the write
+    # that raced and left the owner's volume stuck low. Players that
+    # aren't locally Playing must not be touched at all.
+    front = FakeProps(volume=0.8, status="Paused")   # phone holds playback
+    local = FakeProps(volume=0.6, status="Playing")
+    duck = MprisDuck(0.5, bus={"spotify-front": front, "spotifyd": local})
+    duck.duck()
+    assert front.set_calls == []                     # remote front untouched
+    assert local.volume == pytest.approx(0.3)
+    duck.restore()
+    assert local.volume == pytest.approx(0.6)
+
+
+def test_restore_now_restores_a_live_duck():
+    # desktop shutdown hook: duck active, speech never closed
+    props = FakeProps(volume=0.6, status="Playing")
+    duck = MprisDuck(0.5, bus={"p": props})
+    duck.duck()
+    assert props.volume == pytest.approx(0.3)
+    duck.restore_now()
+    assert props.volume == pytest.approx(0.6)
+
+
 def test_no_bus_silent_noop():
     duck = MprisDuck(0.15, bus=None)                      # module default path
     monkeypatch_target = sd.SESSION_BUS

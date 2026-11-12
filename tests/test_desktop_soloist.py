@@ -23,7 +23,8 @@ import pytest
 
 from riko.music import soloist as so
 from riko.music.soloist import (EXPIRED_EXIT, KEY_SETUP_TEXT, PAIR_HINT,
-                                REDACTION, SoloistDuck, SoloistPlayer,
+                                REDACTION, CompositeDuck, SoloistDuck,
+                                SoloistPlayer,
                                 SoloistUpdater, SoloistWs, select_player)
 
 FAKE_KEY = "FAKE-KEY-9e2f3a-not-a-secret"
@@ -128,10 +129,12 @@ class FakeUpdater:
 
 
 class FakeWs:
-    def __init__(self, playing=False, logged_in=True, available=True):
+    def __init__(self, playing=False, logged_in=True, available=True,
+                 is_active=True):
         self.playing = playing
         self.logged_in_value = logged_in
         self.available_value = available
+        self.is_active_value = is_active
         self.volumes = []
 
     def available(self):
@@ -143,9 +146,13 @@ class FakeWs:
     def logged_in(self):
         return self.logged_in_value
 
+    def auth_state(self):
+        return {"logged_in": self.logged_in_value,
+                "is_active": self.is_active_value, "device_name": "Riko"}
+
     def playback_state(self):
         return {"status": "playing" if self.playing else "paused",
-                "volume": 80}
+                "volume": 80, "is_active": self.is_active_value}
 
     def set_volume(self, v):
         self.volumes.append(v)
@@ -639,26 +646,32 @@ class WsHub:
         self.volume = 80
         self.logged_in = True
         self.status = "playing"
+        self.is_active = True
+        self.volume_sets = []
 
     def handler(self, ws):
         ws.send(json.dumps({"type": "auth_state", "logged_in": self.logged_in,
-                            "is_active": True, "device_name": "Riko"}))
+                            "is_active": self.is_active,
+                            "device_name": "Riko"}))
         if self.logged_in:
             ws.send(json.dumps({"type": "playback_state",
-                                "status": self.status, "volume": self.volume}))
+                                "status": self.status, "volume": self.volume,
+                                "is_active": self.is_active}))
         for raw in ws:
             msg = json.loads(raw)
             cmd = msg.get("command")
             if cmd == "get_auth_state":
                 ws.send(json.dumps({"type": "auth_state",
                                     "logged_in": self.logged_in,
-                                    "is_active": True,
+                                    "is_active": self.is_active,
                                     "device_name": "Riko"}))
             elif cmd == "get_state":
                 ws.send(json.dumps({"type": "playback_state",
                                     "status": self.status,
-                                    "volume": self.volume}))
+                                    "volume": self.volume,
+                                    "is_active": self.is_active}))
             elif cmd == "set_volume":
+                self.volume_sets.append(msg["volume"])
                 self.volume = msg["volume"]
                 ws.send(json.dumps({"type": "volume_changed",
                                     "volume": self.volume}))
@@ -709,9 +722,118 @@ def test_duck_lowers_and_restores_via_websocket(ws_server):
     assert hub.volume == 20                            # 80 * 0.25
     duck.on_speak(True)                                # nested speech: once
     assert hub.volume == 20
-    duck.on_speak(False)
+    duck.on_speak(False)                               # one run closed
+    assert hub.volume == 20                            # still ducked
+    duck.on_speak(False)                               # last run closed
     assert hub.volume == 80                            # exact restore
     duck.on_speak(False)                               # idempotent
+
+
+def test_duck_phone_active_touches_no_volume(ws_server):
+    # live bug B (2026-11-12): owner played on his ANDROID phone; Soloist
+    # mirrored the SESSION state (status playing) but is_active was False.
+    # A WS volume change rides the Connect session to the ACTIVE device:
+    # the duck landed late, the restore raced it, volume stuck low. When
+    # our device doesn't hold playback, not ONE volume call may leave.
+    hub, data_dir = ws_server
+    hub.is_active = False                    # the phone holds playback
+    duck = SoloistDuck(0.25, ws=SoloistWs(data_dir))
+    duck.on_speak(True)
+    duck.on_speak(False)
+    assert hub.volume == 80 and hub.volume_sets == []
+
+
+# ── duck: exact level, once per run, confirmed restore (bug B) ───────────────
+
+class EchoWs(FakeWs):
+    """Device that REPORTS the true current volume (like the real Soloist
+    WS does): playback_state reflects every accepted set_volume."""
+
+    def __init__(self, **kw):
+        super().__init__(playing=True, **kw)
+        self.reported = 80
+
+    def set_volume(self, v):
+        self.volumes.append(v)
+        self.reported = v
+        return True
+
+    def playback_state(self):
+        return {"status": "playing", "is_active": self.is_active_value,
+                "volume": self.reported}
+
+
+def test_duck_nested_speech_captures_pre_duck_level_once():
+    # overlapping speak events: the 2nd duck must NOT capture the already-
+    # ducked level (that baked the dip in permanently, half of bug B)
+    ws = EchoWs()
+    duck = SoloistDuck(0.25, ws=ws)
+    duck.on_speak(True)                    # duck 80 -> 20
+    duck.on_speak(True)                    # nested run: capture must stay 80
+    duck.on_speak(False)                   # one run closed: still ducked
+    assert ws.reported == 20
+    duck.on_speak(False)                   # last run closed
+    assert ws.volumes == [20, 80]
+    assert ws.reported == 80               # the EXACT original level
+
+
+def test_restore_resends_once_when_still_ducked():
+    # Connect can ACK a set_volume and not apply it (session echo).
+    # Confirmation via WS state: reported still at the ducked level ->
+    # re-send exactly once.
+    class DroppyWs(EchoWs):
+        drop_next = False
+
+        def set_volume(self, v):
+            self.volumes.append(v)
+            if self.drop_next:             # commanded, never landed
+                self.drop_next = False
+                return True
+            self.reported = v
+            return True
+
+    ws = DroppyWs()
+    duck = SoloistDuck(0.25, ws=ws)
+    duck.on_speak(True)
+    ws.drop_next = True                    # the restore write gets swallowed
+    duck.on_speak(False)
+    assert ws.volumes == [20, 80, 80]      # original + exactly one resend
+    assert ws.reported == 80
+
+
+def test_restore_now_fires_with_live_duck():
+    # desktop shutdown while she was mid-line: the aboutToQuit hook calls
+    # restore_now(); without it the dip is baked into the session
+    ws = EchoWs()
+    duck = SoloistDuck(0.25, ws=ws)
+    duck.on_speak(True)                    # speech never closed
+    assert ws.reported == 20
+    duck.restore_now()
+    assert ws.volumes == [20, 80]
+
+
+def test_composite_restore_now_restores_active_primary_duck():
+    ws = EchoWs()
+
+    class MprisSpy:
+        def __init__(self):
+            self.restored = 0
+
+        def available(self):
+            return True
+
+        def on_speak(self, speaking):
+            pass
+
+        def restore_now(self):
+            self.restored += 1
+
+    m = MprisSpy()
+    comp = CompositeDuck(SoloistDuck(0.25, ws=ws), m)
+    comp.on_speak(True)
+    assert ws.reported == 20
+    comp.restore_now()
+    assert ws.volumes == [20, 80] and m.restored == 1
 
 
 def test_duck_without_endpoint_is_silent_noop(tmp_path):

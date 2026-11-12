@@ -13,12 +13,13 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from fake_spotify import (DEVICE_ECHO, DEVICE_RIKO, TRACK, FakeSpotify,
-                          playing_snapshot)
+from fake_spotify import (DEVICE_ECHO, DEVICE_RIKO, HIDE, TRACK,
+                          FakeSpotify, playing_snapshot)
 from hub.server import create_app
 from hub.spotify import (POLL_S, SpotifyError, SpotifyNotConnected,
                          SpotifyPremium, SpotifyQuota, make_pkce,
-                         parse_redirect_paste)
+                         parse_redirect_paste, parse_spotify_ref,
+                         split_title_artist)
 from hub.tools.spotify_tools import build_spotify_specs
 
 CID = "deadbeefclientid"
@@ -275,6 +276,98 @@ def test_play_search_limit_clamped(hub_app, fake):
     seed_tokens(app)
     app.state.spotify.client().search("x", "track", limit=999)
     assert fake.last("GET", "/v1/search")["query"]["limit"] == "10"
+
+
+# ── bug A (live 2026-11-12): real search shape, direct URIs, 'title by artist' ──
+# The fake now answers /v1/search under the PLURAL key like the real API —
+# test_play_resolves_and_starts and friends already fail (before the fix)
+# on the old `data.get(kind)`. These lock the rest of the contract.
+
+def test_search_reads_plural_type_key_and_filters_nulls(hub_app, fake):
+    app, client = hub_app
+    seed_tokens(app)
+    items = app.state.spotify.client().search("queen", "track", 3)
+    assert [i["uri"] for i in items] == [TRACK["uri"]]   # null entry dropped
+
+
+def test_play_track_uri_direct_no_search(hub_app, fake):
+    app, client = hub_app
+    seed_tokens(app)
+    uri = "spotify:track:0b4CYurHJcazTtxNpE2OBG"
+    out = app.state.spotify.play(uri)
+    assert out["uri"] == uri and out["kind"] == "track" and out["source"] == "uri"
+    assert fake.hits("GET", "/v1/search") == 0           # never searched
+    play = fake.last("PUT", "/v1/me/player/play")
+    assert play["json"]["uris"] == [uri]
+    assert play["query"]["device_id"] == DEVICE_RIKO["id"]
+
+
+def test_play_open_url_direct_no_search(hub_app, fake):
+    app, client = hub_app
+    seed_tokens(app)
+    out = app.state.spotify.play(
+        "https://open.spotify.com/track/0b4CYurHJcazTtxNpE2OBG?si=abc123")
+    assert out["uri"] == "spotify:track:0b4CYurHJcazTtxNpE2OBG"
+    assert fake.hits("GET", "/v1/search") == 0
+    assert fake.last("PUT", "/v1/me/player/play")["json"]["uris"] == \
+        ["spotify:track:0b4CYurHJcazTtxNpE2OBG"]
+
+
+def test_play_album_url_uses_context_uri(hub_app, fake):
+    app, client = hub_app
+    seed_tokens(app)
+    out = app.state.spotify.play(
+        "https://open.spotify.com/intl-de/album/ALB123?si=x")
+    assert out["uri"] == "spotify:album:ALB123" and out["kind"] == "album"
+    assert fake.hits("GET", "/v1/search") == 0
+    body = fake.last("PUT", "/v1/me/player/play")["json"]
+    assert body.get("context_uri") == "spotify:album:ALB123"
+    assert "uris" not in body
+
+
+def test_play_title_by_artist_uses_field_filters(hub_app, fake):
+    # the owner's spoken shape: 'play hide && seek by i-dle' — the raw
+    # sentence poisons Spotify's query parser ('&&'); the field-filtered
+    # form finds HIDE AND SEEK / (G)I-DLE.
+    app, client = hub_app
+    seed_tokens(app)
+    out = app.state.spotify.play("hide && seek by i-dle")
+    assert out["uri"] == HIDE["uri"]
+    assert out["name"] == "HIDE AND SEEK" and out["artists"] == "(G)I-DLE"
+    searches = [e["query"]["q"] for e in fake.log if e["path"] == "/v1/search"]
+    assert len(searches) == 1                            # filtered query won
+    assert 'track:"hide && seek"' in searches[0]
+    assert 'artist:"i-dle"' in searches[0]
+    assert fake.last("PUT", "/v1/me/player/play")["json"]["uris"] == [HIDE["uri"]]
+
+
+def test_play_title_by_artist_falls_back_to_plain(hub_app, fake):
+    # filtered search answers empty → the plain query still runs
+    app, client = hub_app
+    seed_tokens(app)
+    out = app.state.spotify.play("bohemian rhapsody by nobody")
+    searches = [e["query"]["q"] for e in fake.log if e["path"] == "/v1/search"]
+    assert len(searches) == 2
+    assert 'track:"bohemian rhapsody"' in searches[0] and 'artist:"nobody"' in searches[0]
+    assert searches[1] == "bohemian rhapsody by nobody"
+    assert out["uri"] == TRACK["uri"]
+
+
+def test_parse_spotify_ref_and_split_title_artist():
+    assert parse_spotify_ref("spotify:track:0b4CYurHJcazTtxNpE2OBG") == \
+        ("track", "spotify:track:0b4CYurHJcazTtxNpE2OBG")
+    assert parse_spotify_ref("https://open.spotify.com/track/ABC?si=x") == \
+        ("track", "spotify:track:ABC")
+    assert parse_spotify_ref("https://open.spotify.com/intl-de/playlist/XYZ") == \
+        ("playlist", "spotify:playlist:XYZ")
+    assert parse_spotify_ref("https://open.spotify.com/user/x/playlist/Q") is None
+    assert parse_spotify_ref("bohemian rhapsody") is None
+    assert parse_spotify_ref("https://example.com/track/ABC") is None
+    assert split_title_artist("hide && seek by i-dle") == ("hide && seek", "i-dle")
+    assert split_title_artist("Fly by Night by Rush") == ("Fly by Night", "Rush")
+    assert split_title_artist("bohemian rhapsody") is None
+    assert split_title_artist("by nobody") is None
+    assert split_title_artist("something by ") is None
 
 
 def test_control_actions(hub_app, fake):

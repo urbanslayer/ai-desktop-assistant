@@ -443,6 +443,16 @@ class MprisDuck:
             return
         for name, props in self._players().items():
             try:
+                # Only players that are actually PLAYING locally get ducked.
+                # A Spotify-family player mirroring a REMOTE Connect session
+                # (phone holds playback) answers Get Volume with the session
+                # volume, and Set Volume rides the session to that remote
+                # device — late, out of order, racing the restore (live bug
+                # 2026-11-12, the stuck-low volume on the owner's phone).
+                # Nothing playing here means nothing for us to duck.
+                if str(props.Get(MPRIS_PLAYER_IFACE,
+                                 "PlaybackStatus") or "") != "Playing":
+                    continue
                 vol = float(props.Get(MPRIS_PLAYER_IFACE, "Volume"))
                 props.Set(MPRIS_PLAYER_IFACE, "Volume",
                           max(0.0, min(1.0, vol * self.fraction)))
@@ -459,6 +469,10 @@ class MprisDuck:
             except Exception:
                 pass
         self._saved.clear()
+
+    def restore_now(self) -> None:
+        """Shutdown hook (CompositeDuck/desktop): restore any active duck."""
+        self.restore()
 
     def on_speak(self, speaking: bool) -> None:
         """Session.on_speak hook: True = she started, False = she stopped."""

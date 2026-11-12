@@ -149,9 +149,10 @@ jeepney was already a transitive dep via keyring).
   listing two players for one song picks arbitrarily.
 - **Cover art**: the hub's now_playing snapshot carries `art_url` (largest
   https album image of the item, docs/API.md) → `mpris:artUrl`.
-- **Config**: `desktop.music.mpris: riko|any|off` (default `riko`:
-  advertise only while Riko's own Connect device holds playback; `any`:
-  mirror Spotify on any device as a remote). Tray: Music ▸ "Media players
+- **Config**: `desktop.music.mpris: riko|any|off` (default `any`: mirror
+  Spotify on any device as a remote — phone playback shows and is
+  controllable in the bar; `riko`: advertise only while Riko's own Connect
+  device holds playback). Tray: Music ▸ "Media players
   (MPRIS)" persists the override, same shape as the ticker checkbox.
 - **`MprisDuck` never ducks our own service** (the WS duck above already
   handles her player; ducking `org.mpris.MediaPlayer2.riko` would fight it).

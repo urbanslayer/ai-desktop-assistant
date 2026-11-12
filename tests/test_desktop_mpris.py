@@ -38,11 +38,22 @@ def snap(**kw):
 # ── pure config/gating ────────────────────────────────────────────────────────
 
 def test_resolve_mode():
-    assert resolve_mode({}) == "riko"                  # default
-    assert resolve_mode(None) == "riko"
+    # bug D (live 2026-11-12): the default flipped riko -> any so phone
+    # playback mirrors into the bar's media widget as a remote control
+    assert resolve_mode({}) == "any"                  # default
+    assert resolve_mode(None) == "any"
+    assert resolve_mode({"mpris": "riko"}) == "riko"  # still selectable
     assert resolve_mode({"mpris": "any"}) == "any"
     assert resolve_mode({"mpris": " OFF "}) == "off"
     assert resolve_mode({"mpris": "yes-please"}) == "off"   # fail closed
+
+
+def test_shipped_config_defaults_to_mpris_any():
+    import pathlib
+    import yaml
+    cfg = yaml.safe_load((pathlib.Path(__file__).resolve().parents[1] /
+                          "character_config.yaml").read_text())
+    assert cfg["desktop"]["music"]["mpris"] == "any"
 
 
 def test_should_publish_modes_and_players():
@@ -196,6 +207,24 @@ def test_nonqualifying_state_reports_stopped():
     assert p2._effective_locked(p2._snap)[0] == "Playing"
 
 
+def test_default_publishers_mirror_phone_playback():
+    # bug D live proof: owner played on his phone; the bar's widget saw
+    # Stopped (mode riko). With the default mode the hub's now_playing for
+    # a foreign device must reach MPRIS as Playing/Paused + Metadata.
+    p = RikoMprisPublisher()                          # default ctor = any
+    assert p.mode == "any" and p.device_name == "Riko"
+    phone = snap(device="Pixel 9")
+    p.update(phone)                                   # session.on_music_state path
+    assert p._effective_locked(p._snap)[0] == "Playing"
+    rec = Recorder()
+    p._conn = rec
+    p.update(snap(device="Pixel 9", playing=False))   # pause on the phone
+    pc = _signals(rec, "PropertiesChanged")
+    assert len(pc) == 1
+    assert pc[0][1]["PlaybackStatus"] == ("s", "Paused")
+    assert pc[0][1]["Metadata"][1]["xesam:title"] == ("s", "Test Song")
+
+
 class FakeWs:
     def __init__(self, volume=70):
         self.volume = volume
@@ -258,7 +287,8 @@ def test_duck_skips_our_own_mpris_name():
             self.volume, self.sets = 0.8, []
 
         def Get(self, iface, key):
-            return self.volume
+            # bug B hardening: duck() now checks PlaybackStatus first
+            return "Playing" if key == "PlaybackStatus" else self.volume
 
         def Set(self, iface, key, value):
             self.sets.append(float(value))
