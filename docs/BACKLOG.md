@@ -247,7 +247,8 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 10. The status pill text during tool use is a stopgap: give the page a first-class `status(text=…)`.
 11. The thinking-pose fingers only curl on rigs that have weighted finger bones (the sample avatar doesn't).
 12. Test-run warnings (MCP SDK ping deprecation, FastAPI `on_event`); silence or migrate.
-13. **Hops bend the legs** (owner request 2026-11-12, in progress): docs/SELF_ANIMATION.md "Hops bend the legs".
+13. **DONE 2026-11-12 — Hops bend the legs** (owner request): docs/SELF_ANIMATION.md "Hops bend the legs"
+    (planted crouch, airborne tuck, doc-time landing cushion; hop cookbook + lint on the hub).
 14. **DONE 2026-11-12 (hub fix, needs hub redeploy)**: the greeting-audio cache key had no greeting text, so a
     clip cached while the greeting was empty (preview line) replayed after the greeting was set; PUT persona now
     drops cached persona audio when the greeting changes. Original report: **Greeting uses the persona's own line** (owner report 2026-11-12): on app start and on a
