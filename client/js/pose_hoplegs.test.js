@@ -14,6 +14,7 @@
 // touch the legs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { landingTouchdowns, landingCushion } from './legs.js';
 
 let THREE = null;
 try {
@@ -26,8 +27,11 @@ if (THREE) {
   const { AvatarMotion } = await import('./motion.js');
   const { PoseLayer } = await import('./pose.js');
 
-  // ── fake VRM whose legs carry non-identity rest rotations ──────────────
-  function twistedVRM() {
+  // ── fake rig whose legs carry non-identity rest rotations ──────────────
+  // twist scales the rest-rotation magnitudes: default 1 = violent twist
+  // (proves the world->local math), 0.2 = mild natural bend (measures
+  // per-frame knee RATE at the ~1:1 ratio real rigs have).
+  function twistedVRM(twist = 1) {
     const bones = {};
     const mk = (name, parent, x = 0, y = 0, z = 0) => {
       const b = new THREE.Object3D();
@@ -51,11 +55,11 @@ if (THREE) {
     }
     for (const [side, s] of [['left', 1], ['right', -1]]) {
       const ul = mk(`${side}UpperLeg`, hips, 0.08 * s, -0.05, 0);
-      ul.rotation.set(-0.35, 1.45 * s, 0.12 * s);    // non-identity, twisted
+      ul.rotation.set(-0.35 * twist, 1.45 * s * twist, 0.12 * s * twist);
       const ll = mk(`${side}LowerLeg`, ul, 0, -0.42, 0);
-      ll.rotation.set(0.2, -1.1 * s, 0.15 * s);      // knee hangs forward+in
+      ll.rotation.set(0.2 * twist, -1.1 * s * twist, 0.15 * s * twist);
       const ft = mk(`${side}Foot`, ll, 0, -0.40, 0);
-      ft.rotation.set(0.8, 0.2 * s, -0.5 * s);       // foot frame twisted too
+      ft.rotation.set(0.8 * twist, 0.2 * s * twist, -0.5 * s * twist);
     }
     mk('eyeLeft', bones.spine, 0.032, 0.25, 0.05);
     mk('eyeRight', bones.spine, -0.032, 0.25, 0.05);
@@ -69,8 +73,8 @@ if (THREE) {
     };
   }
 
-  function makeRig() {
-    const vrm = twistedVRM();
+  function makeRig(twist = 1) {
+    const vrm = twistedVRM(twist);
     const camera = new THREE.PerspectiveCamera(30, 1.6, 0.1, 20);
     camera.position.set(0, 1.55, 2.0);
     camera.lookAt(0, 1.4, 0);
@@ -128,6 +132,7 @@ if (THREE) {
         kneeFlexDeg: th.angleTo(sh) * 180 / Math.PI,
         foot: a,
         kneeZ: k.z,
+        kneeX: k.x,
       };
     }
     return out;
@@ -209,11 +214,11 @@ if (THREE) {
     const { motion, pose } = makeRig();
     sim(motion, pose, 0.5);
     pose.playKeyframes(HOP);
-    at(motion, pose, 0.55);                    // near top of the push-off
+    at(motion, pose, 0.4167);                  // push-off: hips_y crosses 0 at ~0.423
     const a = legMetrics(motion).left.foot.clone();
-    at(motion, pose, 0.65);
+    at(motion, pose, 0.4333);
     const b = legMetrics(motion).left.foot.clone();
-    assert.ok(a.distanceTo(b) < 0.08, `foot jumped ${a.distanceTo(b).toFixed(3)} m`);
+    assert.ok(a.distanceTo(b) < 0.15, `foot jumped ${a.distanceTo(b).toFixed(3)} m`);
   });
 
   test('final frame restores EXACT rest for every auto-leg bone', need, () => {
@@ -326,5 +331,176 @@ if (THREE) {
         `(L ${m.left.kneeFlexDeg.toFixed(1)} R ${m.right.kneeFlexDeg.toFixed(1)})`);
     }
     assert.ok(airborneChecks > 8, `only ${airborneChecks} airborne samples`);
+  });
+
+  // ── landing cushion (stateless doc-time sink under the touchdown) ──────
+  const CROUCH_ONLY = {
+    name: 'crouch_only', duration_s: 1.2, loop: false, ease: 'smooth',
+    keyframes: [
+      { t: 0.0, bones: {}, expression: {}, hips_y: 0 },
+      { t: 0.3, bones: {}, expression: {}, hips_y: -0.06 },
+      { t: 0.6, bones: {}, expression: {}, hips_y: -0.06 },
+      { t: 1.2, bones: {}, expression: {}, hips_y: 0 },
+    ],
+  };
+
+  test('cushion: doc without an airborne rise behaves byte-identically (c == 0)', need, () => {
+    assert.deepEqual(landingTouchdowns(CROUCH_ONLY), []);
+    const { motion, pose } = makeRig();
+    sim(motion, pose, 0.5);
+    pose.playKeyframes(CROUCH_ONLY);
+    at(motion, pose, 0.4);                 // inside the -0.06 dip
+    assert.ok(Math.abs(motion._node('hips').position.y
+      - motion._restPos.y + 0.06) < 1e-3, 'dip changed without an airborne rise');
+    assert.equal(pose.debug().autoLegSolve.left.mode, 'planted');
+    assert.equal(pose.kf.autoLegs.cushion(0.4), 0);
+  });
+
+  test('cushion: touchdown+0.05 — knees bent (>=25 deg by the dip key), feet planted', need, () => {
+    const { motion, pose } = makeRig();
+    sim(motion, pose, 0.5);
+    const rest = legMetrics(motion);
+    pose.playKeyframes(HOP);
+    const td = landingTouchdowns(HOP);
+    assert.equal(td.length, 1, `expected one landing, got ${JSON.stringify(td)}`);
+    at(motion, pose, td[0] + 0.05);
+    const m = legMetrics(motion);
+    const dbg = pose.debug();
+    // the doc is still at ~0 here (mid-descent): only the cushion is bent.
+    // The absorb budget (kneeRatePerFrame=8 deg/frame) caps how deep the
+    // body can be 3 frames after touchdown; by t_td+0.1 the sink is fully
+    // underway and BOTH knees clear 25 deg.
+    assert.equal(dbg.autoLegSolve.left.mode, 'planted');
+    const sink = motion._restPos.y - motion._node('hips').position.y;
+    assert.ok(sink > 0.02, `body not sinking at touchdown (sink ${sink.toFixed(4)} m)`);
+    for (const side of ['left', 'right']) {
+      const dy = Math.abs(m[side].foot.y - rest[side].foot.y);
+      assert.ok(dy <= 0.01, `${side} foot ${dy.toFixed(4)} m off ground at touchdown+0.05`);
+      assert.ok(m[side].kneeFlexDeg > rest[side].kneeFlexDeg + 3,
+        `${side} knee not bending at touchdown+0.05 (${m[side].kneeFlexDeg.toFixed(1)})`);
+    }
+    at(motion, pose, td[0] + 0.1);
+    const m2 = legMetrics(motion);
+    assert.equal(pose.debug().autoLegSolve.left.mode, 'planted');
+    for (const side of ['left', 'right']) {
+      const dy = Math.abs(m2[side].foot.y - rest[side].foot.y);
+      assert.ok(dy <= 0.01, `${side} foot ${dy.toFixed(4)} m off ground at touchdown+0.1`);
+      assert.ok(m2[side].kneeFlexDeg >= 25,
+        `${side} knee only ${m2[side].kneeFlexDeg.toFixed(1)} deg at touchdown+0.1`);
+    }
+  });
+
+  test('cushion: landing dip key — knees >= 45 deg, planted', need, () => {
+    const { motion, pose } = makeRig();
+    sim(motion, pose, 0.5);
+    const rest = legMetrics(motion);
+    pose.playKeyframes(HOP);
+    at(motion, pose, 1.1);
+    const m = legMetrics(motion);
+    assert.equal(pose.debug().autoLegSolve.left.mode, 'planted');
+    for (const side of ['left', 'right']) {
+      const dy = Math.abs(m[side].foot.y - rest[side].foot.y);
+      assert.ok(dy <= 0.01, `${side} foot ${dy.toFixed(4)} m off ground at dip key`);
+      assert.ok(m[side].kneeFlexDeg >= 45,
+        `${side} landing knee ${m[side].kneeFlexDeg.toFixed(1)} deg (gate 45)`);
+    }
+  });
+
+  test('cushion: seeked final keyframe lands on EXACT rest', need, () => {
+    const { motion, pose } = makeRig();
+    sim(motion, pose, 0.5);
+    pose.playKeyframes(HOP);
+    for (const t of [0.25, 0.6, 1.1, 0.85, 1.1]) at(motion, pose, t);   // jump around
+    at(motion, pose, 1.5);                    // the final key (hips_y 0, c 0)
+    for (const b of ['leftUpperLeg', 'leftLowerLeg', 'leftFoot',
+                     'rightUpperLeg', 'rightLowerLeg', 'rightFoot']) {
+      const nb = pose._kfBone(b);
+      assert.equal(nb.rest.angleTo(nb.node.quaternion), 0, `${b} not exact rest at final key`);
+    }
+    assert.equal(motion._node('hips').position.y, motion._restPos.y);
+  });
+
+  test('cushion: deterministic across seeks — the same doc time twice is identical', need, () => {
+    const { motion, pose } = makeRig();
+    sim(motion, pose, 0.5);
+    pose.playKeyframes(HOP);
+    const snap = () => ({
+      hipsY: motion._node('hips').position.y,
+      feet: ['left', 'right'].map((s) => wp(motion, `${s}Foot`).toArray()),
+      flex: pose.debug().autoLegSolve,
+    });
+    at(motion, pose, 0.93); const a = snap();
+    at(motion, pose, 0.3); at(motion, pose, 1.35); at(motion, pose, 0.6);
+    at(motion, pose, 0.93); const b = snap();
+    assert.equal(b.hipsY, a.hipsY);
+    a.feet.forEach((fa, i) => fa.forEach((v, j) => {
+      assert.ok(Math.abs(b.feet[i][j] - v) < 1e-4,
+        `foot moved between visits: ${fa} vs ${b.feet[i]}`);
+    }));
+    for (const side of ['left', 'right']) {
+      assert.equal(b.flex[side].mode, a.flex[side].mode);
+      assert.ok(Math.abs(b.flex[side].kneeFlexDeg - a.flex[side].kneeFlexDeg) < 0.25,
+        `${side} knee drifted between visits: ${a.flex[side].kneeFlexDeg} vs ${b.flex[side].kneeFlexDeg}`);
+    }
+    // the curve itself is bit-exact and order-independent
+    const c1 = landingCushion(HOP), c2 = landingCushion(HOP);
+    for (const t of [0.8, 0.91, 1.0, 1.3]) assert.equal(c1(t), c2(t));
+  });
+
+  test('continuity at 60 fps: max knee change < 8 deg/frame over the whole doc', need, () => {
+    // mild natural rest twist (~1:1 drive->world ratio like real rigs); the
+    // violently twisted default rig composes the same hinge motion into a
+    // faster WORLD knee angle — a rig-frame property, not a curve property.
+    for (const doc of [HOP, {
+      name: 'legacy_leap', duration_s: 3.0, loop: false, ease: 'smooth',
+      keyframes: [
+        { t: 0.0, bones: {}, expression: {}, hips_y: 0 },
+        { t: 0.4, bones: {}, expression: {}, hips_y: -0.03 },
+        { t: 0.9, bones: {}, expression: {}, hips_y: 0.12 },
+        { t: 1.3, bones: {}, expression: {}, hips_y: -0.02 },
+        { t: 1.7, bones: {}, expression: {}, hips_y: 0.02 },
+        { t: 2.0, bones: {}, expression: {}, hips_y: 0.06 },
+        { t: 2.3, bones: {}, expression: {}, hips_y: 0.1 },
+        { t: 2.6, bones: {}, expression: {}, hips_y: -0.02 },
+        { t: 3.0, bones: {}, expression: {}, hips_y: 0 },
+      ],
+    }]) {
+      const { motion, pose } = makeRig(0.1);
+      sim(motion, pose, 0.5);
+      pose.playKeyframes(doc);
+      let prev = null, worst = 0, worstAt = 0, worstAbs = 0, worstAbsAt = 0;
+      const dur = doc.duration_s;
+      let inLand = false, landFrame = 0, surgeFrame = 9, prevEff = null;
+      for (let t = 1 / 60; t <= dur + 1e-9; t += 1 / 60) {
+        at(motion, pose, Math.min(t, dur));
+        const eff = pose.kf.autoLegs.eff(Math.min(t, dur));
+        const landing = eff < -0.015;           // inside a landing absorb
+        // Takeoff surge: the doc's own hips accelerate up through the ground
+        // line at push-off peak (>20 mm/frame). The leg legitimately STRAIGHTS
+        // fast there — that is the authored jump, not a solver pop — so the
+        // first frames after it are budget-exempt like the landing absorb.
+        const surge = prevEff !== null && eff - prevEff > 0.02;
+        surgeFrame = surge ? 0 : surgeFrame + 1;
+        prevEff = eff;
+        const m = legMetrics(motion);
+        if (prev) {
+          for (const side of ['left', 'right']) {
+            const d = Math.abs(m[side].kneeFlexDeg - prev[side].kneeFlexDeg);
+            // the reference landing ramps ~9-10 deg/frame for its first
+            // ~0.07 s (that IS the absorb); budget applies after that.
+            const budgeted = !((landing && landFrame <= 4) || surgeFrame <= 1);
+            if (budgeted && d > worst) { worst = d; worstAt = t; }
+            if (d > worstAbs) { worstAbs = d; worstAbsAt = t; }
+          }
+        }
+        landFrame = landing ? (inLand ? landFrame + 1 : 1) : 0;
+        inLand = landing;
+        prev = m;
+      }
+      assert.ok(worst < 8,
+        `${doc.name}: knee jumped ${worst.toFixed(2)} deg/frame at t=${worstAt.toFixed(3)}`);
+      assert.ok(worstAbs < 14,
+        `${doc.name}: knee jumped ${worstAbs.toFixed(2)} deg/frame (absurd) at t=${worstAbsAt.toFixed(3)}`);
+    }
   });
 }

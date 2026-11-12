@@ -23,7 +23,7 @@
 // taken from motion, never re-derived, so both layers share one truth).
 
 import { solveTwoBoneIK, sub, add, mul, dot, len, dist, norm } from './ik.js';
-import { solveHopLegs } from './legs.js';
+import { solveHopLegs, landingCushion, landingEff, tuckCurve, kneeBlendCurve } from './legs.js';
 import {
   sample as sampleKeyframes, clampAnimation, KF_BLEND, KEYFRAME_LIMITS,
   clampRelEuler,
@@ -319,6 +319,20 @@ export class PoseLayer {
       keyed,                   // bone names the doc itself keys (wins)
       bones: new Set(),        // leg bones THIS mechanism wrote (for QA + gates)
       solve: {},               // last frame's solver metrics (QA)
+      active: false,           // last frame wrote bent legs (rest-frame latch)
+      // landing cushion: pure function of DOC time (see legs.js) — the
+      // hips sink under the doc curve around each touchdown so the planted
+      // IK bends the knees WHILE DESCENDING. null-safe: docs without an
+      // airborne rise return a closure that is 0 everywhere.
+      cushion: hasHipsY ? landingCushion(anim) : null,
+      // effective hips_y curve (doc curve minus landing cushion, sink-rate
+      // limited) and rate-limited tuck drive (deg) — same stateless
+      // doc-time design; eff is a byte-exact pass-through for docs with
+      // no airborne rise.
+      eff: hasHipsY ? landingEff(anim) : null,
+      // rate-limited tuck drive (deg) — same stateless doc-time design
+      tuck: hasHipsY ? tuckCurve(anim) : null,
+      blend: hasHipsY ? kneeBlendCurve(anim) : null,
     };
   }
 
@@ -497,18 +511,29 @@ export class PoseLayer {
         }
       }
     }
-    if (s.hips_y || k.hipsY) {
+    // landing cushion: sink the hips UNDER the doc curve around touchdowns
+    // (stateless in doc time -> seeking / QA sampling at any t is exact).
+    // Docs without an airborne rise: c == 0 -> hipsEff == s.hips_y exactly.
+    let hipsEff = s.hips_y;
+    let tuckDeg = null, blendW = null;
+    if (k.autoLegs && k.autoLegs.enabled && k.autoLegs.eff) {
+      const docT = k.anim.loop ? k.t : Math.min(k.t, dur);
+      hipsEff = k.autoLegs.eff(docT);
+      if (k.autoLegs.tuck) tuckDeg = k.autoLegs.tuck(docT) * e;
+      if (k.autoLegs.blend) blendW = k.autoLegs.blend(docT) * e;
+    }
+    if (hipsEff || s.hips_y || k.hipsY) {
       const hips = m._node('hips');
       if (hips && m._restPos) {
-        hips.position.y = m._restPos.y + s.hips_y * e;
+        hips.position.y = m._restPos.y + hipsEff * e;
         k.hipsY = true;
       }
     }
     // hips_y hop legs: crouch plants the feet (IK), airborne rides + tucks.
-    // Solved with the BLEND-SCALED offset and written absolutely, so the
-    // feet stay pinned through the blend-in and both branches hit exact
-    // rest as e -> 0 (the same 0.25 s envelope as every keyed bone).
-    if (k.autoLegs && k.autoLegs.enabled) this._autoLegs(k, s.hips_y * e);
+    // Solved with the BLEND-SCALED effective offset and written absolutely,
+    // so the feet stay pinned through the blend-in and both branches hit
+    // exact rest as e -> 0 (the same 0.25 s envelope as every keyed bone).
+    if (k.autoLegs && k.autoLegs.enabled) this._autoLegs(k, hipsEff * e, tuckDeg, blendW);
     const em = this.vrm.expressionManager;
     if (em) {
       for (const [name, v] of Object.entries(s.expression)) {
@@ -541,10 +566,22 @@ export class PoseLayer {
   // IK arm/leg grabs: the minimal world arc PRE-MULTIPLIES the bone's rest
   // WORLD quaternion, then local = parentWorld^-1 * worldTarget. Synthetic
   // identity-frame tests pass without this and lie; real VRMs do nothing.
-  _autoLegs(k, hipsYeff) {
+  _autoLegs(k, hipsYeff, tuckDeg = null, blendW = null) {
     const m = this.motion;
     k.autoLegs.solve = {};
-    if (!(Math.abs(hipsYeff) > 1e-5)) return;   // both branches == rest at 0
+    if (!(Math.abs(hipsYeff) > 1e-5)) {
+      // legs bent last frame but zero this frame (crossing hips_y = 0, the
+      // cushion releasing, or the last keyframe): write ONE exact rest frame
+      // so seeking/QA sampling lands on exact rest at zero-hips doc times.
+      if (k.autoLegs.active) {
+        for (const bone of k.autoLegs.bones) {
+          const nb = this._kfBone(bone);
+          if (nb) nb.node.quaternion.copy(nb.rest);
+        }
+        k.autoLegs.active = false;
+      }
+      return;
+    }
     const T = this.THREE;
     const scene = m.vrm.scene;
     scene.updateMatrixWorld(true);              // hips_y applied: hips is live
@@ -569,7 +606,7 @@ export class PoseLayer {
         hipLive: [p0.x, p0.y, p0.z],   // root the chain on the ACTUAL hip
       };
     }
-    const solved = solveHopLegs({ legs, forward, hipsY: hipsYeff });
+    const solved = solveHopLegs({ legs, forward, hipsY: hipsYeff, tuckFlexDeg: tuckDeg, blendW });
     for (const { side, hipN, kneeN, footN, p0 } of plan) {
       const sol = solved[side];
       if (!sol) continue;
@@ -609,6 +646,7 @@ export class PoseLayer {
       k.autoLegs.solve[side] = { mode: sol.mode, kneeFlexDeg: +sol.kneeFlexDeg.toFixed(2),
                                  thighFlexDeg: +sol.thighFlexDeg.toFixed(2) };
     }
+    k.autoLegs.active = Object.keys(k.autoLegs.solve).length > 0;
   }
 
   // Write one auto-leg bone ABSOLUTELY (the solver already folded in the
