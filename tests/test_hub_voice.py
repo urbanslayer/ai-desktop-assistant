@@ -19,7 +19,7 @@ import soundfile as sf
 from fastapi.testclient import TestClient
 
 import hub.server as server_mod
-from hub.speech import SPEECH_RULES_VERSION
+from hub.speech import SPEECH_RULES_VERSION, speech_text
 from hub.server import create_app
 from test_hub_brain import FakeHubLLM
 
@@ -565,6 +565,35 @@ def test_clear_history_removes_message_audio_keeps_greeting(client, fake_breeze,
     audio_dir = tmp_path / "hubdata" / "audio"
     names = [f.name for f in audio_dir.glob("*.wav")]
     assert names == [f"greeting-asuka-v1-r{SPEECH_RULES_VERSION}.wav"]  # message audio went with the rows
+
+
+def test_greeting_edit_replaces_cached_greeting_audio(client, fake_breeze, tmp_path):
+    """Owner report (BACKLOG 14): Jahoda spoke the voice-preview line on app
+    start even after her greeting was configured. The greeting is not part of
+    the greeting-audio cache key, so PUT /api/personas/<id> must drop the
+    cached clip when the greeting text changes."""
+    audio_dir = tmp_path / "hubdata" / "audio"
+    assert client.post("/api/personas", json={"name": "Wraith"}).status_code == 201
+    # Empty greeting: the cached clip falls back to the preview line...
+    assert client.get("/api/personas/wraith/greeting/audio").status_code == 200
+    assert fake_breeze.speech_requests[-1]["input"] == speech_text(server_mod.PREVIEW_LINE)
+    assert (audio_dir / f"greeting-wraith-v1-r{SPEECH_RULES_VERSION}.wav").exists()
+    # ...set the greeting (a plain persona edit: voice_version stays put)...
+    r = client.put("/api/personas/wraith", json={"greeting": "Wraith reporting for duty!"})
+    assert r.status_code == 200
+    assert r.json()["voice_version"] == 1
+    # ...the stale preview-line clip must NOT be served: it is re-synthesized.
+    assert client.get("/api/personas/wraith/greeting/audio").status_code == 200
+    assert fake_breeze.speech_requests[-1]["input"] == "Wraith reporting for duty!"
+    # Re-PUTting the same greeting changes nothing: no needless re-synthesis.
+    n = len(fake_breeze.speech_requests)
+    client.put("/api/personas/wraith", json={"greeting": "Wraith reporting for duty!"})
+    assert client.get("/api/personas/wraith/greeting/audio").status_code == 200
+    assert len(fake_breeze.speech_requests) == n
+    # Editing an unrelated field also keeps the greeting clip.
+    client.put("/api/personas/wraith", json={"system_prompt": "new prompt"})
+    assert client.get("/api/personas/wraith/greeting/audio").status_code == 200
+    assert len(fake_breeze.speech_requests) == n
 
 
 # ── voice editing rules ──────────────────────────────────────────────────────
