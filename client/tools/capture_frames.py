@@ -579,6 +579,11 @@ def main():
     ap.add_argument("--touch", default=None,
                     help="page ?touch= scripted touch QA steps (grab/tap/taps/stroke/sit/"
                          "stand/mode ops, '@ms' anchors after avatar attach) — see runTouchSpec")
+    ap.add_argument("--kftime", default=None,
+                    help="page ?kftime= doc-time shots '0.25,0.6,…' — event-driven "
+                         "captures at keyframe-clock crossings, name-qualified "
+                         "(hop-legs acceptance: exact keyframe moments despite "
+                         "attach latency)")
     ap.add_argument("--roam", action="store_true",
                     help="open the page with ?roam=1 (strip mode: walk director + "
                          "/control/bbox housekeeping active)")
@@ -668,6 +673,8 @@ def main():
         url += f"&wheelzoom={args.gestures}"
     if args.touch:
         url += "&touch=" + urllib.parse.quote(args.touch, safe="")
+    if args.kftime:
+        url += "&kftime=" + args.kftime
     if args.scenario in ("custom_say", "custom_say_inline", "actions_preview_inline"):
         url += "&kfwatch=0.35,0.8"
     maxsec = max(float(s) for s in args.secs.split(","))

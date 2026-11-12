@@ -2003,6 +2003,25 @@
             } catch { /* harness gone */ }
           }, 100);
         }
+        // 'kftime=0.25,0.6,…': shoot at DOC-TIME crossings (name-qualified),
+        // event-driven for the same load-latency reason as kfwatch — used by
+        // the hop-legs acceptance to photograph exact keyframe moments of
+        // hip-only docs across several animations in one run.
+        const kfT = String(new URLSearchParams(location.search).get('kftime') || '')
+          .split(',').map(Number).filter((n) => n > 0);
+        if (kfT.length) {
+          const shots = new Set();
+          setInterval(async () => {
+            try {
+              const kf = window.rikoMeasure().metrics.keyframeQA;
+              if (!kf || !kf.name || kf.out) return;
+              for (const tv of kfT) {
+                const key = `${kf.name}@${tv}`;
+                if (kf.t >= tv && !shots.has(key)) { shots.add(key); await postShot(); }
+              }
+            } catch { /* harness gone */ }
+          }, 40);
+        }
         for (const s of String(CAPTURE).split(',').map(Number).filter((n) => n > 0)) {
           setTimeout(async () => {
             try {

@@ -554,21 +554,27 @@ export class PoseLayer {
     const fl = Math.hypot(face.x, face.z);
     const forward = fl > 1e-6 ? [face.x / fl, 0, face.z / fl] : [0, 0, 1];
     const legs = {};
+    const plan = [];
     for (const side of ['left', 'right']) {
       const leg = this._legRest && this._legRest[side];
-      if (leg) legs[side] = { hip: leg.hip, knee: leg.knee, ankle: leg.ankle };
-    }
-    const solved = solveHopLegs({ legs, forward, hipsY: hipsYeff });
-    for (const side of ['left', 'right']) {
-      const sol = solved[side];
-      if (!sol) continue;
+      if (!leg) continue;
       const hipN = m._node(`${side}UpperLeg`);
       const kneeN = m._node(`${side}LowerLeg`);
       const footN = m._node(`${side}Foot`);
       if (!hipN || !kneeN || !footN) continue;        // rig without this bone
-      // rest WORLD directions/quaternions read live BEFORE any write this
-      // frame (the keyframe layer owns the legs here, so live == rest)
       const p0 = hipN.getWorldPosition(new T.Vector3());
+      plan.push({ side, leg, hipN, kneeN, footN, p0 });
+      legs[side] = {
+        hip: leg.hip, knee: leg.knee, ankle: leg.ankle,
+        hipLive: [p0.x, p0.y, p0.z],   // root the chain on the ACTUAL hip
+      };
+    }
+    const solved = solveHopLegs({ legs, forward, hipsY: hipsYeff });
+    for (const { side, hipN, kneeN, footN, p0 } of plan) {
+      const sol = solved[side];
+      if (!sol) continue;
+      // rest WORLD directions read live BEFORE any write this frame (the
+      // keyframe layer owns the legs here; unkeyed ones still sit at rest)
       const p1 = kneeN.getWorldPosition(new T.Vector3());
       const p2 = footN.getWorldPosition(new T.Vector3());
       const u0 = p1.clone().sub(p0).normalize();

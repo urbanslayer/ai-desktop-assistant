@@ -141,6 +141,30 @@ test('hopFrame: hinge axis sign holds for any facing (rotated character)', () =>
   }
 });
 
+test('hipLive: idle-swayed hip root still plants the foot EXACTLY at rest', () => {
+  // hip sways 2.4 cm sideways/forward this frame (life layer rotates hips)
+  const sway = [0.018, 0.001, -0.014];
+  const live = [REST.hip[0] + sway[0], REST.hip[1] + sway[1] - 0.08, REST.hip[2] + sway[2]];
+  const s = solveHopLeg({ ...REST, forward: F, hipsY: -0.08, hipLive: live });
+  assert.equal(s.mode, 'planted');
+  // 1 cm window = the 8 mm crouch lean (heels forward); sway must NOT add drift
+  assert.ok(dist(s.anklePos, REST.ankle) <= 0.01,
+    `swayed hip drifted the planted foot ${dist(s.anklePos, REST.ankle).toFixed(4)} m`);
+  assert.ok(Math.abs(s.anklePos[1] - REST.ankle[1]) <= 1e-6, 'planted foot left the ground plane');
+  const H = [REST.hip[0], REST.hip[1] - 0.08, REST.hip[2]];
+  assert.ok(Math.abs(len(sub(s.kneePos, live)) - dist(REST.hip, REST.knee)) < 1e-9);
+  // near zero the target softens toward the PASSIVE foot (sway-following):
+  // exact continuity with the unactuated hierarchy, no sway-scale pop
+  const t = solveHopLeg({ ...REST, forward: F, hipsY: -1e-4,
+    hipLive: [live[0], live[1] + 0.0799, live[2]] });
+  const passive = REST.ankle.map((v, i) => v + (i === 1 ? -0.0001 : sway[i]));
+  assert.ok(dist(t.anklePos, passive) < 2e-3,
+    `near-zero planted snapped off the passive foot (${dist(t.anklePos, passive)})`);
+  // tuck rides the live hip too (feet follow sway while airborne)
+  const a = solveHopLeg({ ...REST, forward: F, hipsY: 0.14, hipLive: [live[0], live[1] + 0.22, live[2]] });
+  assert.ok(Math.abs(a.anklePos[0] - REST.hip[0] - sway[0]) < 0.05);
+});
+
 test('planted xz drift stays <= 2 cm for the whole contract dip range', () => {
   for (let y = -0.01; y >= -0.25; y -= 0.01) {
     const s = solve(y);

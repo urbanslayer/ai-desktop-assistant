@@ -78,6 +78,16 @@ export function hopFrame(forward) {
  *                      legs at rest; the Foot bone origin is the ankle)
  *   forward          — character facing (world, horizontal; any y ignored)
  *   hipsY            — the BLEND-SCALED hips_y for this frame (metres)
+ *   hipLive          — optional: this frame's ACTUAL hip-joint world position
+ *                      (hips_y already applied, idle sway included). The
+ *                      life layer rotates the hips every frame, so solving
+ *                      from the attach-time rest hip would hand that sway to
+ *                      the "planted" foot (measured: up to 2.4 cm of xz
+ *                      drift on the owner's rig). With hipLive the chain is
+ *                      rooted where the hip actually is, and the planted
+ *                      target blends from passive (sway-following, at
+ *                      hips_y=0 — exact continuity) to fully pinned at the
+ *                      rest world position by |hips_y| = 0.01.
  *   sideScale        — per-side tuck multiplier (HOP_LEGS.asym L/R flavour)
  * Returns null when the chain is degenerate (rig without usable legs).
  *
@@ -91,14 +101,16 @@ export function hopFrame(forward) {
  *      kneeFlexDeg, thighFlexDeg, thighAngle, shinAngle }  // metrics
  */
 export function solveHopLeg({ hip, knee, ankle, forward, hipsY,
-                              sideScale = 1, limits = HOP_LEGS }) {
+                              hipLive = null, sideScale = 1, limits = HOP_LEGS }) {
   if (!hip || !knee || !ankle || !Number.isFinite(hipsY)) return null;
   const l1 = dist(hip, knee), l2 = dist(knee, ankle);
   if (!(l1 > 0.05 && l2 > 0.05)) return null;
   const { forward: f, axis } = hopFrame(forward);
   const u0 = norm(sub(knee, hip));            // rest thigh world direction
   const w0 = norm(sub(ankle, knee));          // rest shin world direction
-  const H = [hip[0], hip[1] + hipsY, hip[2]]; // hips at this frame's offset
+  const H0 = [hip[0], hip[1] + hipsY, hip[2]]; // hips at this frame's offset
+  const H = hipLive ? [hipLive[0], hipLive[1], hipLive[2]] : H0;
+  const sway = hipLive ? sub(H, H0) : [0, 0, 0];  // non-hips_y hip offset
   let mode, thighDir, shinDir, kneePos, anklePos, footArc, thighAngle = null, shinAngle = null;
 
   if (hipsY >= 0) {
@@ -120,7 +132,16 @@ export function solveHopLeg({ hip, knee, ankle, forward, hipsY,
   } else {
     // ── crouch / landing: feet planted, hips sink, knees forward ──
     mode = 'planted';
-    const d = dist(H, ankle);
+    // planted target: rest ankle spot, softened toward the PASSIVE foot
+    // (sway-following) as hips_y approaches 0 so the branch is exactly
+    // continuous there; fully pinned by |hips_y| = 0.01 (a crouch). Long-
+    // legged rigs only reach ~49 deg of flex from a pure 8 cm dip — a real
+    // crouch also rolls the weight forward (heels lift), so the ankle
+    // target leans back 8 mm as the crouch sets in: +2-3 deg of knee flex
+    // for an 8 mm xz shift (the contract drift gate is 2 cm).
+    const pin = smoothstep(clamp(-hipsY / 0.010, 0, 1));
+    const baseT = add(add(ankle, mul(sway, 1 - pin)), mul(f, -0.008 * pin));
+    const d = dist(H, baseT);
     // knee flex the geometry demands for hips->planted-ankle distance d
     const cosB = clamp((d * d - l1 * l1 - l2 * l2) / (2 * l1 * l2), -1, 1);
     let beta = Math.acos(cosB);
@@ -129,19 +150,19 @@ export function solveHopLeg({ hip, knee, ankle, forward, hipsY,
     let betaMax = limits.kneeMaxDeg * DEG;
     const s = (d * Math.sin(limits.thighMaxDeg * DEG)) / l2;
     if (s < 1) betaMax = Math.min(betaMax, Math.asin(s));
-    let target = ankle;
+    let target = baseT;
     if (beta > betaMax) {
       // deeper than the legs can fold: bend ONLY to the limit and let the
       // foot sink below its planted rest height (no over-rotation)
       beta = betaMax;
       const dEff = Math.sqrt(Math.max(0, l1 * l1 + l2 * l2 + 2 * l1 * l2 * Math.cos(betaMax)));
-      const dir = norm(sub(ankle, H));
+      const dir = norm(sub(baseT, H));
       target = add(H, mul(dir, dEff));
     }
     // pole: the rest knee's perpendicular around the hip->ankle line so a
     // bent-rest rig keeps bending ITS way (and continuity at hips_y=0 is
     // exact); straight rest legs fall back to knees-toward-facing.
-    const line = norm(sub(ankle, hip));
+    const line = norm(sub(baseT, H));
     const ko = sub(knee, hip);
     let pole = norm(sub(ko, mul(line, dot(ko, line))));
     if (!(len(pole) > 1e-3)) pole = f;
