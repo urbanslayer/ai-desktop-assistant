@@ -539,15 +539,48 @@ def evaluate_bubble_gates(outdir):
       body below chin      mode=body:   bubble top >= face bottom (chin)
       inside canvas        bubble rect fully inside the canvas
       mode sane            mode in {above, body, top}
+    Headroom frames (metrics.roomQA / bubbleQA.room, --room runs, docs/
+    TOUCH.md "Speech bubble headroom") add, per frame that ASKED for room:
+      granted-room-above   granted > 0 => mode must be 'above'
+      no-lie               asked but granted == 0 => mode must NOT be 'above'
+                           (the page may not claim the head slot the desktop
+                           did not give)
+      grew-upward-only     view width unchanged, view height grew by exactly
+                           the granted px, and her feet pixel moved DOWN by
+                           exactly the granted px (canvas coords): the window
+                           top moved up by the same amount, so on screen her
+                           feet stay put and only new space appears above her.
+                           Tolerance +-1 px on the first grown frame (adjacent
+                           to the kept pre-grow frame) and +-3 px afterwards
+                           (her idle bob moves the toe/head bones a couple of
+                           px by itself; a real re-frame slips by ~25 px)
+      same-size            head top moved down by exactly the granted px too
+                           (pixels-per-metre preserved: she did not scale)
+    and across the run: once room was granted, a later frame must show the
+    canvas back at the pre-grow size (release).
     Returns the number of FAILed checks.
     """
     fails = 0
     frames = 0
+    pre = None            # last pre-grow evidence snapshot seen
+    grew = False          # any frame where room was actually granted
+    base_win = None       # the fake desktop window WITHOUT room (pre.view)
+    restored = False      # a later frame back at that size
+    prev_granted = 0      # previous frame's granted px (idle-bob tolerance)
     for j in sorted(Path(outdir).glob("*.json")):
         try:
             met = json.loads(j.read_text()).get("metrics") or {}
         except (json.JSONDecodeError, OSError):
             continue
+        room = met.get("roomQA") or {}
+        if room.get("pre") and pre is None:
+            pre = room["pre"]
+            base_win = tuple(pre["view"])
+        if room.get("granted", 0) > 0:
+            grew = True
+        elif grew and base_win and tuple(room.get("win", [])) == base_win \
+                and room.get("granted", 0) == 0:
+            restored = True
         qa = met.get("bubbleQA")
         if not qa or not qa.get("shown"):
             continue
@@ -571,15 +604,64 @@ def evaluate_bubble_gates(outdir):
                            by + bh <= hy - 6 + 0.5))
         if mode == "body":
             checks.append(("below-chin", by >= fy + fh - 2))
+        rqa = qa.get("room") or room
+        asked, granted = rqa.get("asked", 0), rqa.get("granted", 0)
+        drift = rqa.get("drift") or {}
+        if asked:
+            # Enough granted room MUST put the bubble over her head; a partial
+            # grant (the monitor's top clamped it) may not be enough yet, and a
+            # bubble shorter than placeBubble's 2-line above-slot stays on the
+            # chest anyway — only a FULL grant is a hard promise.
+            checks.append((f"granted-room-above(a={asked},g={granted})",
+                           granted < asked or mode == "above"))
+            checks.append((f"no-fake-above(a={asked},g={granted})",
+                           granted > 0 or mode != "above"))
+            # The page's own +-1 px invariance proof, measured on the ADJACENT
+            # frame pair each resize landed between (roomQA.drift): her feet
+            # and head rows moved by EXACTLY the canvas delta. Any resize that
+            # happened while the seam is live must have been measured; frames
+            # seconds apart are only ever compared with the wider idle-bob band.
+            if granted > 0:
+                checks.append((f"drift-+-1px(max {drift.get('maxPx')} px over "
+                               f"{drift.get('frames')} resize(s))", bool(drift.get("ok"))))
+            else:
+                checks.append(("drift-+-1px(no resize)", drift.get("ok", True) is not False))
+            snap = rqa.get("pre") or pre
+            if granted > 0 and snap:
+                # Grow evidence compares a grown frame with the LAST un-grown
+                # frame the page kept. The frame right where the grow landed
+                # must match to the pixel (±1: adjacent frames); frames later
+                # in the same bubble are seconds apart and her idle bob moves
+                # the toe/head bones a couple of px on its own, so they carry
+                # a ±3 px band — still far below any real re-frame (a 4.7%
+                # scale slip here is ~25 px).
+                tol = 1 if prev_granted == 0 else 3
+                # grow-upward-only in CANVAS coords: everything of hers moves
+                # down by exactly the granted px (the window top moved up by
+                # the same amount, so nothing of hers moved on screen)
+                grew_up = (qa["view"][0] == snap["view"][0]
+                           and qa["view"][1] == snap["view"][1] + granted)
+                if snap.get("feet") is not None:
+                    grew_up = grew_up and qa.get("feet") is not None \
+                        and abs(qa["feet"] - (snap["feet"] + granted)) <= tol
+                checks.append((f"grew-upward-only(feet {snap.get('feet')}+{granted} vs {qa.get('feet')}, "
+                               f"{snap['view']} +{granted} vs {qa['view']}, tol {tol})", grew_up))
+                checks.append((f"same-size(head {snap['head']}+{granted} -> {qa['head'][1]}, tol {tol})",
+                               abs(qa["head"][1] - (snap["head"] + granted)) <= tol))
         bad = [c for c, ok in checks if not ok]
         fails += len(bad)
         print(f"[bubble-gate] {j.name} mode={mode} bubble={qa['bubble']} "
               f"head={qa['head']} face={qa['face']} view={qa['view']} "
-              f"font={qa.get('fontStep')} "
+              f"font={qa.get('fontStep')} room={asked}/{granted} "
+              f"feet={qa.get('feet')} "
               + ("PASS" if not bad else "FAIL " + "; ".join(bad)), flush=True)
     if not frames:
         print("[bubble-gate] FAIL: no captured frame showed the bubble — "
               "check the say: touch step and the capture times", flush=True)
+        fails += 1
+    if grew and not restored:
+        print(f"[bubble-gate] FAIL: room was granted but the window never came "
+              f"back to {base_win} — release missing", flush=True)
         fails += 1
     return fails
 
@@ -708,12 +790,26 @@ def main():
     ap.add_argument("--roam", action="store_true",
                     help="open the page with ?roam=1 (strip mode: walk director + "
                          "/control/bbox housekeeping active)")
+    ap.add_argument("--room", action="store_true",
+                    help="speech-bubble HEADROOM run (bubble scenario): the fake "
+                         "desktop answers POST /control/bubble-room by growing the "
+                         "window UPWARD (taller canvas, same feet pixels) and gives "
+                         "it back on release. Needs a browser window taller than "
+                         "--size so the grown canvas fits; --size stays the fake "
+                         "desktop window and is passed to the page as ?fakebase. "
+                         "Gates: evaluate_bubble_gates() room section")
     args = ap.parse_args()
 
     force, events = SCENARIOS[args.scenario]
     if args.force:
         force = args.force
     w, h = (int(v) for v in args.size.lower().split("x"))
+    if args.room and args.scenario != "bubble":
+        ap.error("--room only makes sense with the bubble scenario")
+    # --room: the fake desktop window (--size) is what Riko's window IS; the
+    # browser window is taller so the grown canvas has somewhere to render,
+    # exactly like a monitor with room above her (docs/TOUCH.md).
+    win_h = h + 240 if args.room else h
     os.makedirs(args.outdir, exist_ok=True)
     Handler.scenario = args.scenario
     Handler.outdir = args.outdir
@@ -796,6 +892,10 @@ def main():
         url += "&touch=" + urllib.parse.quote(args.touch, safe="")
     if args.kftime:
         url += "&kftime=" + args.kftime
+    if args.room:
+        # the fake desktop's UN-grown window (client/index.html FAKE_BASE):
+        # the browser window is taller so the grown canvas fits on screen
+        url += f"&fakebase={w}x{h}"
     if args.scenario in ("custom_say", "custom_say_inline", "actions_preview_inline"):
         url += "&kfwatch=0.35,0.8"
     maxsec = max(float(s) for s in args.secs.split(","))

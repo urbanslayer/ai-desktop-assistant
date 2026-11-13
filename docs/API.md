@@ -1239,8 +1239,15 @@ curl -s -H "$AUTH" -X POST "$HUB/api/touch" -d '{"kind":"pat","part":"head"}' -H
 ```
 
 Desktop seams (viewer `POST /control/<cmd>`, docs/TOUCH.md): `bbox` carries
-`parts` + `hips_y` (+ `hit_extra` — the song-ticker button's rect, a second
-interactive rect in the roam click-through mask); `/control/touch`
+`parts` + `hips_y` (+ `hit_extra` — the song-ticker button's rect — and
+`hit_extras`, ALL interactive islands outside her limbs: the ticker button
+AND, on the headroom path, the speech bubble above her head; each becomes an
+extra rect in the roam click-through mask and is exempt in the press
+arbiter); `/control/bubble-room` `{extra}` asks for that many px of window
+ABOVE her head while the bubble is up (`extra: 0` gives it back) and answers
+`{ok, granted, reason}` — the window grows upward only, feet and size
+untouched, restored exactly on release (docs/TOUCH.md "Speech bubble
+headroom"); `/control/touch`
 `{part, kind, x, y, hold_ms}` forwards here off every UI thread;
 `/control/sit-state` `{sitting}` reports the page finished blending.
 `/control/music-control` `{action}` and `/control/music-state` `{}` drive the

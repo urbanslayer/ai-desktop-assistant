@@ -33,6 +33,14 @@ export const ROOM_MAX = 220;
 /** Must match bubblePlacement's clearance numbers in client/index.html. */
 export const ROOM_GAP = 8;
 export const ROOM_MARGIN = 8;
+/**
+ * placeBubble only takes the above-head slot when it can show at least
+ * `minLines` readable lines (padV + 2 * lineH at the readable font:
+ * 20 + 2 * 20.3 = 60.6 => 61). Asking for less than that buys a window that
+ * STILL puts the bubble on her chest, so the request floor is this tall even
+ * for a one-line bubble.
+ */
+export const ROOM_MIN_H = 61;
 /** Wait this long after the bubble hides before giving the room back. */
 export const ROOM_RELEASE_MS = 1500;
 /** Re-ask at most this often while the bubble is shown (keep-alive). */
@@ -50,15 +58,20 @@ function num(v) {
 }
 
 /**
- * Extra px of window above her head so a bubble of `bubbleH` fits in the
- * `above` slot: that slot is `headTopY - gap - margin` tall today, so the
- * shortfall is `bubbleH + gap + margin - headTopY`, rounded up to `step` and
+ * Extra px of window above her head so a bubble of `bubbleH` really lands in
+ * the `above` slot. Two floors decide it: the bubble itself, and
+ * placeBubble's "at least 2 readable lines over the head" rule (`minH`) —
+ * the slot must be `max(bubbleH, minH) + gap` above the head top, inside
+ * `margin` px of window margin. So the shortfall is
+ * `max(bubbleH, minH) + gap + margin - headTopY`, rounded up to `step` and
  * capped at `max`. 0 when it already fits (or the inputs are junk).
  */
-export function roomNeeded({ headTopY, bubbleH, gap = ROOM_GAP, margin = ROOM_MARGIN,
+export function roomNeeded({ headTopY, bubbleH, minH = ROOM_MIN_H,
+                             gap = ROOM_GAP, margin = ROOM_MARGIN,
                              step = ROOM_STEP, max = ROOM_MAX } = {}) {
-  const head = num(headTopY), h = num(bubbleH);
-  if (head === null || h === null) return 0;
+  const head = num(headTopY), hRaw = num(bubbleH), floor = num(minH) ?? ROOM_MIN_H;
+  if (head === null || hRaw === null) return 0;
+  const h = Math.max(hRaw, floor);
   const need = h + (num(gap) ?? ROOM_GAP) + (num(margin) ?? ROOM_MARGIN) - head;
   if (need <= 0) return 0;
   const s = Math.max(1, num(step) ?? ROOM_STEP);
@@ -95,7 +108,8 @@ export class BubbleRoomTracker {
     this.askAt = -Infinity;
   }
 
-  frame({ nowMs, shown, headTopY = null, bubbleH = 0, aboveFits = false } = {}) {
+  frame({ nowMs, shown, headTopY = null, bubbleH = 0, minH = ROOM_MIN_H,
+          aboveFits = false } = {}) {
     const now = num(nowMs);
     if (now === null) return null;
     if (!shown) {
@@ -111,7 +125,7 @@ export class BubbleRoomTracker {
     this.shown = true;
     this.releaseAt = null;             // back within the window: no release, no pump
     if (!aboveFits) {
-      const need = roomNeeded({ headTopY, bubbleH, step: this.step, max: this.max });
+      const need = roomNeeded({ headTopY, bubbleH, minH, step: this.step, max: this.max });
       if (need > this.target) {        // grow further (never shrink while shown)
         this.target = need;
         this.askAt = now;

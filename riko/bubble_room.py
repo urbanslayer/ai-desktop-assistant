@@ -51,6 +51,11 @@ MAX_EXTRA = 220
 # must match bubblePlacement's `gap` / `margin` (client/index.html)
 GAP = 8
 MARGIN = 8
+# placeBubble only takes the above-head slot when it can show at least
+# `minLines` readable lines (padV(20) + 2 * lineH(20.3) = 60.6 -> 61). Asking
+# for less than that buys a window that STILL puts a one-line bubble on her
+# chest, so this is the request floor (must match client/js/bubble_room.js).
+MIN_BUBBLE_H = 61
 # the page waits this long after the bubble hides before releasing, so
 # consecutive lines/replies never pump the window up and down
 RELEASE_DELAY_MS = 1500
@@ -64,15 +69,22 @@ def round_step(px, step: int = STEP) -> int:
     return int(math.ceil(n / float(step)) * step)
 
 
-def room_needed(head_top_y, bubble_h, gap: int = GAP, margin: int = MARGIN,
+def room_needed(head_top_y, bubble_h, min_bubble_h: int = MIN_BUBBLE_H,
+                gap: int = GAP, margin: int = MARGIN,
                 step: int = STEP, max_extra: int = MAX_EXTRA) -> int:
-    """Extra px of window above her head so a bubble of `bubble_h` fits in
-    the `above` slot: that slot is `head_top_y - gap - margin` tall today, so
-    the shortfall is `bubble_h + gap + margin - head_top_y`, rounded up to
-    `step` and capped at `max_extra`. 0 when it already fits (or junk)."""
+    """Extra px of window above her head so a bubble of `bubble_h` really
+    lands in the `above` slot. Two floors decide it: the bubble itself and
+    placeBubble's "at least 2 readable lines over the head" rule
+    (`min_bubble_h`) — the slot must be `max(bubble_h, min_bubble_h) + gap`
+    above the head top, inside `margin` px of window margin. So the shortfall
+    is `max(bubble_h, min_bubble_h) + gap + margin - head_top_y`, rounded up
+    to `step` and capped at `max_extra`. 0 when it already fits (or junk).
+
+    Without the floor a one-line bubble would ask for ~16 px, the desktop
+    would grow the window, and the bubble would STILL sit on her chest."""
     try:
         head = float(head_top_y)
-        h = float(bubble_h)
+        h = max(float(bubble_h), float(min_bubble_h))
     except (TypeError, ValueError):
         return 0
     if not (math.isfinite(head) and math.isfinite(h)):

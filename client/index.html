@@ -357,6 +357,8 @@
       motion.attach(vrm);   // re-targets bones, gaze, and gestures onto the new body
       pose.attach(vrm);     // the pose layer rides the same bone cache (docs/TOUCH.md)
       resetTouchState();    // persona swap: no dangling grabs/sits on the old bones
+      if (bubbleRoomGranted > 0) postBubbleRoom(0);   // give the room back first
+      resetBubbleRoom();
       if (GAZE_PARAM) {
         const [gy, gp] = GAZE_PARAM.split(',').map(Number);
         motion.setGazeOverride({ yaw: (gy || 0) * Math.PI / 180,
@@ -544,21 +546,19 @@
     let bubbleRoomAsked = 0;     // last px we asked the desktop for
     let bubbleRoomGranted = 0;   // px the desktop REALLY gave
     let bubbleRoomPre = null;    // framing snapshot taken before a grow lands
+    let bubbleRoomEver = false;  // sticky: the room QA rides every later frame
+    let bubbleRoomPrev = null;   // previous frame's {viewH, feet, head} rows
+    let bubbleRoomDrift = null;  // {frames, maxPx, ok}: the +-1 px grow evidence
     function bubbleRoomQA() {
       return { asked: bubbleRoomAsked, granted: bubbleRoomGranted, pre: bubbleRoomPre,
+               drift: bubbleRoomDrift,
                win: [viewW(), viewH()] };
     }
     function postBubbleRoom(extra) {
       if (!DESKTOP || ROAM) return;
       const px = Math.max(0, Math.round(+extra || 0));
       bubbleRoomAsked = px;
-      if (px > bubbleRoomGranted && !bubbleRoomPre && bubbleQAState) {
-        // evidence for the harness gate: her feet px and head-top px in the
-        // LAST frame before the window grew, so "nothing below the feet moved,
-        // she did not change size" is measurable, not implied
-        bubbleRoomPre = { view: [viewW(), viewH()], feet: feetPxY(),
-                          head: bubbleQAState.head[1] };
-      }
+      if (px > 0) bubbleRoomEver = true;
       if (FAKE_DESK) {   // capture harness: the page IS the desktop
         bubbleRoomGranted = px;
         const b = fakeWinBase || { w: innerWidth, h: innerHeight };
@@ -581,6 +581,9 @@
       bubbleRoomAsked = 0;
       bubbleRoomGranted = 0;
       bubbleRoomPre = null;
+      bubbleRoomEver = false;
+      bubbleRoomPrev = null;
+      bubbleRoomDrift = null;
     }
     if (DESKTOP) {
       controls.enableZoom = false;  // the wheel is ours now; dolly is manual
@@ -818,6 +821,25 @@
           : foot ? foot.getWorldPosition(new THREE.Vector3()).add(new THREE.Vector3(0, -0.05, 0)) : null;
         if (!p) continue;
         const y = _pxOf(p.toArray())[1];
+        low = low === null ? y : Math.max(low, y);
+      }
+      return low;
+    }
+    // Same feet row in CANVAS pixels: every bubble/headroom QA rect is
+    // measured on the canvas (viewW/viewH), and in the capture harness the
+    // fake desktop canvas can differ from the browser viewport. In the real
+    // desktop the two are identical, so this only makes measurements honest.
+    function feetCanvasPx() {
+      if (!vrm) return null;
+      let low = null;
+      for (const s of ['left', 'right']) {
+        const toe = vrm.humanoid.getNormalizedBoneNode(`${s}Toes`);
+        const foot = vrm.humanoid.getNormalizedBoneNode(`${s}Foot`);
+        const p = toe ? toe.getWorldPosition(new THREE.Vector3())
+          : foot ? foot.getWorldPosition(new THREE.Vector3()).add(new THREE.Vector3(0, -0.05, 0)) : null;
+        if (!p) continue;
+        _tp.set(p.x, p.y, p.z).project(camera);
+        const y = (-_tp.y * 0.5 + 0.5) * viewH();
         low = low === null ? y : Math.max(low, y);
       }
       return low;
@@ -1755,6 +1777,7 @@
           // mode + bubble/head/face/body rects in CSS px; null when hidden.
           // Gate: client/tools/capture_frames.py evaluate_bubble_gates.
           bubbleQA: bubbleQAState,
+          ...(bubbleRoomEver ? { roomQA: bubbleRoomQA() } : {}),
           handToChin: d(bones.rightHand, chin),
           leftHandToRightElbow: d(bones.leftHand, bones.rightLowerArm),
           handAboveShoulderY: bones.rightHand && bones.rightShoulder
@@ -2324,15 +2347,7 @@
       if (chosen.tail) bubble.style.setProperty('--tail-x', `${Math.round(chosen.tail.x)}px`);
       const r = bubble.getBoundingClientRect();
       const rect4 = (q) => [q.x, q.y, q.w, q.h].map((v) => Math.round(v));
-      // Headroom request for THIS frame's placement: `above` did not fit and
-      // the bubble is riding her chest => ask the desktop for the missing px
-      // above her head (client/js/bubble_room.js decides whether to say
-      // anything at all this frame). Nothing else here moves the window.
-      const ask = bubbleRoom.frame({ nowMs: performance.now(), shown: true,
-                                     headTopY: rects.headRect.y, bubbleH: hFull,
-                                     aboveFits: !!modes.above });
-      if (ask !== null) postBubbleRoom(ask);
-      const fy = feetPxY();
+      const fy = feetCanvasPx();
       bubbleQAState = { shown: true, mode: chosen.mode, fontStep: chosen.fontStep,
                         bubble: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
                         head: rect4(rects.headRect), face: rect4(rects.faceRect),
@@ -2340,6 +2355,50 @@
                         ...(fy != null ? { feet: Math.round(fy) } : {}),
                         room: bubbleRoomQA(),
                         text: bubble.textContent.slice(0, 80) };
+      // Headroom request for THIS frame's placement: `above` did not fit and
+      // the bubble is riding her chest => ask the desktop for the missing px
+      // above her head (client/js/bubble_room.js decides whether to say
+      // anything at all this frame). Nothing else here moves the window.
+      // While no room is granted the frame's own feet/head pixels are kept as
+      // the grow evidence, so the harness compares the frame right after a
+      // grow with the frame right before it (idle bob between two adjacent
+      // frames is a fraction of a pixel; against a second-old frame it is
+      // 2 px and the +-1 px "feet did not move" gate would cry wolf).
+      if (bubbleRoomGranted === 0 && fy != null) {
+        bubbleRoomPre = { view: [view.w, view.h], feet: fy, head: rects.headRect.y };
+      }
+      // The +-1 px proof, measured on the ADJACENT frame pair a grow or a
+      // release lands between (docs/TOUCH.md "Speech bubble headroom"): when
+      // the canvas height changes by dv, every row of hers must move by
+      // exactly dv — the window edge moved the other way by the same amount,
+      // so on screen she neither moved nor resized. Frame-adjacent on
+      // purpose: her idle bob alone is ~2 px a second later, which is why the
+      // harness's own cross-time check carries a wider band.
+      if (fy != null && bubbleRoomPrev && bubbleRoomAsked > 0) {
+        const dv = view.h - bubbleRoomPrev.viewH;
+        if (dv !== 0) {
+          const px = Math.max(Math.abs((fy - bubbleRoomPrev.feet) - dv),
+                              Math.abs((rects.headRect.y - bubbleRoomPrev.head) - dv));
+          const maxPx = Math.max(px, bubbleRoomDrift ? bubbleRoomDrift.maxPx : 0);
+          bubbleRoomDrift = {
+            frames: (bubbleRoomDrift ? bubbleRoomDrift.frames : 0) + 1,
+            maxPx: Math.round(maxPx * 100) / 100,
+            ok: maxPx <= 1 && (bubbleRoomDrift ? bubbleRoomDrift.ok : true),
+          };
+        }
+      }
+      if (fy != null) {
+        bubbleRoomPrev = { viewH: view.h, feet: fy, head: rects.headRect.y };
+      }
+      const ask = bubbleRoom.frame({ nowMs: performance.now(), shown: true,
+                                     headTopY: rects.headRect.y, bubbleH: hFull,
+                                     // placeBubble's own floor: `above` is refused
+                                     // unless the slot shows 2 readable lines at the
+                                     // readable font, so a 1-line bubble needs this
+                                     // much room anyway (client/js/bubble_room.js).
+                                     minH: 20 + 2 * LINE_H[0],
+                                     aboveFits: !!modes.above });
+      if (ask !== null) postBubbleRoom(ask);
     }
     // Approval bubble: desktop.py emits 'approval' while a tool waits for an
     // answer; Enter says yes, Esc says no (a hub-side timeout denies anyway).

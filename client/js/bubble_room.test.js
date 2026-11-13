@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   roomNeeded, BubbleRoomTracker,
-  ROOM_STEP, ROOM_MAX, ROOM_GAP, ROOM_MARGIN, ROOM_RELEASE_MS, ROOM_ASK_MS,
+  ROOM_STEP, ROOM_MAX, ROOM_GAP, ROOM_MARGIN, ROOM_MIN_H, ROOM_RELEASE_MS, ROOM_ASK_MS,
 } from './bubble_room.js';
 
 // The SAME table tests/test_bubble_room.py asserts on the Python side
@@ -17,7 +17,18 @@ test('constants match the desktop module', () => {
   assert.equal(ROOM_MAX, 220);
   assert.equal(ROOM_GAP, 8);
   assert.equal(ROOM_MARGIN, 8);
+  assert.equal(ROOM_MIN_H, 61);
   assert.equal(ROOM_RELEASE_MS, 1500);
+});
+
+test('roomNeeded: a one-line bubble still buys the 2-line above slot', () => {
+  // placeBubble refuses `above` when the slot cannot show 2 readable lines
+  // (padV + 2 * lineH = 61 px), so a 40 px bubble needs the same room a 61 px
+  // one does — asking only for 40 would grow the window and STILL land on her
+  // chest (the exact bug the first acceptance run caught).
+  assert.equal(roomNeeded({ ...OWNER, bubbleH: 40 }), 64);    // 61+16-24 -> 64
+  assert.equal(roomNeeded({ ...SAMPLE, bubbleH: 40 }), 48);
+  assert.equal(roomNeeded({ ...SAMPLE, bubbleH: 40, minH: 40 }), 16);
 });
 
 test('roomNeeded: exactly-fitting text asks for nothing', () => {

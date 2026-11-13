@@ -50,7 +50,11 @@ def test_room_needed_matches_the_above_slot():
     for junk in (None, "", "abc", float("nan"), float("inf")):
         assert br.room_needed(junk, 100) == 0
         assert br.room_needed(44, junk) == 0
-    assert br.room_needed(44, 8) == 0        # nothing to gain
+    assert br.room_needed(44, 8) == 48         # 1-line bubble: the 2-line
+    # slot floor (MIN_BUBBLE_H) rules, not the bubble — asking for less would
+    # grow the window and STILL leave the bubble on her chest
+    assert br.room_needed(44, 8, min_bubble_h=8) == 0
+    assert br.room_needed(24, 40) == 64        # owner rig, one-line bubble
 
 
 def test_round_step_rounds_up_and_ignores_junk():
