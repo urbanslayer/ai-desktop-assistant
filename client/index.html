@@ -15,16 +15,31 @@
       font-size: 20px; color: #444; background: rgba(255, 255, 255, 0.8); cursor: pointer;
     }
 
-    /* Her speech bubble, at the top so it never covers her face for long */
+    /* Her speech bubble rides her live head (client/js/bubble.js placeBubble,
+       every frame while shown): ABOVE the head when there is room, else on
+       the torso below the chin — never over the face; 'top' (old pinned
+       behaviour) only in windows too small for both. The page writes
+       --bx/--by/--tail-x + width + max-height; long text scrolls inside. */
     #bubble {
-      position: fixed; top: 10px; left: 12px; right: 12px; max-height: 32vh; overflow-y: auto;
+      position: fixed; top: 0; left: 0; box-sizing: border-box;
+      width: 340px; max-height: 32vh; overflow-y: auto;
       padding: 10px 14px; border-radius: 16px; color: #2b2233;
       background: rgba(255, 255, 255, 0.93); box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
-      opacity: 0; transform: translateY(-8px); transition: opacity .25s, transform .25s; pointer-events: none;
+      opacity: 0; transition: opacity .25s; pointer-events: none;
+      transform: translate(var(--bx, 12px), var(--by, 10px));
       scrollbar-width: none;
     }
-    #bubble.show { opacity: 1; transform: none; pointer-events: auto; }
+    #bubble.show { opacity: 1; pointer-events: auto; }
+    #bubble.small { font-size: 13px; }   /* one step down to fit above the head */
     #bubble.error { background: rgba(255, 228, 228, 0.95); color: #7a1c1c; font-size: 13px; }
+    /* Tail pointing at her: down when above the head, up when on the body.
+       It lives in the >=8 px clearance gap, so it never touches the face. */
+    #bubble.tail-down::after, #bubble.tail-up::after {
+      content: ""; position: absolute; left: var(--tail-x, 50%); margin-left: -8px;
+      border: 8px solid transparent;
+    }
+    #bubble.tail-down::after { top: 100%; margin-top: -2px; border-bottom: 0; border-top-color: rgba(255, 255, 255, 0.93); }
+    #bubble.tail-up::after { bottom: 100%; margin-bottom: -2px; border-top: 0; border-bottom-color: rgba(255, 255, 255, 0.93); }
 
     /* What she heard you say + what she's doing */
     #hud {
@@ -37,13 +52,9 @@
     }
     #heard.show, #status.show { opacity: 1; }
     #status { align-self: center; }
-    /* Roam strip: the bubble and the status pill follow her along the strip
-       (the page sets --roam-x to her projected screen offset) */
-    html.desktop.roam #bubble {
-      left: calc(50% + var(--roam-x, 0px)); right: auto; width: max-content;
-      max-width: min(60vw, 560px); transform: translate(-50%, -8px);
-    }
-    html.desktop.roam #bubble.show { transform: translate(-50%, 0); }
+    /* Roam strip: the status pill follows her along the strip (the page sets
+       --roam-x to her projected screen offset). The bubble does NOT need the
+       strip special case anymore: placeBubble tracks her head in every mode. */
     html.desktop.roam #status { transform: translateX(var(--roam-x, 0px)); }
     #status.listening { background: rgba(200, 40, 70, 0.88); }
     #status.listening::before { content: "● "; animation: blink 1s infinite; }
@@ -142,6 +153,7 @@
       tickerState, setEnabled, applySnapshot, press, resolveControl, tickerView,
     } from './js/ticker.js';
     import { WalkDirector } from './js/walk.js';
+    import { placeBubble, BubbleTracker } from './js/bubble.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
              GestureTracker, framingDistance, feetAnchorTarget,
              sizeChanged, controlsDistanceBand,
@@ -1178,7 +1190,8 @@
       if (now - xPostAt >= 5 && Math.abs(director.walk.x - (lastXSent ?? 0)) > 0.05) {
         xPostAt = now; persistWalkX();
       }
-      // bubble + status pill follow her projected head down the strip
+      // status pill follows her projected head down the strip (the speech
+      // bubble rides her head via bubblePlacement/placeBubble in every mode)
       const rig = motion.rig;
       if (rig) {
         _bboxV.set(director.walk.x, rig.headTop + 0.12, 0.15).project(camera);
@@ -1504,11 +1517,14 @@
       renderer.render(scene, camera);
       renderer.getContext().finish();
       const tqa = tickerCaptureQA();
-      if (!tqa || !tqa.shown) return renderer.domElement.toDataURL('image/png');
-      // Song-ticker evidence (docs/SPOTIFY_NOTES.md): this harness shoots the
-      // WebGL canvas, which by nature misses DOM. Composite the ticker's REAL
-      // state — its live rects, text and button mode (tickerCaptureQA) — onto
-      // the shot so the PNG shows exactly what the page paints at that frame.
+      const bqa = bubbleQAState;
+      if (!(tqa && tqa.shown) && !(bqa && bqa.shown)) return renderer.domElement.toDataURL('image/png');
+      // DOM evidence (this harness shoots the WebGL canvas, which by nature
+      // misses DOM): composite the ticker's REAL state and the speech
+      // bubble's REAL placement (live rects from tickerCaptureQA / the
+      // bubbleQA seam) onto the shot so the PNG shows exactly what the page
+      // paints. The bubble shot also outlines the QA bands (red = face,
+      // blue = head) so "never over the face" is checkable by eye.
       const c = document.createElement('canvas');
       c.width = renderer.domElement.width; c.height = renderer.domElement.height;
       const g = c.getContext('2d');
@@ -1516,35 +1532,71 @@
       const sx = c.width / innerWidth, sy = c.height / innerHeight;
       g.save();
       g.scale(sx, sy);
-      const [bx, by, bw, bh] = tqa.bar;
-      g.fillStyle = 'rgba(30, 25, 45, 0.55)';
-      g.fillRect(bx, by, bw, bh);
-      const [kx, ky, kw, kh] = tqa.btn;
-      g.fillStyle = 'rgba(255, 255, 255, 0.16)';
-      g.beginPath();
-      g.roundRect(kx, ky, kw, kh, 8);
-      g.fill();
-      g.fillStyle = '#f3eefc';
-      if (tqa.btnState === 'pause') {
-        g.fillRect(kx + kw * 0.28, ky + kh * 0.2, kw * 0.15, kh * 0.6);
-        g.fillRect(kx + kw * 0.57, ky + kh * 0.2, kw * 0.15, kh * 0.6);
-      } else {
+      if (tqa && tqa.shown) {
+        const [bx, by, bw, bh] = tqa.bar;
+        g.fillStyle = 'rgba(30, 25, 45, 0.55)';
+        g.fillRect(bx, by, bw, bh);
+        const [kx, ky, kw, kh] = tqa.btn;
+        g.fillStyle = 'rgba(255, 255, 255, 0.16)';
         g.beginPath();
-        g.moveTo(kx + kw * 0.32, ky + kh * 0.2);
-        g.lineTo(kx + kw * 0.78, ky + kh * 0.5);
-        g.lineTo(kx + kw * 0.32, ky + kh * 0.8);
-        g.closePath();
+        g.roundRect(kx, ky, kw, kh, 8);
         g.fill();
+        g.fillStyle = '#f3eefc';
+        if (tqa.btnState === 'pause') {
+          g.fillRect(kx + kw * 0.28, ky + kh * 0.2, kw * 0.15, kh * 0.6);
+          g.fillRect(kx + kw * 0.57, ky + kh * 0.2, kw * 0.15, kh * 0.6);
+        } else {
+          g.beginPath();
+          g.moveTo(kx + kw * 0.32, ky + kh * 0.2);
+          g.lineTo(kx + kw * 0.78, ky + kh * 0.5);
+          g.lineTo(kx + kw * 0.32, ky + kh * 0.8);
+          g.closePath();
+          g.fill();
+        }
+        const tx = kx + kw + 8, tw = bx + bw - tx - 8;
+        g.beginPath();
+        g.rect(tx, by, tw, bh);
+        g.clip();
+        g.font = '12.5px system-ui, sans-serif';
+        g.textBaseline = 'middle';
+        // marquee frames look mid-scroll on purpose (the CSS animation's phase
+        // isn't readable cross-process; the .scroll class IS the proof)
+        g.fillText(tqa.text, tx + (tqa.marquee ? -tw * 0.35 : 0), by + bh / 2);
       }
-      const tx = kx + kw + 8, tw = bx + bw - tx - 8;
-      g.beginPath();
-      g.rect(tx, by, tw, bh);
-      g.clip();
-      g.font = '12.5px system-ui, sans-serif';
-      g.textBaseline = 'middle';
-      // marquee frames look mid-scroll on purpose (the CSS animation's phase
-      // isn't readable cross-process; the .scroll class IS the proof)
-      g.fillText(tqa.text, tx + (tqa.marquee ? -tw * 0.35 : 0), by + bh / 2);
+      if (bqa && bqa.shown) {
+        const [bx, by, bw, bh] = bqa.bubble;
+        const [hx0, hy0, hw0, hh0] = bqa.head, [fx0, fy0, fw0, fh0] = bqa.face;
+        g.save();
+        g.setLineDash([4, 3]); g.lineWidth = 1;
+        g.strokeStyle = 'rgba(40, 90, 255, 0.85)'; g.strokeRect(hx0, hy0, hw0, hh0);
+        g.strokeStyle = 'rgba(255, 40, 40, 0.9)'; g.strokeRect(fx0, fy0, fw0, fh0);
+        g.restore();
+        g.fillStyle = 'rgba(255, 255, 255, 0.93)';
+        if (bqa.mode === 'above' || bqa.mode === 'body') {   // tail toward her head
+          const txp = bx + Math.min(Math.max(bqa.mode && (hx0 + hw0 / 2 - bx), 16), bw - 16);
+          g.beginPath();
+          if (bqa.mode === 'above') { g.moveTo(txp - 8, by + bh - 1); g.lineTo(txp + 8, by + bh - 1); g.lineTo(txp, by + bh + 9); }
+          else { g.moveTo(txp - 8, by + 1); g.lineTo(txp + 8, by + 1); g.lineTo(txp, by - 9); }
+          g.closePath(); g.fill();
+        }
+        g.beginPath(); g.roundRect(bx, by, bw, bh, 16); g.fill();
+        g.fillStyle = '#2b2233';
+        const fs = bqa.fontStep === 1 ? 13 : 15;
+        g.font = `${fs}px system-ui, sans-serif`; g.textBaseline = 'top';
+        g.save();
+        g.beginPath(); g.rect(bx + 14, by + 10, bw - 28, bh - 20); g.clip();
+        let line = '', ly = by + 10;
+        for (const word of String(bqa.text).split(' ')) {
+          const test = line ? `${line} ${word}` : word;
+          if (g.measureText(test).width > bw - 28 && line) {
+            g.fillText(line, bx + 14, ly); ly += fs * 1.35; line = word;
+          } else line = test;
+        }
+        g.fillText(line, bx + 14, ly);
+        g.restore();
+        g.fillStyle = 'rgba(255, 255, 255, 0.85)'; g.font = '11px system-ui, sans-serif';
+        g.fillText(`mode=${bqa.mode}`, bx + 4, by > 18 ? by - 15 : by + bh + 3);
+      }
       g.restore();
       return c.toDataURL('image/png');
     };
@@ -1613,6 +1665,10 @@
         },
         ndc: { rightHand: handNdc, rightElbow: elbowNdc, leftHand: lHandNdc, leftElbow: lElbowNdc },
         metrics: {
+          // speech-bubble placement QA (bubblePlacement in this page):
+          // mode + bubble/head/face/body rects in CSS px; null when hidden.
+          // Gate: client/tools/capture_frames.py evaluate_bubble_gates.
+          bubbleQA: bubbleQAState,
           handToChin: d(bones.rightHand, chin),
           leftHandToRightElbow: d(bones.leftHand, bones.rightLowerArm),
           handAboveShoulderY: bones.rightHand && bones.rightShoulder
@@ -2068,8 +2124,121 @@
     function flash(el, text, seconds, cls = '') {
       el.textContent = text;
       el.className = `show ${cls}`;
+      if (el === bubble) { bubbleTracker.reset(); bubblePlacement(T()); }
       clearTimeout(timers[el.id]);
       if (seconds) timers[el.id] = setTimeout(() => el.classList.remove('show'), seconds * 1000);
+    }
+    // ── Bubble placement (client/js/bubble.js) ─────────────────────────
+    // Every frame while the bubble is shown (cheap: only when shown):
+    // project head / face / torso bands from the LIVE rig, measure the
+    // bubble at its current width/font, and let placeBubble pick
+    // above-head > body-below-chin > top. The tracker below adds 0.5 s mode
+    // hysteresis + a position low-pass so hops/sways/zoom never make it
+    // flip or jump. Roam strip uses the same path (the --roam-x special
+    // case is gone). VRM 0.x and 1.0 both work: normalized bone nodes; rigs
+    // missing bones fall back to rig.headTop / rig.chest / bbox.
+    const bubbleTracker = new BubbleTracker();
+    let bubbleQAState = null;   // exported via window.rikoMeasure (harness gate)
+    const _bubV = new THREE.Vector3();
+    const _bubPx = (x, y, z) => {   // world -> CSS px (same projection as rikoMeasure)
+      _bubV.set(x, y, z).project(camera);
+      return [(_bubV.x * 0.5 + 0.5) * viewW(), (-_bubV.y * 0.5 + 0.5) * viewH()];
+    };
+    function bubbleBodyRects() {
+      const rig = motion.rig;
+      if (!rig || !vrm) return null;
+      const wpos = (n) => {
+        const b = vrm.humanoid?.getNormalizedBoneNode(n);
+        return b ? b.getWorldPosition(new THREE.Vector3()) : null;
+      };
+      const headW = wpos('head');
+      const sceneX = vrm.scene.position.x || 0;
+      const hx = headW ? headW.x : sceneX;
+      const hz = headW ? headW.z : 0;
+      // skull top: head bone + 0.62*headLen (motion.js headTop rule) plus
+      // the rest-pose hair/hat pad (bboxTop - headTop), so hats/hair clear
+      const hairPad = Math.max(0, rig.bboxTop - rig.headTop);
+      const skullTopY = headW ? headW.y + 0.62 * rig.headLen + hairPad : rig.headTop + hairPad;
+      const chinY = headW ? headW.y - 0.50 * rig.headLen : rig.headTop - rig.headLen;
+      const eL = wpos('eyeLeft'), eR = wpos('eyeRight');
+      const eyeY = eL && eR ? (eL.y + eR.y) / 2 : skullTopY - 0.35 * rig.headLen;
+      const band = (yTop, yBot, halfX) => {
+        const tl = _bubPx(hx - halfX, yTop, hz), tr = _bubPx(hx + halfX, yTop, hz);
+        const bl = _bubPx(hx - halfX, yBot, hz), br = _bubPx(hx + halfX, yBot, hz);
+        const x = Math.min(tl[0], tr[0], bl[0], br[0]);
+        const y = Math.min(tl[1], tr[1], bl[1], br[1]);
+        const r = Math.max(tl[0], tr[0], bl[0], br[0]);
+        const b = Math.max(tl[1], tr[1], bl[1], br[1]);
+        return { x, y, w: r - x, h: b - y };
+      };
+      const headRect = band(skullTopY, chinY, 0.55 * rig.headLen);
+      const faceTop = band(eyeY, eyeY, 0.45 * rig.headLen);
+      const chinBand = band(chinY, chinY, 0.45 * rig.headLen);
+      const faceRect = { x: faceTop.x, y: faceTop.y, w: faceTop.w, h: chinBand.y + chinBand.h - faceTop.y };
+      const hipsW = wpos('hips') || (rig.chest ? { y: rig.chest[1] - 0.12, x: hx, z: hz } : null);
+      const hipY = hipsW ? hipsW.y : chinY - 0.5;
+      const bodyRect = band(chinY, hipY, 0.5 * rig.shoulderWidth);
+      // first frames project through stale matrices: drop absurd samples
+      for (const r of [headRect, faceRect, bodyRect]) {
+        if (!Number.isFinite(r.x + r.y + r.w + r.h)
+            || Math.abs(r.y) > 8 * viewH() || Math.abs(r.x) > 8 * viewW()) return null;
+      }
+      return { headRect, faceRect, bodyRect };
+    }
+    function bubblePlacement(nowS) {
+      if (!bubble.classList.contains('show')) {
+        if (bubbleTracker.mode !== null) bubbleTracker.reset();
+        bubbleQAState = null;
+        return;
+      }
+      const rects = bubbleBodyRects();
+      if (!rects) return;
+      const view = { w: viewW(), h: viewH() };
+      const margin = 8, gap = 8;
+      const LINE_H = [20.3, 17.6];   // 15px and 13px at line-height 1.35
+      const W = Math.min(340, view.w - 2 * margin);
+      bubble.style.width = `${W}px`;
+      const measure = (step) => {   // natural height at this font (forced reflow, only while shown)
+        bubble.classList.toggle('small', step === 1);
+        bubble.style.maxHeight = 'none';
+        return bubble.offsetHeight;
+      };
+      const modes = {};
+      for (const step of [0, 1]) {  // one font step down may buy the above-head slot
+        const p = placeBubble({ ...rects, view, margin, gap, lineH: LINE_H[step],
+                                bubble: { w: W, h: measure(step) }, force: 'above' });
+        if (p.mode === 'above') { modes.above = { ...p, fontStep: step }; break; }
+      }
+      const hFull = measure(0);     // body/top always keep the readable font
+      const pBody = placeBubble({ ...rects, view, margin, gap, bubble: { w: W, h: hFull }, force: 'body' });
+      if (pBody.mode === 'body') modes.body = { ...pBody, fontStep: 0 };
+      modes.top = { ...placeBubble({ ...rects, view, margin, gap,
+                                     bubble: { w: W, h: hFull }, force: 'top' }), fontStep: 0 };
+      const chosen = bubbleTracker.decide({ modes }, nowS);
+      if (!chosen) return;
+      // Safety clamp (mid-hop): the eased y may lag the anchor it hangs from
+      // (chin / head top) during fast motion — never let the lag push it
+      // onto the face (body) or into the hair (above).
+      let y = chosen.y;
+      let x = chosen.x;
+      if (chosen.mode === 'body') y = Math.max(y, chosen.ty);
+      else if (chosen.mode === 'above') y = Math.min(y, chosen.ty);
+      else if (chosen.mode === 'top' && chosen.xClamp === 'min') x = Math.min(x, chosen.tx);
+      else if (chosen.mode === 'top' && chosen.xClamp === 'max') x = Math.max(x, chosen.tx);
+      bubble.classList.toggle('small', chosen.fontStep === 1);
+      bubble.classList.toggle('tail-down', chosen.mode === 'above');
+      bubble.classList.toggle('tail-up', chosen.mode === 'body');
+      bubble.style.maxHeight = `${Math.floor(chosen.maxH)}px`;
+      bubble.style.setProperty('--bx', `${Math.round(x)}px`);
+      bubble.style.setProperty('--by', `${Math.round(y)}px`);
+      if (chosen.tail) bubble.style.setProperty('--tail-x', `${Math.round(chosen.tail.x)}px`);
+      const r = bubble.getBoundingClientRect();
+      const rect4 = (q) => [q.x, q.y, q.w, q.h].map((v) => Math.round(v));
+      bubbleQAState = { shown: true, mode: chosen.mode, fontStep: chosen.fontStep,
+                        bubble: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+                        head: rect4(rects.headRect), face: rect4(rects.faceRect),
+                        body: rect4(rects.bodyRect), view: [view.w, view.h],
+                        text: bubble.textContent.slice(0, 80) };
     }
     // Approval bubble: desktop.py emits 'approval' while a tool waits for an
     // answer; Enter says yes, Esc says no (a hub-side timeout denies anyway).
@@ -2393,6 +2562,7 @@
       vrm.update(dt);
       controls.update();  // runs the glide
       renderer.render(scene, camera);
+      bubblePlacement(T());  // follows her head while she talks (cheap: only when shown)
     });
   </script>
 </body>

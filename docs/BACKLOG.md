@@ -256,9 +256,16 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
     sounds like" — the voice-sample/preview text, not her greeting. Find which path (startup greet vs the
     persona-switch/voice-preview path) feeds the TTS, make both speak the active persona's greeting, test the
     switch case too.
-15. **Speech bubble above the head, not over the face** (owner request 2026-11-12, do after 13): place the
-    bubble above the head bone (fallback: on the body) using the live head position, kept on screen and
-    clear of the face; mind the touch rule that the bubble swallows presses (TOUCH.md) and the roam strip.
+15. **Speech bubble above the head, not over the face** (owner request 2026-11-12, do after 13, done
+    2026-11-13): the bubble now rides her live head — above the head when it fits (>= 2 readable lines,
+    font may step down once), otherwise on the torso below the chin, `top` (slid beside her face in wide
+    roam strips) only when neither fits; never over the face band, gated per frame by the `bubble`
+    scenario in the capture harness (rules + measurements: docs/TOUCH.md "Speech bubble placement",
+    evidence docs/evidence/bubble_placement_sample.png). Measured: the default 420x680 desktop window
+    keeps only 28 px (sample rig) / 8 px (owner rig) of above-head space at visual scale 1.0 (head top
+    y≈44/24, fit framing includes the wave envelope), so above-head fits only at hop apexes with the
+    small font; a reserved top band in `applyFraming` (~+90 px) would make above-head fit 1-line
+    replies — proposed, not implemented (framing changes out of scope here).
 16. **Reduce memory use** (owner report 2026-11-12): loading the desktop assistant uses over 1 GB of RAM,
     which is too high. First measure: per-process RSS/PSS of desktop.py and its web-view (renderer, GPU,
     utility) with the owner's avatar vs the sample avatar, idle and after a few minutes of chat. Then cut

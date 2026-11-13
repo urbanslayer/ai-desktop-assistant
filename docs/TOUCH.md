@@ -94,6 +94,41 @@ animations) follows after T1 is merged and tested, and reuses the posing code bu
 - Settings with secrets/write-only rules unchanged; new settings are plain values.
 - Commit after each green milestone.
 
+## Speech bubble placement (BACKLOG item 15)
+
+The speech bubble never sits on her face. While it is shown, the page re-places it EVERY frame
+(cheap: only while shown) from the LIVE rig — `placeBubble` + `BubbleTracker` in `client/js/bubble.js`
+(pure, `node --test` covered), driven by `bubblePlacement()` in `client/index.html`:
+
+- **above** (preferred): the bubble over her head, bottom edge >= 8 px above the head top (hair/hat pad
+  included: rest-pose `bboxTop - headTop` is added to the live skull top), horizontally centred on the
+  projected head and clamped inside the window with 8 px margins. If the text would not leave >= ~2
+  readable lines, the font steps down once (13 px) and the text scrolls inside `max-height` before the
+  mode gives up. A CSS tail (`::after` triangle) points down at her.
+- **body** (fallback): over the chest/torso, top edge below the chin + 8 px, so eyes/mouth are never
+  covered; `max-height` runs down to the hips. Tail points up at her.
+- **top** (last resort): the old pinned-to-top behaviour, only when the window is too small for both.
+- Head/face/torso bands are projected from normalized bones (VRM 0.x and 1.0 alike; rigs missing bones
+  fall back to `rig.headTop` / `rig.chest` / bbox). Mode switches carry 0.5 s hysteresis and the
+  position is low-passed, so hops, sways and zoom never make the bubble flip or jump. Roam-strip mode
+  uses the SAME placement (the old `--roam-x` bubble special case is gone; the status pill still rides
+  `--roam-x`).
+- Presses on the bubble still pass through to touch (unchanged rule above). The approval pill and the
+  error bubble keep their own styles; the error bubble rides the same placement because it is `#bubble`.
+- QA seam: `metrics.bubbleQA` in `window.rikoMeasure` (mode + bubble/head/face/body rects in CSS px),
+  gated by `evaluate_bubble_gates()` in `client/tools/capture_frames.py` (scenario `bubble`): bubble
+  rect never intersects the face band, `above` keeps >= 6 px over the head top, bubble fully inside
+  the canvas. The `?capture` PNGs composite the real bubble DOM rect + the QA bands (the harness shoots
+  the WebGL canvas, which misses DOM).
+
+Measured headroom above the head at visual scale 1.0 (fit framing includes the wave/think envelope,
+so the head sits near the window top; usable above-space = head-top y − 16 px gap+margin): default
+420x680 gives 28 px (sample rig, head top y≈44) / 8 px (owner rig, y≈24); 1000x900 gives 52 px /
+23 px. Two readable lines need ~61 px, so at idle `above` fits NONE of short/1-3-sentence/6+-sentence
+replies at the default size, and only transiently (hop apex, small font) at 1000x900 — `body` is the
+workhorse mode. A ~90 px reserved top band in `applyFraming` would make `above` fit one-line replies
+at the default size (proposed in BACKLOG item 15, not implemented — framing changes are out of scope).
+
 ## Live-issue notes (Nov 2026 grab investigation)
 
 Owner report (Furina persona, normal desktop window, press held ~250 ms then dragged): "moving her hand
