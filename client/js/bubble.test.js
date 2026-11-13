@@ -135,3 +135,18 @@ test('ty carries the exact target so the page can clamp the lag off the face', (
   assert.ok(p.y < p.ty, 'eased value lags above the target');
   assert.ok(Math.max(p.y, p.ty) === 300, 'page clamp max(y,ty) keeps it below the chin');
 });
+
+test('top fallback slides beside the face in wide strips (no face overlap)', () => {
+  // roam strip: full window width, tiny head near the vertical top
+  const p = placeBubble(base({
+    view: { w: 1920, h: 277 }, bubble: MED,
+    headRect: { x: 950, y: 14, w: 20, h: 44 },
+    faceRect: { x: 952, y: 20, w: 16, h: 38 },
+    bodyRect: { x: 944, y: 58, w: 32, h: 20 },
+  }));
+  assert.equal(p.mode, 'top');
+  assert.equal(overlapArea({ x: p.x, y: p.y, w: p.w, h: p.h },
+                           { x: 952, y: 20, w: 16, h: 38 }), 0,
+    `top bubble still on face at x=${p.x}`);
+  assert.ok(p.x >= 8 && p.x + p.w <= 1920 - 8, 'stays inside the window');
+});

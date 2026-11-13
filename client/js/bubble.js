@@ -95,9 +95,26 @@ export function placeBubble(opts) {
       return { mode, x, y: top, w: W, h, maxH: space,
                tail: { x: clamp(headCx - x, 16, Math.max(16, W - 16)), side: 'up' } };
     }
-    // 'top': the old pinned-to-top behaviour.
+    // 'top': the old pinned-to-top behaviour (tiny windows / roam strips),
+    // but slide it horizontally off her face when there is room on a side —
+    // in a wide strip the head sits mid-window and both sides have space.
     const h = Math.min(bubble.h, view.h * 0.32);
-    return { mode: 'top', x: fitX(), y: margin, w: W, h,
+    let x = fitX();
+    let xClamp = null;
+    if (face.y != null && overlapArea({ x, y: margin, w: W, h }, face) > 0) {
+      const lim = Math.max(margin, view.w - margin - W);
+      const cand = [face.x - margin - W, face.x + face.w + margin]
+        .map((cx) => clamp(cx, margin, lim))
+        .filter((cx) => overlapArea({ x: cx, y: margin, w: W, h }, face) === 0)
+        .sort((a, b) => Math.abs(a + W / 2 - headCx) - Math.abs(b + W / 2 - headCx));
+      if (cand.length) {
+        x = cand[0];
+        // which side we parked on: the page clamps the eased x so the low-pass
+        // never drags the bubble back ACROSS her face mid-slide.
+        xClamp = x + W <= face.x ? 'min' : 'max';
+      }
+    }
+    return { mode: 'top', x, y: margin, w: W, h, xClamp,
              maxH: Math.floor(view.h * 0.32), tail: null };
   }
 
@@ -151,6 +168,6 @@ export class BubbleTracker {
     // (above: never sink below the target into her hair; body: never rise
     // above it into her face). The target rides the body, so clamping to it
     // is safe under hops/sway while the ease still damps projection jitter.
-    return { ...chosen, ty: chosen.y, x: this.px.x, y: this.px.y };
+    return { ...chosen, tx: chosen.x, ty: chosen.y, x: this.px.x, y: this.px.y };
   }
 }

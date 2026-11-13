@@ -2220,13 +2220,16 @@
       // (chin / head top) during fast motion — never let the lag push it
       // onto the face (body) or into the hair (above).
       let y = chosen.y;
+      let x = chosen.x;
       if (chosen.mode === 'body') y = Math.max(y, chosen.ty);
       else if (chosen.mode === 'above') y = Math.min(y, chosen.ty);
+      else if (chosen.mode === 'top' && chosen.xClamp === 'min') x = Math.min(x, chosen.tx);
+      else if (chosen.mode === 'top' && chosen.xClamp === 'max') x = Math.max(x, chosen.tx);
       bubble.classList.toggle('small', chosen.fontStep === 1);
       bubble.classList.toggle('tail-down', chosen.mode === 'above');
       bubble.classList.toggle('tail-up', chosen.mode === 'body');
       bubble.style.maxHeight = `${Math.floor(chosen.maxH)}px`;
-      bubble.style.setProperty('--bx', `${Math.round(chosen.x)}px`);
+      bubble.style.setProperty('--bx', `${Math.round(x)}px`);
       bubble.style.setProperty('--by', `${Math.round(y)}px`);
       if (chosen.tail) bubble.style.setProperty('--tail-x', `${Math.round(chosen.tail.x)}px`);
       const r = bubble.getBoundingClientRect();
