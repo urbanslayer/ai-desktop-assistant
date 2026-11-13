@@ -75,6 +75,32 @@ test('tracker: grows further for a longer line, never shrinks mid-bubble', () =>
   assert.equal(t.target, 176);
 });
 
+test('tracker: a grant that lands a step short is topped up, not given up on', () => {
+  // She is talking, above does not fit, we ask 48. The grant lands while her
+  // head has bobbed, so the slot is still 16 px short: the frame reports
+  // granted=32 and headTopY measured IN THE GROWN canvas. The ask must become
+  // granted + the remaining shortfall (48), never the smaller fresh number.
+  const t = new BubbleRoomTracker({ askMs: 1e9 });   // keep-alive off: pure grow logic
+  assert.equal(t.frame({ nowMs: 0, shown: true, ...SAMPLE, bubbleH: 61 }), 48);
+  assert.equal(t.frame({ nowMs: 100, shown: true, ...SAMPLE, bubbleH: 61,
+                         headTopY: 44 + 32, granted: 32 }), 48);
+  assert.equal(t.target, 48);
+  // same answer again: no POST storm (the desktop cannot give more than 32 yet)
+  assert.equal(t.frame({ nowMs: 116, shown: true, ...SAMPLE, bubbleH: 61,
+                         headTopY: 44 + 32, granted: 32 }), null);
+  // fully granted => above fits => no further ask, no shrink
+  assert.equal(t.frame({ nowMs: 200, shown: true, ...SAMPLE, bubbleH: 61,
+                         headTopY: 44 + 48, granted: 48, aboveFits: true }), null);
+  assert.equal(t.target, 48);
+});
+
+test('tracker: top-up respects the ceiling', () => {
+  const t = new BubbleRoomTracker({ askMs: 1e9 });
+  assert.equal(t.frame({ nowMs: 0, shown: true, ...OWNER, bubbleH: 600 }), ROOM_MAX);
+  assert.equal(t.frame({ nowMs: 100, shown: true, ...OWNER, bubbleH: 600,
+                         headTopY: 24 + 208, granted: 208 }), ROOM_MAX);
+});
+
 test('tracker: ceiling caps the ask for a 6-sentence reply', () => {
   const t = new BubbleRoomTracker();
   assert.equal(t.frame({ nowMs: 0, shown: true, ...OWNER, bubbleH: 600 }), ROOM_MAX);

@@ -22,7 +22,9 @@
 //     instead of pumping the window up and down;
 //   * a slow keep-alive re-ask (askMs) while shown: the desktop answers
 //     'already' without touching the compositor, and an external resize
-//     (a zoom FIT, a drag) is repaired on the next ask.
+//     (a zoom FIT, a drag) is repaired on the next ask; a grant that landed
+//     a step short (her head moved between ask and grant) is topped up by
+//     adding the room already granted to the freshly measured shortfall.
 //
 // The numbers mirror riko/bubble_room.py 1:1 (room_needed / STEP / MAX /
 // GAP / MARGIN) — both sides are unit-tested against the same table.
@@ -82,7 +84,7 @@ export function roomNeeded({ headTopY, bubbleH, minH = ROOM_MIN_H,
  * One tracker per page (the page has one bubble). The render loop calls
  * frame() every frame with what THIS frame's placement decided:
  *
- *   frame({ nowMs, shown, headTopY, bubbleH, aboveFits }) → null | px
+ *   frame({ nowMs, shown, headTopY, bubbleH, aboveFits, granted }) → null | px
  *
  * A number is what to POST to /control/bubble-room right now (0 = give the
  * room back); null means say nothing. It never decides anything about her
@@ -97,6 +99,7 @@ export class BubbleRoomTracker {
     this.askMs = askMs;
     this.target = 0;         // px we are holding (what we last asked for)
     this.shown = false;
+    this.grantedSeen = -1;   // last grant the desktop reported (change detector)
     this.releaseAt = null;   // wall ms at which an idle bubble releases
     this.askAt = -Infinity;  // last POST time (debounce + keep-alive clock)
   }
@@ -104,12 +107,13 @@ export class BubbleRoomTracker {
   reset() {
     this.target = 0;
     this.shown = false;
+    this.grantedSeen = -1;
     this.releaseAt = null;
     this.askAt = -Infinity;
   }
 
   frame({ nowMs, shown, headTopY = null, bubbleH = 0, minH = ROOM_MIN_H,
-          aboveFits = false } = {}) {
+          aboveFits = false, granted = 0 } = {}) {
     const now = num(nowMs);
     if (now === null) return null;
     if (!shown) {
@@ -125,11 +129,32 @@ export class BubbleRoomTracker {
     this.shown = true;
     this.releaseAt = null;             // back within the window: no release, no pump
     if (!aboveFits) {
-      const need = roomNeeded({ headTopY, bubbleH, minH, step: this.step, max: this.max });
-      if (need > this.target) {        // grow further (never shrink while shown)
-        this.target = need;
+      // `granted` is what the window ALREADY grew by: headTopY is measured in
+      // the grown canvas, so roomNeeded() now returns the ADDITIONAL px the
+      // slot still lacks. Her head bobs a few px between the ask and the
+      // grant, so the first grant can land a step short; without adding the
+      // room we already hold, the recomputed need would look smaller than the
+      // target and the bubble would stay on her chest forever.
+      const g = Math.max(0, Math.round(num(granted) ?? 0));
+      const add = roomNeeded({ headTopY, bubbleH, minH, step: this.step,
+                               max: this.max - g });
+      const want = Math.min(this.max, g + add);
+      if (want > this.target) {        // grow further (never shrink while shown)
+        this.target = want;
         this.askAt = now;
+        this.grantedSeen = g;
         return this.target;
+      }
+      // The grant UNDER-delivered (monitor clamp, or her head bobbed between
+      // ask and grow): re-assert the target ONCE per changed answer, so a
+      // desktop that cannot give more is not spammed every frame — the slow
+      // keep-alive below carries any repair of an external resize.
+      if (g !== this.grantedSeen) {
+        this.grantedSeen = g;
+        if (this.target > g) {
+          this.askAt = now;
+          return this.target;
+        }
       }
     }
     if (this.target > 0 && now - this.askAt >= this.askMs) {

@@ -2348,6 +2348,36 @@
       const r = bubble.getBoundingClientRect();
       const rect4 = (q) => [q.x, q.y, q.w, q.h].map((v) => Math.round(v));
       const fy = feetCanvasPx();
+      // Room evidence FIRST (it rides this frame's metrics snapshot): while no
+      // room is granted the frame's own feet/head pixels are kept as the
+      // pre-grow evidence, and the +-1 px proof is measured on the ADJACENT
+      // frame pair a grow or release lands between — when the canvas height
+      // changes by dv, every row of hers must move by exactly dv (the window
+      // edge moved the other way by the same amount, so on screen she neither
+      // moved nor resized). Adjacent frames only: her idle bob alone is ~2 px
+      // a second later, which is why the harness's cross-time check carries a
+      // wider band (client/tools/capture_frames.py evaluate_bubble_gates).
+      if (bubbleRoomGranted === 0 && fy != null) {
+        bubbleRoomPre = { view: [view.w, view.h], feet: fy, head: rects.headRect.y };
+      }
+      if (fy != null && bubbleRoomPrev && bubbleRoomAsked > 0) {
+        const dv = view.h - bubbleRoomPrev.viewH;
+        if (dv !== 0) {
+          const px = Math.max(Math.abs((fy - bubbleRoomPrev.feet) - dv),
+                              Math.abs((rects.headRect.y - bubbleRoomPrev.head) - dv));
+          const maxPx = Math.max(px, bubbleRoomDrift ? bubbleRoomDrift.maxPx : 0);
+          bubbleRoomDrift = {
+            frames: (bubbleRoomDrift ? bubbleRoomDrift.frames : 0) + 1,
+            maxPx: Math.round(maxPx * 100) / 100,
+            ok: maxPx <= 1 && (bubbleRoomDrift ? bubbleRoomDrift.ok : true),
+            last: { dv, feet: Math.round((fy - bubbleRoomPrev.feet) * 100) / 100,
+                    head: Math.round((rects.headRect.y - bubbleRoomPrev.head) * 100) / 100 },
+          };
+        }
+      }
+      if (fy != null) {
+        bubbleRoomPrev = { viewH: view.h, feet: fy, head: rects.headRect.y };
+      }
       bubbleQAState = { shown: true, mode: chosen.mode, fontStep: chosen.fontStep,
                         bubble: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
                         head: rect4(rects.headRect), face: rect4(rects.faceRect),
@@ -2359,37 +2389,6 @@
       // the bubble is riding her chest => ask the desktop for the missing px
       // above her head (client/js/bubble_room.js decides whether to say
       // anything at all this frame). Nothing else here moves the window.
-      // While no room is granted the frame's own feet/head pixels are kept as
-      // the grow evidence, so the harness compares the frame right after a
-      // grow with the frame right before it (idle bob between two adjacent
-      // frames is a fraction of a pixel; against a second-old frame it is
-      // 2 px and the +-1 px "feet did not move" gate would cry wolf).
-      if (bubbleRoomGranted === 0 && fy != null) {
-        bubbleRoomPre = { view: [view.w, view.h], feet: fy, head: rects.headRect.y };
-      }
-      // The +-1 px proof, measured on the ADJACENT frame pair a grow or a
-      // release lands between (docs/TOUCH.md "Speech bubble headroom"): when
-      // the canvas height changes by dv, every row of hers must move by
-      // exactly dv — the window edge moved the other way by the same amount,
-      // so on screen she neither moved nor resized. Frame-adjacent on
-      // purpose: her idle bob alone is ~2 px a second later, which is why the
-      // harness's own cross-time check carries a wider band.
-      if (fy != null && bubbleRoomPrev && bubbleRoomAsked > 0) {
-        const dv = view.h - bubbleRoomPrev.viewH;
-        if (dv !== 0) {
-          const px = Math.max(Math.abs((fy - bubbleRoomPrev.feet) - dv),
-                              Math.abs((rects.headRect.y - bubbleRoomPrev.head) - dv));
-          const maxPx = Math.max(px, bubbleRoomDrift ? bubbleRoomDrift.maxPx : 0);
-          bubbleRoomDrift = {
-            frames: (bubbleRoomDrift ? bubbleRoomDrift.frames : 0) + 1,
-            maxPx: Math.round(maxPx * 100) / 100,
-            ok: maxPx <= 1 && (bubbleRoomDrift ? bubbleRoomDrift.ok : true),
-          };
-        }
-      }
-      if (fy != null) {
-        bubbleRoomPrev = { viewH: view.h, feet: fy, head: rects.headRect.y };
-      }
       const ask = bubbleRoom.frame({ nowMs: performance.now(), shown: true,
                                      headTopY: rects.headRect.y, bubbleH: hFull,
                                      // placeBubble's own floor: `above` is refused
@@ -2397,6 +2396,7 @@
                                      // readable font, so a 1-line bubble needs this
                                      // much room anyway (client/js/bubble_room.js).
                                      minH: 20 + 2 * LINE_H[0],
+                                     granted: bubbleRoomGranted,
                                      aboveFits: !!modes.above });
       if (ask !== null) postBubbleRoom(ask);
     }

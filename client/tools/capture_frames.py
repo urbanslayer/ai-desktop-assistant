@@ -550,10 +550,13 @@ def evaluate_bubble_gates(outdir):
                            exactly the granted px (canvas coords): the window
                            top moved up by the same amount, so on screen her
                            feet stay put and only new space appears above her.
-                           Tolerance +-1 px on the first grown frame (adjacent
-                           to the kept pre-grow frame) and +-3 px afterwards
-                           (her idle bob moves the toe/head bones a couple of
-                           px by itself; a real re-frame slips by ~25 px)
+                           Band +-3 px (captures are ~1 s apart, so the frame
+                           pair is not adjacent and her idle bob moves those
+                           bones ~2 px by itself; a real re-frame slips ~25 px)
+      drift-+-1px          the page's own ADJACENT-frame proof (roomQA.drift):
+                           on the frame pair each resize landed between, her
+                           feet and head rows moved by EXACTLY the canvas
+                           height delta, +-1 px
       same-size            head top moved down by exactly the granted px too
                            (pixels-per-metre preserved: she did not scale)
     and across the run: once room was granted, a later frame must show the
@@ -566,7 +569,9 @@ def evaluate_bubble_gates(outdir):
     grew = False          # any frame where room was actually granted
     base_win = None       # the fake desktop window WITHOUT room (pre.view)
     restored = False      # a later frame back at that size
-    prev_granted = 0      # previous frame's granted px (idle-bob tolerance)
+    first_granted_t = None  # capture time of the first frame with room granted
+    drift_seen = False      # any frame carrying the page's +-1 px measurement
+    drift_ok = True         # ... and every measurement it carried was clean
     for j in sorted(Path(outdir).glob("*.json")):
         try:
             met = json.loads(j.read_text()).get("metrics") or {}
@@ -607,13 +612,21 @@ def evaluate_bubble_gates(outdir):
         rqa = qa.get("room") or room
         asked, granted = rqa.get("asked", 0), rqa.get("granted", 0)
         drift = rqa.get("drift") or {}
+        m = re.search(r"t(\d+\.\d+)s", j.name)
+        t_sec = float(m.group(1)) if m else None
+        if granted > 0 and first_granted_t is None and t_sec is not None:
+            first_granted_t = t_sec
         if asked:
             # Enough granted room MUST put the bubble over her head; a partial
             # grant (the monitor's top clamped it) may not be enough yet, and a
             # bubble shorter than placeBubble's 2-line above-slot stays on the
-            # chest anyway — only a FULL grant is a hard promise.
+            # chest anyway — only a FULL grant is a hard promise. BubbleTracker
+            # holds the old mode 0.5 s after a better mode reappears, so the
+            # first second after a grant is transition, not violation.
+            settling = (first_granted_t is not None and t_sec is not None
+                        and t_sec < first_granted_t + 1.0)
             checks.append((f"granted-room-above(a={asked},g={granted})",
-                           granted < asked or mode == "above"))
+                           granted < asked or mode == "above" or settling))
             checks.append((f"no-fake-above(a={asked},g={granted})",
                            granted > 0 or mode != "above"))
             # The page's own +-1 px invariance proof, measured on the ADJACENT
@@ -621,21 +634,26 @@ def evaluate_bubble_gates(outdir):
             # and head rows moved by EXACTLY the canvas delta. Any resize that
             # happened while the seam is live must have been measured; frames
             # seconds apart are only ever compared with the wider idle-bob band.
-            if granted > 0:
+            # A frame may legitimately carry no drift record (it was captured
+            # before any resize it could witness); what may never happen is a
+            # resize the page measured as >1 px. The run-level check below
+            # demands that the proof exists at least once when room was given.
+            if drift:
+                drift_seen = True
                 checks.append((f"drift-+-1px(max {drift.get('maxPx')} px over "
-                               f"{drift.get('frames')} resize(s))", bool(drift.get("ok"))))
-            else:
-                checks.append(("drift-+-1px(no resize)", drift.get("ok", True) is not False))
+                               f"{drift.get('frames')} resize(s))", drift.get("ok") is True))
+                if drift.get("ok") is not True:
+                    drift_ok = False
             snap = rqa.get("pre") or pre
             if granted > 0 and snap:
                 # Grow evidence compares a grown frame with the LAST un-grown
-                # frame the page kept. The frame right where the grow landed
-                # must match to the pixel (±1: adjacent frames); frames later
-                # in the same bubble are seconds apart and her idle bob moves
-                # the toe/head bones a couple of px on its own, so they carry
-                # a ±3 px band — still far below any real re-frame (a 4.7%
-                # scale slip here is ~25 px).
-                tol = 1 if prev_granted == 0 else 3
+                # frame the page kept. Captures are ~1 s apart and the grow
+                # lands between two of them, so the pair is NEVER adjacent and
+                # her idle bob alone moves the toe/head bones ~2 px in that
+                # second: this cross-time check carries a ±3 px band (a real
+                # re-frame slips ~25 px). The strict ±1 px proof is the page's
+                # own adjacent-frame measurement, roomQA.drift, checked above.
+                tol = 3
                 # grow-upward-only in CANVAS coords: everything of hers moves
                 # down by exactly the granted px (the window top moved up by
                 # the same amount, so nothing of hers moved on screen)
@@ -658,6 +676,15 @@ def evaluate_bubble_gates(outdir):
     if not frames:
         print("[bubble-gate] FAIL: no captured frame showed the bubble — "
               "check the say: touch step and the capture times", flush=True)
+        fails += 1
+    if grew and not drift_seen:
+        print("[bubble-gate] FAIL: room was granted but the page never measured "
+              "a +-1 px adjacent-frame grow (roomQA.drift missing) — the "
+              "invariance claim is unproven", flush=True)
+        fails += 1
+    elif grew and not drift_ok:
+        print("[bubble-gate] FAIL: the page measured a grow that moved her by "
+              "more than +-1 px (roomQA.drift.ok false)", flush=True)
         fails += 1
     if grew and not restored:
         print(f"[bubble-gate] FAIL: room was granted but the window never came "
