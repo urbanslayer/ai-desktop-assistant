@@ -248,27 +248,37 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
 11. The thinking-pose fingers only curl on rigs that have weighted finger bones (the sample avatar doesn't).
 12. Test-run warnings (MCP SDK ping deprecation, FastAPI `on_event`); silence or migrate.
 13. **DONE 2026-11-12 — Hops bend the legs** (owner request): docs/SELF_ANIMATION.md "Hops bend the legs"
-    (planted crouch, airborne tuck, doc-time landing cushion; hop cookbook + lint on the hub).
-14. **DONE 2026-11-12 (hub fix, needs hub redeploy)**: the greeting-audio cache key had no greeting text, so a
-    clip cached while the greeting was empty (preview line) replayed after the greeting was set; PUT persona now
-    drops cached persona audio when the greeting changes. Original report: **Greeting uses the persona's own line** (owner report 2026-11-12): on app start and on a
-    persona switch, Jahoda (greeting "Jahoda, reporting for duty!") instead speaks "Senpai, this is what my voice
-    sounds like" — the voice-sample/preview text, not her greeting. Find which path (startup greet vs the
-    persona-switch/voice-preview path) feeds the TTS, make both speak the active persona's greeting, test the
-    switch case too.
-15. **Speech bubble above the head, not over the face** (owner request 2026-11-12, do after 13, done
-    2026-11-13): the bubble now rides her live head — above the head when it fits (>= 2 readable lines,
-    font may step down once), otherwise on the torso below the chin, `top` (slid beside her face in wide
-    roam strips) only when neither fits; never over the face band, gated per frame by the `bubble`
-    scenario in the capture harness (rules + measurements: docs/TOUCH.md "Speech bubble placement",
-    evidence docs/evidence/bubble_placement_sample.png). Measured: the default 420x680 desktop window
-    keeps only 28 px (sample rig) / 8 px (owner rig) of above-head space at visual scale 1.0 (head top
-    y≈44/24, fit framing includes the wave envelope), so above-head fits only at hop apexes with the
-    small font; a reserved top band in `applyFraming` (~+90 px) would make above-head fit 1-line
-    replies — proposed, not implemented (framing changes out of scope here).
+    (planted crouch, airborne tuck, doc-time landing cushion; hop cookbook + lint on the hub). Deployed + pushed.
+    **Owner to check live:** restart `uv run desktop.py`, ask her to hop / play `victory_leap` — knees should
+    bend on the crouch, tuck in the air and absorb the landing. Report anything odd on his avatar.
+14. **DONE 2026-11-12 — Greeting uses the persona's own line** (hub fix, deployed to eve): the greeting-audio
+    cache key had no greeting text, so a clip cached while Jahoda's greeting was still empty (the voice-preview
+    line "Hey senpai, this is how I sound…") replayed on every start/switch. PUT persona now drops cached
+    persona audio when the greeting changes (regression test in tests/test_hub_voice.py). Owner to confirm on
+    the next switch to Jahoda.
+15. **DONE 2026-11-13 — Speech bubble above the head, not over the face**: the bubble rides her live head
+    (client/js/bubble.js: above the head > on the torso below the chin > top), never over the face band
+    (gated per frame by the capture harness `bubble` scenario). Owner decision for room above the head: the
+    desktop GROWS THE WINDOW UPWARD while a bubble shows (feet and her size unchanged; riko/bubble_room.py +
+    `/control/bubble-room`, one batched hyprctl call through `HyprlandSizer.dispatch_geometry`) and restores the
+    exact geometry ~1.5 s after it hides; never persisted; skipped in the roam strip, deferred while a scale
+    gesture / drag / sit is in flight; the new band is click-through except the bubble. Rules: docs/TOUCH.md
+    "Speech bubble placement"; evidence docs/evidence/bubble_placement_sample.png.
+    **Not yet seen live** (children may never drive the real compositor): owner to restart desktop.py and check
+    (a) the window grows up while she talks and returns exactly after, (b) clicks through the empty band reach
+    the window behind, (c) behaviour when her window sits at the very top of a monitor (grant is clamped →
+    bubble falls back to the chest), (d) no flicker on multi-sentence replies. Any glitch: first check the
+    desktop log for the `bubble-room` dispatch argv/grant.
 16. **Reduce memory use** (owner report 2026-11-12): loading the desktop assistant uses over 1 GB of RAM,
     which is too high. First measure: per-process RSS/PSS of desktop.py and its web-view (renderer, GPU,
     utility) with the owner's avatar vs the sample avatar, idle and after a few minutes of chat. Then cut
     the biggest costs, e.g. avatar textures (downscale/compress, free CPU copies after GPU upload), Chromium
     flags/process model, Python-side imports and caches. Set a target from the measurements and keep a
     repeatable measurement script.
+    Next session starts here (owner asked to reduce memory after the bubble work).
+17. **Converted Genshin VRMs (PMX → VRM 0.0 + 1.0)** — reference, done 2026-11-12, outside this repo: pipeline
+    in the owner's local pmx2vrm scripts (Blender + mmd_tools + VRM add-on; sphere-only colliders because the
+    owner's Godot viewer, godot-vrm, mis-projects capsules). Remaining known minor issues: Sandrone skirt grazes
+    the thighs by up to ~15 mm on long strides, Lauma 7–9 mm; long ribbons skip arm colliders (may pass through
+    an arm on big arm motions).
+
