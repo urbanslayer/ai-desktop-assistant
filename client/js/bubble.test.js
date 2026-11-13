@@ -126,3 +126,12 @@ test('low-pass: position eases toward the target and snaps within 0.5 px', () =>
   for (let i = 0; i < 60; i++) y = t.decide(modes({ ...A, y: 160 }), 1 + i * 0.1).y;
   assert.equal(y, 160, 'snapped to the target');
 });
+
+test('ty carries the exact target so the page can clamp the lag off the face', () => {
+  const t = new BubbleTracker({ alpha: 0.3 });
+  t.decide(modes(B), 0);
+  const p = t.decide(modes({ ...B, y: 300 }), 0.1);   // chin dropped
+  assert.equal(p.ty, 300);
+  assert.ok(p.y < p.ty, 'eased value lags above the target');
+  assert.ok(Math.max(p.y, p.ty) === 300, 'page clamp max(y,ty) keeps it below the chin');
+});

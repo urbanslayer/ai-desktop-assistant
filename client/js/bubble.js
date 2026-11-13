@@ -147,6 +147,10 @@ export class BubbleTracker {
         this.px[k] = Math.abs(d) <= 0.5 ? chosen[k] : this.px[k] + d * this.alpha;
       }
     }
-    return { ...chosen, x: this.px.x, y: this.px.y };
+    // ty = this frame's exact target: the page clamps the eased y against it
+    // (above: never sink below the target into her hair; body: never rise
+    // above it into her face). The target rides the body, so clamping to it
+    // is safe under hops/sway while the ease still damps projection jitter.
+    return { ...chosen, ty: chosen.y, x: this.px.x, y: this.px.y };
   }
 }

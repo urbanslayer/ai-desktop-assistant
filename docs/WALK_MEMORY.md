@@ -36,7 +36,8 @@ Builds on docs/ANIMATION.md §3 (owner decision: overlay strip, click-through ex
   - She wanders now and then: when idle, every 1–4 min, a 1–6 s walk to a random spot. She never walks while
     listening, thinking, speaking or typing, or while the approval bubble is up. A walk in progress stops
     smoothly when one of those starts.
-  - Speech bubble and status pill follow her.
+  - Speech bubble and status pill follow her (the bubble via the normal placeBubble placement,
+    docs/TOUCH.md "Speech bubble placement"; the pill via `--roam-x`).
   - Dragging her (left-drag) moves her along the strip; right-drag / shift-drag / scroll keep their meanings.
   - Persistence: her last x position is saved and restored on start.
 - **Director.** Walking is a director-level activity: a pure state, tested with `node --test`. Gestures

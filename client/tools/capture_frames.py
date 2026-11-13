@@ -125,6 +125,14 @@ SCENARIOS = {
     # exact text, marquee iff long title, bar above the feet rects.
     "ticker": (None, []),
     "ticker_short": (None, []),
+    # speech-bubble placement QA (docs/TOUCH.md): drive a bubble up with
+    # --touch "say:<text>@ms" and photograph/measure at frames while it is
+    # shown. evaluate_bubble_gates() gates metrics.bubbleQA per frame:
+    # never over the face, above-head keeps >= 6 px over the head top, and
+    # the bubble stays fully inside the canvas. Combine with --animations +
+    # "custom:<name>@ms" for mid-hop frames and --force "wave@1" for the
+    # raised-hand case.
+    "bubble": (None, []),
 }
 
 
@@ -521,6 +529,61 @@ def evaluate_ticker_gates(outdir, expect_marquee, expect_text):
     return fails
 
 
+def evaluate_bubble_gates(outdir):
+    """Speech-bubble placement gates off metrics.bubbleQA (the page's live
+    placement seam, client/js/bubble.js): for every captured frame that
+    shows the bubble:
+      face never covered   bubble rect does not intersect the face band
+                           (tolerance 2 px of rect rounding)
+      above clears head    mode=above: bubble bottom <= head top - 6 px
+      body below chin      mode=body:   bubble top >= face bottom (chin)
+      inside canvas        bubble rect fully inside the canvas
+      mode sane            mode in {above, body, top}
+    Returns the number of FAILed checks.
+    """
+    fails = 0
+    frames = 0
+    for j in sorted(Path(outdir).glob("*.json")):
+        try:
+            met = json.loads(j.read_text()).get("metrics") or {}
+        except (json.JSONDecodeError, OSError):
+            continue
+        qa = met.get("bubbleQA")
+        if not qa or not qa.get("shown"):
+            continue
+        frames += 1
+        bx, by, bw, bh = qa["bubble"]
+        hx, hy, hw, hh = qa["head"]
+        fx, fy, fw, fh = qa["face"]
+        vw, vh = qa["view"]
+        mode = qa.get("mode")
+        ox = min(bx + bw, fx + fw) - max(bx, fx)
+        oy = min(by + bh, fy + fh) - max(by, fy)
+        overlap = ox > 2 and oy > 2      # > 2 px on both axes = real overlap
+        checks = [
+            (f"mode={mode}", mode in ("above", "body", "top")),
+            ("no-face-overlap", not overlap),
+            ("inside-canvas", bx >= -0.5 and by >= -0.5
+             and bx + bw <= vw + 0.5 and by + bh <= vh + 0.5),
+        ]
+        if mode == "above":
+            checks.append((f"clears-head-top(by={by + bh}<=hy-6={hy - 6})",
+                           by + bh <= hy - 6 + 0.5))
+        if mode == "body":
+            checks.append(("below-chin", by >= fy + fh - 2))
+        bad = [c for c, ok in checks if not ok]
+        fails += len(bad)
+        print(f"[bubble-gate] {j.name} mode={mode} bubble={qa['bubble']} "
+              f"head={qa['head']} face={qa['face']} view={qa['view']} "
+              f"font={qa.get('fontStep')} "
+              + ("PASS" if not bad else "FAIL " + "; ".join(bad)), flush=True)
+    if not frames:
+        print("[bubble-gate] FAIL: no captured frame showed the bubble — "
+              "check the say: touch step and the capture times", flush=True)
+        fails += 1
+    return fails
+
+
 class Handler(SimpleHTTPRequestHandler):
     t0 = time.monotonic()
     queue = []
@@ -778,6 +841,8 @@ def main():
     if args.scenario in ("ticker", "ticker_short"):
         gate_fails += evaluate_ticker_gates(args.outdir, args.scenario == "ticker",
                                             _text)
+    if args.scenario == "bubble":
+        gate_fails += evaluate_bubble_gates(args.outdir)
     print(f"[harness] scenario={args.scenario} shots={len(shots)} touch-gate-fails={gate_fails}")
     for s in shots:
         print("  ", os.path.join(args.outdir, s))

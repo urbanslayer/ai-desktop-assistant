@@ -2216,12 +2216,18 @@
                                      bubble: { w: W, h: hFull }, force: 'top' }), fontStep: 0 };
       const chosen = bubbleTracker.decide({ modes }, nowS);
       if (!chosen) return;
+      // Safety clamp (mid-hop): the eased y may lag the anchor it hangs from
+      // (chin / head top) during fast motion — never let the lag push it
+      // onto the face (body) or into the hair (above).
+      let y = chosen.y;
+      if (chosen.mode === 'body') y = Math.max(y, chosen.ty);
+      else if (chosen.mode === 'above') y = Math.min(y, chosen.ty);
       bubble.classList.toggle('small', chosen.fontStep === 1);
       bubble.classList.toggle('tail-down', chosen.mode === 'above');
       bubble.classList.toggle('tail-up', chosen.mode === 'body');
       bubble.style.maxHeight = `${Math.floor(chosen.maxH)}px`;
       bubble.style.setProperty('--bx', `${Math.round(chosen.x)}px`);
-      bubble.style.setProperty('--by', `${Math.round(chosen.y)}px`);
+      bubble.style.setProperty('--by', `${Math.round(y)}px`);
       if (chosen.tail) bubble.style.setProperty('--tail-x', `${Math.round(chosen.tail.x)}px`);
       const r = bubble.getBoundingClientRect();
       const rect4 = (q) => [q.x, q.y, q.w, q.h].map((v) => Math.round(v));
