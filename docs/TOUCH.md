@@ -121,9 +121,13 @@ The speech bubble never sits on her face. While it is shown, the page re-places 
   the canvas. The `?capture` PNGs composite the real bubble DOM rect + the QA bands (the harness shoots
   the WebGL canvas, which misses DOM).
 
-Measured headroom at visual scale 1.0 is small in the default window because the fit framing includes
-the wave/think envelope: see BACKLOG item 15 report (2026-11-13) — at 420x680 the above mode rarely
-fits 1-3-sentence replies; a reserved top band in `applyFraming` would fix it (proposed, not done).
+Measured headroom above the head at visual scale 1.0 (fit framing includes the wave/think envelope,
+so the head sits near the window top): default 420x680 leaves ~36 px (sample rig) / ~16 px (owner
+rig); 1000x900 leaves ~52 px / ~33 px. Two readable lines need ~61 px (66 with the small font step),
+so at idle `above` fits NONE of short/1-3-sentence/6+-sentence replies at the default size, and only
+transiently (hop apex, small font) at 1000x900 — `body` is the workhorse mode. A ~90 px reserved top
+band in `applyFraming` would make `above` fit one-line replies at the default size (proposed in
+BACKLOG item 15, not implemented — window/framing changes are out of scope).
 
 ## Live-issue notes (Nov 2026 grab investigation)
 
