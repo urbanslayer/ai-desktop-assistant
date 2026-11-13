@@ -178,7 +178,8 @@ nothing is permanently re-framed. Reserved-band framing stayed out; the window m
   unchanged and height = pre + granted; her feet row and head row moved DOWN by exactly the granted
   px (so on screen: unchanged, same size, ±1 px); and across the run the window must come back to its
   pre-grow size after release. Evidence: `docs/evidence/bubble_placement_sample.png` (before = no
-  room, bubble on her chest; after = grown window, bubble above her head).
+  room, bubble on her chest; after = grown window, bubble above her head; plus the released frame
+  proving her pixel size is unchanged when the window comes back).
 
 ## Live-issue notes (Nov 2026 grab investigation)
 
