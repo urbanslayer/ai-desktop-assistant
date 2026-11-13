@@ -129,6 +129,58 @@ replies at the default size, and only transiently (hop apex, small font) at 1000
 workhorse mode. A ~90 px reserved top band in `applyFraming` would make `above` fit one-line replies
 at the default size (proposed in BACKLOG item 15, not implemented — framing changes are out of scope).
 
+### Speech bubble headroom (owner decision 2026-11-13)
+
+Owner decision: the bubble belongs ABOVE her head, so while she is talking the DESKTOP WINDOW GROWS
+UPWARD and gives the room back afterwards — feet stay where they are, she does not change size, and
+nothing is permanently re-framed. Reserved-band framing stayed out; the window moves instead.
+
+- **Page** (`client/js/bubble_room.js`, pure + `node --test`, wired in `bubblePlacement()`): when the
+  bubble is shown and `above` does not fit, the missing pixels are
+  `bubbleH + ROOM_GAP(8) + ROOM_MARGIN(8) − headTopY`, rounded UP to `ROOM_STEP` (16 px) and capped at
+  `ROOM_MAX` (220 px), and posted to the desktop. While the bubble is up the target never shrinks (a
+  shorter line does not take room back), it only grows when the text needs more, and a keep-alive
+  re-ask every `ROOM_ASK_MS` reconciles refusals/clamps. When the bubble has been gone for
+  `ROOM_RELEASE_MS` (1.5 s — consecutive lines and replies reuse the room instead of pumping the
+  window) exactly ONE release (`extra: 0`) is sent. Roam STRIP mode never asks: its band already
+  slides beside her head.
+- **Seam**: `POST /control/bubble-room` `{extra: <css px>}` → `{ok, granted, reason}` (`extra: 0` =
+  give it back; `reason` is `grown|already|no-room|released|roam|hidden|gesture|no-desktop|error`).
+  `granted` is what the window REALLY got — it can be less than asked (monitor top) or 0, and the
+  page keeps `body` placement until it is enough. The desktop's `argv` evidence is stripped before
+  the page sees the reply.
+- **Desktop** (`riko/bubble_room.py` pure geometry + `HyprlandBubbleRoom`, route
+  `handle_bubble_room_post` in `desktop.py`): grow = `y -= extra`, `h += extra`, `x`/`w` untouched,
+  clamped so the top stops at the monitor's usable top; ONE batched `hyprctl --batch` (resize ; move,
+  the same cached window/monitor state and dispatcher as the scroll-zoom sizer in
+  `riko/avatar_scale.py`) per decision. Release restores the pre-grow rect exactly and the grown
+  geometry is NEVER persisted as her saved size/position. Guards that defer without touching the
+  window: roam strip active, window hidden, a scale gesture in flight (the page re-asks on its
+  keep-alive). A user drag calls `mark_dirty()` at drag end, so the release restores around WHERE
+  THE USER LEFT HER; a scale FIT that changes her normal size mid-bubble calls `rebase(w, h)` so the
+  room is re-measured from the new size instead of resizing back to the old one.
+- **Why she does not move**: the canvas resize re-frames through the existing zoom invariant
+  (`syncViewport` → `applyScaleFrame`): pixels-per-metre preserved and her feet anchored a fixed
+  margin above the canvas BOTTOM. The window top moved up by exactly the granted px, so on screen
+  every pixel of hers stays put and all of the new space is above her head — where `placeBubble`
+  then puts the bubble.
+- **Click-through**: the new band is pass-through like the rest of the transparent window; the bubble
+  itself is reported in `hit_extras` (with the ticker button) by `bboxBody`, and
+  `riko/touch_desk.py:interactive_rects()` carries ALL those islands into the roam click-through
+  mask and the press arbiter, so a press on the bubble above her head reaches the page instead of
+  dragging the window.
+- **Harness + gates**: `client/tools/capture_frames.py --room` (bubble scenario) answers the seam
+  inside the page (`FAKE_DESK`): the fake desktop window is `--size` (passed to the page as
+  `?fakebase=WxH`) and the BROWSER window is 240 px taller so the grown canvas fits — i.e. growing
+  upward for real. Per-frame gates in `evaluate_bubble_gates()` (`metrics.roomQA` +
+  `bubbleQA.room`, measured against the last pre-grow frame): granted room ⇒ `mode=above`; asked but
+  not granted ⇒ NOT `above` (no claiming the head slot the desktop did not give); canvas width
+  unchanged and height = pre + granted; her feet row and head row moved DOWN by exactly the granted
+  px (so on screen: unchanged, same size, ±1 px); and across the run the window must come back to its
+  pre-grow size after release. Evidence: `docs/evidence/bubble_placement_sample.png` (before = no
+  room, bubble on her chest; after = grown window, bubble above her head; plus the released frame
+  proving her pixel size is unchanged when the window comes back).
+
 ## Live-issue notes (Nov 2026 grab investigation)
 
 Owner report (Furina persona, normal desktop window, press held ~250 ms then dragged): "moving her hand

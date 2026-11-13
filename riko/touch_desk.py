@@ -90,20 +90,36 @@ def limb_at(bbox, x, y):
     return None
 
 
+def interactive_rects(bbox) -> list:
+    """Every interactive island the page reported OUTSIDE her limb rects:
+    `hit_extra` (one rect: the song ticker's play/pause button) plus
+    `hit_extras` (a list of rects — since the bubble headroom work the speech
+    bubble rides ABOVE her head, i.e. outside every body rect, so it must be
+    an island of its own or a press on it becomes a window drag)."""
+    out = []
+    b = bbox or {}
+    raw = [b.get("hit_extra")]
+    extra = b.get("hit_extras")
+    if isinstance(extra, (list, tuple)):
+        raw.extend(extra)
+    for r in raw:
+        if (isinstance(r, (list, tuple)) and len(r) == 4
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        for v in r)):
+            out.append(tuple(float(v) for v in r))
+    return out
+
+
 def interactive_at(bbox, x, y) -> bool:
     """A press at (x, y) (page CSS px) belongs to the PAGE, not to a window
-    drag: it is on a limb rect or on the bbox post's `hit_extra` (the song
-    ticker's play/pause button — the one interactive island outside her body).
+    drag: it is on a limb rect or on one of the bbox post's extra islands
+    (see interactive_rects: the song ticker's button, the speech bubble).
     Live bug 2026-11-12: the floating window's press arbitration consumed
     every off-limb press as a window move, so the ticker button never saw a
     click and /control/music-control was never POSTed."""
     if limb_at(bbox, x, y) is not None:
         return True
-    extra = (bbox or {}).get("hit_extra")
-    if (isinstance(extra, (list, tuple)) and len(extra) == 4
-            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                    for v in extra)):
-        ex, ey, ew, eh = (float(v) for v in extra)
+    for ex, ey, ew, eh in interactive_rects(bbox):
         if ew > 0 and eh > 0 and ex <= x <= ex + ew and ey <= y <= ey + eh:
             return True
     return False

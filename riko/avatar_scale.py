@@ -378,6 +378,44 @@ class HyprlandSizer:
                 self.style = "lua"
         return self.style
 
+    # ── shared compositor state (riko/bubble_room.py grows on top of it) ──
+    def window_state(self, force: bool = False):
+        """(error, {monitor, geometry, address}) — her cached window + monitor
+        state, exposed for the other window mover (bubble headroom) so one
+        reader owns the `hyprctl -j` round trips. Refreshes when nothing is
+        cached, when `force`, or when the monitor cache aged out."""
+        with self._lock:
+            err, _ = self._ensure_state(force=force)
+            if err:
+                return err, None
+            return None, {"monitor": self._monitor, "geometry": self._geom,
+                          "address": self._address}
+
+    def dispatch_geometry(self, geometry):
+        """Put her window at an EXACT logical (x, y, w, h) — no scale math —
+        in the same ONE batched dispatch (resize + move) `apply()` uses.
+        {ok, geometry, argv, error}: the cached geometry becomes this rect on
+        success (we are the only mover) and everything refreshes on failure."""
+        x, y, w, h = (int(v) for v in geometry)
+        with self._lock:
+            err, _ = self._ensure_state()
+            if err:
+                return {"ok": False, "error": err}
+            style = self._resolve_style()
+            if style == "lua" and not self._address:
+                self.invalidate()
+                return {"ok": False, "error": "own window address unknown"}
+            argv = hypr_scale_batch(style, w, h, x, y, self._address, self.app_id)
+            from .desktop_sense.util import run
+            done = run(argv, timeout=3, runner=self.runner)
+            ok, error = batch_reply_ok(getattr(done, "stdout", ""))
+            if not ok:
+                self.invalidate()
+                return {"ok": False, "error": error or "dispatch failed",
+                        "geometry": (x, y, w, h), "argv": argv}
+            self._geom = (x, y, w, h)
+            return {"ok": True, "geometry": (x, y, w, h), "argv": argv}
+
     # ── the applies ───────────────────────────────────────────────────
     def fit_cap(self):
         """The largest FINAL scale her monitor can show (the page clamps
