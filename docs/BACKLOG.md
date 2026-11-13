@@ -262,10 +262,10 @@ Agreed with the owner on 2026-11-04. The order is the suggested order; the owner
     roam strips) only when neither fits; never over the face band, gated per frame by the `bubble`
     scenario in the capture harness (rules + measurements: docs/TOUCH.md "Speech bubble placement",
     evidence docs/evidence/bubble_placement_sample.png). Measured: the default 420x680 desktop window
-    keeps only ~36 px (sample rig) / ~16 px (owner rig) above the head at visual scale 1.0 because the
-    fit framing includes the wave envelope, so above-head fits only at hop apexes with the small font;
-    a reserved top band in `applyFraming` (~+90 px) would make above-head fit 1-line replies — proposed,
-    not implemented (window/framing changes out of scope here).
+    keeps only 28 px (sample rig) / 8 px (owner rig) of above-head space at visual scale 1.0 (head top
+    y≈44/24, fit framing includes the wave envelope), so above-head fits only at hop apexes with the
+    small font; a reserved top band in `applyFraming` (~+90 px) would make above-head fit 1-line
+    replies — proposed, not implemented (framing changes out of scope here).
 16. **Reduce memory use** (owner report 2026-11-12): loading the desktop assistant uses over 1 GB of RAM,
     which is too high. First measure: per-process RSS/PSS of desktop.py and its web-view (renderer, GPU,
     utility) with the owner's avatar vs the sample avatar, idle and after a few minutes of chat. Then cut

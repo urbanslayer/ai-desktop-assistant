@@ -122,12 +122,12 @@ The speech bubble never sits on her face. While it is shown, the page re-places 
   the WebGL canvas, which misses DOM).
 
 Measured headroom above the head at visual scale 1.0 (fit framing includes the wave/think envelope,
-so the head sits near the window top): default 420x680 leaves ~36 px (sample rig) / ~16 px (owner
-rig); 1000x900 leaves ~52 px / ~33 px. Two readable lines need ~61 px (66 with the small font step),
-so at idle `above` fits NONE of short/1-3-sentence/6+-sentence replies at the default size, and only
-transiently (hop apex, small font) at 1000x900 — `body` is the workhorse mode. A ~90 px reserved top
-band in `applyFraming` would make `above` fit one-line replies at the default size (proposed in
-BACKLOG item 15, not implemented — window/framing changes are out of scope).
+so the head sits near the window top; usable above-space = head-top y − 16 px gap+margin): default
+420x680 gives 28 px (sample rig, head top y≈44) / 8 px (owner rig, y≈24); 1000x900 gives 52 px /
+23 px. Two readable lines need ~61 px, so at idle `above` fits NONE of short/1-3-sentence/6+-sentence
+replies at the default size, and only transiently (hop apex, small font) at 1000x900 — `body` is the
+workhorse mode. A ~90 px reserved top band in `applyFraming` would make `above` fit one-line replies
+at the default size (proposed in BACKLOG item 15, not implemented — framing changes are out of scope).
 
 ## Live-issue notes (Nov 2026 grab investigation)
 
