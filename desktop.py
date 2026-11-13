@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (QApplication, QInputDialog, QLineEdit, QMenu,
                                QSystemTrayIcon)
 
 from riko import appstate, asr, avatar_scale, client_tools, hub_client, shortcuts, touch_desk
+from riko import bubble_room as bubble_room_mod
 from riko import tts, viewer
 from riko import roam as roam_state
 from riko.config import load_config
@@ -139,6 +140,10 @@ class AvatarWindow(QWebEngineView):
         # hips_y) + main()'s sit-edge poller arm hook.
         self._arb = touch_desk.PressArbiter()
         self.last_bbox: dict = {}
+        # main()'s speech-bubble headroom room (riko/bubble_room.py): a drag
+        # must invalidate its cached geometry so the release restores around
+        # WHERE THE USER LEFT HER.
+        self.bubble_room: Optional[bubble_room_mod.HyprlandBubbleRoom] = None
         self.sit_state: dict = {"sitting": None}
         self.sit_watch: Optional[Callable[[], None]] = None
         self.on_focus: Optional[Callable[[], None]] = None  # chat.read report on focus (docs/TIMERS.md D)
@@ -221,8 +226,13 @@ class AvatarWindow(QWebEngineView):
                 and event.button() == Qt.MouseButton.LeftButton):
             was_drag = self._arb.state == touch_desk.PressArbiter.MOVING
             self._arb.release(touch_desk.now_ms())   # never consume it
-            if was_drag and self.sit_watch:
-                self.sit_watch()   # 3 more s of edge polling: the drop settles
+            if was_drag:
+                if self.bubble_room is not None:
+                    # headroom bookkeeping: the window moved under us, so the
+                    # next bubble-room request re-reads the compositor first
+                    self.bubble_room.mark_dirty()
+                if self.sit_watch:
+                    self.sit_watch()   # 3 more s: the drop settles
         return super().eventFilter(obj, event)
 
     def js(self, code):
@@ -487,6 +497,9 @@ class RoamController(QObject):
         self.in_strip = False
         self.x = None                  # (x, y, w, h) window coords of her body
         self.x_extra = None            # second interactive rect (ticker button)
+        # since the bubble headroom work the page may report SEVERAL islands
+        # (hit_extras: the ticker button AND the speech bubble above her head)
+        self.x_extras = []
         self._sent = None
         self._sent_extra = None
         self.xcb = None
@@ -643,11 +656,11 @@ class RoamController(QObject):
         if not (self.in_strip and self.backend == "xcb" and self.xcb and self.xcb.display):
             return
         rect = self._clipped_bbox()
-        extra = self._clipped_extra()
+        extra = self._clipped_extras()
         changed = rect != self._sent or extra != self._sent_extra
         self._sent = rect
         self._sent_extra = extra
-        new = self.xcb.create_region([r for r in (rect, extra) if r])
+        new = self.xcb.create_region([r for r in [rect] + extra if r])
         self.xcb.set_input_region(self.xid, new)
         self.xcb.destroy_region(new)
         # Rate-limited trace of every shaping change (≤ 1 line / 2 s): the first
@@ -685,17 +698,29 @@ class RoamController(QObject):
     def _clipped_bbox(self):
         return self._clip(self.x)
 
-    def _clipped_extra(self):
-        """The ticker button's rect (bbox `hit_extra`): a second interactive
-        island in the roam click-through mask, so the song button stays
-        clickable while everything around her body stays click-through."""
-        return self._clip(self.x_extra)
+    def _clipped_extras(self):
+        """Every interactive island outside her body (bbox `hit_extra` +
+        `hit_extras`: the song ticker's button, the speech bubble riding above
+        her head since the headroom work): they stay clickable in the
+        click-through mask while everything else around her body passes
+        clicks through to whatever is behind her."""
+        out = []
+        for r in [self.x_extra] + list(self.x_extras):
+            c = self._clip(r)
+            if c and c not in out:
+                out.append(c)
+        return out
 
     # ── from the page / viewer ─────────────────────────────────────────
-    def update_bbox(self, x, y, w, h, extra=None):
+    def update_bbox(self, x, y, w, h, extra=None, extras=None):
         self.x = (int(x), int(y), int(w), int(h))
         self.x_extra = tuple(extra) if (isinstance(extra, (list, tuple))
                                         and len(extra) == 4) else None
+        # hit_extras: list of rects (ticker button, speech bubble). Both keys
+        # are honoured so an old page and a new desktop (or the reverse) keep
+        # working; duplicates are just overlapping rects in one region.
+        self.x_extras = [tuple(r) for r in (extras or [])
+                         if isinstance(r, (list, tuple)) and len(r) == 4]
         self.apply_bbox()
 
     # ── click forwarding (xcb path) ────────────────────────────────────
@@ -719,7 +744,7 @@ class RoamController(QObject):
         except Exception:  # noqa: BLE001
             return False
         rect = self._clipped_bbox()
-        rects = [r for r in (rect, self._clipped_extra()) if r]
+        rects = [r for r in [rect] + self._clipped_extras() if r]
         inside = any(r[0] <= ex < r[0] + r[2] and r[1] <= ey < r[1] + r[3]
                      for r in rects)
         kind = "pointerdown" if code == 4 else "pointerup"
@@ -744,10 +769,63 @@ def handle_bbox_post(win, roamc, args: dict) -> dict:
     win.last_bbox = args
     try:
         roamc.update_bbox(args["x"], args["y"], args["w"], args["h"],
-                          args.get("hit_extra"))
+                          args.get("hit_extra"),
+                          touch_desk.interactive_rects(args))
     except (KeyError, TypeError, ValueError):
         return {"ok": False, "error": "bbox: need numeric x, y, w, h"}
     return {"ok": True}
+
+
+def handle_bubble_room_post(room, args, *, roam: bool, visible: bool,
+                            gesture: bool, emit=None) -> dict:
+    """The /control/bubble-room branch (docs/TOUCH.md "Speech bubble headroom").
+
+    The page (client/js/bubble_room.js) asks for N px of window ABOVE her
+    head while the speech bubble needs the above-head slot, and for 0 once the
+    bubble has been gone for a while.
+
+    `room` is the compositor answer: riko/bubble_room.HyprlandBubbleRoom under
+    Hyprland, where clients cannot place their own windows — its IO is plain
+    subprocesses, so it runs inline here and the reply carries the truth
+    (granted px, clamped by the monitor's usable top). `emit` is the X11/Qt
+    fallback (same optimistic shape as /control/avatar-scale): the request is
+    queued to the Qt thread and the reply carries what was ASKED — the page
+    reads the real size from its own canvas resize and its keep-alive
+    re-ask reconciles anything the WM refused. Neither available (a plain
+    browser tab, no window control) answers granted 0 so the page keeps the
+    chest placement instead of covering her face.
+
+    The desktop guards live HERE, not in the pure geometry: the roam strip
+    already slides beside her head (never grow the band), a hidden window has
+    nothing to grow, and a scale gesture in flight owns the window rect — all
+    three DEFER with the room unchanged, because the page re-asks on its
+    keep-alive (≤ ROOM_ASK_MS) and the bubble never covers her face meanwhile.
+    """
+    if room is None and emit is None:
+        return {"ok": True, "granted": 0, "reason": "no-desktop"}
+    if roam:
+        if room is not None:
+            room.abandon()      # the strip owns the window: forget our bookkeeping
+        else:
+            emit(0)             # release anything the floating window had grown
+        return {"ok": True, "granted": 0, "reason": "roam"}
+    if not visible:
+        return {"ok": True, "granted": room.granted if room else 0,
+                "reason": "hidden"}
+    if gesture:
+        return {"ok": True, "granted": room.granted if room else 0,
+                "reason": "gesture"}
+    try:
+        extra = int(round(float(args.get("extra"))))
+    except (TypeError, ValueError):    # missing, None or text
+        return {"ok": False, "error": "bubble-room: numeric extra (px)"}
+    if room is not None:
+        out = room.release() if extra <= 0 else room.apply(extra)
+        out.pop("argv", None)   # hyprctl argv is test evidence, not page payload
+        return out
+    emit(extra)
+    return {"ok": True, "granted": min(max(extra, 0), bubble_room_mod.MAX_EXTRA),
+            "reason": "queued"}
 
 
 def music_control_cmd(cmd: str, args: dict) -> dict:
@@ -1377,6 +1455,8 @@ def main():
 
     def show_window():
         if roamc.enabled and not roamc.in_strip:
+            if bubble_room is not None:
+                bubble_room.abandon()   # the strip is about to own the geometry
             roamc.enter_strip()      # strip flags + size + bottom-edge placement
             if roamc.in_strip:
                 win.roam_strip = True
@@ -1425,6 +1505,11 @@ def main():
         elif cmd == "reset-size":  # tray Reset size: the page resets scale +
             # camera and POSTs scale 1.0 back through /control/avatar-scale
             win.js("window.riko && riko.resetSize && riko.resetSize()")
+        elif cmd.startswith("bubble-room:"):   # speech-bubble headroom (X11/Qt)
+            try:
+                apply_bubble_room(int(cmd.partition(":")[2]))
+            except ValueError:
+                pass
         elif cmd.startswith("avatar-scale:"):  # scroll = zoom her (see below)
             parts = cmd.split(":")             # final:window:gesture-flag
             try:
@@ -1500,6 +1585,36 @@ def main():
     scale_timer.setSingleShot(True)
     scale_timer.setInterval(120)
 
+    # ── Speech-bubble headroom (docs/TOUCH.md) ───────────────────────────
+    # While the bubble needs the slot ABOVE her head the page asks this
+    # desktop for the missing px (client/js/bubble_room.js → POST
+    # /control/bubble-room); the window grows UPWARD (y -= extra, h += extra)
+    # so her size and her feet pixels never change, and the exact rect comes
+    # back when the bubble has been gone for a while. Under Hyprland the pure
+    # module does everything inline on the HTTP thread (subprocesses only,
+    # ONE batched hyprctl, nothing persisted); on X11/Qt the same pure state
+    # machine runs here on the Qt thread with win.resize()/win.move().
+    bubble_room = (bubble_room_mod.HyprlandBubbleRoom(scale_sizer)
+                   if scale_sizer is not None else None)
+    qt_room = bubble_room_mod.BubbleRoom()
+    win.bubble_room = bubble_room
+
+    def apply_bubble_room(extra):
+        """Qt thread (X11/Qt path): honour the page's headroom request."""
+        scr = win.screen() or QGuiApplication.primaryScreen()
+        g = scr.availableGeometry()
+        mon = (g.x(), g.y(), g.width(), g.height())
+        cur = (win.x(), win.y(), win.width(), win.height())
+        d = qt_room.want(extra, cur, mon) if extra > 0 else qt_room.released(cur, mon)
+        geom = d.get("geometry")
+        if geom and d["action"] in ("grow", "release"):
+            x, y, w, h = geom
+            win.resize(w, h)     # resize FIRST, then move: one bottom edge
+            win.move(x, y)       # never crosses the feet line twice
+            qt_room.applied(geom)
+            if d["action"] == "release":
+                qt_room.reset()
+
     def apply_avatar_scale(scale, window_scale=None, persist=True):
         """Qt thread: put the window (or the roam strip) at the request.
         `scale` is her final size (what persists); `window_scale` is what
@@ -1520,6 +1635,10 @@ def main():
                 ws, max_scale=avatar_scale.WINDOW_SCALE_MAX)
             win.resize(w, h)
             win.move(x, y)   # grow upward from the feet where the WM allows it
+            if qt_room.base is not None:
+                # same rule as the Hyprland path above: the room re-measures
+                # itself from the new normal size on the page's next ask
+                qt_room.rebase(round(base_w * s), round(base_h * s))
         if persist:
             pid = (hub_client.active_persona() or {}).get("id") or "default"
             appstate.save_scale(pid, s)
@@ -1729,6 +1848,24 @@ def main():
             # song ticker: page's transport button / late-open seed. Module-
             # level music_control_cmd (unit-tested; bug E regression).
             return music_control_cmd(cmd, args)
+        elif cmd == "bubble-room":
+            # speech-bubble headroom (docs/TOUCH.md): the page asks for N px
+            # of window above her head while a bubble needs the above-head
+            # slot, 0 to give it back. {extra: px}. Reply {ok, granted,
+            # reason}: granted is what the desktop REALLY has room for (the
+            # monitor's usable top clamps it), so the page keeps the chest
+            # placement rather than covering her face. Deferred (reason
+            # roam/hidden/gesture) while something else owns the window rect;
+            # the page's keep-alive (<= 500 ms) re-asks, so a FIT or a drag
+            # that overwrote the grown rect is repaired on its own.
+            in_gesture = (scale_state["want"] is not None
+                          and (scale_state["want"][2]
+                               or scale_state["want"] != scale_state["applied"]))
+            return handle_bubble_room_post(
+                bubble_room, args, roam=roamc.in_strip, visible=win.isVisible(),
+                gesture=in_gesture,
+                emit=None if in_gesture else
+                (lambda e: bridge.command.emit(f"bubble-room:{int(e)}")))
         elif cmd == "avatar-scale":
             # scroll over her = her zoom: the PAGE renders the visual zoom
             # every frame and asks the desktop only for WINDOW moves at
@@ -1756,6 +1893,11 @@ def main():
                 res = scale_sizer.apply(w)
                 if res.get("ok") and not gesture:
                     scale_state["cur"] = s
+                    # a FIT changed her NORMAL window size while a bubble was
+                    # up: the headroom is measured from the new size, so the
+                    # page's next keep-alive re-grows around it (feet kept)
+                    if bubble_room is not None:
+                        bubble_room.rebase(round(base_w * s), round(base_h * s))
                     pid = (hub_client.active_persona() or {}).get("id") or "default"
                     appstate.save_scale(pid, s)
                 return {"ok": bool(res.get("ok")), "scale": s,

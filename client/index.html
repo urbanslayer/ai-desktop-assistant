@@ -154,6 +154,7 @@
     } from './js/ticker.js';
     import { WalkDirector } from './js/walk.js';
     import { placeBubble, BubbleTracker } from './js/bubble.js';
+    import { BubbleRoomTracker } from './js/bubble_room.js';
     import { clampScale, stepScale, dollyDistance, approachScale,
              GestureTracker, framingDistance, feetAnchorTarget,
              sizeChanged, controlsDistanceBand,
@@ -194,6 +195,20 @@
     // a gesture run exercises the same grow/fit + resize-refit path.
     const FAKE_DESK = DESKTOP && !!CAPTURE;
     let fakeWin = null;   // canvas size while faking a window (null = viewport)
+    // The headroom harness (client/tools/capture_frames.py --room) runs the
+    // BROWSER window taller than the fake desktop window so the grown canvas
+    // fits on screen; ?fakebase=WxH then says what the un-grown window is.
+    const FAKE_BASE = (FAKE_DESK
+                       && new URLSearchParams(location.search).get('fakebase')) || '';
+    let fakeWinBase = null;   // FAKE_DESK: the window WITHOUT any bubble room
+    if (FAKE_BASE) {
+      const bw = parseInt(FAKE_BASE.split('x')[0], 10);
+      const bh = parseInt(FAKE_BASE.split('x')[1], 10);
+      if (Number.isFinite(bw) && Number.isFinite(bh)) {
+        fakeWin = { w: bw, h: bh };
+        fakeWinBase = { w: bw, h: bh };
+      }
+    }
     const viewW = () => (fakeWin ? fakeWin.w : innerWidth);
     const viewH = () => (fakeWin ? fakeWin.h : innerHeight);
     // In ?force= mode the director is silenced: only the forced items move her.
@@ -488,7 +503,8 @@
       windowAsk = w;   // gesture bookkeeping compares against what we ASKED
       if (FAKE_DESK) {   // capture harness: the page IS the desktop
         windowScale = w;
-        fakeWin = { w: Math.round(baseW * w), h: Math.round(baseH * w) };
+        fakeWinBase = { w: Math.round(baseW * w), h: Math.round(baseH * w) };
+        fakeWin = { w: fakeWinBase.w, h: fakeWinBase.h + bubbleRoomGranted };
         dispatchEvent(new Event('resize'));  // same path a WM resize takes
         return;
       }
@@ -508,6 +524,63 @@
       scaleShown = 1.0;
       postScale(1.0, 1.0, false);
       applyScaleFrame(1.0);       // undo a Ctrl+scroll close-up too
+    }
+
+    // ── Speech-bubble headroom (docs/TOUCH.md "Speech bubble headroom") ──
+    // placeBubble wants the bubble ABOVE her head; at the default 420x680
+    // desktop window there are only 8-28 px there, so without help it always
+    // lands on her chest. While that is true this asks the desktop (POST
+    // /control/bubble-room {extra}) for the missing px of window ABOVE her
+    // head: the window grows upward (y -= extra, h += extra), the resize
+    // re-frames with pixels-per-metre AND the feet pixel position preserved
+    // (syncViewport/applyScaleFrame), so she stays exactly the same size in
+    // exactly the same place and the new space appears where the bubble needs
+    // it. client/js/bubble_room.js owns the request policy (step 16 px,
+    // ceiling 220 px, never shrink while shown, ONE release per bubble after
+    // 1.5 s of quiet so consecutive lines do not pump the window); this glue
+    // only moves the window. Roam STRIP mode never asks: its band already
+    // slides beside her head.
+    const bubbleRoom = new BubbleRoomTracker();
+    let bubbleRoomAsked = 0;     // last px we asked the desktop for
+    let bubbleRoomGranted = 0;   // px the desktop REALLY gave
+    let bubbleRoomPre = null;    // framing snapshot taken before a grow lands
+    function bubbleRoomQA() {
+      return { asked: bubbleRoomAsked, granted: bubbleRoomGranted, pre: bubbleRoomPre,
+               win: [viewW(), viewH()] };
+    }
+    function postBubbleRoom(extra) {
+      if (!DESKTOP || ROAM) return;
+      const px = Math.max(0, Math.round(+extra || 0));
+      bubbleRoomAsked = px;
+      if (px > bubbleRoomGranted && !bubbleRoomPre && bubbleQAState) {
+        // evidence for the harness gate: her feet px and head-top px in the
+        // LAST frame before the window grew, so "nothing below the feet moved,
+        // she did not change size" is measurable, not implied
+        bubbleRoomPre = { view: [viewW(), viewH()], feet: feetPxY(),
+                          head: bubbleQAState.head[1] };
+      }
+      if (FAKE_DESK) {   // capture harness: the page IS the desktop
+        bubbleRoomGranted = px;
+        const b = fakeWinBase || { w: innerWidth, h: innerHeight };
+        fakeWin = { w: b.w, h: b.h + px };
+        dispatchEvent(new Event('resize'));   // the WM resize path, unchanged
+        if (px === 0) bubbleRoomPre = null;
+        return;
+      }
+      fetch('/control/bubble-room', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ extra: px }),
+      }).then((r) => r.json()).then((res) => {
+        const g = res && Number.isFinite(+res.granted) ? Math.max(0, +res.granted) : 0;
+        bubbleRoomGranted = g;
+        if (g === 0) bubbleRoomPre = null;    // released: evidence done
+      }).catch(() => { bubbleRoomGranted = 0; });   // no desktop: chest placement
+    }
+    function resetBubbleRoom() {   // persona swap / harness: forget the room
+      bubbleRoom.reset();
+      bubbleRoomAsked = 0;
+      bubbleRoomGranted = 0;
+      bubbleRoomPre = null;
     }
     if (DESKTOP) {
       controls.enableZoom = false;  // the wheel is ours now; dolly is manual
@@ -1134,14 +1207,26 @@
       const bh = Math.min(innerHeight - y, Math.round(y1 - y0 + pad * 2));
       const parts = computeParts();
       const hy = hipsPxY(), fy = feetPxY();
-      // the ticker button is the one interactive island OUTSIDE her body
-      // rect: roam click-through masks add it as a second rect (hit_extra)
+      // Interactive islands OUTSIDE her body rect: the ticker button and (on
+      // the headroom path) the speech bubble riding above her head. Roam
+      // click-through masks add them as extra rects and the press arbiter
+      // (touch_desk.interactive_at) must not eat presses on them as window
+      // drags; `hit_extra` stays the single ticker rect for older desktops.
+      const extras = [];
       let hitExtra;
       if (tBar.classList.contains('show')) {
         const b = tBtn.getBoundingClientRect();
         if (b.width > 0 && b.height > 0) {
           hitExtra = [Math.round(b.x), Math.round(b.y),
                       Math.round(b.width), Math.round(b.height)];
+          extras.push(hitExtra);
+        }
+      }
+      if (bubble.classList.contains('show')) {
+        const b = bubble.getBoundingClientRect();
+        if (b.width > 0 && b.height > 0) {
+          extras.push([Math.round(b.x), Math.round(b.y),
+                       Math.round(b.width), Math.round(b.height)]);
         }
       }
       return {
@@ -1150,6 +1235,7 @@
         ...(hy != null ? { hips_y: Math.round(hy) } : {}),
         ...(fy != null ? { feet_y: Math.round(fy) } : {}),
         ...(hitExtra ? { hit_extra: hitExtra } : {}),
+        ...(extras.length ? { hit_extras: extras } : {}),
       };
     }
     function postBbox() {
@@ -1529,7 +1615,7 @@
       c.width = renderer.domElement.width; c.height = renderer.domElement.height;
       const g = c.getContext('2d');
       g.drawImage(renderer.domElement, 0, 0);
-      const sx = c.width / innerWidth, sy = c.height / innerHeight;
+      const sx = c.width / viewW(), sy = c.height / viewH();
       g.save();
       g.scale(sx, sy);
       if (tqa && tqa.shown) {
@@ -2189,6 +2275,10 @@
       if (!bubble.classList.contains('show')) {
         if (bubbleTracker.mode !== null) bubbleTracker.reset();
         bubbleQAState = null;
+        // the room's release timer runs while she is NOT talking: exactly one
+        // give-back per bubble, 1.5 s after the bubble actually went away
+        const ask = bubbleRoom.frame({ nowMs: performance.now(), shown: false });
+        if (ask !== null) postBubbleRoom(ask);
         return;
       }
       const rects = bubbleBodyRects();
@@ -2234,10 +2324,21 @@
       if (chosen.tail) bubble.style.setProperty('--tail-x', `${Math.round(chosen.tail.x)}px`);
       const r = bubble.getBoundingClientRect();
       const rect4 = (q) => [q.x, q.y, q.w, q.h].map((v) => Math.round(v));
+      // Headroom request for THIS frame's placement: `above` did not fit and
+      // the bubble is riding her chest => ask the desktop for the missing px
+      // above her head (client/js/bubble_room.js decides whether to say
+      // anything at all this frame). Nothing else here moves the window.
+      const ask = bubbleRoom.frame({ nowMs: performance.now(), shown: true,
+                                     headTopY: rects.headRect.y, bubbleH: hFull,
+                                     aboveFits: !!modes.above });
+      if (ask !== null) postBubbleRoom(ask);
+      const fy = feetPxY();
       bubbleQAState = { shown: true, mode: chosen.mode, fontStep: chosen.fontStep,
                         bubble: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
                         head: rect4(rects.headRect), face: rect4(rects.faceRect),
                         body: rect4(rects.bodyRect), view: [view.w, view.h],
+                        ...(fy != null ? { feet: Math.round(fy) } : {}),
+                        room: bubbleRoomQA(),
                         text: bubble.textContent.slice(0, 80) };
     }
     // Approval bubble: desktop.py emits 'approval' while a tool waits for an

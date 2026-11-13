@@ -213,6 +213,16 @@ class BubbleRoom:
         return {"action": "release", "granted": 0, "geometry": geom,
                 "reason": "released"}
 
+    def rebase(self, w, h):
+        """The window's NORMAL size changed while the room was granted (a
+        scroll-zoom FIT landing mid-bubble): the room must be measured from
+        the NEW normal size, not the pre-grow one, or the next keep-alive
+        would resize her back. Same px of room, new base, re-dispatch."""
+        w, h = int(w), int(h)
+        if w > 0 and h > 0 and self.base is not None:
+            self.base = (w, h)
+            self.geometry = None    # nothing on screen matches our bookkeeping
+
     def applied(self, geometry):
         """Book a successful dispatch (this rect is now the truth)."""
         self.geometry = _rect(geometry)
@@ -237,6 +247,10 @@ class HyprlandBubbleRoom:
         self.sizer = sizer
         self.state = BubbleRoom(max_extra=max_extra)
         self._dirty = False    # a user drag happened: re-read before deciding
+
+    def rebase(self, w, h):
+        """A scale FIT changed her normal window size: re-measure the room."""
+        self.state.rebase(w, h)
 
     def mark_dirty(self):
         """The user moved her window (desktop.py's drag end): the cached

@@ -355,3 +355,47 @@ def test_sizer_state_is_shared_not_re_read_per_call():
     # (a drag while grown must release where the user left her), so two
     # pairs total — never one per request.
     assert fake.listing_calls == 4
+
+
+# ── a zoom FIT landing while the bubble is up ────────────────────────
+def test_rebase_re_measures_the_room_after_a_fit():
+    """The scroll-zoom FIT resizes the window to base x fit, which drops the
+    grown band. The room must then be measured from the NEW normal size (same
+    px of room, feet line untouched), not from the pre-grow 420x680."""
+    st = br.BubbleRoom()
+    mon = (0, 44, 2560, 1396)
+    d1 = st.want(96, (100, 400, BASE_W, BASE_H), mon)
+    st.applied(d1["geometry"])                       # grown: 420x776
+    assert d1["geometry"] == (100, 400 - 96, BASE_W, BASE_H + 96)
+    # the wheel's fit lands (fit 1.25 -> 525x850, feet-anchored like every
+    # avatar_scale apply): the room rebases instead of fighting it
+    fit = (100, 1080 - 850, 525, 850)
+    st.rebase(525, 850)
+    assert st.geometry is None                       # nothing is trusted now
+    d2 = st.want(96, fit, mon)
+    assert d2["action"] == "grow" and d2["granted"] == 96
+    x, y, w, h = d2["geometry"]
+    assert (w, h) == (525, 850 + 96)                 # new size + the room
+    assert y + h == 1080                             # her feet never moved
+    # not grown => nothing to rebase (a plain FIT is left completely alone)
+    st2 = br.BubbleRoom()
+    st2.rebase(525, 850)
+    assert st2.base is None and st2.granted == 0
+
+
+def test_hypr_rebase_forces_the_next_ask_to_redispatch():
+    grown_h = BASE_H + 96
+    room, fake = _room((HIGH[0], 400 + 96), [BASE_W, grown_h])
+    assert room.apply(96)["reason"] == "grown"       # sizer reports the grown
+    n = len(fake.dispatches)
+    assert room.apply(96)["reason"] == "already"     # keep-alive: no dispatch
+    assert len(fake.dispatches) == n
+    room.rebase(525, 850)                            # a FIT changed her size
+    out = room.apply(96)
+    assert out["reason"] == "grown" and out["granted"] == 96
+    assert len(fake.dispatches) == n + 1
+    body = fake.dispatches[-1][2]
+    resize, move = body.split(" ; ")
+    assert f"y={850 + 96}" in resize                 # resize to the new height
+    assert f"x={525}" in resize
+    assert f"y={400 + 96 + grown_h - (850 + 96)}" in move   # feet line kept
